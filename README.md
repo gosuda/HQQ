@@ -1,10 +1,10 @@
 # HQQ: Efficient Shared-Memory IPC
 
-HQQ is a Go IPC library built around shared memory and lock-free MPMC rings. The current implementation focuses on making the **StandardLink / Standard Protocol** data path correct, bounded, and fast.
+HQQ is a Go IPC library built around shared memory and lock-free MPMC rings. The current implementation focuses on making the **StandardLink / Standard Protocol** data path correct, bounded, and fast, with an **Advanced Protocol** overlay for large-data copy and request-response IPC.
 
 ## Current Focus
 
-Implemented for `StandardLink`:
+Implemented:
 
 - fixed-size 64-byte protocol packets
 - little-endian packet encoding
@@ -16,12 +16,15 @@ Implemented for `StandardLink`:
 - `io.Reader`, `io.Writer`, and `net.PacketConn` style APIs
 - read/write deadline timeout behavior
 - StandardLink functional and benchmark coverage
+- `AdvancedLink` protocol negotiation
+- Advanced Protocol large-data copy over chunked `OpConnCopy` frames
+- Advanced Protocol request-response IPC
+- AdvancedLink functional and benchmark coverage
 
 Planned or experimental:
 
-- `AdvancedLink` protocol negotiation
-- logical connection lifecycle
-- compression, encryption, flow control, QoS, and reliability extensions
+- explicit logical stream lifecycle APIs
+- streaming Advanced receive callbacks that avoid full message assembly
 - production hardening of unsafe shared-memory internals
 
 ## Standard Protocol Overview
@@ -157,6 +160,43 @@ _ = read.Release()
 
 > WARNING: Reserved slots must be finished. Writers must call `Commit` or `Abort`; readers must call `Release`. Dropping a reservation can cause head-of-line (HOL) blocking for the whole direction. `Abort` publishes a tombstone packet so readers can skip the abandoned slot and preserve ring progress.
 
+
+### AdvancedLink methods
+
+```go
+func NewAdvancedLink(offset uintptr, bufferCount int, bufferSize int) (*AdvancedLink, error)
+func (l *AdvancedLink) NegotiateProtocol(ctx context.Context, version ProtocolVersion, features uint64) (bool, error)
+func (l *AdvancedLink) WaitForNegotiation(ctx context.Context) (bool, error)
+func (l *AdvancedLink) SendLarge(ctx context.Context, connectionID uint64, payload []byte) (messageID uint64, err error)
+func (l *AdvancedLink) Receive(ctx context.Context) (AdvancedMessage, error)
+func (l *AdvancedLink) Call(ctx context.Context, methodID uint64, request []byte) ([]byte, error)
+func (l *AdvancedLink) CallOn(ctx context.Context, connectionID uint64, methodID uint64, request []byte) (AdvancedMessage, error)
+func (l *AdvancedLink) Respond(ctx context.Context, request AdvancedMessage, status uint64, response []byte) error
+func (l *AdvancedLink) RespondError(ctx context.Context, request AdvancedMessage, status uint64, response []byte) error
+```
+
+Advanced feature flags are intentionally narrow: `FeatureLargeCopy` and `FeatureRequestResponse`. `SendLarge` splits payloads larger than `bufferSize` into chunked `OpConnCopy` frames. `Call`/`CallOn` use the same chunking for request and response bodies and correlate responses by `MessageID`. `Receive` assembles complete Advanced messages before returning; future streaming APIs may avoid full assembly for very large payloads. Do not read Advanced traffic through the Standard `Read` APIs.
+
+Minimal request-response flow:
+
+```go
+// Server side
+req, err := server.Receive(ctx)
+if err != nil {
+    panic(err)
+}
+if req.IsRequest() && req.MethodID == 7 {
+    _ = server.Respond(ctx, req, 0, []byte("ok"))
+}
+
+// Client side
+resp, err := client.Call(ctx, 7, []byte("ping"))
+if err != nil {
+    panic(err)
+}
+fmt.Println(string(resp))
+```
+
 `StandardLink` also implements `net.PacketConn`:
 
 ```go
@@ -172,7 +212,7 @@ func (l *StandardLink) SetWriteDeadline(t time.Time) error
 
 ```bash
 go test ./...
-go test -bench=StandardLink -run '^$' -benchtime=1s
+go test -bench='(StandardLink|AdvancedLink)' -run '^$' -benchtime=1s
 ```
 
 Current known caveat: the low-level shared-memory ring uses unsafe pointer arithmetic. Standard functional tests pass, but full `go vet`/checkptr hardening of the MPMC internals is still a separate hardening task.

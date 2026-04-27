@@ -35,25 +35,29 @@ const (
 	LinkTypeAdvanced                 // Advanced link with protocol negotiation
 )
 
-// Feature flags for protocol negotiation
-// These flags are used during protocol negotiation to enable optional features
+// Feature flags for Advanced Protocol negotiation.
 const (
-	FeatureNone        uint64 = 0
-	FeatureCompression uint64 = 1 << iota // Enable data compression
-	FeatureEncryption                     // Enable data encryption
-	FeatureFlowControl                    // Enable advanced flow control
-	FeatureStatistics                     // Enable enhanced statistics
-	FeatureQoS                            // Enable quality of service features
+	FeatureNone            uint64 = 0
+	FeatureLargeCopy       uint64 = 1 << iota // Enable OpConnCopy chunking for payloads larger than bufferSize.
+	FeatureRequestResponse                    // Enable request-response IPC over OpConnCopy.
 )
 
-// Capability flags for protocol negotiation
-// These flags indicate system capabilities during negotiation
+// Capability flags for Advanced Protocol negotiation.
 const (
-	CapabilityNone             uint64 = 0
-	CapabilityLargeBuffers     uint64 = 1 << iota // Support for large buffers
-	CapabilityHighThroughput                      // High throughput mode
-	CapabilityLowLatency                          // Low latency optimizations
-	CapabilityReliableDelivery                    // Reliable delivery guarantees
+	CapabilityNone           uint64 = 0
+	CapabilityLargeBuffers   uint64 = 1 << iota // Endpoint supports large configured payload buffers.
+	CapabilityHighThroughput                    // Endpoint is optimized for high-throughput chunk streams.
+	CapabilityLowLatency                        // Endpoint is optimized for low-latency request-response calls.
+)
+
+// Advanced Protocol frame flags stored in OpConnCopy operand 5.
+const (
+	AdvFlagBegin uint64 = 1 << iota
+	AdvFlagEnd
+	AdvFlagAbort
+	AdvFlagRequest
+	AdvFlagResponse
+	AdvFlagError
 )
 
 // ProtocolVersion represents a protocol version using semantic versioning
@@ -876,8 +880,7 @@ func (l *StandardLink) enqueueWithTimeout(ctx context.Context, ring *mpmc.MPMCRi
 	return nil
 }
 
-// AdvancedLink represents an advanced HQQ link with additional features
-// Built on top of StandardLink to provide enhanced capabilities
+// AdvancedLink implements the Advanced Protocol overlay on top of StandardLink.
 type AdvancedLink struct {
 	slink *StandardLink // Wrapped standard link
 
@@ -887,15 +890,19 @@ type AdvancedLink struct {
 	negotiatedFeatures     uint64          // Negotiated feature flags
 	negotiatedCapabilities uint64          // Negotiated capability flags
 
-	// Advanced features
-	compressionEnabled bool // Compression is enabled
-	encryptionEnabled  bool // Encryption is enabled
-	flowControlEnabled bool // Flow control is enabled
+	largeCopyEnabled       bool
+	requestResponseEnabled bool
+
+	messageIDGenerator atomic.Uint64
 
 	// Connection management
 	connections sync.Map   // map[uint64]*Connection - Active connections
 	listening   bool       // Whether the link is listening for connections
 	connCond    *sync.Cond // Condition variable for connection notifications
+
+	receiveMu       sync.Mutex
+	assemblies      map[advancedMessageKey]*advancedAssembly
+	pendingMessages []AdvancedMessage
 
 	// Statistics
 	advancedStats AdvancedStats // Advanced statistics
@@ -904,11 +911,63 @@ type AdvancedLink struct {
 
 // AdvancedStats contains advanced statistics for the AdvancedLink
 type AdvancedStats struct {
-	// Advanced stats
-	CompressionRatio   float64       // Compression ratio achieved
-	EncryptionOverhead uint64        // Overhead from encryption
-	FlowControlEvents  uint64        // Number of flow control events
-	NegotiationTime    time.Duration // Time taken for protocol negotiation
+	NegotiationTime time.Duration
+	LargeMessages   uint64
+	LargeBytes      uint64
+	Requests        uint64
+	Responses       uint64
+}
+
+// AdvancedMessage is one complete Advanced Protocol message.
+type AdvancedMessage struct {
+	ConnectionID uint64
+	MessageID    uint64
+	MethodID     uint64
+	Status       uint64
+	Flags        uint64
+	Payload      []byte
+}
+
+func (m AdvancedMessage) IsData() bool {
+	return m.Flags&(AdvFlagRequest|AdvFlagResponse|AdvFlagAbort) == 0
+}
+
+func (m AdvancedMessage) IsRequest() bool {
+	return m.Flags&AdvFlagRequest != 0
+}
+
+func (m AdvancedMessage) IsResponse() bool {
+	return m.Flags&AdvFlagResponse != 0
+}
+
+func (m AdvancedMessage) IsError() bool {
+	return m.Flags&AdvFlagError != 0
+}
+
+func (m AdvancedMessage) IsAbort() bool {
+	return m.Flags&AdvFlagAbort != 0
+}
+
+// AdvancedResponseError reports an application/protocol error response.
+type AdvancedResponseError struct {
+	Status  uint64
+	Payload []byte
+}
+
+func (e AdvancedResponseError) Error() string {
+	return "hqq: advanced response error"
+}
+
+type advancedMessageKey struct {
+	connectionID uint64
+	messageID    uint64
+	kind         uint64
+}
+
+type advancedAssembly struct {
+	message AdvancedMessage
+	data    []byte
+	next    uint64
 }
 
 // NewAdvancedLink creates a new advanced link
@@ -923,6 +982,7 @@ func NewAdvancedLink(offset uintptr, bufferCount int, bufferSize int) (*Advanced
 		slink:         slink,
 		protocolState: ProtocolStateNone,
 		listening:     false,
+		assemblies:    make(map[advancedMessageKey]*advancedAssembly),
 		advancedStats: AdvancedStats{},
 	}
 	advLink.connCond = sync.NewCond(&sync.Mutex{})
@@ -989,7 +1049,7 @@ func (l *AdvancedLink) NegotiateProtocol(ctx context.Context, version ProtocolVe
 
 	// Prepare negotiation packet
 	versionEncoded := uint64(version.Major)<<8 | uint64(version.Minor)
-	capabilities := CapabilityLargeBuffers | CapabilityHighThroughput
+	capabilities := CapabilityLargeBuffers | CapabilityHighThroughput | CapabilityLowLatency
 
 	packet := protocol.NewPacket(
 		protocol.OpProtoNegotiate,
@@ -1035,10 +1095,7 @@ func (l *AdvancedLink) NegotiateProtocol(ctx context.Context, version ProtocolVe
 			l.negotiatedFeatures = p.Operand(1)
 			l.negotiatedCapabilities = p.Operand(2)
 
-			// Enable features based on negotiation
-			l.compressionEnabled = (l.negotiatedFeatures & FeatureCompression) != 0
-			l.encryptionEnabled = (l.negotiatedFeatures & FeatureEncryption) != 0
-			l.flowControlEnabled = (l.negotiatedFeatures & FeatureFlowControl) != 0
+			l.enableNegotiatedFeatures()
 
 			l.protocolState = ProtocolStateNegotiated
 			return true, nil
@@ -1097,8 +1154,8 @@ func (l *AdvancedLink) WaitForNegotiation(ctx context.Context) (bool, error) {
 			Major: protocol.HQQProtocolMajorVersion,
 			Minor: protocol.HQQProtocolMinorVersion,
 		}
-		supportedFeatures := FeatureCompression | FeatureFlowControl | FeatureStatistics
-		supportedCapabilities := CapabilityLargeBuffers | CapabilityHighThroughput
+		supportedFeatures := FeatureLargeCopy | FeatureRequestResponse
+		supportedCapabilities := CapabilityLargeBuffers | CapabilityHighThroughput | CapabilityLowLatency
 
 		// Negotiate version (use the minimum of requested and supported)
 		if uint8(requestedVersion>>8) > supportedVersion.Major ||
@@ -1119,10 +1176,7 @@ func (l *AdvancedLink) WaitForNegotiation(ctx context.Context) (bool, error) {
 		// Negotiate capabilities (use intersection of requested and supported)
 		l.negotiatedCapabilities = requestedCapabilities & supportedCapabilities
 
-		// Enable features based on negotiation
-		l.compressionEnabled = (l.negotiatedFeatures & FeatureCompression) != 0
-		l.encryptionEnabled = (l.negotiatedFeatures & FeatureEncryption) != 0
-		l.flowControlEnabled = (l.negotiatedFeatures & FeatureFlowControl) != 0
+		l.enableNegotiatedFeatures()
 
 		// Send acknowledgment
 		versionEncoded := uint64(l.negotiatedVersion.Major)<<8 | uint64(l.negotiatedVersion.Minor)
@@ -1159,19 +1213,19 @@ func (l *AdvancedLink) GetNegotiatedCapabilities() uint64 {
 	return l.negotiatedCapabilities
 }
 
-// IsCompressionEnabled returns whether compression is enabled
-func (l *AdvancedLink) IsCompressionEnabled() bool {
-	return l.compressionEnabled
+func (l *AdvancedLink) enableNegotiatedFeatures() {
+	l.largeCopyEnabled = (l.negotiatedFeatures & FeatureLargeCopy) != 0
+	l.requestResponseEnabled = (l.negotiatedFeatures & FeatureRequestResponse) != 0
 }
 
-// IsEncryptionEnabled returns whether encryption is enabled
-func (l *AdvancedLink) IsEncryptionEnabled() bool {
-	return l.encryptionEnabled
+// IsLargeCopyEnabled returns whether Advanced large-data copy is enabled.
+func (l *AdvancedLink) IsLargeCopyEnabled() bool {
+	return l.largeCopyEnabled
 }
 
-// IsFlowControlEnabled returns whether flow control is enabled
-func (l *AdvancedLink) IsFlowControlEnabled() bool {
-	return l.flowControlEnabled
+// IsRequestResponseEnabled returns whether Advanced request-response IPC is enabled.
+func (l *AdvancedLink) IsRequestResponseEnabled() bool {
+	return l.requestResponseEnabled
 }
 
 // GetAdvancedStats returns advanced statistics for the link
@@ -1180,6 +1234,376 @@ func (l *AdvancedLink) GetAdvancedStats() AdvancedStats {
 	defer l.statsMutex.RUnlock()
 
 	return l.advancedStats
+}
+
+// SendLarge publishes payload as one Advanced large-copy message. It may split
+// the payload into multiple OpConnCopy chunks when len(payload) > bufferSize.
+func (l *AdvancedLink) SendLarge(ctx context.Context, connectionID uint64, payload []byte) (uint64, error) {
+	if err := l.requireNegotiatedFeature(FeatureLargeCopy); err != nil {
+		return 0, err
+	}
+	messageID := l.nextMessageID()
+	if err := l.sendAdvancedPayload(ctx, connectionID, messageID, 0, 0, payload); err != nil {
+		return 0, err
+	}
+	l.statsMutex.Lock()
+	l.advancedStats.LargeMessages++
+	l.advancedStats.LargeBytes += uint64(len(payload))
+	l.statsMutex.Unlock()
+	return messageID, nil
+}
+
+// Receive returns the next complete Advanced Protocol message.
+func (l *AdvancedLink) Receive(ctx context.Context) (AdvancedMessage, error) {
+	return l.receiveMatching(ctx, func(AdvancedMessage) bool { return true })
+}
+
+// Call sends a link-level request and waits for its response.
+func (l *AdvancedLink) Call(ctx context.Context, methodID uint64, request []byte) ([]byte, error) {
+	response, err := l.CallOn(ctx, 0, methodID, request)
+	if err != nil {
+		return nil, err
+	}
+	if response.IsError() {
+		return nil, AdvancedResponseError{Status: response.Status, Payload: response.Payload}
+	}
+	return response.Payload, nil
+}
+
+// CallOn sends a request on connectionID and waits for the matching response.
+func (l *AdvancedLink) CallOn(ctx context.Context, connectionID uint64, methodID uint64, request []byte) (AdvancedMessage, error) {
+	if err := l.requireNegotiatedFeature(FeatureRequestResponse); err != nil {
+		return AdvancedMessage{}, err
+	}
+	messageID := l.nextMessageID()
+	if err := l.sendAdvancedPayload(ctx, connectionID, messageID, AdvFlagRequest, methodID, request); err != nil {
+		return AdvancedMessage{}, err
+	}
+	l.statsMutex.Lock()
+	l.advancedStats.Requests++
+	l.statsMutex.Unlock()
+
+	return l.receiveMatching(ctx, func(message AdvancedMessage) bool {
+		return message.ConnectionID == connectionID &&
+			message.MessageID == messageID &&
+			message.IsResponse()
+	})
+}
+
+// Respond sends a successful response for request.
+func (l *AdvancedLink) Respond(ctx context.Context, request AdvancedMessage, status uint64, response []byte) error {
+	if !request.IsRequest() {
+		return ErrInvalidOp
+	}
+	if err := l.requireNegotiatedFeature(FeatureRequestResponse); err != nil {
+		return err
+	}
+	if err := l.sendAdvancedPayload(ctx, request.ConnectionID, request.MessageID, AdvFlagResponse, status, response); err != nil {
+		return err
+	}
+	l.statsMutex.Lock()
+	l.advancedStats.Responses++
+	l.statsMutex.Unlock()
+	return nil
+}
+
+// RespondError sends an error response for request.
+func (l *AdvancedLink) RespondError(ctx context.Context, request AdvancedMessage, status uint64, response []byte) error {
+	if !request.IsRequest() {
+		return ErrInvalidOp
+	}
+	if err := l.requireNegotiatedFeature(FeatureRequestResponse); err != nil {
+		return err
+	}
+	if status == 0 {
+		status = uint64(ErrCodeInvalidOp)
+	}
+	if err := l.sendAdvancedPayload(ctx, request.ConnectionID, request.MessageID, AdvFlagResponse|AdvFlagError, status, response); err != nil {
+		return err
+	}
+	l.statsMutex.Lock()
+	l.advancedStats.Responses++
+	l.statsMutex.Unlock()
+	return nil
+}
+
+func (l *AdvancedLink) requireNegotiatedFeature(feature uint64) error {
+	if l.protocolState == ProtocolStateNegotiated && l.negotiatedFeatures&feature == 0 {
+		return ErrInvalidOp
+	}
+	return nil
+}
+
+func (l *AdvancedLink) nextMessageID() uint64 {
+	if id := l.messageIDGenerator.Add(1); id != 0 {
+		return id
+	}
+	return l.messageIDGenerator.Add(1)
+}
+
+func (l *AdvancedLink) sendAdvancedPayload(ctx context.Context, connectionID, messageID, baseFlags, aux uint64, payload []byte) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	totalSize := uint64(len(payload))
+	if totalSize == 0 {
+		return l.sendAdvancedChunk(ctx, connectionID, messageID, 0, 0, AdvFlagBegin|AdvFlagEnd|baseFlags, aux, nil)
+	}
+
+	offset := uint64(0)
+	for offset < totalSize {
+		chunkSize := uint64(l.slink.bufferSize)
+		remaining := totalSize - offset
+		if remaining < chunkSize {
+			chunkSize = remaining
+		}
+		flags := baseFlags
+		if offset == 0 {
+			flags |= AdvFlagBegin
+		}
+		if offset+chunkSize == totalSize {
+			flags |= AdvFlagEnd
+		}
+		chunk := payload[offset : offset+chunkSize]
+		if err := l.sendAdvancedChunk(ctx, connectionID, messageID, totalSize, offset, flags, auxForChunk(aux, offset), chunk); err != nil {
+			_ = l.trySendAdvancedAbort(ctx, connectionID, messageID, baseFlags)
+			return err
+		}
+		offset += chunkSize
+	}
+	return nil
+}
+
+func auxForChunk(aux uint64, offset uint64) uint64 {
+	if offset == 0 {
+		return aux
+	}
+	return 0
+}
+
+func (l *AdvancedLink) trySendAdvancedAbort(ctx context.Context, connectionID, messageID, baseFlags uint64) error {
+	return l.sendAdvancedChunk(ctx, connectionID, messageID, 0, 0, AdvFlagAbort|baseFlags, 0, nil)
+}
+
+func (l *AdvancedLink) sendAdvancedChunk(ctx context.Context, connectionID, messageID, totalSize, chunkOffset, flags, aux uint64, chunk []byte) error {
+	tx, txBuffers := l.slink.tx()
+	slot, ok := reserveProducerContext(ctx, tx)
+	if !ok {
+		if ctx != nil && ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return ErrTimeout
+	}
+
+	slotIndex := int(slot.Slot())
+	if slotIndex < 0 || slotIndex >= len(txBuffers) {
+		*slot.Value() = protocol.NewStandardLinkTombstonePacket(messageID, slot.Slot(), uint64(ErrCodeInvalidSize))
+		slot.Commit()
+		return ErrInvalidSize
+	}
+
+	if len(chunk) > len(txBuffers[slotIndex]) {
+		*slot.Value() = protocol.NewConnCopyPacket(connectionID, messageID, totalSize, chunkOffset, 0, AdvFlagAbort|flags, uint64(ErrCodeBufferOverflow))
+		slot.Commit()
+		return ErrBufferOverflow
+	}
+	if len(chunk) > 0 {
+		race.Copy(txBuffers[slotIndex], chunk)
+	}
+	*slot.Value() = protocol.NewConnCopyPacket(
+		connectionID,
+		messageID,
+		totalSize,
+		chunkOffset,
+		uint64(len(chunk)),
+		flags,
+		aux,
+	)
+	slot.Commit()
+	return nil
+}
+
+func (l *AdvancedLink) receiveMatching(ctx context.Context, match func(AdvancedMessage) bool) (AdvancedMessage, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	l.receiveMu.Lock()
+	defer l.receiveMu.Unlock()
+
+	for {
+		for i, message := range l.pendingMessages {
+			if match(message) {
+				copy(l.pendingMessages[i:], l.pendingMessages[i+1:])
+				l.pendingMessages[len(l.pendingMessages)-1] = AdvancedMessage{}
+				l.pendingMessages = l.pendingMessages[:len(l.pendingMessages)-1]
+				return message, nil
+			}
+		}
+
+		message, err := l.receiveAdvancedMessageLocked(ctx)
+		if err != nil {
+			return AdvancedMessage{}, err
+		}
+		if match(message) {
+			return message, nil
+		}
+		l.pendingMessages = append(l.pendingMessages, message)
+	}
+}
+
+func (l *AdvancedLink) receiveAdvancedMessageLocked(ctx context.Context) (AdvancedMessage, error) {
+	rx, rxBuffers := l.slink.rx()
+	for {
+		slot, ok := reserveConsumerContext(ctx, rx)
+		if !ok {
+			if ctx != nil && ctx.Err() != nil {
+				return AdvancedMessage{}, ctx.Err()
+			}
+			return AdvancedMessage{}, ErrTimeout
+		}
+
+		slotIndex := int(slot.Slot())
+		if slotIndex < 0 || slotIndex >= len(rxBuffers) {
+			slot.Release()
+			return AdvancedMessage{}, ErrInvalidSize
+		}
+
+		p := slot.Value()
+		switch p.Op() {
+		case protocol.OpStandardLinkTombstone:
+			slot.Release()
+			continue
+		case protocol.OpConnCopy:
+			message, complete, err := l.consumeAdvancedChunk(p, rxBuffers[slotIndex])
+			slot.Release()
+			if err != nil {
+				return AdvancedMessage{}, err
+			}
+			if complete {
+				return message, nil
+			}
+		case protocol.OpError:
+			err := l.slink.handleError(p)
+			slot.Release()
+			return AdvancedMessage{}, err
+		default:
+			slot.Release()
+			return AdvancedMessage{}, ErrInvalidOp
+		}
+	}
+}
+
+func (l *AdvancedLink) consumeAdvancedChunk(p *protocol.Packet, buffer []byte) (AdvancedMessage, bool, error) {
+	connectionID := p.Operand(0)
+	messageID := p.Operand(1)
+	totalSize := p.Operand(2)
+	chunkOffset := p.Operand(3)
+	chunkSize := p.Operand(4)
+	flags := p.Operand(5)
+	aux := p.Operand(6)
+	kind := advancedKind(flags)
+	key := advancedMessageKey{connectionID: connectionID, messageID: messageID, kind: kind}
+
+	if flags&AdvFlagAbort != 0 {
+		delete(l.assemblies, key)
+		return AdvancedMessage{
+			ConnectionID: connectionID,
+			MessageID:    messageID,
+			MethodID:     methodIDFromFlags(flags, aux),
+			Status:       statusFromFlags(flags, aux),
+			Flags:        flags,
+		}, true, nil
+	}
+
+	if chunkSize > uint64(len(buffer)) || chunkOffset > totalSize || chunkSize > totalSize-chunkOffset {
+		delete(l.assemblies, key)
+		return AdvancedMessage{}, false, ErrInvalidSize
+	}
+	if totalSize == 0 && (chunkOffset != 0 || chunkSize != 0 || flags&(AdvFlagBegin|AdvFlagEnd) != AdvFlagBegin|AdvFlagEnd) {
+		delete(l.assemblies, key)
+		return AdvancedMessage{}, false, ErrInvalidSize
+	}
+	if totalSize > 0 && chunkSize == 0 {
+		delete(l.assemblies, key)
+		return AdvancedMessage{}, false, ErrInvalidSize
+	}
+
+	assembly := l.assemblies[key]
+	if flags&AdvFlagBegin != 0 {
+		if chunkOffset != 0 {
+			return AdvancedMessage{}, false, ErrInvalidSize
+		}
+		if totalSize > uint64(^uint(0)>>1) {
+			return AdvancedMessage{}, false, ErrBufferOverflow
+		}
+		assembly = &advancedAssembly{
+			message: AdvancedMessage{
+				ConnectionID: connectionID,
+				MessageID:    messageID,
+				MethodID:     methodIDFromFlags(flags, aux),
+				Status:       statusFromFlags(flags, aux),
+				Flags:        flags &^ (AdvFlagBegin | AdvFlagEnd),
+			},
+			data: make([]byte, int(totalSize)),
+		}
+		l.assemblies[key] = assembly
+	}
+	if assembly == nil {
+		return AdvancedMessage{}, false, ErrInvalidOp
+	}
+	if chunkOffset != assembly.next || uint64(len(assembly.data)) != totalSize {
+		delete(l.assemblies, key)
+		return AdvancedMessage{}, false, ErrInvalidSize
+	}
+	if chunkSize > 0 {
+		race.Copy(assembly.data[chunkOffset:chunkOffset+chunkSize], buffer[:chunkSize])
+	}
+	assembly.next += chunkSize
+	assembly.message.Flags |= flags & (AdvFlagRequest | AdvFlagResponse | AdvFlagError)
+
+	if flags&AdvFlagEnd == 0 {
+		return AdvancedMessage{}, false, nil
+	}
+	if assembly.next != totalSize {
+		delete(l.assemblies, key)
+		return AdvancedMessage{}, false, ErrInvalidSize
+	}
+	delete(l.assemblies, key)
+	assembly.message.Flags |= AdvFlagBegin | AdvFlagEnd
+	assembly.message.Payload = assembly.data
+	return assembly.message, true, nil
+}
+
+func advancedKind(flags uint64) uint64 {
+	return flags & (AdvFlagRequest | AdvFlagResponse)
+}
+
+func methodIDFromFlags(flags, aux uint64) uint64 {
+	if flags&AdvFlagRequest != 0 {
+		return aux
+	}
+	return 0
+}
+
+func statusFromFlags(flags, aux uint64) uint64 {
+	if flags&AdvFlagResponse != 0 {
+		return aux
+	}
+	return 0
+}
+
+func reserveProducerContext(ctx context.Context, r *mpmc.MPMCRing[protocol.Packet]) (mpmc.ProducerSlot[protocol.Packet], bool) {
+	if ctx == nil || ctx.Done() == nil {
+		return r.ReserveProducer(), true
+	}
+	return r.ReserveProducerWithContext(ctx)
+}
+
+func reserveConsumerContext(ctx context.Context, r *mpmc.MPMCRing[protocol.Packet]) (mpmc.ConsumerSlot[protocol.Packet], bool) {
+	if ctx == nil || ctx.Done() == nil {
+		return r.ReserveConsumer(), true
+	}
+	return r.ReserveConsumerWithContext(ctx)
 }
 
 // Listen starts listening for incoming connection requests

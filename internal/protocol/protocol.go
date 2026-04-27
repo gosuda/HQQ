@@ -61,10 +61,16 @@ const (
 	//   Operand0: ConnectionID
 	OpConnClose OpCode = 0x03
 
-	// OpConnCopy (0x04): Connection-oriented data transfer.
+	// OpConnCopy (0x04): Advanced Protocol chunk transfer.
 	//
-	// Connection-oriented transfer is currently reserved for AdvancedLink. The
-	// Standard Protocol uses OpStandardLinkCopy directly.
+	// Operands:
+	//   Operand0: ConnectionID, or zero for link-level request-response
+	//   Operand1: MessageID
+	//   Operand2: TotalSize
+	//   Operand3: ChunkOffset
+	//   Operand4: ChunkSize
+	//   Operand5: Advanced frame flags
+	//   Operand6: MethodID, status code, or zero depending on flags
 	OpConnCopy OpCode = 0x04
 
 	// OpProtoNegotiate (0x05): Protocol negotiation request.
@@ -159,6 +165,20 @@ func NewStandardLinkTombstonePacket(copyID, bufferIndex, reason uint64) Packet {
 	binary.LittleEndian.PutUint64(p[8:16], copyID)
 	binary.LittleEndian.PutUint64(p[16:24], bufferIndex)
 	binary.LittleEndian.PutUint64(p[24:32], reason)
+	return p
+}
+
+// NewConnCopyPacket returns an Advanced Protocol chunk packet.
+func NewConnCopyPacket(connectionID, messageID, totalSize, chunkOffset, chunkSize, flags, aux uint64) Packet {
+	var p Packet
+	binary.LittleEndian.PutUint64(p[0:8], uint64(OpConnCopy))
+	binary.LittleEndian.PutUint64(p[8:16], connectionID)
+	binary.LittleEndian.PutUint64(p[16:24], messageID)
+	binary.LittleEndian.PutUint64(p[24:32], totalSize)
+	binary.LittleEndian.PutUint64(p[32:40], chunkOffset)
+	binary.LittleEndian.PutUint64(p[40:48], chunkSize)
+	binary.LittleEndian.PutUint64(p[48:56], flags)
+	binary.LittleEndian.PutUint64(p[56:64], aux)
 	return p
 }
 

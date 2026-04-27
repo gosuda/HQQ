@@ -809,7 +809,7 @@ func TestAdvancedLinkProtocolNegotiation(t *testing.T) {
 	// Test negotiation
 	ctx := context.Background()
 	version := ProtocolVersion{Major: 1, Minor: 0}
-	features := FeatureCompression | FeatureFlowControl
+	features := FeatureLargeCopy | FeatureRequestResponse
 
 	// Start negotiation in goroutines
 	var wg sync.WaitGroup
@@ -864,19 +864,19 @@ func TestAdvancedLinkProtocolNegotiation(t *testing.T) {
 
 	// Check negotiated features
 	negotiatedFeatures := primary.GetNegotiatedFeatures()
-	if (negotiatedFeatures & FeatureCompression) == 0 {
-		t.Error("Compression feature should be negotiated")
+	if (negotiatedFeatures & FeatureLargeCopy) == 0 {
+		t.Error("large-copy feature should be negotiated")
 	}
-	if (negotiatedFeatures & FeatureFlowControl) == 0 {
-		t.Error("Flow control feature should be negotiated")
+	if (negotiatedFeatures & FeatureRequestResponse) == 0 {
+		t.Error("request-response feature should be negotiated")
 	}
 
 	// Check feature flags
-	if !primary.IsCompressionEnabled() {
-		t.Error("Compression should be enabled")
+	if !primary.IsLargeCopyEnabled() {
+		t.Error("large-copy should be enabled")
 	}
-	if !primary.IsFlowControlEnabled() {
-		t.Error("Flow control should be enabled")
+	if !primary.IsRequestResponseEnabled() {
+		t.Error("request-response should be enabled")
 	}
 }
 
@@ -909,7 +909,7 @@ func TestAdvancedLinkReadWrite(t *testing.T) {
 	defer cancel()
 
 	version := ProtocolVersion{Major: 1, Minor: 0}
-	features := FeatureCompression | FeatureFlowControl
+	features := FeatureLargeCopy | FeatureRequestResponse
 
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -960,19 +960,221 @@ func TestAdvancedLinkReadWrite(t *testing.T) {
 
 	// Check negotiated features
 	negotiatedFeatures := primary.GetNegotiatedFeatures()
-	if (negotiatedFeatures & FeatureCompression) == 0 {
-		t.Error("Compression feature should be negotiated")
+	if (negotiatedFeatures & FeatureLargeCopy) == 0 {
+		t.Error("large-copy feature should be negotiated")
 	}
-	if (negotiatedFeatures & FeatureFlowControl) == 0 {
-		t.Error("Flow control feature should be negotiated")
+	if (negotiatedFeatures & FeatureRequestResponse) == 0 {
+		t.Error("request-response feature should be negotiated")
 	}
 
 	// Check feature flags
-	if !primary.IsCompressionEnabled() {
-		t.Error("Compression should be enabled")
+	if !primary.IsLargeCopyEnabled() {
+		t.Error("large-copy should be enabled")
 	}
-	if !primary.IsFlowControlEnabled() {
-		t.Error("Flow control should be enabled")
+	if !primary.IsRequestResponseEnabled() {
+		t.Error("request-response should be enabled")
+	}
+}
+
+func negotiateAdvancedPair(t *testing.T, primary, secondary *AdvancedLink) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	version := ProtocolVersion{Major: 1, Minor: 0}
+	features := FeatureLargeCopy | FeatureRequestResponse
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	var primaryErr, secondaryErr error
+	var primarySuccess, secondarySuccess bool
+	go func() {
+		defer wg.Done()
+		primarySuccess, primaryErr = primary.NegotiateProtocol(ctx, version, features)
+	}()
+	go func() {
+		defer wg.Done()
+		secondarySuccess, secondaryErr = secondary.WaitForNegotiation(ctx)
+	}()
+	wg.Wait()
+
+	if primaryErr != nil {
+		t.Fatalf("primary negotiation failed: %v", primaryErr)
+	}
+	if secondaryErr != nil {
+		t.Fatalf("secondary negotiation failed: %v", secondaryErr)
+	}
+	if !primarySuccess || !secondarySuccess {
+		t.Fatalf("negotiation success = %v/%v, want true/true", primarySuccess, secondarySuccess)
+	}
+}
+
+func newAdvancedPair(t *testing.T, bufferCount, bufferSize int) ([]byte, *AdvancedLink, *AdvancedLink) {
+	t.Helper()
+	size := SizeStandardLink(bufferCount, bufferSize)
+	backing, offset := createAlignedBuffer(t, size)
+
+	primary, err := NewAdvancedLink(offset, bufferCount, bufferSize)
+	if err != nil {
+		t.Fatalf("Failed to create primary advanced link: %v", err)
+	}
+	secondary, err := NewAdvancedLink(offset, bufferCount, bufferSize)
+	if err != nil {
+		primary.Close()
+		t.Fatalf("Failed to create secondary advanced link: %v", err)
+	}
+	return backing, primary, secondary
+}
+
+func TestAdvancedLinkLargeCopy(t *testing.T) {
+	backing, primary, secondary := newAdvancedPair(t, 8, 16)
+	defer runtime.KeepAlive(backing)
+	defer primary.Close()
+	defer secondary.Close()
+	negotiateAdvancedPair(t, primary, secondary)
+
+	payload := make([]byte, 97)
+	for i := range payload {
+		payload[i] = byte(i*17 + 3)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	messageID, err := primary.SendLarge(ctx, 0, payload)
+	if err != nil {
+		t.Fatalf("SendLarge failed: %v", err)
+	}
+	message, err := secondary.Receive(ctx)
+	if err != nil {
+		t.Fatalf("Receive failed: %v", err)
+	}
+	if !message.IsData() {
+		t.Fatalf("message flags = %#x, want data", message.Flags)
+	}
+	if message.MessageID != messageID {
+		t.Fatalf("message id = %d, want %d", message.MessageID, messageID)
+	}
+	if string(message.Payload) != string(payload) {
+		t.Fatalf("payload mismatch: got %x want %x", message.Payload, payload)
+	}
+}
+
+func TestAdvancedLinkRequestResponse(t *testing.T) {
+	backing, primary, secondary := newAdvancedPair(t, 16, 16)
+	defer runtime.KeepAlive(backing)
+	defer primary.Close()
+	defer secondary.Close()
+	negotiateAdvancedPair(t, primary, secondary)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	requestPayload := []byte("request payload that spans multiple chunks")
+	responsePayload := []byte("response payload that also spans multiple chunks")
+	serverErr := make(chan error, 1)
+	go func() {
+		request, err := secondary.Receive(ctx)
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		if !request.IsRequest() {
+			serverErr <- fmt.Errorf("received flags %#x, want request", request.Flags)
+			return
+		}
+		if request.MethodID != 42 {
+			serverErr <- fmt.Errorf("method = %d, want 42", request.MethodID)
+			return
+		}
+		if string(request.Payload) != string(requestPayload) {
+			serverErr <- fmt.Errorf("request payload = %q, want %q", request.Payload, requestPayload)
+			return
+		}
+		serverErr <- secondary.Respond(ctx, request, 200, responsePayload)
+	}()
+
+	response, err := primary.Call(ctx, 42, requestPayload)
+	if err != nil {
+		t.Fatalf("Call failed: %v", err)
+	}
+	if string(response) != string(responsePayload) {
+		t.Fatalf("response = %q, want %q", response, responsePayload)
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatalf("server failed: %v", err)
+	}
+}
+
+func TestAdvancedLinkErrorResponse(t *testing.T) {
+	backing, primary, secondary := newAdvancedPair(t, 8, 32)
+	defer runtime.KeepAlive(backing)
+	defer primary.Close()
+	defer secondary.Close()
+	negotiateAdvancedPair(t, primary, secondary)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	serverErr := make(chan error, 1)
+	go func() {
+		request, err := secondary.Receive(ctx)
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		serverErr <- secondary.RespondError(ctx, request, 404, []byte("missing method"))
+	}()
+
+	_, err := primary.Call(ctx, 99, []byte("hello"))
+	if err == nil {
+		t.Fatal("Call succeeded, want error response")
+	}
+	responseErr, ok := err.(AdvancedResponseError)
+	if !ok {
+		t.Fatalf("Call error = %T %v, want AdvancedResponseError", err, err)
+	}
+	if responseErr.Status != 404 || string(responseErr.Payload) != "missing method" {
+		t.Fatalf("response error = status %d payload %q", responseErr.Status, responseErr.Payload)
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatalf("server failed: %v", err)
+	}
+}
+
+func TestAdvancedLinkEmptyRequestResponse(t *testing.T) {
+	backing, primary, secondary := newAdvancedPair(t, 8, 32)
+	defer runtime.KeepAlive(backing)
+	defer primary.Close()
+	defer secondary.Close()
+	negotiateAdvancedPair(t, primary, secondary)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	serverErr := make(chan error, 1)
+	go func() {
+		request, err := secondary.Receive(ctx)
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		if !request.IsRequest() || len(request.Payload) != 0 {
+			serverErr <- fmt.Errorf("request flags=%#x payload=%q", request.Flags, request.Payload)
+			return
+		}
+		serverErr <- secondary.Respond(ctx, request, 204, nil)
+	}()
+
+	response, err := primary.Call(ctx, 1, nil)
+	if err != nil {
+		t.Fatalf("Call failed: %v", err)
+	}
+	if len(response) != 0 {
+		t.Fatalf("response payload = %q, want empty", response)
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatalf("server failed: %v", err)
 	}
 }
 
@@ -1231,7 +1433,7 @@ func TestAdvancedLinkNegotiationTimeout(t *testing.T) {
 	defer cancel()
 
 	version := ProtocolVersion{Major: 1, Minor: 0}
-	features := FeatureCompression
+	features := FeatureLargeCopy
 
 	success, err := advLink.NegotiateProtocol(ctx, version, features)
 	if err == nil {
@@ -1839,5 +2041,131 @@ func TestStandardLinkPacketConn(t *testing.T) {
 	_, err = primary.WriteTo(largeData, customAddr)
 	if err != ErrBufferOverflow {
 		t.Errorf("Expected ErrBufferOverflow for large data, got %v", err)
+	}
+}
+
+func BenchmarkAdvancedLinkLargeCopy(b *testing.B) {
+	const (
+		bufferCount = 1024
+		bufferSize  = 256
+		payloadSize = 4096
+	)
+	size := SizeStandardLink(bufferCount, bufferSize)
+	backing, offset := createAlignedBuffer(nil, size)
+	defer runtime.KeepAlive(backing)
+
+	primary, err := NewAdvancedLink(offset, bufferCount, bufferSize)
+	if err != nil {
+		b.Fatalf("Failed to create primary advanced link: %v", err)
+	}
+	defer primary.Close()
+	secondary, err := NewAdvancedLink(offset, bufferCount, bufferSize)
+	if err != nil {
+		b.Fatalf("Failed to create secondary advanced link: %v", err)
+	}
+	defer secondary.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	negotiateAdvancedPairForBenchmark(b, ctx, primary, secondary)
+	cancel()
+
+	payload := make([]byte, payloadSize)
+	b.SetBytes(payloadSize)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		ctx := context.Background()
+		if _, err := primary.SendLarge(ctx, 0, payload); err != nil {
+			b.Fatalf("SendLarge failed: %v", err)
+		}
+		message, err := secondary.Receive(ctx)
+		if err != nil {
+			b.Fatalf("Receive failed: %v", err)
+		}
+		if len(message.Payload) != payloadSize {
+			b.Fatalf("payload size = %d, want %d", len(message.Payload), payloadSize)
+		}
+	}
+}
+
+func BenchmarkAdvancedLinkRequestResponse(b *testing.B) {
+	const (
+		bufferCount = 1024
+		bufferSize  = 256
+		payloadSize = 1024
+	)
+	size := SizeStandardLink(bufferCount, bufferSize)
+	backing, offset := createAlignedBuffer(nil, size)
+	defer runtime.KeepAlive(backing)
+
+	primary, err := NewAdvancedLink(offset, bufferCount, bufferSize)
+	if err != nil {
+		b.Fatalf("Failed to create primary advanced link: %v", err)
+	}
+	defer primary.Close()
+	secondary, err := NewAdvancedLink(offset, bufferCount, bufferSize)
+	if err != nil {
+		b.Fatalf("Failed to create secondary advanced link: %v", err)
+	}
+	defer secondary.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	negotiateAdvancedPairForBenchmark(b, ctx, primary, secondary)
+	cancel()
+
+	request := make([]byte, payloadSize)
+	response := make([]byte, payloadSize)
+	done := make(chan error, 1)
+	go func() {
+		for i := 0; i < b.N; i++ {
+			message, err := secondary.Receive(context.Background())
+			if err != nil {
+				done <- err
+				return
+			}
+			if err := secondary.Respond(context.Background(), message, 0, response); err != nil {
+				done <- err
+				return
+			}
+		}
+		done <- nil
+	}()
+
+	b.SetBytes(payloadSize * 2)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		reply, err := primary.Call(context.Background(), 7, request)
+		if err != nil {
+			b.Fatalf("Call failed: %v", err)
+		}
+		if len(reply) != payloadSize {
+			b.Fatalf("reply size = %d, want %d", len(reply), payloadSize)
+		}
+	}
+	if err := <-done; err != nil {
+		b.Fatalf("server failed: %v", err)
+	}
+}
+
+func negotiateAdvancedPairForBenchmark(b *testing.B, ctx context.Context, primary, secondary *AdvancedLink) {
+	b.Helper()
+	var wg sync.WaitGroup
+	wg.Add(2)
+	var primaryErr, secondaryErr error
+	go func() {
+		defer wg.Done()
+		_, primaryErr = primary.NegotiateProtocol(ctx, ProtocolVersion{Major: 1, Minor: 0}, FeatureLargeCopy|FeatureRequestResponse)
+	}()
+	go func() {
+		defer wg.Done()
+		_, secondaryErr = secondary.WaitForNegotiation(ctx)
+	}()
+	wg.Wait()
+	if primaryErr != nil {
+		b.Fatalf("primary negotiation failed: %v", primaryErr)
+	}
+	if secondaryErr != nil {
+		b.Fatalf("secondary negotiation failed: %v", secondaryErr)
 	}
 }

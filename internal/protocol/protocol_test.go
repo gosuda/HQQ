@@ -70,6 +70,18 @@ func TestTombstonePacketLayout(t *testing.T) {
 	}
 }
 
+func TestConnCopyPacketLayout(t *testing.T) {
+	p := protocol.NewConnCopyPacket(1, 2, 3, 4, 5, 6, 7)
+	if got := p.Op(); got != protocol.OpConnCopy {
+		t.Fatalf("Op() = %v, want %v", got, protocol.OpConnCopy)
+	}
+	for i, want := range []uint64{1, 2, 3, 4, 5, 6, 7} {
+		if got := p.Operand(i); got != want {
+			t.Fatalf("operand %d = %d, want %d", i, got, want)
+		}
+	}
+}
+
 func BenchmarkNewPacket(b *testing.B) {
 	var p protocol.Packet
 	b.ReportAllocs()
@@ -84,6 +96,15 @@ func BenchmarkNewStandardLinkCopyPacket(b *testing.B) {
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
 		p = protocol.NewStandardLinkCopyPacket(uint64(i), 2, 3)
+	}
+	sinkPacket = p
+}
+
+func BenchmarkNewConnCopyPacket(b *testing.B) {
+	var p protocol.Packet
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		p = protocol.NewConnCopyPacket(1, uint64(i), 3, 4, 5, 6, 7)
 	}
 	sinkPacket = p
 }
