@@ -255,8 +255,8 @@ func TestStandardLinkPartialReadPreservesRemainderAndReleasesBuffer(t *testing.T
 		t.Fatalf("partial Read() = %q, want %q", got, "01234")
 	}
 
-	// The first buffer should already be returned to the free ring even though
-	// the unread tail is served from receiveBuffer.
+	// The first ring slot should already be released even though the unread
+	// tail is served from receiveBuffer.
 	if n, err := primary.Write(second); err != nil || n != len(second) {
 		t.Fatalf("second Write() = %d, %v", n, err)
 	}
@@ -277,6 +277,82 @@ func TestStandardLinkPartialReadPreservesRemainderAndReleasesBuffer(t *testing.T
 	}
 	if got := string(full[:n]); got != string(second) {
 		t.Fatalf("second Read() = %q, want %q", got, second)
+	}
+}
+
+func TestStandardLinkZeroCopyReadWrite(t *testing.T) {
+	bufferCount := 8
+	bufferSize := 64
+	size := SizeStandardLink(bufferCount, bufferSize)
+	backing, offset := createAlignedBuffer(t, size)
+	defer runtime.KeepAlive(backing)
+
+	primary, err := OpenStandardLink(offset, bufferCount, bufferSize)
+	if err != nil {
+		t.Fatalf("Failed to create primary link: %v", err)
+	}
+	defer primary.Close()
+
+	secondary, err := OpenStandardLink(offset, bufferCount, bufferSize)
+	if err != nil {
+		t.Fatalf("Failed to create secondary link: %v", err)
+	}
+	defer secondary.Close()
+
+	payload := []byte("zero-copy payload")
+	n, err := primary.WriteZeroCopy(func(buffer []byte) (int, error) {
+		return copy(buffer, payload), nil
+	})
+	if err != nil {
+		t.Fatalf("WriteZeroCopy failed: %v", err)
+	}
+	if n != len(payload) {
+		t.Fatalf("WriteZeroCopy size = %d, want %d", n, len(payload))
+	}
+
+	n, err = secondary.ReadZeroCopy(func(buffer []byte) error {
+		if got := string(buffer); got != string(payload) {
+			return fmt.Errorf("ReadZeroCopy payload = %q, want %q", got, payload)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("ReadZeroCopy failed: %v", err)
+	}
+	if n != len(payload) {
+		t.Fatalf("ReadZeroCopy size = %d, want %d", n, len(payload))
+	}
+
+	regularPayload := []byte("regular write to zero-copy read")
+	if n, err := primary.Write(regularPayload); err != nil || n != len(regularPayload) {
+		t.Fatalf("Write() = %d, %v", n, err)
+	}
+	n, err = secondary.ReadZeroCopy(func(buffer []byte) error {
+		if got := string(buffer); got != string(regularPayload) {
+			return fmt.Errorf("ReadZeroCopy after Write payload = %q, want %q", got, regularPayload)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("ReadZeroCopy after Write failed: %v", err)
+	}
+	if n != len(regularPayload) {
+		t.Fatalf("ReadZeroCopy after Write size = %d, want %d", n, len(regularPayload))
+	}
+
+	n, err = primary.WriteZeroCopy(func(buffer []byte) (int, error) {
+		return copy(buffer, payload), nil
+	})
+	if err != nil || n != len(payload) {
+		t.Fatalf("WriteZeroCopy before Read() = %d, %v", n, err)
+	}
+	readBuffer := make([]byte, bufferSize)
+	n, err = secondary.Read(readBuffer)
+	if err != nil {
+		t.Fatalf("Read after WriteZeroCopy failed: %v", err)
+	}
+	if got := string(readBuffer[:n]); got != string(payload) {
+		t.Fatalf("Read after WriteZeroCopy = %q, want %q", got, payload)
 	}
 }
 
@@ -553,7 +629,7 @@ func TestStandardLinkErrors(t *testing.T) {
 	}
 
 	// Test non-power-of-two buffer count. Standard Protocol requires exact
-	// buffer/free-ring symmetry for lock-free ownership transfer.
+	// data-ring/buffer symmetry for slot-owned payload transfer.
 	size = SizeStandardLink(6, 4096)
 	if size != 0 {
 		t.Error("SizeStandardLink should return 0 for non-power-of-two buffer count")
@@ -994,6 +1070,67 @@ func benchmarkStandardLinkReadWrite(b *testing.B, payloadSize int) {
 		}
 		if n != len(testData) {
 			b.Fatalf("read size = %d, want %d", n, len(testData))
+		}
+	}
+}
+
+func BenchmarkStandardLinkZeroCopySizes(b *testing.B) {
+	for _, payloadSize := range []int{8, 64, 4096} {
+		b.Run(fmt.Sprintf("%dB", payloadSize), func(b *testing.B) {
+			benchmarkStandardLinkZeroCopy(b, payloadSize)
+		})
+	}
+}
+
+func benchmarkStandardLinkZeroCopy(b *testing.B, payloadSize int) {
+	bufferCount := 1024
+	bufferSize := payloadSize
+	if bufferSize < 8 {
+		bufferSize = 8
+	}
+
+	size := SizeStandardLink(bufferCount, bufferSize)
+	backing, offset := createAlignedBuffer(nil, size)
+	defer runtime.KeepAlive(backing)
+
+	primary, err := OpenStandardLink(offset, bufferCount, bufferSize)
+	if err != nil {
+		b.Fatalf("Failed to create primary link: %v", err)
+	}
+	defer primary.Close()
+
+	secondary, err := OpenStandardLink(offset, bufferCount, bufferSize)
+	if err != nil {
+		b.Fatalf("Failed to create secondary link: %v", err)
+	}
+	defer secondary.Close()
+
+	b.SetBytes(int64(payloadSize))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		n, err := primary.WriteZeroCopy(func(buffer []byte) (int, error) {
+			buffer[0] = byte(i)
+			buffer[payloadSize-1] = byte(i >> 8)
+			return payloadSize, nil
+		})
+		if err != nil {
+			b.Fatalf("WriteZeroCopy failed: %v", err)
+		}
+		if n != payloadSize {
+			b.Fatalf("WriteZeroCopy size = %d, want %d", n, payloadSize)
+		}
+
+		n, err = secondary.ReadZeroCopy(func(buffer []byte) error {
+			_ = buffer[0]
+			_ = buffer[len(buffer)-1]
+			return nil
+		})
+		if err != nil {
+			b.Fatalf("ReadZeroCopy failed: %v", err)
+		}
+		if n != payloadSize {
+			b.Fatalf("ReadZeroCopy size = %d, want %d", n, payloadSize)
 		}
 	}
 }

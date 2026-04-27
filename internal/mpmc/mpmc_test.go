@@ -113,6 +113,36 @@ func TestMPMCFunc(t *testing.T) {
 	}
 }
 
+func TestMPMCZeroCopySlot(t *testing.T) {
+	const size = 8
+	buffer := make([]byte, mpmc.SizeMPMCRing[uintptr](size))
+	b := uintptr(unsafe.Pointer(&buffer[0]))
+	if !mpmc.MPMCInit[uintptr](b, size) {
+		panic("failed to initialize offheap mpmc ring")
+	}
+	r := mpmc.MPMCAttach[uintptr](b, 0)
+
+	for i := uintptr(0); i < size; i++ {
+		r.EnqueueZeroCopy(func(slot uint64, v *uintptr) {
+			if slot != uint64(i) {
+				t.Fatalf("enqueue slot = %d, want %d", slot, i)
+			}
+			*v = i + 100
+		})
+	}
+
+	for i := uintptr(0); i < size; i++ {
+		r.DequeueZeroCopy(func(slot uint64, v *uintptr) {
+			if slot != uint64(i) {
+				t.Fatalf("dequeue slot = %d, want %d", slot, i)
+			}
+			if *v != i+100 {
+				t.Fatalf("value = %d, want %d", *v, i+100)
+			}
+		})
+	}
+}
+
 func TestMPMCParallel(t *testing.T) {
 	const size = 1 << 10
 	buffer := make([]byte, mpmc.SizeMPMCRing[uintptr](size))
@@ -278,6 +308,53 @@ func BenchmarkMPMCFuncPayloadTypes(b *testing.B) {
 				})
 				r.DequeueFunc(func(packet *protocol.Packet) {
 					_ = packet.Operand(1)
+				})
+			}
+		})
+	})
+}
+
+func BenchmarkMPMCZeroCopyPayloadTypes(b *testing.B) {
+	const size = 128
+
+	b.Run("chunk16", func(b *testing.B) {
+		buffer := make([]byte, mpmc.SizeMPMCRing[_chunk](size))
+		bb := uintptr(unsafe.Pointer(&buffer[0]))
+		if !mpmc.MPMCInit[_chunk](bb, size) {
+			b.Fatal("failed to initialize offheap mpmc ring")
+		}
+
+		b.ReportAllocs()
+		b.RunParallel(func(p *testing.PB) {
+			r := mpmc.MPMCAttach[_chunk](bb, 0)
+			for p.Next() {
+				r.EnqueueZeroCopy(func(slot uint64, c *_chunk) {
+					c._pointer = uintptr(slot)
+					c._size = 2
+				})
+				r.DequeueZeroCopy(func(slot uint64, c *_chunk) {
+					_ = c._pointer + uintptr(slot)
+				})
+			}
+		})
+	})
+
+	b.Run("packet64", func(b *testing.B) {
+		buffer := make([]byte, mpmc.SizeMPMCRing[protocol.Packet](size))
+		bb := uintptr(unsafe.Pointer(&buffer[0]))
+		if !mpmc.MPMCInit[protocol.Packet](bb, size) {
+			b.Fatal("failed to initialize offheap mpmc ring")
+		}
+
+		b.ReportAllocs()
+		b.RunParallel(func(p *testing.PB) {
+			r := mpmc.MPMCAttach[protocol.Packet](bb, 0)
+			for p.Next() {
+				r.EnqueueZeroCopy(func(slot uint64, packet *protocol.Packet) {
+					*packet = protocol.NewStandardLinkCopyPacket(1, slot, 3)
+				})
+				r.DequeueZeroCopy(func(slot uint64, packet *protocol.Packet) {
+					_ = packet.Operand(1) + slot
 				})
 			}
 		})

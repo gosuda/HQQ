@@ -109,8 +109,6 @@ type StandardLink struct {
 	// MPMC Rings for bidirectional communication
 	ring0          *mpmc.MPMCRing[protocol.Packet] // Primary to Secondary data ring
 	ring1          *mpmc.MPMCRing[protocol.Packet] // Secondary to Primary data ring
-	free0          *mpmc.MPMCRing[uint64]          // Free buffers for primary-to-secondary direction
-	free1          *mpmc.MPMCRing[uint64]          // Free buffers for secondary-to-primary direction
 	buffers0Offset uintptr                         // Offset to primary-to-secondary buffers
 	buffers1Offset uintptr                         // Offset to secondary-to-primary buffers
 
@@ -154,13 +152,9 @@ const (
 // <<<< PAGE_START
 // MPMC_RING (Primary to Secondary)     // Ring buffer for packets from primary to secondary
 // <<<< PAGE_BREAK
-// FREE_RING (Primary to Secondary)     // Buffer ownership ring for primary-to-secondary buffers
-// <<<< PAGE_BREAK
 // BUFFERS (Primary to Secondary)       // Data buffers for primary to secondary communication
 // <<<< PAGE_BREAK
 // MPMC_RING (Secondary to Primary)     // Ring buffer for packets from secondary to primary
-// <<<< PAGE_BREAK
-// FREE_RING (Secondary to Primary)     // Buffer ownership ring for secondary-to-primary buffers
 // <<<< PAGE_BREAK
 // BUFFERS (Secondary to Primary)       // Data buffers for secondary to primary communication
 // <<<< PAGE_END
@@ -182,15 +176,12 @@ func SizeStandardLink(bufferCount int, bufferSize int) uintptr {
 	}
 
 	dataRingSize := mpmc.SizeMPMCRing[protocol.Packet](uintptr(bufferCount))
-	freeRingSize := mpmc.SizeMPMCRing[uint64](uintptr(bufferCount))
 	buffersSize := uintptr(bufferSize) * uintptr(bufferCount)
 
 	var size uintptr
 	size = alignPage(size + dataRingSize)
-	size = alignPage(size + freeRingSize)
 	size = alignPage(size + buffersSize)
 	size = alignPage(size + dataRingSize)
-	size = alignPage(size + freeRingSize)
 	size = alignPage(size + buffersSize)
 
 	return size
@@ -241,7 +232,6 @@ func OpenStandardLink(offset uintptr, bufferCount int, bufferSize int) (*Standar
 
 	// Calculate memory layout
 	dataRingSize := mpmc.SizeMPMCRing[protocol.Packet](uintptr(bufferCount))
-	freeRingSize := mpmc.SizeMPMCRing[uint64](uintptr(bufferCount))
 	buffersSize := uintptr(bufferCount) * uintptr(bufferSize)
 
 	// Initialize or attach to first ring (Primary to Secondary)
@@ -250,10 +240,6 @@ func OpenStandardLink(offset uintptr, bufferCount int, bufferSize int) (*Standar
 		link.linkMode = LinkModePrimary
 	}
 	offset = alignPage(offset + dataRingSize)
-
-	free0Offset := offset
-	free0Initialized := mpmc.MPMCInit[uint64](offset, uint64(bufferCount))
-	offset = alignPage(offset + freeRingSize)
 
 	// Setup first buffer pool
 	link.buffers0Offset = offset
@@ -264,10 +250,6 @@ func OpenStandardLink(offset uintptr, bufferCount int, bufferSize int) (*Standar
 	mpmc.MPMCInit[protocol.Packet](offset, uint64(bufferCount))
 	offset = alignPage(offset + dataRingSize)
 
-	free1Offset := offset
-	free1Initialized := mpmc.MPMCInit[uint64](offset, uint64(bufferCount))
-	offset = alignPage(offset + freeRingSize)
-
 	// Setup second buffer pool
 	link.buffers1Offset = offset
 	offset = alignPage(offset + buffersSize)
@@ -275,9 +257,7 @@ func OpenStandardLink(offset uintptr, bufferCount int, bufferSize int) (*Standar
 	// Attach to rings
 	link.ring0 = mpmc.MPMCAttach[protocol.Packet](ring0Offset, time.Second)
 	link.ring1 = mpmc.MPMCAttach[protocol.Packet](ring1Offset, time.Second)
-	link.free0 = mpmc.MPMCAttach[uint64](free0Offset, time.Second)
-	link.free1 = mpmc.MPMCAttach[uint64](free1Offset, time.Second)
-	if link.ring0 == nil || link.ring1 == nil || link.free0 == nil || link.free1 == nil {
+	if link.ring0 == nil || link.ring1 == nil {
 		return nil, ErrFailedInit
 	}
 
@@ -289,20 +269,6 @@ func OpenStandardLink(offset uintptr, bufferCount int, bufferSize int) (*Standar
 	if link.linkMode == LinkModePrimary {
 		race.Zero(buffers0)
 		race.Zero(buffers1)
-	}
-
-	// Populate free-buffer rings exactly once per shared memory region. Data
-	// rings provide packet backpressure; free rings provide payload-buffer
-	// ownership so unread buffers are never overwritten.
-	if free0Initialized {
-		for i := 0; i < bufferCount; i++ {
-			link.free0.Enqueue(uint64(i))
-		}
-	}
-	if free1Initialized {
-		for i := 0; i < bufferCount; i++ {
-			link.free1.Enqueue(uint64(i))
-		}
 	}
 
 	// Create buffer slices for indexed access
@@ -327,18 +293,15 @@ func (l *StandardLink) Read(b []byte) (n int, err error) {
 	// Determine which ring and buffers to use based on link mode
 	var rx *mpmc.MPMCRing[protocol.Packet]
 	var rxBuffers [][]byte
-	var rxFree *mpmc.MPMCRing[uint64]
 
 	if l.linkMode == LinkModeSecondary {
 		// Secondary reads from ring0 (Primary to Secondary)
 		rx = l.ring0
 		rxBuffers = l.buffers0
-		rxFree = l.free0
 	} else {
 		// Primary reads from ring1 (Secondary to Primary)
 		rx = l.ring1
 		rxBuffers = l.buffers1
-		rxFree = l.free1
 	}
 
 	// First, consume any remaining data in receiveBuffer
@@ -353,23 +316,31 @@ func (l *StandardLink) Read(b []byte) (n int, err error) {
 
 	// If we still need more data, try to dequeue from the ring
 	for bOffset < bN {
-		p, ok := l.dequeuePacket(rx)
+		var readErr error
+		ok := l.dequeuePacketZeroCopy(rx, func(slot int, p *protocol.Packet) {
+			if slot < 0 || slot >= len(rxBuffers) {
+				readErr = ErrInvalidSize
+				return
+			}
+
+			// Handle different packet types. For payload packets, the ring
+			// slot itself owns the payload buffer until this callback returns.
+			switch p.Op() {
+			case protocol.OpStandardLinkCopy:
+				readErr = l.handleStandardLinkCopy(p, rxBuffers[slot], b[bOffset:], &bOffset)
+			case protocol.OpConnCopy:
+				readErr = l.handleConnCopy(p, rxBuffers[slot], b[bOffset:], &bOffset)
+			case protocol.OpError:
+				readErr = l.handleError(p)
+			default:
+				readErr = ErrInvalidOp
+			}
+		})
 		if !ok {
 			return bOffset, ErrTimeout
 		}
-
-		// Handle different packet types
-		switch p.Op() {
-		case protocol.OpStandardLinkCopy:
-			err = l.handleStandardLinkCopy(&p, rxBuffers, rxFree, b[bOffset:], &bOffset)
-		case protocol.OpConnCopy:
-			err = l.handleConnCopy(&p, rxBuffers, rxFree, b[bOffset:], &bOffset)
-		case protocol.OpError:
-			err = l.handleError(&p)
-		default:
-			err = ErrInvalidOp
-		}
-		if err != nil {
+		if readErr != nil {
+			err = readErr
 			break
 		}
 		if bOffset > 0 {
@@ -398,99 +369,211 @@ func (l *StandardLink) Write(b []byte) (n int, err error) {
 	// Determine which ring and buffers to use based on link mode
 	var tx *mpmc.MPMCRing[protocol.Packet]
 	var txBuffers [][]byte
-	var txFree *mpmc.MPMCRing[uint64]
 
 	if l.linkMode == LinkModeSecondary {
 		// Secondary writes to ring1 (Secondary to Primary)
 		tx = l.ring1
 		txBuffers = l.buffers1
-		txFree = l.free1
 	} else {
 		// Primary writes to ring0 (Primary to Secondary)
 		tx = l.ring0
 		txBuffers = l.buffers0
-		txFree = l.free0
 	}
 
-	bufferIndex64, ok := l.dequeueFreeBuffer(txFree)
+	copyID := l.idGenerator.Add(1)
+	ok := l.enqueuePacketZeroCopy(tx, func(slot int, p *protocol.Packet) {
+		if slot < 0 || slot >= len(txBuffers) {
+			*p = protocol.NewPacket(protocol.OpError, copyID, uint64(ErrCodeInvalidSize))
+			return
+		}
+
+		// The claimed ring slot owns the same-index payload buffer. The slot
+		// is not reusable until the receiver dequeues this packet.
+		copySize := min(bN, l.bufferSize)
+		race.Copy(txBuffers[slot], b[bOffset:bOffset+copySize])
+		bOffset += copySize
+		*p = protocol.NewStandardLinkCopyPacket(
+			copyID,
+			uint64(slot),
+			uint64(copySize),
+		)
+	})
 	if !ok {
-		return 0, ErrTimeout
-	}
-	bufferIndex := int(bufferIndex64)
-	if bufferIndex < 0 || bufferIndex >= len(txBuffers) {
-		return 0, ErrInvalidSize
-	}
-
-	// Copy data to buffer
-	copySize := min(bN, l.bufferSize)
-	race.Copy(txBuffers[bufferIndex], b[bOffset:bOffset+copySize])
-	bOffset += copySize
-
-	// Send packet
-	packet := protocol.NewStandardLinkCopyPacket(
-		l.idGenerator.Add(1),
-		uint64(bufferIndex),
-		uint64(copySize),
-	)
-
-	if !l.enqueuePacket(tx, packet) {
-		// The data packet was not published; return the buffer to the free
-		// pool so a timed-out writer cannot leak buffer ownership.
-		txFree.Enqueue(uint64(bufferIndex))
 		return 0, ErrTimeout
 	}
 
 	return bOffset, nil
 }
 
-func (l *StandardLink) dequeuePacket(r *mpmc.MPMCRing[protocol.Packet]) (protocol.Packet, bool) {
+// WriteZeroCopy writes one message by letting fn fill the ring-slot-owned
+// shared payload buffer directly.
+//
+// WARNING: The callback runs while the underlying ring slot is claimed. It must
+// return promptly; if it blocks or never returns, the whole ring can suffer
+// head-of-line (HOL) blocking. Do not retain the buffer after the callback returns.
+//
+// The callback must return a payload size in the range 1..BufferSize. If it
+// returns an error or an invalid size, StandardLink publishes an error packet to
+// keep the ring moving and returns that error to the caller.
+func (l *StandardLink) WriteZeroCopy(fn func(buffer []byte) (int, error)) (n int, err error) {
+	if fn == nil {
+		return 0, ErrInvalidOp
+	}
+
+	var tx *mpmc.MPMCRing[protocol.Packet]
+	var txBuffers [][]byte
+	if l.linkMode == LinkModeSecondary {
+		tx = l.ring1
+		txBuffers = l.buffers1
+	} else {
+		tx = l.ring0
+		txBuffers = l.buffers0
+	}
+
+	copyID := l.idGenerator.Add(1)
+	var callbackErr error
+	ok := l.enqueuePacketZeroCopy(tx, func(slot int, p *protocol.Packet) {
+		if slot < 0 || slot >= len(txBuffers) {
+			callbackErr = ErrInvalidSize
+			*p = protocol.NewPacket(protocol.OpError, copyID, uint64(ErrCodeInvalidSize))
+			return
+		}
+
+		buffer := txBuffers[slot]
+		n, callbackErr = fn(buffer)
+		if callbackErr != nil {
+			*p = protocol.NewPacket(protocol.OpError, copyID, uint64(ErrCodeInvalidOp))
+			return
+		}
+		if n <= 0 {
+			callbackErr = ErrInvalidSize
+			*p = protocol.NewPacket(protocol.OpError, copyID, uint64(ErrCodeInvalidSize))
+			return
+		}
+		if n > len(buffer) {
+			callbackErr = ErrBufferOverflow
+			*p = protocol.NewPacket(protocol.OpError, copyID, uint64(ErrCodeBufferOverflow))
+			return
+		}
+
+		*p = protocol.NewStandardLinkCopyPacket(copyID, uint64(slot), uint64(n))
+	})
+	if !ok {
+		return 0, ErrTimeout
+	}
+	if callbackErr != nil {
+		return 0, callbackErr
+	}
+	return n, nil
+}
+
+// ReadZeroCopy reads one message by passing the ring-slot-owned shared payload
+// buffer directly to fn.
+//
+// WARNING: The callback runs while the underlying ring slot is claimed. It must
+// return promptly; if it blocks or never returns, the whole ring can suffer
+// head-of-line (HOL) blocking. Do not retain the buffer after the callback returns.
+//
+// The buffer is only valid for the duration of fn. Returning from fn releases
+// the ring slot and allows a future writer to overwrite the same memory.
+func (l *StandardLink) ReadZeroCopy(fn func(buffer []byte) error) (n int, err error) {
+	if fn == nil {
+		return 0, ErrInvalidOp
+	}
+
+	if len(l.receiveBuffer) > 0 {
+		buffer := l.receiveBuffer
+		n = len(buffer)
+		err = fn(buffer)
+		l.receiveBuffer = l.receiveBuffer[:0]
+		return n, err
+	}
+
+	var rx *mpmc.MPMCRing[protocol.Packet]
+	var rxBuffers [][]byte
+	if l.linkMode == LinkModeSecondary {
+		rx = l.ring0
+		rxBuffers = l.buffers0
+	} else {
+		rx = l.ring1
+		rxBuffers = l.buffers1
+	}
+
+	var readErr error
+	ok := l.dequeuePacketZeroCopy(rx, func(slot int, p *protocol.Packet) {
+		if slot < 0 || slot >= len(rxBuffers) {
+			readErr = ErrInvalidSize
+			return
+		}
+
+		switch p.Op() {
+		case protocol.OpStandardLinkCopy, protocol.OpConnCopy:
+			size := int(p.Operand(2))
+			if size <= 0 || size > len(rxBuffers[slot]) {
+				readErr = ErrInvalidSize
+				return
+			}
+			buffer := rxBuffers[slot][:size:size]
+			n = size
+			readErr = fn(buffer)
+		case protocol.OpError:
+			readErr = l.handleError(p)
+		default:
+			readErr = ErrInvalidOp
+		}
+	})
+	if !ok {
+		return 0, ErrTimeout
+	}
+	if readErr != nil {
+		return 0, readErr
+	}
+	return n, nil
+}
+
+func (l *StandardLink) dequeuePacketZeroCopy(r *mpmc.MPMCRing[protocol.Packet], fn func(slot int, p *protocol.Packet)) bool {
 	if l.readDeadline.IsZero() {
-		return r.Dequeue(), true
+		r.DequeueZeroCopy(func(slot uint64, p *protocol.Packet) {
+			fn(int(slot), p)
+		})
+		return true
 	}
 	ctx, cancel := contextForDeadline(l.readDeadline)
 	defer cancel()
-	return r.DequeueWithContext(ctx)
+	return r.DequeueZeroCopyWithContext(ctx, func(slot uint64, p *protocol.Packet) {
+		fn(int(slot), p)
+	})
 }
 
-func (l *StandardLink) dequeueFreeBuffer(r *mpmc.MPMCRing[uint64]) (uint64, bool) {
+func (l *StandardLink) enqueuePacketZeroCopy(r *mpmc.MPMCRing[protocol.Packet], fn func(slot int, p *protocol.Packet)) bool {
 	if l.writeDeadline.IsZero() {
-		return r.Dequeue(), true
-	}
-	ctx, cancel := contextForDeadline(l.writeDeadline)
-	defer cancel()
-	return r.DequeueWithContext(ctx)
-}
-
-func (l *StandardLink) enqueuePacket(r *mpmc.MPMCRing[protocol.Packet], packet protocol.Packet) bool {
-	if l.writeDeadline.IsZero() {
-		r.Enqueue(packet)
+		r.EnqueueZeroCopy(func(slot uint64, p *protocol.Packet) {
+			fn(int(slot), p)
+		})
 		return true
 	}
 	ctx, cancel := contextForDeadline(l.writeDeadline)
 	defer cancel()
-	return r.EnqueueWithContext(ctx, packet)
+	return r.EnqueueZeroCopyWithContext(ctx, func(slot uint64, p *protocol.Packet) {
+		fn(int(slot), p)
+	})
 }
 
 // handleStandardLinkCopy processes a standard link copy packet
 // It extracts data from the specified buffer and copies it to the destination
-func (l *StandardLink) handleStandardLinkCopy(p *protocol.Packet, buffers [][]byte, free *mpmc.MPMCRing[uint64], dst []byte, dstOffset *int) error {
-	bufferIndex := int(p.Operand(1))
+func (l *StandardLink) handleStandardLinkCopy(p *protocol.Packet, buffer []byte, dst []byte, dstOffset *int) error {
 	size := int(p.Operand(2))
-
-	// Validate buffer index
-	if bufferIndex < 0 || bufferIndex >= len(buffers) {
+	if size <= 0 {
 		return ErrInvalidSize
 	}
 
-	buffer := buffers[bufferIndex]
 	if size > len(buffer) {
-		size = len(buffer)
+		return ErrInvalidSize
 	}
 
 	available := len(dst) - *dstOffset
 	if available <= 0 {
 		l.appendReceiveBuffer(buffer[:size])
-		free.Enqueue(uint64(bufferIndex))
 		return nil
 	}
 
@@ -505,30 +588,24 @@ func (l *StandardLink) handleStandardLinkCopy(p *protocol.Packet, buffers [][]by
 		*dstOffset += copied
 	}
 
-	free.Enqueue(uint64(bufferIndex))
 	return nil
 }
 
 // handleConnCopy processes a connection copy packet
 // It validates the connection and copies data from the specified buffer
-func (l *StandardLink) handleConnCopy(p *protocol.Packet, buffers [][]byte, free *mpmc.MPMCRing[uint64], dst []byte, dstOffset *int) error {
-	bufferIndex := int(p.Operand(1))
+func (l *StandardLink) handleConnCopy(p *protocol.Packet, buffer []byte, dst []byte, dstOffset *int) error {
 	size := int(p.Operand(2))
-
-	// Validate buffer index
-	if bufferIndex < 0 || bufferIndex >= len(buffers) {
+	if size <= 0 {
 		return ErrInvalidSize
 	}
 
-	buffer := buffers[bufferIndex]
 	if size > len(buffer) {
-		size = len(buffer)
+		return ErrInvalidSize
 	}
 
 	available := len(dst) - *dstOffset
 	if available <= 0 {
 		l.appendReceiveBuffer(buffer[:size])
-		free.Enqueue(uint64(bufferIndex))
 		return nil
 	}
 
@@ -543,7 +620,6 @@ func (l *StandardLink) handleConnCopy(p *protocol.Packet, buffers [][]byte, free
 		*dstOffset += copied
 	}
 
-	free.Enqueue(uint64(bufferIndex))
 	return nil
 }
 
@@ -830,7 +906,10 @@ func (l *AdvancedLink) WaitForNegotiation(ctx context.Context) (bool, error) {
 		requestedCapabilities := p.Operand(2)
 
 		// Determine our capabilities
-		supportedVersion := ProtocolVersion{Major: 1, Minor: 1}
+		supportedVersion := ProtocolVersion{
+			Major: protocol.HQQProtocolMajorVersion,
+			Minor: protocol.HQQProtocolMinorVersion,
+		}
 		supportedFeatures := FeatureCompression | FeatureFlowControl | FeatureStatistics
 		supportedCapabilities := CapabilityLargeBuffers | CapabilityHighThroughput
 

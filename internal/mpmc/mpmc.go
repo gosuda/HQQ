@@ -260,6 +260,97 @@ func (m *MPMCRing[T]) EnqueueFunc(fn func(*T)) {
 	atomic.StoreUint64(&c._seq, p+1)
 }
 
+// EnqueueZeroCopy claims one producer slot, passes the slot index and in-place
+// element pointer to fn, then publishes the slot when fn returns.
+//
+// WARNING: The callback runs while the ring slot is claimed. It must return
+// promptly; if it blocks or never returns, the whole ring can suffer
+// head-of-line (HOL) blocking. Do not retain elem after the callback returns.
+//
+//go:nocheckptr
+func (m *MPMCRing[T]) EnqueueZeroCopy(fn func(slot uint64, elem *T)) {
+	_h := (*_mring)(unsafe.Pointer(m._head))
+
+	var c *_melem[T]
+	p := atomic.LoadUint64(&_h.w) // Get current write position
+
+	for {
+		slot := p & m._mask
+		c = (*_melem[T])(unsafe.Pointer(m._data + unsafe.Sizeof(_melem[T]{})*uintptr(slot)))
+		seq := atomic.LoadUint64(&c._seq)
+		diff := seq - p
+
+		// Check if we can claim this slot
+		if diff == 0 {
+			// Try to atomically claim the slot by incrementing the write position
+			if atomic.CompareAndSwapUint64(&_h.w, p, p+1) {
+				fn(slot, &c._data)
+				atomic.StoreUint64(&c._seq, p+1)
+				return
+			}
+		} else if diff > 0 {
+			// Another producer has claimed this slot, try again
+			p = atomic.LoadUint64(&_h.w)
+		} else {
+			// This should never happen in a correctly implemented ring buffer
+			panic("unreachable")
+		}
+
+		// Yield to other goroutines
+		runtime.Gosched()
+	}
+}
+
+// EnqueueZeroCopyWithContext is EnqueueZeroCopy with context cancellation
+// before a producer slot is claimed.
+//
+// WARNING: The callback runs while the ring slot is claimed. It must return
+// promptly; if it blocks or never returns, the whole ring can suffer
+// head-of-line (HOL) blocking. Do not retain elem after the callback returns.
+// Context cancellation is not checked after the slot has been claimed.
+//
+//go:nocheckptr
+func (m *MPMCRing[T]) EnqueueZeroCopyWithContext(ctx context.Context, fn func(slot uint64, elem *T)) bool {
+	done := ctx.Done()
+	_h := (*_mring)(unsafe.Pointer(m._head))
+
+	var c *_melem[T]
+	p := atomic.LoadUint64(&_h.w) // Get current write position
+
+	for {
+		// Check for context cancellation
+		select {
+		case <-done:
+			return false
+		default:
+		}
+
+		slot := p & m._mask
+		c = (*_melem[T])(unsafe.Pointer(m._data + unsafe.Sizeof(_melem[T]{})*uintptr(slot)))
+		seq := atomic.LoadUint64(&c._seq)
+		diff := seq - p
+
+		// Check if we can claim this slot
+		if diff == 0 {
+			// Try to atomically claim the slot by incrementing the write position
+			if atomic.CompareAndSwapUint64(&_h.w, p, p+1) {
+				fn(slot, &c._data)
+				atomic.StoreUint64(&c._seq, p+1)
+				return true
+			}
+		} else if diff > 0 {
+			// Another producer has claimed this slot, try again
+			p = atomic.LoadUint64(&_h.w)
+		} else {
+			// This should never happen in a correctly implemented ring buffer
+			panic("unreachable")
+		}
+
+		// Yield to other goroutines
+		runtime.Gosched()
+	}
+}
+
 // DequeueWithContext removes an element from the ring buffer with context support
 // This function will return false if the context is cancelled before an element can be dequeued.
 //
@@ -414,6 +505,104 @@ func (m *MPMCRing[T]) DequeueFunc(fn func(*T)) {
 	// Update the sequence number to make the slot available for producers
 	atomic.StoreUint64(&c._seq, p+m._mask+1)
 	return
+}
+
+// DequeueZeroCopy claims one consumer slot, passes the slot index and in-place
+// element pointer to fn, then releases the slot back to producers when fn
+// returns.
+//
+// WARNING: The callback runs while the ring slot is claimed. It must return
+// promptly; if it blocks or never returns, the whole ring can suffer
+// head-of-line (HOL) blocking. Do not retain elem after the callback returns.
+//
+//go:nocheckptr
+func (m *MPMCRing[T]) DequeueZeroCopy(fn func(slot uint64, elem *T)) {
+	_h := (*_mring)(unsafe.Pointer(m._head))
+
+	var c *_melem[T]
+	p := atomic.LoadUint64(&_h.r) // Get current read position
+
+	for {
+		slot := p & m._mask
+		c = (*_melem[T])(unsafe.Pointer(m._data + unsafe.Sizeof(_melem[T]{})*uintptr(slot)))
+		seq := atomic.LoadUint64(&c._seq)
+		diff := seq - (p + 1)
+
+		// Check if this element is ready to be consumed
+		if diff == 0 {
+			// Try to atomically claim the slot by incrementing the read position
+			if atomic.CompareAndSwapUint64(&_h.r, p, p+1) {
+				// Memory barrier to ensure the read of c._data happens after
+				// we've successfully claimed the slot
+				atomic.LoadUint64(&c._seq) // This acts as a memory barrier
+				fn(slot, &c._data)
+				atomic.StoreUint64(&c._seq, p+m._mask+1)
+				return
+			}
+		} else if diff > 0 {
+			// The element is not ready yet, try again
+			p = atomic.LoadUint64(&_h.r)
+		} else {
+			// This should never happen in a correctly implemented ring buffer
+			panic("unreachable")
+		}
+
+		// Yield to other goroutines
+		runtime.Gosched()
+	}
+}
+
+// DequeueZeroCopyWithContext is DequeueZeroCopy with context cancellation
+// before a consumer slot is claimed.
+//
+// WARNING: The callback runs while the ring slot is claimed. It must return
+// promptly; if it blocks or never returns, the whole ring can suffer
+// head-of-line (HOL) blocking. Do not retain elem after the callback returns.
+// Context cancellation is not checked after the slot has been claimed.
+//
+//go:nocheckptr
+func (m *MPMCRing[T]) DequeueZeroCopyWithContext(ctx context.Context, fn func(slot uint64, elem *T)) bool {
+	done := ctx.Done()
+	_h := (*_mring)(unsafe.Pointer(m._head))
+
+	var c *_melem[T]
+	p := atomic.LoadUint64(&_h.r) // Get current read position
+
+	for {
+		// Check for context cancellation
+		select {
+		case <-done:
+			return false
+		default:
+		}
+
+		slot := p & m._mask
+		c = (*_melem[T])(unsafe.Pointer(m._data + unsafe.Sizeof(_melem[T]{})*uintptr(slot)))
+		seq := atomic.LoadUint64(&c._seq)
+		diff := seq - (p + 1)
+
+		// Check if this element is ready to be consumed
+		if diff == 0 {
+			// Try to atomically claim the slot by incrementing the read position
+			if atomic.CompareAndSwapUint64(&_h.r, p, p+1) {
+				// Memory barrier to ensure the read of c._data happens after
+				// we've successfully claimed the slot
+				atomic.LoadUint64(&c._seq) // This acts as a memory barrier
+				fn(slot, &c._data)
+				atomic.StoreUint64(&c._seq, p+m._mask+1)
+				return true
+			}
+		} else if diff > 0 {
+			// The element is not ready yet, try again
+			p = atomic.LoadUint64(&_h.r)
+		} else {
+			// This should never happen in a correctly implemented ring buffer
+			panic("unreachable")
+		}
+
+		// Yield to other goroutines
+		runtime.Gosched()
+	}
 }
 
 // Magic number to identify initialized MPMC rings

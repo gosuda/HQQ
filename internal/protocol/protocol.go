@@ -9,8 +9,8 @@ import "encoding/binary"
 // shared-memory ABI does not depend on uintptr width, Go struct padding, or the
 // local machine's native byte order.
 const (
-	HQQProtocolMajorVersion = 1
-	HQQProtocolMinorVersion = 1
+	HQQProtocolMajorVersion = 2
+	HQQProtocolMinorVersion = 0
 )
 
 const (
@@ -88,11 +88,12 @@ const (
 	// Operands:
 	//   Operand0: CopyID, monotonically increasing per endpoint
 	//   Operand1: BufferIndex into the direction-local payload buffer pool
-	//   Operand2: DataSize in bytes, 0 <= DataSize <= BufferSize
+	//   Operand2: DataSize in bytes, 1 <= DataSize <= BufferSize
 	//
-	// Buffer ownership is not encoded in-band. Each direction has a separate
-	// lock-free free-buffer ring. The receiver returns Operand1 to that free
-	// ring after copying the payload out of shared memory.
+	// Buffer ownership is derived from the data ring slot. Operand1 mirrors
+	// that slot index for diagnostics and compatibility, but the receiver uses
+	// the claimed slot to locate the payload buffer and releases ownership when
+	// the dequeue callback returns.
 	OpStandardLinkCopy OpCode = 0xFF
 )
 

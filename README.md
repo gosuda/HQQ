@@ -9,8 +9,9 @@ Implemented for `StandardLink`:
 - fixed-size 64-byte protocol packets
 - little-endian packet encoding
 - bidirectional primary/secondary data transfer
-- lock-free data rings and lock-free free-buffer rings
-- explicit payload-buffer ownership transfer to prevent unread-buffer overwrite
+- lock-free data rings with ring-slot-owned payload buffers
+- zero-copy callback APIs for direct shared-buffer access
+- implicit payload-buffer ownership transfer to prevent unread-buffer overwrite
 - `io.Reader`, `io.Writer`, and `net.PacketConn` style APIs
 - read/write deadline timeout behavior
 - StandardLink functional and benchmark coverage
@@ -28,14 +29,12 @@ Shared memory is split into two independent directions:
 
 ```text
 DATA_RING_0   protocol.Packet ring, Primary -> Secondary
-FREE_RING_0   uint64 ring, free buffer indexes for direction 0
 BUFFERS_0     fixed payload buffers for direction 0
 DATA_RING_1   protocol.Packet ring, Secondary -> Primary
-FREE_RING_1   uint64 ring, free buffer indexes for direction 1
 BUFFERS_1     fixed payload buffers for direction 1
 ```
 
-Senders dequeue a buffer index from the direction's free ring, copy payload bytes into that buffer, then publish an `OpStandardLinkCopy` packet. Receivers copy the payload out and return the buffer index to the free ring. This keeps the hot path lock-free and prevents unread payloads from being overwritten.
+Each data-ring slot owns the same-index payload buffer. Senders claim a ring slot, fill `BUFFERS[slot]`, then publish an `OpStandardLinkCopy` packet. Receivers claim the packet slot and either copy the payload out (`Read`) or process it in-place (`ReadZeroCopy`); returning from the dequeue callback releases the slot and its buffer for reuse. This keeps the hot path lock-free without a separate free-buffer ring.
 
 See [PROTOCOL.md](PROTOCOL.md) for the full Standard Protocol specification.
 
@@ -120,10 +119,16 @@ func OpenStandardLink(offset uintptr, bufferCount int, bufferSize int) (*Standar
 ```go
 func (l *StandardLink) Read(b []byte) (int, error)
 func (l *StandardLink) Write(b []byte) (int, error)
+func (l *StandardLink) ReadZeroCopy(func([]byte) error) (int, error)
+func (l *StandardLink) WriteZeroCopy(func([]byte) (int, error)) (int, error)
 func (l *StandardLink) Close() error
 func (l *StandardLink) GetMode() LinkMode
 func (l *StandardLink) GetType() LinkType
 ```
+
+`ReadZeroCopy` and `WriteZeroCopy` expose the shared payload buffer directly for the duration of the callback.
+
+> WARNING: The callback runs while the underlying ring slot is claimed. It must return promptly; if it blocks or never returns, the whole ring can suffer head-of-line (HOL) blocking. Do not retain the buffer after the callback returns.
 
 `StandardLink` also implements `net.PacketConn`:
 
