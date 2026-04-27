@@ -42,7 +42,8 @@ func TestStandardLinkCreation(t *testing.T) {
 	}
 
 	// Create aligned buffer
-	_, offset := createAlignedBuffer(t, size)
+	backing, offset := createAlignedBuffer(t, size)
+	defer runtime.KeepAlive(backing)
 
 	// Create primary link
 	primary, err := OpenStandardLink(offset, bufferCount, bufferSize)
@@ -81,7 +82,8 @@ func TestStandardLinkReadWrite(t *testing.T) {
 	size := SizeStandardLink(bufferCount, bufferSize)
 
 	// Create aligned buffer
-	_, offset := createAlignedBuffer(t, size)
+	backing, offset := createAlignedBuffer(t, size)
+	defer runtime.KeepAlive(backing)
 
 	// Create links
 	primary, err := OpenStandardLink(offset, bufferCount, bufferSize)
@@ -127,7 +129,8 @@ func TestStandardLinkBidirectionalReadWrite(t *testing.T) {
 	bufferCount := 16
 	bufferSize := 128
 	size := SizeStandardLink(bufferCount, bufferSize)
-	_, offset := createAlignedBuffer(t, size)
+	backing, offset := createAlignedBuffer(t, size)
+	defer runtime.KeepAlive(backing)
 
 	primary, err := OpenStandardLink(offset, bufferCount, bufferSize)
 	if err != nil {
@@ -173,7 +176,8 @@ func TestStandardLinkDoesNotOverwriteUnreadBuffers(t *testing.T) {
 	bufferCount := 4
 	bufferSize := 16
 	size := SizeStandardLink(bufferCount, bufferSize)
-	_, offset := createAlignedBuffer(t, size)
+	backing, offset := createAlignedBuffer(t, size)
+	defer runtime.KeepAlive(backing)
 
 	primary, err := OpenStandardLink(offset, bufferCount, bufferSize)
 	if err != nil {
@@ -220,7 +224,8 @@ func TestStandardLinkPartialReadPreservesRemainderAndReleasesBuffer(t *testing.T
 	bufferCount := 2
 	bufferSize := 16
 	size := SizeStandardLink(bufferCount, bufferSize)
-	_, offset := createAlignedBuffer(t, size)
+	backing, offset := createAlignedBuffer(t, size)
+	defer runtime.KeepAlive(backing)
 
 	primary, err := OpenStandardLink(offset, bufferCount, bufferSize)
 	if err != nil {
@@ -283,7 +288,8 @@ func TestAdvancedLinkCreation(t *testing.T) {
 
 	// Calculate required memory size
 	size := SizeStandardLink(bufferCount, bufferSize)
-	_, offset := createAlignedBuffer(t, size)
+	backing, offset := createAlignedBuffer(t, size)
+	defer runtime.KeepAlive(backing)
 
 	// Create advanced link
 	advLink, err := NewAdvancedLink(offset, bufferCount, bufferSize)
@@ -314,7 +320,8 @@ func TestAdvancedLinkProtocolNegotiation(t *testing.T) {
 
 	// Calculate required memory size
 	size := SizeStandardLink(bufferCount, bufferSize)
-	_, offset := createAlignedBuffer(t, size)
+	backing, offset := createAlignedBuffer(t, size)
+	defer runtime.KeepAlive(backing)
 
 	// Create advanced links
 	primary, err := NewAdvancedLink(offset, bufferCount, bufferSize)
@@ -411,7 +418,8 @@ func TestAdvancedLinkReadWrite(t *testing.T) {
 
 	// Calculate required memory size
 	size := SizeStandardLink(bufferCount, bufferSize)
-	_, offset := createAlignedBuffer(t, size)
+	backing, offset := createAlignedBuffer(t, size)
+	defer runtime.KeepAlive(backing)
 
 	// Create advanced links
 	primary, err := NewAdvancedLink(offset, bufferCount, bufferSize)
@@ -506,7 +514,8 @@ func TestAdvancedLinkStatistics(t *testing.T) {
 
 	// Calculate required memory size
 	size := SizeStandardLink(bufferCount, bufferSize)
-	_, offset := createAlignedBuffer(t, size)
+	backing, offset := createAlignedBuffer(t, size)
+	defer runtime.KeepAlive(backing)
 
 	// Create advanced link
 	advLink, err := NewAdvancedLink(offset, bufferCount, bufferSize)
@@ -533,7 +542,8 @@ func TestStandardLinkErrors(t *testing.T) {
 	}
 
 	// Test memory alignment error
-	_, offset := createAlignedBuffer(t, 4096)
+	backing, offset := createAlignedBuffer(t, 4096)
+	defer runtime.KeepAlive(backing)
 	// Create misalignment by adding 1
 	offset++
 
@@ -554,7 +564,8 @@ func TestStandardLinkDeadlines(t *testing.T) {
 	bufferCount := 2
 	bufferSize := 64
 	size := SizeStandardLink(bufferCount, bufferSize)
-	_, offset := createAlignedBuffer(t, size)
+	backing, offset := createAlignedBuffer(t, size)
+	defer runtime.KeepAlive(backing)
 
 	primary, err := OpenStandardLink(offset, bufferCount, bufferSize)
 	if err != nil {
@@ -597,7 +608,8 @@ func TestStandardLinkHighVolumeOrderedDelivery(t *testing.T) {
 	bufferSize := 64
 	messageCount := 4096
 	size := SizeStandardLink(bufferCount, bufferSize)
-	_, offset := createAlignedBuffer(t, size)
+	backing, offset := createAlignedBuffer(t, size)
+	defer runtime.KeepAlive(backing)
 
 	primary, err := OpenStandardLink(offset, bufferCount, bufferSize)
 	if err != nil {
@@ -665,7 +677,8 @@ func TestStandardLinkMultiPProgress(t *testing.T) {
 	bufferSize := 128
 	messageCount := 8192
 	size := SizeStandardLink(bufferCount, bufferSize)
-	_, offset := createAlignedBuffer(t, size)
+	backing, offset := createAlignedBuffer(t, size)
+	defer runtime.KeepAlive(backing)
 
 	primary, err := OpenStandardLink(offset, bufferCount, bufferSize)
 	if err != nil {
@@ -733,7 +746,8 @@ func TestAdvancedLinkNegotiationTimeout(t *testing.T) {
 
 	// Calculate required memory size
 	size := SizeStandardLink(bufferCount, bufferSize)
-	_, offset := createAlignedBuffer(t, size)
+	backing, offset := createAlignedBuffer(t, size)
+	defer runtime.KeepAlive(backing)
 
 	// Create advanced link
 	advLink, err := NewAdvancedLink(offset, bufferCount, bufferSize)
@@ -770,7 +784,8 @@ func TestConcurrentReadWrite(t *testing.T) {
 
 	// Calculate required memory size
 	size := SizeStandardLink(bufferCount, bufferSize)
-	_, offset := createAlignedBuffer(t, size)
+	backing, offset := createAlignedBuffer(t, size)
+	defer runtime.KeepAlive(backing)
 
 	// Create links
 	primary, err := OpenStandardLink(offset, bufferCount, bufferSize)
@@ -886,7 +901,8 @@ func BenchmarkStandardLinkReadWrite(b *testing.B) {
 
 	// Calculate required memory size
 	size := SizeStandardLink(bufferCount, bufferSize)
-	_, offset := createAlignedBuffer(nil, size)
+	backing, offset := createAlignedBuffer(nil, size)
+	defer runtime.KeepAlive(backing)
 
 	// Create links
 	primary, err := OpenStandardLink(offset, bufferCount, bufferSize)
@@ -923,11 +939,71 @@ func BenchmarkStandardLinkReadWrite(b *testing.B) {
 	}
 }
 
+func BenchmarkStandardLinkReadWriteSizes(b *testing.B) {
+	for _, payloadSize := range []int{8, 64, 4096} {
+		b.Run(fmt.Sprintf("%dB", payloadSize), func(b *testing.B) {
+			benchmarkStandardLinkReadWrite(b, payloadSize)
+		})
+	}
+}
+
+func benchmarkStandardLinkReadWrite(b *testing.B, payloadSize int) {
+	bufferCount := 1024
+	bufferSize := payloadSize
+	if bufferSize < 8 {
+		bufferSize = 8
+	}
+
+	size := SizeStandardLink(bufferCount, bufferSize)
+	backing, offset := createAlignedBuffer(nil, size)
+	defer runtime.KeepAlive(backing)
+
+	primary, err := OpenStandardLink(offset, bufferCount, bufferSize)
+	if err != nil {
+		b.Fatalf("Failed to create primary link: %v", err)
+	}
+	defer primary.Close()
+
+	secondary, err := OpenStandardLink(offset, bufferCount, bufferSize)
+	if err != nil {
+		b.Fatalf("Failed to create secondary link: %v", err)
+	}
+	defer secondary.Close()
+
+	testData := make([]byte, payloadSize)
+	readBuffer := make([]byte, payloadSize)
+	for i := range testData {
+		testData[i] = byte(i)
+	}
+
+	b.SetBytes(int64(payloadSize))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		n, err := primary.Write(testData)
+		if err != nil {
+			b.Fatalf("Write failed: %v", err)
+		}
+		if n != len(testData) {
+			b.Fatalf("write size = %d, want %d", n, len(testData))
+		}
+
+		n, err = secondary.Read(readBuffer)
+		if err != nil {
+			b.Fatalf("Read failed: %v", err)
+		}
+		if n != len(testData) {
+			b.Fatalf("read size = %d, want %d", n, len(testData))
+		}
+	}
+}
+
 func BenchmarkStandardLinkPipeline(b *testing.B) {
 	bufferCount := 1024
 	bufferSize := 1 << 12
 	size := SizeStandardLink(bufferCount, bufferSize)
-	_, offset := createAlignedBuffer(nil, size)
+	backing, offset := createAlignedBuffer(nil, size)
+	defer runtime.KeepAlive(backing)
 
 	primary, err := OpenStandardLink(offset, bufferCount, bufferSize)
 	if err != nil {
@@ -982,6 +1058,80 @@ func BenchmarkStandardLinkPipeline(b *testing.B) {
 	}
 }
 
+func BenchmarkStandardLinkPipelineSizes(b *testing.B) {
+	for _, payloadSize := range []int{8, 64, 4096} {
+		b.Run(fmt.Sprintf("%dB", payloadSize), func(b *testing.B) {
+			benchmarkStandardLinkPipeline(b, payloadSize)
+		})
+	}
+}
+
+func benchmarkStandardLinkPipeline(b *testing.B, payloadSize int) {
+	bufferCount := 1024
+	bufferSize := payloadSize
+	if bufferSize < 8 {
+		bufferSize = 8
+	}
+
+	size := SizeStandardLink(bufferCount, bufferSize)
+	backing, offset := createAlignedBuffer(nil, size)
+	defer runtime.KeepAlive(backing)
+
+	primary, err := OpenStandardLink(offset, bufferCount, bufferSize)
+	if err != nil {
+		b.Fatalf("Failed to create primary link: %v", err)
+	}
+	defer primary.Close()
+
+	secondary, err := OpenStandardLink(offset, bufferCount, bufferSize)
+	if err != nil {
+		b.Fatalf("Failed to create secondary link: %v", err)
+	}
+	defer secondary.Close()
+
+	testData := make([]byte, payloadSize)
+	readBuffer := make([]byte, payloadSize)
+	for i := range testData {
+		testData[i] = byte(i)
+	}
+
+	b.SetBytes(int64(payloadSize))
+	b.ReportAllocs()
+
+	start := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		<-start
+		for i := 0; i < b.N; i++ {
+			n, err := secondary.Read(readBuffer)
+			if err != nil {
+				done <- err
+				return
+			}
+			if n != len(testData) {
+				done <- fmt.Errorf("read size = %d, want %d", n, len(testData))
+				return
+			}
+		}
+		done <- nil
+	}()
+
+	b.ResetTimer()
+	close(start)
+	for i := 0; i < b.N; i++ {
+		n, err := primary.Write(testData)
+		if err != nil {
+			b.Fatalf("Write failed: %v", err)
+		}
+		if n != len(testData) {
+			b.Fatalf("write size = %d, want %d", n, len(testData))
+		}
+	}
+	if err := <-done; err != nil {
+		b.Fatalf("reader failed: %v", err)
+	}
+}
+
 // TestStandardLinkBufferOverflow tests buffer overflow handling
 // It verifies that attempts to write data larger than buffer size are rejected
 func TestStandardLinkBufferOverflow(t *testing.T) {
@@ -992,7 +1142,8 @@ func TestStandardLinkBufferOverflow(t *testing.T) {
 	size := SizeStandardLink(bufferCount, bufferSize)
 
 	// Create aligned buffer
-	_, offset := createAlignedBuffer(t, size)
+	backing, offset := createAlignedBuffer(t, size)
+	defer runtime.KeepAlive(backing)
 
 	// Create links
 	primary, err := OpenStandardLink(offset, bufferCount, bufferSize)
@@ -1021,7 +1172,8 @@ func TestStandardLinkPacketConn(t *testing.T) {
 	size := SizeStandardLink(bufferCount, bufferSize)
 
 	// Create aligned buffer
-	_, offset := createAlignedBuffer(t, size)
+	backing, offset := createAlignedBuffer(t, size)
+	defer runtime.KeepAlive(backing)
 
 	// Create links
 	primary, err := OpenStandardLink(offset, bufferCount, bufferSize)

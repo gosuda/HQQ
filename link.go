@@ -353,9 +353,7 @@ func (l *StandardLink) Read(b []byte) (n int, err error) {
 
 	// If we still need more data, try to dequeue from the ring
 	for bOffset < bN {
-		ctx, cancel := contextForDeadline(l.readDeadline)
-		p, ok := rx.DequeueWithContext(ctx)
-		cancel()
+		p, ok := l.dequeuePacket(rx)
 		if !ok {
 			return bOffset, ErrTimeout
 		}
@@ -414,10 +412,7 @@ func (l *StandardLink) Write(b []byte) (n int, err error) {
 		txFree = l.free0
 	}
 
-	ctx, cancel := contextForDeadline(l.writeDeadline)
-	defer cancel()
-
-	bufferIndex64, ok := txFree.DequeueWithContext(ctx)
+	bufferIndex64, ok := l.dequeueFreeBuffer(txFree)
 	if !ok {
 		return 0, ErrTimeout
 	}
@@ -432,14 +427,13 @@ func (l *StandardLink) Write(b []byte) (n int, err error) {
 	bOffset += copySize
 
 	// Send packet
-	packet := protocol.NewPacket(
-		protocol.OpStandardLinkCopy,
+	packet := protocol.NewStandardLinkCopyPacket(
 		l.idGenerator.Add(1),
 		uint64(bufferIndex),
 		uint64(copySize),
 	)
 
-	if !tx.EnqueueWithContext(ctx, packet) {
+	if !l.enqueuePacket(tx, packet) {
 		// The data packet was not published; return the buffer to the free
 		// pool so a timed-out writer cannot leak buffer ownership.
 		txFree.Enqueue(uint64(bufferIndex))
@@ -447,6 +441,34 @@ func (l *StandardLink) Write(b []byte) (n int, err error) {
 	}
 
 	return bOffset, nil
+}
+
+func (l *StandardLink) dequeuePacket(r *mpmc.MPMCRing[protocol.Packet]) (protocol.Packet, bool) {
+	if l.readDeadline.IsZero() {
+		return r.Dequeue(), true
+	}
+	ctx, cancel := contextForDeadline(l.readDeadline)
+	defer cancel()
+	return r.DequeueWithContext(ctx)
+}
+
+func (l *StandardLink) dequeueFreeBuffer(r *mpmc.MPMCRing[uint64]) (uint64, bool) {
+	if l.writeDeadline.IsZero() {
+		return r.Dequeue(), true
+	}
+	ctx, cancel := contextForDeadline(l.writeDeadline)
+	defer cancel()
+	return r.DequeueWithContext(ctx)
+}
+
+func (l *StandardLink) enqueuePacket(r *mpmc.MPMCRing[protocol.Packet], packet protocol.Packet) bool {
+	if l.writeDeadline.IsZero() {
+		r.Enqueue(packet)
+		return true
+	}
+	ctx, cancel := contextForDeadline(l.writeDeadline)
+	defer cancel()
+	return r.EnqueueWithContext(ctx, packet)
 }
 
 // handleStandardLinkCopy processes a standard link copy packet

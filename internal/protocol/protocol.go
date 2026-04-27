@@ -126,8 +126,21 @@ func NewPacket(op OpCode, operands ...uint64) Packet {
 	return p
 }
 
+// NewStandardLinkCopyPacket returns the hot-path StandardLink data packet.
+//
+// It avoids the variadic operand loop in NewPacket for the most frequently
+// emitted packet type.
+func NewStandardLinkCopyPacket(copyID, bufferIndex, size uint64) Packet {
+	var p Packet
+	binary.LittleEndian.PutUint64(p[0:8], uint64(OpStandardLinkCopy))
+	binary.LittleEndian.PutUint64(p[8:16], copyID)
+	binary.LittleEndian.PutUint64(p[16:24], bufferIndex)
+	binary.LittleEndian.PutUint64(p[24:32], size)
+	return p
+}
+
 // Op returns the packet opcode.
-func (p Packet) Op() OpCode {
+func (p *Packet) Op() OpCode {
 	return OpCode(binary.LittleEndian.Uint64(p[0:8]) & 0xFF)
 }
 
@@ -137,7 +150,7 @@ func (p *Packet) SetOp(op OpCode) {
 }
 
 // Operand returns operand i. It returns zero for out-of-range operand indexes.
-func (p Packet) Operand(i int) uint64 {
+func (p *Packet) Operand(i int) uint64 {
 	if i < 0 || i >= PacketOperandCount {
 		return 0
 	}

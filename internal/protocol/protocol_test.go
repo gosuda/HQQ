@@ -8,6 +8,12 @@ import (
 	"gosuda.org/hqq/internal/protocol"
 )
 
+var (
+	sinkPacket  protocol.Packet
+	sinkOp      protocol.OpCode
+	sinkOperand uint64
+)
+
 func TestPacketLittleEndianLayout(t *testing.T) {
 	p := protocol.NewPacket(
 		protocol.OpStandardLinkCopy,
@@ -43,4 +49,35 @@ func TestOpCodeStringIncludesStandardCopy(t *testing.T) {
 	if got := protocol.OpStandardLinkCopy.String(); got != "OpStandardLinkCopy" {
 		t.Fatalf("OpStandardLinkCopy.String() = %q", got)
 	}
+}
+
+func BenchmarkNewPacket(b *testing.B) {
+	var p protocol.Packet
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		p = protocol.NewPacket(protocol.OpStandardLinkCopy, uint64(i), 2, 3)
+	}
+	sinkPacket = p
+}
+
+func BenchmarkNewStandardLinkCopyPacket(b *testing.B) {
+	var p protocol.Packet
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		p = protocol.NewStandardLinkCopyPacket(uint64(i), 2, 3)
+	}
+	sinkPacket = p
+}
+
+func BenchmarkPacketDecode(b *testing.B) {
+	p := protocol.NewStandardLinkCopyPacket(1, 2, 3)
+	var op protocol.OpCode
+	var operand uint64
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		op = p.Op()
+		operand = p.Operand(1)
+	}
+	sinkOp = op
+	sinkOperand = operand
 }

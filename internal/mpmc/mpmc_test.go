@@ -6,6 +6,7 @@ import (
 	"unsafe"
 
 	"gosuda.org/hqq/internal/mpmc"
+	"gosuda.org/hqq/internal/protocol"
 )
 
 func TestMPMC(t *testing.T) {
@@ -177,5 +178,108 @@ func BenchmarkMPMC(b *testing.B) {
 			r.Enqueue(0)
 			_ = r.Dequeue()
 		}
+	})
+}
+
+func BenchmarkMPMCPayloadTypes(b *testing.B) {
+	const size = 128
+
+	b.Run("uint64", func(b *testing.B) {
+		buffer := make([]byte, mpmc.SizeMPMCRing[uint64](size))
+		bb := uintptr(unsafe.Pointer(&buffer[0]))
+		if !mpmc.MPMCInit[uint64](bb, size) {
+			b.Fatal("failed to initialize offheap mpmc ring")
+		}
+
+		b.ReportAllocs()
+		b.RunParallel(func(p *testing.PB) {
+			r := mpmc.MPMCAttach[uint64](bb, 0)
+			for p.Next() {
+				r.Enqueue(0)
+				_ = r.Dequeue()
+			}
+		})
+	})
+
+	b.Run("chunk16", func(b *testing.B) {
+		buffer := make([]byte, mpmc.SizeMPMCRing[_chunk](size))
+		bb := uintptr(unsafe.Pointer(&buffer[0]))
+		if !mpmc.MPMCInit[_chunk](bb, size) {
+			b.Fatal("failed to initialize offheap mpmc ring")
+		}
+
+		b.ReportAllocs()
+		b.RunParallel(func(p *testing.PB) {
+			r := mpmc.MPMCAttach[_chunk](bb, 0)
+			for p.Next() {
+				r.Enqueue(_chunk{})
+				_ = r.Dequeue()
+			}
+		})
+	})
+
+	b.Run("packet64", func(b *testing.B) {
+		buffer := make([]byte, mpmc.SizeMPMCRing[protocol.Packet](size))
+		bb := uintptr(unsafe.Pointer(&buffer[0]))
+		if !mpmc.MPMCInit[protocol.Packet](bb, size) {
+			b.Fatal("failed to initialize offheap mpmc ring")
+		}
+		packet := protocol.NewPacket(protocol.OpStandardLinkCopy, 1, 2, 3)
+
+		b.ReportAllocs()
+		b.RunParallel(func(p *testing.PB) {
+			r := mpmc.MPMCAttach[protocol.Packet](bb, 0)
+			for p.Next() {
+				r.Enqueue(packet)
+				_ = r.Dequeue()
+			}
+		})
+	})
+}
+
+func BenchmarkMPMCFuncPayloadTypes(b *testing.B) {
+	const size = 128
+
+	b.Run("chunk16", func(b *testing.B) {
+		buffer := make([]byte, mpmc.SizeMPMCRing[_chunk](size))
+		bb := uintptr(unsafe.Pointer(&buffer[0]))
+		if !mpmc.MPMCInit[_chunk](bb, size) {
+			b.Fatal("failed to initialize offheap mpmc ring")
+		}
+
+		b.ReportAllocs()
+		b.RunParallel(func(p *testing.PB) {
+			r := mpmc.MPMCAttach[_chunk](bb, 0)
+			for p.Next() {
+				r.EnqueueFunc(func(c *_chunk) {
+					c._pointer = 1
+					c._size = 2
+				})
+				r.DequeueFunc(func(c *_chunk) {
+					_ = c._pointer
+				})
+			}
+		})
+	})
+
+	b.Run("packet64", func(b *testing.B) {
+		buffer := make([]byte, mpmc.SizeMPMCRing[protocol.Packet](size))
+		bb := uintptr(unsafe.Pointer(&buffer[0]))
+		if !mpmc.MPMCInit[protocol.Packet](bb, size) {
+			b.Fatal("failed to initialize offheap mpmc ring")
+		}
+
+		b.ReportAllocs()
+		b.RunParallel(func(p *testing.PB) {
+			r := mpmc.MPMCAttach[protocol.Packet](bb, 0)
+			for p.Next() {
+				r.EnqueueFunc(func(packet *protocol.Packet) {
+					*packet = protocol.NewStandardLinkCopyPacket(1, 2, 3)
+				})
+				r.DequeueFunc(func(packet *protocol.Packet) {
+					_ = packet.Operand(1)
+				})
+			}
+		})
 	})
 }

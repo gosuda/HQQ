@@ -31,6 +31,11 @@ jobs:
           check-latest: true
           cache: true
 
+      - name: Install profiling dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y graphviz
+
       - name: Restore benchmark history
         id: benchmark-history
         uses: actions/cache/restore@v5.0.5
@@ -42,6 +47,7 @@ jobs:
 
       - name: Run StandardLink benchmarks
         run: |
+          mkdir -p benchmark-artifacts/pprof
           go test . \
             -timeout 2m \
             -run '^$' \
@@ -49,7 +55,15 @@ jobs:
             -benchmem \
             -benchtime 1000x \
             -count 3 \
+            -cpuprofile benchmark-artifacts/pprof/cpu.pprof \
+            -memprofile benchmark-artifacts/pprof/mem.pprof \
             | tee benchmark.txt
+          test_binary=$(find . -maxdepth 1 -type f -name '*.test' -print -quit)
+          if [ -z "$test_binary" ]; then
+            echo "expected go test to leave a test binary for pprof" >&2
+            exit 1
+          fi
+          mv "$test_binary" benchmark-artifacts/pprof/hqq.test
 
       - name: Publish benchmark summary
         uses: benchmark-action/github-action-benchmark@v1.22.0
@@ -63,6 +77,37 @@ jobs:
           alert-threshold: '200%'
           auto-push: false
           github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Render pprof reports
+        run: |
+          go tool pprof -top -nodecount=50 \
+            benchmark-artifacts/pprof/hqq.test \
+            benchmark-artifacts/pprof/cpu.pprof \
+            > benchmark-artifacts/pprof/cpu-top.txt
+          go tool pprof -svg \
+            -output benchmark-artifacts/pprof/cpu.svg \
+            benchmark-artifacts/pprof/hqq.test \
+            benchmark-artifacts/pprof/cpu.pprof
+          go tool pprof -top -sample_index=alloc_space -nodecount=50 \
+            benchmark-artifacts/pprof/hqq.test \
+            benchmark-artifacts/pprof/mem.pprof \
+            > benchmark-artifacts/pprof/mem-alloc-top.txt
+          go tool pprof -svg -sample_index=alloc_space \
+            -output benchmark-artifacts/pprof/mem-alloc.svg \
+            benchmark-artifacts/pprof/hqq.test \
+            benchmark-artifacts/pprof/mem.pprof
+
+      - name: Upload benchmark artifacts
+        if: always()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: standardlink-benchmark-artifacts
+          path: |
+            benchmark.txt
+            benchmark-data.json
+            benchmark-artifacts/
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Save benchmark history
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
