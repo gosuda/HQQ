@@ -1,475 +1,141 @@
-# HQQ Protocol Specification
+# HQQ Standard Protocol Specification
 
-## Overview
+## Scope
 
-The HQQ protocol is designed for efficient inter-process communication (IPC) using shared memory and lock-free MPMC (Multi-Producer Multi-Consumer) queues. This protocol enables high-performance data exchange between processes with minimal overhead and zero-copy transfers.
+This document defines the **Standard Protocol** used by `StandardLink`. The goal is a fast, lock-free, shared-memory data path for one primary endpoint and one secondary endpoint.
 
-## Design Principles
+Advanced features such as protocol negotiation, logical connections, compression, encryption, QoS, and reliable delivery are outside the Standard Protocol data path. They may be layered later, but `StandardLink` is intentionally kept small and deterministic.
 
-1. **Zero-Copy**: Data remains in shared memory to minimize memory bandwidth usage
-2. **Lock-Free**: All operations use atomic primitives for maximum concurrency
-3. **Bidirectional**: Full-duplex communication with separate channels for each direction
-4. **Extensible**: Protocol negotiation allows for feature discovery and future extensions
-5. **Efficient**: Optimized memory layout with proper alignment to reduce cache misses
+## Design Goals
 
-## Architecture
+1. **Fixed ABI**: packets have a stable byte layout independent of Go struct padding or `uintptr` width.
+2. **Little-endian encoding**: all packet words are encoded with `binary.LittleEndian`.
+3. **Lock-free ownership transfer**: data rings and free-buffer rings use atomic MPMC queues; no mutex is required for the StandardLink hot path.
+4. **No unread-buffer overwrite**: payload buffers are recycled only after the receiver copies the payload out of shared memory.
+5. **Bounded memory**: all rings and payload buffers are allocated up front.
 
-### Memory Layout
+## Shared Memory Layout
 
-The HQQ protocol uses a shared memory region organized as follows:
+The Standard Protocol allocates two independent directions. Each direction has:
 
-```
-<<<<< PAGE_START
-MPMC_RING (Primary to Secondary)     // Lock-free ring buffer for packets
-<<<<< PAGE_BREAK
-BUFFERS (Primary to Secondary)       // Data buffers for payload storage
-<<<<< PAGE_BREAK
-MPMC_RING (Secondary to Primary)     // Lock-free ring buffer for return packets
-<<<<< PAGE_BREAK
-BUFFERS (Secondary to Primary)       // Data buffers for return payloads
-<<<<< PAGE_END
-```
+- one packet ring for published data packets
+- one free-buffer ring for returning payload-buffer ownership
+- one fixed-size payload buffer pool
 
-### Memory Alignment
-
-- All structures are page-aligned to reduce cache misses
-- Buffer sizes are multiples of 8 bytes for proper alignment
-- Ring buffers use cache-line padding to prevent false sharing
-
-### Components
-
-1. **MPMC Rings**: Two lock-free ring buffers for bidirectional communication
-   - Ring 0: Primary to Secondary communication
-   - Ring 1: Secondary to Primary communication
-   
-2. **Buffer Pools**: Memory regions for storing actual data payloads
-   - Pre-allocated buffers indexed by position
-   - Buffer indices are passed in packets, not actual data
-   
-3. **Packet Structure**: Standardized message format for all communications
-   - Fixed-size header with operation code and operands
-   - Extensible design for future protocol versions
-
-## Packet Format
-
-All communication uses the following packet structure:
-
-```go
-type Packet struct {
-    Op       OpCode     // Operation type (1 byte)
-    Operand0 uintptr    // First operand (typically ID or offset)
-    Operand1 uintptr    // Second operand (typically size or flags)
-    Operand2 uintptr    // Third operand (typically offset or count)
-    Operand3 uintptr    // Fourth operand (reserved for future use)
-    Operand4 uintptr    // Fifth operand (reserved for future use)
-    Operand5 uintptr    // Sixth operand (reserved for future use)
-    Operand6 uintptr    // Seventh operand (reserved for future use)
-}
+```text
+PAGE_START
+  DATA_RING_0   protocol.Packet ring, Primary -> Secondary
+PAGE_BREAK
+  FREE_RING_0   uint64 ring, free buffer indexes for DATA_RING_0
+PAGE_BREAK
+  BUFFERS_0     bufferCount * bufferSize bytes, Primary -> Secondary payloads
+PAGE_BREAK
+  DATA_RING_1   protocol.Packet ring, Secondary -> Primary
+PAGE_BREAK
+  FREE_RING_1   uint64 ring, free buffer indexes for DATA_RING_1
+PAGE_BREAK
+  BUFFERS_1     bufferCount * bufferSize bytes, Secondary -> Primary payloads
+PAGE_END
 ```
 
-### Packet Size
+All regions are page-aligned. `bufferCount` must be a power of two and at least 2. `bufferSize` must be at least 8 bytes and a multiple of 8.
 
-- Fixed size of 56 bytes (7 operands × 8 bytes + 1 byte opcode + padding)
-- Optimized for cache line efficiency
-- All operands are uintptr for platform independence
+## Packet ABI
 
-## Operation Codes
+Every packet is exactly **64 bytes**: eight little-endian `uint64` words.
 
-### Error Handling
-
-#### OpError (0x00)
-- **Purpose**: Report errors between processes
-- **Operand0**: ContextID (typically connection ID or request ID)
-- **Operand1**: Error Number ( ErrorCode )
-- **Usage**: Sent in response to invalid operations or system errors
-
-### Connection Management
-
-#### OpConnCreate (0x01)
-- **Purpose**: Create a new logical connection
-- **Operand0**: ConnectionID (unique identifier for the connection)
-- **Response**: OpConnAccept with the same ConnectionID or OpError on failure
-- **Flow**: Primary → Secondary
-
-#### OpConnAccept (0x02)
-- **Purpose**: Accept a connection request
-- **Operand0**: ConnectionID (matches the OpConnCreate request)
-- **Usage**: Sent in response to OpConnCreate
-- **Flow**: Secondary → Primary
-
-#### OpConnClose (0x03)
-- **Purpose**: Close an existing connection
-- **Operand0**: ConnectionID (identifier of the connection to close)
-- **Usage**: Sent by either party to terminate a connection
-- **Flow**: Bidirectional
-
-### Data Transfer
-
-#### OpConnCopy (0x04)
-- **Purpose**: Transfer data between processes over a connection
-- **Operand0**: ConnectionID (identifier of the connection)
-- **Operand1**: CopyID (unique identifier for this transfer)
-- **Operand2**: CopySize (total size of the data to transfer)
-- **Operand3**: TransferSize (size of this specific transfer)
-- **Operand4**: TransferOffset (offset within the total data)
-- **Operand5**: BufferSize (size of the buffer containing data)
-- **Operand6**: BufferOffset (offset within the buffer)
-- **Usage**: For connection-oriented data transfer
-
-#### OpStandardLinkCopy (0xFF)
-- **Purpose**: Direct data copy without connection overhead
-- **Operand0**: CopyID (unique identifier for this transfer)
-- **Operand1**: BufferIndex (index of the buffer containing data)
-- **Operand2**: DataSize (actual size of data in the buffer)
-- **Usage**: For simple, connection-less data transfer
-- **Performance**: Lowest overhead data transfer method
-
-### Protocol Negotiation
-
-#### OpProtoNegotiate (0x05)
-- **Purpose**: Initiate protocol negotiation
-- **Operand0**: Protocol Version (encoded as major.minor)
-- **Operand1**: Feature Flags (bitmask of requested features)
-- **Operand2**: Capability Flags (bitmask of supported capabilities)
-- **Encoding**: Version = (Major << 8) | Minor
-
-#### OpProtoAck (0x06)
-- **Purpose**: Acknowledge protocol negotiation
-- **Operand0**: Accepted Protocol Version (encoded as major.minor)
-- **Operand1**: Accepted Feature Flags (bitmask of negotiated features)
-- **Operand2**: Accepted Capability Flags (bitmask of negotiated capabilities)
-- **Usage**: Sent in response to OpProtoNegotiate
-
-## Link Types
-
-### Standard Link
-
-The Standard Link provides basic inter-process communication functionality:
-
-- **Bidirectional Data Transfer**: Using two MPMC rings for full-duplex communication
-- **Connection Management**: State tracking for logical connections
-- **Error Handling**: Comprehensive error reporting with specific error codes
-- **Basic Statistics**: Packet counts, byte transfers, and error tracking
-- **Interface Compatibility**: Implements io.Reader, io.Writer, and net.PacketConn
-
-### Advanced Link
-
-The Advanced Link is built on top of the Standard Link and extends its capabilities:
-
-- **Protocol Negotiation**: Dynamic feature discovery and version negotiation
-- **Enhanced Flow Control**: Advanced backpressure and congestion control
-- **Advanced Statistics**: Detailed metrics including compression ratios and timing
-- **Quality of Service**: Priority handling and bandwidth management
-- **Future Features**: Framework for compression, encryption, and reliability
-
-## Protocol Negotiation
-
-Advanced Links perform protocol negotiation to ensure compatibility and enable features:
-
-### Negotiation Process
-
-1. **Version Negotiation**: Both ends agree on the highest mutually supported protocol version
-2. **Feature Negotiation**: Optional features are enabled based on mutual support
-3. **Capability Exchange**: Each endpoint advertises its system capabilities
-
-### Supported Features
-
-```go
-const (
-    FeatureNone        uint64 = 0
-    FeatureCompression uint64 = 1 << iota  // Data compression support
-    FeatureEncryption                     // Data encryption support
-    FeatureFlowControl                    // Advanced flow control
-    FeatureStatistics                     // Enhanced statistics
-    FeatureQoS                           // Quality of Service
-)
+```text
+word 0: opcode in low byte; remaining bits reserved and written as zero
+word 1: operand 0
+word 2: operand 1
+word 3: operand 2
+word 4: operand 3
+word 5: operand 4
+word 6: operand 5
+word 7: operand 6
 ```
 
-### Supported Capabilities
+In Go this is represented as `protocol.Packet [64]byte`. Use `protocol.NewPacket`, `Packet.Op`, and `Packet.Operand` instead of relying on native struct layout.
 
-```go
-const (
-    CapabilityNone         uint64 = 0
-    CapabilityLargeBuffers uint64 = 1 << iota  // Support for large buffers
-    CapabilityHighThroughput                    // High throughput mode
-    CapabilityLowLatency                        // Low latency optimizations
-    CapabilityReliableDelivery                  // Reliable delivery guarantees
-)
-```
+## Standard Data Operation
 
-### Negotiation Flow
+### `OpStandardLinkCopy` (`0xFF`)
 
-1. **Primary Initiates**: Sends OpProtoNegotiate with desired version and features
-2. **Secondary Responds**: Sends OpProtoAck with negotiated parameters
-3. **Feature Selection**: Intersection of requested and supported features
-4. **Version Selection**: Minimum of requested and supported versions
+Transfers one payload stored in a direction-local buffer pool.
 
-## Link Modes
+| Operand | Meaning |
+| --- | --- |
+| `Operand0` | `CopyID`, monotonically increasing per endpoint |
+| `Operand1` | `BufferIndex`, index into the sender direction's payload buffer pool |
+| `Operand2` | `DataSize`, number of valid bytes in the buffer |
+| `Operand3..6` | Reserved, must be zero |
 
-### Primary Mode
-
-- **Initialization**: Sets up the shared memory region and initializes structures
-- **Memory Management**: Responsible for allocating and managing shared memory
-- **Ring Initialization**: Creates and initializes MPMC rings and buffer pools
-- **Leadership**: Acts as the primary endpoint in the communication pair
-
-### Secondary Mode
-
-- **Attachment**: Connects to existing shared memory region
-- **Structure Usage**: Uses pre-initialized structures without modification
-- **Memory Access**: Read/write access to shared memory but no layout changes
-- **Followership**: Acts as the secondary endpoint in the communication pair
-
-## Flow Control
-
-### Buffer Management
-
-- **Pre-allocation**: All buffers are allocated during initialization
-- **Index-based Access**: Buffer indices are passed in packets, not memory addresses
-- **Ownership Model**: Clear ownership semantics for buffer access
-- **Reuse Strategy**: Buffers are returned to pool after use
-
-### Backpressure Mechanisms
-
-- **Ring Buffer Limits**: MPMC rings provide natural backpressure when full
-- **Producer Throttling**: Producers must wait when rings are full
-- **Consumer Pacing**: Consumers process packets at their own pace
-- **Resource Protection**: Prevents resource exhaustion through bounded queues
-
-## Error Handling
-
-### Error Codes
-
-| Error Code | Hex Value | Description |
-|------------|-----------|-------------|
-| ErrCodeMemoryAlign | 0x01 | Memory alignment violation |
-| ErrCodeInvalidSize | 0x02 | Invalid buffer ring size |
-| ErrCodeMemorySmall | 0x03 | Memory too small for configuration |
-| ErrCodeFailedInit | 0x04 | Failed to initialize buffer ring |
-| ErrCodeConnNotFound | 0x05 | Connection not found |
-| ErrCodeInvalidOp | 0x06 | Invalid operation |
-| ErrCodeBufferOverflow | 0x07 | Buffer overflow detected |
-
-### Error Reporting
-
-- **Synchronous Errors**: Immediate error responses for invalid operations
-- **Asynchronous Errors**: Error packets for operational failures
-- **Context Preservation**: Error packets include context for debugging
-- **Recovery Strategies**: Defined recovery procedures for common errors
-
-## Performance Considerations
-
-### Lock-Free Design
-
-- **Atomic Operations**: All shared state modifications use atomic primitives
-- **Memory Barriers**: Proper memory ordering for cross-CPU visibility
-- **Cache Optimization**: Cache-line padding to prevent false sharing
-- **Wait-free Algorithms**: Algorithms that complete in bounded time
-
-### Memory Alignment
-
-- **Page Alignment**: All structures aligned to page boundaries
-- **Buffer Alignment**: Buffer sizes are multiples of 8 bytes
-- **Cache Efficiency**: Optimized for modern CPU cache hierarchies
-- **NUMA Awareness**: Consideration for NUMA architectures
-
-### Zero-Copy Transfers
-
-- **Shared Memory**: Data remains in shared memory throughout transfer
-- **Index Passing**: Only indices and metadata are copied between processes
-- **Direct Access**: Both processes access the same physical memory
-- **Bandwidth Efficiency**: Minimizes memory bandwidth usage
-
-## Usage Examples
-
-### Basic Data Transfer
-
-#### Primary Process
-```go
-// Create shared memory region
-size := sizeStandardLink(bufferCount, bufferSize)
-shm, err := shm.Create(size)
-if err != nil {
-    log.Fatal(err)
-}
-
-// Initialize link
-link, err := openStandardLink(uintptr(unsafe.Pointer(&shm[0])), bufferCount, bufferSize)
-if err != nil {
-    log.Fatal(err)
-}
-
-// Send data
-packet := protocol.Packet{
-    Op:       protocol.OpStandardLinkCopy,
-    Operand0: copyID,
-    Operand1: bufferIndex,
-    Operand2: dataSize,
-}
-link.ring0.Enqueue(packet)
-```
-
-#### Secondary Process
-```go
-// Open existing shared memory region
-shm, err := shm.Open(name)
-if err != nil {
-    log.Fatal(err)
-}
-
-// Attach to link
-link, err := openStandardLink(uintptr(unsafe.Pointer(&shm[0])), bufferCount, bufferSize)
-if err != nil {
-    log.Fatal(err)
-}
-
-// Receive data
-buf := make([]byte, bufferSize)
-n, err := link.Read(buf)
-if err != nil {
-    log.Fatal(err)
-}
-```
-
-### Connection-Oriented Communication
-
-#### Connection Creation
-```go
-// Create connection
-connID, err := link.CreateConnection(context.Background())
-if err != nil {
-    log.Fatal(err)
-}
-
-// Send data over connection
-packet := protocol.Packet{
-    Op:       protocol.OpConnCopy,
-    Operand0: connID,
-    Operand1: copyID,
-    Operand2: dataSize,
-    // ... other operands
-}
-link.ring0.Enqueue(packet)
-```
-
-### Advanced Link with Protocol Negotiation
-
-#### Primary Process
-```go
-// Create advanced link
-advLink, err := NewAdvancedLink(offset, bufferCount, bufferSize)
-if err != nil {
-    log.Fatal(err)
-}
-
-// Perform protocol negotiation
-ctx := context.Background()
-version := ProtocolVersion{Major: 1, Minor: 1}
-features := FeatureCompression | FeatureEncryption
-
-negotiated, err := advLink.NegotiateProtocol(ctx, version, features)
-if err != nil {
-    log.Fatal(err)
-}
-
-if !negotiated {
-    log.Println("Negotiation failed, falling back to standard mode")
-}
-```
-
-#### Secondary Process
-```go
-// Create advanced link
-advLink, err := NewAdvancedLink(offset, bufferCount, bufferSize)
-if err != nil {
-    log.Fatal(err)
-}
-
-// Wait for negotiation request
-ctx := context.Background()
-negotiated, err := advLink.WaitForNegotiation(ctx)
-if err != nil {
-    log.Fatal(err)
-}
-
-if negotiated {
-    log.Println("Advanced features negotiated successfully")
-} else {
-    log.Println("Using standard mode")
-}
-```
-
-## Versioning
-
-### Semantic Versioning
-
-The protocol uses semantic versioning:
-- **Major Version**: Incompatible API changes
-- **Minor Version**: Backward-compatible feature additions
-- **Patch Version**: Bug fixes and optimizations
-
-### Version Negotiation
-
-- **Backward Compatibility**: Newer versions support older protocol versions
-- **Feature Detection**: Dynamic feature discovery through negotiation
-- **Graceful Degradation**: Fallback to basic features when negotiation fails
-
-### Current Version
-
-- **Protocol Version**: 1.1
-- **Major**: 1 (stable API)
-- **Minor**: 1 (with protocol negotiation support)
-
-## Security Considerations
-
-### Shared Memory Access
-
-- **Permission Control**: OS-level permissions control shared memory access
-- **Process Isolation**: Only authorized processes can access shared memory
-- **Data Protection**: Sensitive data should be encrypted when needed
-
-### Protocol Security
-
-- **Input Validation**: All packet operands are validated before use
-- **Bounds Checking**: Buffer indices and sizes are strictly validated
-- **Resource Limits**: Built-in protection against resource exhaustion
-
-## Future Extensions
-
-### Planned Features
-
-1. **Compression Support**: Optional data compression for large payloads
-2. **Encryption**: End-to-end encryption for sensitive data
-3. **Reliability**: Acknowledgments and retransmission for guaranteed delivery
-4. **Multicast**: One-to-many communication patterns
-5. **Dynamic Buffering**: Adaptive buffer sizing based on workload
-
-### Extension Mechanisms
-
-- **Feature Flags**: Bitmask-based feature negotiation
-- **Reserved Operands**: Unused operands for future extensions
-- **Version Negotiation**: Framework for protocol evolution
-- **Capability Exchange**: Dynamic capability discovery
-
-## Implementation Notes
-
-### Platform Considerations
-
-- **Memory Alignment**: Different platforms have different alignment requirements
-- **Atomic Operations**: Implementation varies across CPU architectures
-- **Cache Behavior**: Cache coherency protocols affect performance
-- **NUMA Effects**: Non-Uniform Memory Access impacts performance
-
-### Optimization Techniques
-
-- **Cache Line Padding**: Prevents false sharing between CPU cores
-- **Memory Prefetching**: Improves cache hit rates for sequential access
-- **Branch Prediction**: Optimizes conditional branches in hot paths
-- **SIMD Instructions**: Vector operations for data processing
-
-### Debugging Support
-
-- **Packet Tracing**: Optional logging of all packet transfers
-- **Statistics Collection**: Detailed metrics for performance analysis
-- **Error Reporting**: Comprehensive error information for debugging
-- **Memory Debugging**: Tools for detecting memory corruption and leaks
+`DataSize` must satisfy `0 <= DataSize <= bufferSize`.
+
+## Buffer Ownership Protocol
+
+Each direction starts with every buffer index in its free ring.
+
+### Send path
+
+1. Sender dequeues `BufferIndex` from the direction's free ring.
+2. Sender copies the payload into `BUFFERS[BufferIndex]`.
+3. Sender enqueues `OpStandardLinkCopy` to the direction's data ring.
+
+### Receive path
+
+1. Receiver dequeues one packet from the direction's data ring.
+2. Receiver validates `BufferIndex` and `DataSize`.
+3. Receiver copies payload bytes out of shared memory into the caller buffer or the link's local remainder buffer.
+4. Receiver enqueues `BufferIndex` back to the direction's free ring.
+
+This makes buffer reuse explicit and prevents a producer from overwriting unread payloads.
+
+## Backpressure
+
+The protocol has two bounded backpressure points:
+
+- **Free ring empty**: all payload buffers for the direction are currently in flight; writers wait until receivers return a buffer.
+- **Data ring full**: data packets are not being consumed fast enough; writers wait before publishing more packets.
+
+`StandardLink` exposes write deadlines through `net.PacketConn` deadline methods. On timeout, it returns `ErrTimeout` and returns any unpublished acquired buffer to the free ring.
+
+## StandardLink Semantics
+
+- `Write` publishes at most one packet and rejects payloads larger than `bufferSize` with `ErrBufferOverflow`.
+- `Read` returns after delivering data from one packet, or from a previously saved local remainder.
+- If the caller's read buffer is smaller than the payload, the unread tail is copied into a local per-link remainder buffer and the shared payload buffer is immediately returned to the free ring.
+- `ReadFrom` and `WriteTo` are thin `net.PacketConn` adapters over `Read` and `Write`.
+
+## Error Codes
+
+| Error Code | Hex | Meaning |
+| --- | ---: | --- |
+| `ErrCodeMemoryAlign` | `0x01` | Shared memory or buffer alignment violation |
+| `ErrCodeInvalidSize` | `0x02` | Invalid buffer count, buffer size, or buffer index |
+| `ErrCodeMemorySmall` | `0x03` | Shared memory region is too small |
+| `ErrCodeFailedInit` | `0x04` | Ring initialization or attachment failed |
+| `ErrCodeConnNotFound` | `0x05` | Reserved for connection-oriented extensions |
+| `ErrCodeInvalidOp` | `0x06` | Unknown or unsupported opcode |
+| `ErrCodeBufferOverflow` | `0x07` | Payload exceeds configured `bufferSize` |
+
+## Current Implementation Status
+
+Implemented and covered by tests:
+
+- fixed-size little-endian packet ABI
+- StandardLink primary/secondary creation
+- bidirectional StandardLink read/write
+- explicit free-buffer ownership transfer
+- unread-buffer overwrite regression coverage
+- partial-read remainder handling
+- read/write deadline timeout behavior
+- high-volume ordered delivery smoke test
+- StandardLink throughput benchmarks
+
+Not part of the Standard Protocol data path yet:
+
+- logical connection lifecycle
+- compression/encryption/QoS
+- end-to-end retransmission/reliability
+- cross-endian mixed-architecture process pairs beyond the packet ABI

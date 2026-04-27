@@ -13,15 +13,27 @@ func _() {
 	_ = x[OpConnAccept-2]
 	_ = x[OpConnClose-3]
 	_ = x[OpConnCopy-4]
+	_ = x[OpProtoNegotiate-5]
+	_ = x[OpProtoAck-6]
+	_ = x[OpStandardLinkCopy-255]
 }
 
-const _OpCode_name = "OpErrorOpConnCreateOpConnAcceptOpConnCloseOpConnCopy"
+const (
+	_OpCode_name_0 = "OpErrorOpConnCreateOpConnAcceptOpConnCloseOpConnCopyOpProtoNegotiateOpProtoAck"
+	_OpCode_name_1 = "OpStandardLinkCopy"
+)
 
-var _OpCode_index = [...]uint8{0, 7, 19, 31, 42, 52}
+var (
+	_OpCode_index_0 = [...]uint8{0, 7, 19, 31, 42, 52, 68, 78}
+)
 
 func (i OpCode) String() string {
-	if i >= OpCode(len(_OpCode_index)-1) {
+	switch {
+	case i <= 6:
+		return _OpCode_name_0[_OpCode_index_0[i]:_OpCode_index_0[i+1]]
+	case i == 255:
+		return _OpCode_name_1
+	default:
 		return "OpCode(" + strconv.FormatInt(int64(i), 10) + ")"
 	}
-	return _OpCode_name[_OpCode_index[i]:_OpCode_index[i+1]]
 }

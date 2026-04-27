@@ -12,6 +12,7 @@ import (
 
 	"gosuda.org/hqq/internal/mpmc"
 	"gosuda.org/hqq/internal/protocol"
+	"gosuda.org/hqq/internal/race"
 )
 
 // pagesize stores the system page size for memory alignment
@@ -106,8 +107,10 @@ type StandardLink struct {
 	bufferSize  int      // Size of each buffer in bytes
 
 	// MPMC Rings for bidirectional communication
-	ring0          *mpmc.MPMCRing[protocol.Packet] // Primary to Secondary ring
-	ring1          *mpmc.MPMCRing[protocol.Packet] // Secondary to Primary ring
+	ring0          *mpmc.MPMCRing[protocol.Packet] // Primary to Secondary data ring
+	ring1          *mpmc.MPMCRing[protocol.Packet] // Secondary to Primary data ring
+	free0          *mpmc.MPMCRing[uint64]          // Free buffers for primary-to-secondary direction
+	free1          *mpmc.MPMCRing[uint64]          // Free buffers for secondary-to-primary direction
 	buffers0Offset uintptr                         // Offset to primary-to-secondary buffers
 	buffers1Offset uintptr                         // Offset to secondary-to-primary buffers
 
@@ -120,9 +123,10 @@ type StandardLink struct {
 	receiveBuffer []byte        // Buffer for storing excess received data
 
 	// PacketConn interface support
-	localAddr  net.Addr  // Local address for PacketConn interface
-	remoteAddr net.Addr  // Remote address for PacketConn interface
-	deadline   time.Time // Deadline for PacketConn operations
+	localAddr     net.Addr  // Local address for PacketConn interface
+	remoteAddr    net.Addr  // Remote address for PacketConn interface
+	readDeadline  time.Time // Deadline for PacketConn read operations
+	writeDeadline time.Time // Deadline for PacketConn write operations
 }
 
 // Connection represents an active connection between processes
@@ -150,9 +154,13 @@ const (
 // <<<< PAGE_START
 // MPMC_RING (Primary to Secondary)     // Ring buffer for packets from primary to secondary
 // <<<< PAGE_BREAK
+// FREE_RING (Primary to Secondary)     // Buffer ownership ring for primary-to-secondary buffers
+// <<<< PAGE_BREAK
 // BUFFERS (Primary to Secondary)       // Data buffers for primary to secondary communication
 // <<<< PAGE_BREAK
 // MPMC_RING (Secondary to Primary)     // Ring buffer for packets from secondary to primary
+// <<<< PAGE_BREAK
+// FREE_RING (Secondary to Primary)     // Buffer ownership ring for secondary-to-primary buffers
 // <<<< PAGE_BREAK
 // BUFFERS (Secondary to Primary)       // Data buffers for secondary to primary communication
 // <<<< PAGE_END
@@ -165,49 +173,52 @@ func SizeStandardLink(bufferCount int, bufferSize int) uintptr {
 		return 0
 	}
 
-	if bufferCount%2 != 0 {
+	if !isPowerOfTwo(bufferCount) {
 		return 0
 	}
 
-	if bufferCount < 2 || bufferSize < 8 {
+	if bufferCount < 2 || bufferSize < 8 || bufferSize%8 != 0 {
 		return 0
 	}
 
-	// Calculate ring buffer size
-	ringSize := mpmc.SizeMPMCRing[protocol.Packet](uintptr(bufferCount))
-	size := ringSize
+	dataRingSize := mpmc.SizeMPMCRing[protocol.Packet](uintptr(bufferCount))
+	freeRingSize := mpmc.SizeMPMCRing[uint64](uintptr(bufferCount))
+	buffersSize := uintptr(bufferSize) * uintptr(bufferCount)
 
-	// Align to page boundary
-	size = ((size + pagesize - 1) / pagesize) * pagesize
-
-	// Add buffer space for primary to secondary
-	size += uintptr(bufferSize) * uintptr(bufferCount)
-	size = ((size + pagesize - 1) / pagesize) * pagesize
-
-	// Add second ring buffer
-	size += ringSize
-	size = ((size + pagesize - 1) / pagesize) * pagesize
-
-	// Add second buffer space for secondary to primary
-	size += uintptr(bufferSize) * uintptr(bufferCount)
-	size = ((size + pagesize - 1) / pagesize) * pagesize
+	var size uintptr
+	size = alignPage(size + dataRingSize)
+	size = alignPage(size + freeRingSize)
+	size = alignPage(size + buffersSize)
+	size = alignPage(size + dataRingSize)
+	size = alignPage(size + freeRingSize)
+	size = alignPage(size + buffersSize)
 
 	return size
 }
 
+func alignPage(size uintptr) uintptr {
+	return ((size + pagesize - 1) / pagesize) * pagesize
+}
+
+func isPowerOfTwo(v int) bool {
+	return v > 0 && v&(v-1) == 0
+}
+
 // OpenStandardLink creates or attaches to a standard link
 // This function initializes a StandardLink instance in shared memory
+//
+//go:nocheckptr
 func OpenStandardLink(offset uintptr, bufferCount int, bufferSize int) (*StandardLink, error) {
 	// Validate inputs
 	if offset%pagesize != 0 || bufferSize%8 != 0 {
 		return nil, ErrMemoryAlign
 	}
 
-	if bufferCount%2 != 0 {
+	if !isPowerOfTwo(bufferCount) {
 		return nil, ErrInvalidSize
 	}
 
-	if bufferCount < 2 || bufferSize < 0 {
+	if bufferCount < 2 || bufferSize < 8 {
 		return nil, ErrInvalidSize
 	}
 
@@ -229,7 +240,8 @@ func OpenStandardLink(offset uintptr, bufferCount int, bufferSize int) (*Standar
 	}
 
 	// Calculate memory layout
-	ringSize := mpmc.SizeMPMCRing[protocol.Packet](uintptr(bufferCount))
+	dataRingSize := mpmc.SizeMPMCRing[protocol.Packet](uintptr(bufferCount))
+	freeRingSize := mpmc.SizeMPMCRing[uint64](uintptr(bufferCount))
 	buffersSize := uintptr(bufferCount) * uintptr(bufferSize)
 
 	// Initialize or attach to first ring (Primary to Secondary)
@@ -237,29 +249,35 @@ func OpenStandardLink(offset uintptr, bufferCount int, bufferSize int) (*Standar
 	if mpmc.MPMCInit[protocol.Packet](offset, uint64(bufferCount)) {
 		link.linkMode = LinkModePrimary
 	}
-	offset += ringSize
-	offset = ((offset + pagesize - 1) / pagesize) * pagesize
+	offset = alignPage(offset + dataRingSize)
+
+	free0Offset := offset
+	free0Initialized := mpmc.MPMCInit[uint64](offset, uint64(bufferCount))
+	offset = alignPage(offset + freeRingSize)
 
 	// Setup first buffer pool
 	link.buffers0Offset = offset
-	offset += buffersSize
-	offset = ((offset + pagesize - 1) / pagesize) * pagesize
+	offset = alignPage(offset + buffersSize)
 
 	// Initialize or attach to second ring (Secondary to Primary)
 	ring1Offset := offset
 	mpmc.MPMCInit[protocol.Packet](offset, uint64(bufferCount))
-	offset += ringSize
-	offset = ((offset + pagesize - 1) / pagesize) * pagesize
+	offset = alignPage(offset + dataRingSize)
+
+	free1Offset := offset
+	free1Initialized := mpmc.MPMCInit[uint64](offset, uint64(bufferCount))
+	offset = alignPage(offset + freeRingSize)
 
 	// Setup second buffer pool
 	link.buffers1Offset = offset
-	offset += buffersSize
-	offset = ((offset + pagesize - 1) / pagesize) * pagesize
+	offset = alignPage(offset + buffersSize)
 
 	// Attach to rings
 	link.ring0 = mpmc.MPMCAttach[protocol.Packet](ring0Offset, time.Second)
 	link.ring1 = mpmc.MPMCAttach[protocol.Packet](ring1Offset, time.Second)
-	if link.ring0 == nil || link.ring1 == nil {
+	link.free0 = mpmc.MPMCAttach[uint64](free0Offset, time.Second)
+	link.free1 = mpmc.MPMCAttach[uint64](free1Offset, time.Second)
+	if link.ring0 == nil || link.ring1 == nil || link.free0 == nil || link.free1 == nil {
 		return nil, ErrFailedInit
 	}
 
@@ -269,11 +287,21 @@ func OpenStandardLink(offset uintptr, bufferCount int, bufferSize int) (*Standar
 
 	// Initialize buffers to zero if we're the primary process
 	if link.linkMode == LinkModePrimary {
-		for i := range buffers0 {
-			buffers0[i] = 0
+		race.Zero(buffers0)
+		race.Zero(buffers1)
+	}
+
+	// Populate free-buffer rings exactly once per shared memory region. Data
+	// rings provide packet backpressure; free rings provide payload-buffer
+	// ownership so unread buffers are never overwritten.
+	if free0Initialized {
+		for i := 0; i < bufferCount; i++ {
+			link.free0.Enqueue(uint64(i))
 		}
-		for i := range buffers1 {
-			buffers1[i] = 0
+	}
+	if free1Initialized {
+		for i := 0; i < bufferCount; i++ {
+			link.free1.Enqueue(uint64(i))
 		}
 	}
 
@@ -299,15 +327,18 @@ func (l *StandardLink) Read(b []byte) (n int, err error) {
 	// Determine which ring and buffers to use based on link mode
 	var rx *mpmc.MPMCRing[protocol.Packet]
 	var rxBuffers [][]byte
+	var rxFree *mpmc.MPMCRing[uint64]
 
 	if l.linkMode == LinkModeSecondary {
 		// Secondary reads from ring0 (Primary to Secondary)
 		rx = l.ring0
 		rxBuffers = l.buffers0
+		rxFree = l.free0
 	} else {
 		// Primary reads from ring1 (Secondary to Primary)
 		rx = l.ring1
 		rxBuffers = l.buffers1
+		rxFree = l.free1
 	}
 
 	// First, consume any remaining data in receiveBuffer
@@ -315,33 +346,35 @@ func (l *StandardLink) Read(b []byte) (n int, err error) {
 		copied := copy(b, l.receiveBuffer)
 		bOffset += copied
 		l.receiveBuffer = l.receiveBuffer[copied:]
+		if bOffset > 0 {
+			return bOffset, nil
+		}
 	}
 
 	// If we still need more data, try to dequeue from the ring
 	for bOffset < bN {
-		processed := false
-		rx.DequeueFunc(func(p *protocol.Packet) {
-			processed = true
-
-			// Handle different packet types
-			switch p.Op {
-			case protocol.OpStandardLinkCopy:
-				l.handleStandardLinkCopy(p, rxBuffers, b[bOffset:], &bOffset)
-			case protocol.OpConnCopy:
-				err = l.handleConnCopy(p, rxBuffers, b[bOffset:], &bOffset)
-			case protocol.OpError:
-				err = l.handleError(p)
-			default:
-				err = ErrInvalidOp
-			}
-		})
-
-		if !processed {
-			// No more packets in the ring
-			break
+		ctx, cancel := contextForDeadline(l.readDeadline)
+		p, ok := rx.DequeueWithContext(ctx)
+		cancel()
+		if !ok {
+			return bOffset, ErrTimeout
 		}
 
+		// Handle different packet types
+		switch p.Op() {
+		case protocol.OpStandardLinkCopy:
+			err = l.handleStandardLinkCopy(&p, rxBuffers, rxFree, b[bOffset:], &bOffset)
+		case protocol.OpConnCopy:
+			err = l.handleConnCopy(&p, rxBuffers, rxFree, b[bOffset:], &bOffset)
+		case protocol.OpError:
+			err = l.handleError(&p)
+		default:
+			err = ErrInvalidOp
+		}
 		if err != nil {
+			break
+		}
+		if bOffset > 0 {
 			break
 		}
 	}
@@ -353,6 +386,9 @@ func (l *StandardLink) Read(b []byte) (n int, err error) {
 // It writes data from the provided buffer to the link
 func (l *StandardLink) Write(b []byte) (n int, err error) {
 	bN := len(b)
+	if bN == 0 {
+		return 0, nil
+	}
 
 	// Check if data size exceeds buffer size
 	if bN > l.bufferSize {
@@ -364,80 +400,60 @@ func (l *StandardLink) Write(b []byte) (n int, err error) {
 	// Determine which ring and buffers to use based on link mode
 	var tx *mpmc.MPMCRing[protocol.Packet]
 	var txBuffers [][]byte
+	var txFree *mpmc.MPMCRing[uint64]
 
 	if l.linkMode == LinkModeSecondary {
 		// Secondary writes to ring1 (Secondary to Primary)
 		tx = l.ring1
 		txBuffers = l.buffers1
+		txFree = l.free1
 	} else {
 		// Primary writes to ring0 (Primary to Secondary)
 		tx = l.ring0
 		txBuffers = l.buffers0
+		txFree = l.free0
 	}
 
-	// Find an available buffer
-	bufferIndex := l.findAvailableBuffer(txBuffers)
-	if bufferIndex == -1 {
-		return 0, ErrBufferOverflow
+	ctx, cancel := contextForDeadline(l.writeDeadline)
+	defer cancel()
+
+	bufferIndex64, ok := txFree.DequeueWithContext(ctx)
+	if !ok {
+		return 0, ErrTimeout
+	}
+	bufferIndex := int(bufferIndex64)
+	if bufferIndex < 0 || bufferIndex >= len(txBuffers) {
+		return 0, ErrInvalidSize
 	}
 
 	// Copy data to buffer
 	copySize := min(bN, l.bufferSize)
-	copy(txBuffers[bufferIndex], b[bOffset:bOffset+copySize])
+	race.Copy(txBuffers[bufferIndex], b[bOffset:bOffset+copySize])
 	bOffset += copySize
 
 	// Send packet
-	packet := protocol.Packet{
-		Op:       protocol.OpStandardLinkCopy,
-		Operand0: uintptr(l.idGenerator.Add(1)),
-		Operand1: uintptr(bufferIndex),
-		Operand2: uintptr(copySize),
-	}
+	packet := protocol.NewPacket(
+		protocol.OpStandardLinkCopy,
+		l.idGenerator.Add(1),
+		uint64(bufferIndex),
+		uint64(copySize),
+	)
 
-	tx.Enqueue(packet)
+	if !tx.EnqueueWithContext(ctx, packet) {
+		// The data packet was not published; return the buffer to the free
+		// pool so a timed-out writer cannot leak buffer ownership.
+		txFree.Enqueue(uint64(bufferIndex))
+		return 0, ErrTimeout
+	}
 
 	return bOffset, nil
 }
 
 // handleStandardLinkCopy processes a standard link copy packet
 // It extracts data from the specified buffer and copies it to the destination
-func (l *StandardLink) handleStandardLinkCopy(p *protocol.Packet, buffers [][]byte, dst []byte, dstOffset *int) {
-	bufferIndex := int(p.Operand1)
-	size := int(p.Operand2)
-
-	// Validate buffer index
-	if bufferIndex < 0 || bufferIndex >= len(buffers) {
-		return
-	}
-
-	buffer := buffers[bufferIndex]
-	if size > len(buffer) {
-		size = len(buffer)
-	}
-
-	available := len(dst) - *dstOffset
-	if available <= 0 {
-		return
-	}
-
-	// Copy data to destination buffer
-	if size > available {
-		// Store excess in receiveBuffer
-		copied := copy(dst[*dstOffset:], buffer[:available])
-		*dstOffset += copied
-		l.receiveBuffer = append(l.receiveBuffer, buffer[available:size]...)
-	} else {
-		copied := copy(dst[*dstOffset:], buffer[:size])
-		*dstOffset += copied
-	}
-
-}
-
-// handleConnCopy processes a connection copy packet
-// It validates the connection and copies data from the specified buffer
-func (l *StandardLink) handleConnCopy(p *protocol.Packet, buffers [][]byte, dst []byte, dstOffset *int) error {
-	bufferIndex := int(p.Operand1)
-	size := int(p.Operand2)
+func (l *StandardLink) handleStandardLinkCopy(p *protocol.Packet, buffers [][]byte, free *mpmc.MPMCRing[uint64], dst []byte, dstOffset *int) error {
+	bufferIndex := int(p.Operand(1))
+	size := int(p.Operand(2))
 
 	// Validate buffer index
 	if bufferIndex < 0 || bufferIndex >= len(buffers) {
@@ -451,27 +467,77 @@ func (l *StandardLink) handleConnCopy(p *protocol.Packet, buffers [][]byte, dst 
 
 	available := len(dst) - *dstOffset
 	if available <= 0 {
+		l.appendReceiveBuffer(buffer[:size])
+		free.Enqueue(uint64(bufferIndex))
 		return nil
 	}
 
 	// Copy data to destination buffer
 	if size > available {
 		// Store excess in receiveBuffer
-		copied := copy(dst[*dstOffset:], buffer[:available])
+		copied := race.Copy(dst[*dstOffset:], buffer[:available])
 		*dstOffset += copied
-		l.receiveBuffer = append(l.receiveBuffer, buffer[available:size]...)
+		l.appendReceiveBuffer(buffer[available:size])
 	} else {
-		copied := copy(dst[*dstOffset:], buffer[:size])
+		copied := race.Copy(dst[*dstOffset:], buffer[:size])
 		*dstOffset += copied
 	}
 
+	free.Enqueue(uint64(bufferIndex))
 	return nil
+}
+
+// handleConnCopy processes a connection copy packet
+// It validates the connection and copies data from the specified buffer
+func (l *StandardLink) handleConnCopy(p *protocol.Packet, buffers [][]byte, free *mpmc.MPMCRing[uint64], dst []byte, dstOffset *int) error {
+	bufferIndex := int(p.Operand(1))
+	size := int(p.Operand(2))
+
+	// Validate buffer index
+	if bufferIndex < 0 || bufferIndex >= len(buffers) {
+		return ErrInvalidSize
+	}
+
+	buffer := buffers[bufferIndex]
+	if size > len(buffer) {
+		size = len(buffer)
+	}
+
+	available := len(dst) - *dstOffset
+	if available <= 0 {
+		l.appendReceiveBuffer(buffer[:size])
+		free.Enqueue(uint64(bufferIndex))
+		return nil
+	}
+
+	// Copy data to destination buffer
+	if size > available {
+		// Store excess in receiveBuffer
+		copied := race.Copy(dst[*dstOffset:], buffer[:available])
+		*dstOffset += copied
+		l.appendReceiveBuffer(buffer[available:size])
+	} else {
+		copied := race.Copy(dst[*dstOffset:], buffer[:size])
+		*dstOffset += copied
+	}
+
+	free.Enqueue(uint64(bufferIndex))
+	return nil
+}
+
+func (l *StandardLink) appendReceiveBuffer(src []byte) {
+	if len(src) == 0 {
+		return
+	}
+	offset := len(l.receiveBuffer)
+	l.receiveBuffer = append(l.receiveBuffer, make([]byte, len(src))...)
+	race.Copy(l.receiveBuffer[offset:], src)
 }
 
 // handleError processes an error packet
 // It converts error codes to appropriate error types
 func (l *StandardLink) handleError(p *protocol.Packet) error {
-	errorCode := ErrorCode(p.Operand1)
+	errorCode := ErrorCode(p.Operand(1))
 
 	// Convert error code to error type
 	switch errorCode {
@@ -496,12 +562,6 @@ func (l *StandardLink) handleError(p *protocol.Packet) error {
 
 // findAvailableBuffer finds an available buffer index
 // This implementation uses a simple round-robin strategy
-func (l *StandardLink) findAvailableBuffer(buffers [][]byte) int {
-	// Simple round-robin implementation
-	// In a production system, you might want a more sophisticated selection strategy
-	return int(l.idGenerator.Add(1)-1) % len(buffers)
-}
-
 // GetMode returns the current link mode (Primary or Secondary)
 func (l *StandardLink) GetMode() LinkMode {
 	return l.linkMode
@@ -525,24 +585,16 @@ func (l *StandardLink) Close() error {
 // enqueueWithTimeout enqueues a packet with a timeout
 // This function ensures the enqueue operation respects the context deadline
 func (l *StandardLink) enqueueWithTimeout(ctx context.Context, ring *mpmc.MPMCRing[protocol.Packet], packet protocol.Packet) error {
-	done := make(chan struct{})
-	go func() {
-		ring.Enqueue(packet)
-		close(done)
-	}()
-
-	select {
-	case <-done:
-		return nil
-	case <-ctx.Done():
+	if !ring.EnqueueWithContext(ctx, packet) {
 		return ctx.Err()
 	}
+	return nil
 }
 
 // AdvancedLink represents an advanced HQQ link with additional features
 // Built on top of StandardLink to provide enhanced capabilities
 type AdvancedLink struct {
-	slink StandardLink // Embedded standard link
+	slink *StandardLink // Wrapped standard link
 
 	// Protocol negotiation state
 	protocolState          ProtocolState   // Current negotiation state
@@ -583,7 +635,7 @@ func NewAdvancedLink(offset uintptr, bufferCount int, bufferSize int) (*Advanced
 	}
 
 	advLink := &AdvancedLink{
-		slink:         *slink,
+		slink:         slink,
 		protocolState: ProtocolStateNone,
 		listening:     false,
 		advancedStats: AdvancedStats{},
@@ -654,12 +706,12 @@ func (l *AdvancedLink) NegotiateProtocol(ctx context.Context, version ProtocolVe
 	versionEncoded := uint64(version.Major)<<8 | uint64(version.Minor)
 	capabilities := CapabilityLargeBuffers | CapabilityHighThroughput
 
-	packet := protocol.Packet{
-		Op:       protocol.OpProtoNegotiate,
-		Operand0: uintptr(versionEncoded),
-		Operand1: uintptr(features),
-		Operand2: uintptr(capabilities),
-	}
+	packet := protocol.NewPacket(
+		protocol.OpProtoNegotiate,
+		versionEncoded,
+		features,
+		capabilities,
+	)
 
 	// Determine which ring to use based on link mode
 	var tx *mpmc.MPMCRing[protocol.Packet]
@@ -679,62 +731,36 @@ func (l *AdvancedLink) NegotiateProtocol(ctx context.Context, version ProtocolVe
 		return false, err
 	}
 
-	// Wait for acknowledgment
-	done := make(chan bool, 1)
-	errChan := make(chan error, 1)
-
-	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				l.protocolState = ProtocolStateFailed
-				errChan <- ctx.Err()
-				return
-			default:
-				processed := false
-				rx.DequeueFunc(func(p *protocol.Packet) {
-					processed = true
-					if p.Op == protocol.OpProtoAck {
-						// Extract negotiated parameters
-						negotiatedVersion := uint16(p.Operand0)
-						l.negotiatedVersion = ProtocolVersion{
-							Major: uint8(negotiatedVersion >> 8),
-							Minor: uint8(negotiatedVersion & 0xFF),
-						}
-						l.negotiatedFeatures = uint64(p.Operand1)
-						l.negotiatedCapabilities = uint64(p.Operand2)
-
-						// Enable features based on negotiation
-						l.compressionEnabled = (l.negotiatedFeatures & FeatureCompression) != 0
-						l.encryptionEnabled = (l.negotiatedFeatures & FeatureEncryption) != 0
-						l.flowControlEnabled = (l.negotiatedFeatures & FeatureFlowControl) != 0
-
-						l.protocolState = ProtocolStateNegotiated
-						done <- true
-						return
-					} else if p.Op == protocol.OpError {
-						l.protocolState = ProtocolStateFailed
-						errChan <- errors.New("hqq: negotiation rejected by peer")
-						return
-					}
-				})
-
-				// If no packet was processed, yield to prevent busy waiting
-				if !processed {
-					time.Sleep(time.Millisecond)
-				}
-			}
+	// Wait for acknowledgment. This loop runs inline so successful negotiation
+	// does not leave behind a goroutine that can keep consuming the shared ring.
+	for {
+		p, ok := rx.DequeueWithContext(ctx)
+		if !ok {
+			l.protocolState = ProtocolStateFailed
+			return false, ctx.Err()
 		}
-	}()
+		switch p.Op() {
+		case protocol.OpProtoAck:
+			// Extract negotiated parameters
+			negotiatedVersion := uint16(p.Operand(0))
+			l.negotiatedVersion = ProtocolVersion{
+				Major: uint8(negotiatedVersion >> 8),
+				Minor: uint8(negotiatedVersion & 0xFF),
+			}
+			l.negotiatedFeatures = p.Operand(1)
+			l.negotiatedCapabilities = p.Operand(2)
 
-	select {
-	case success := <-done:
-		return success, nil
-	case err := <-errChan:
-		return false, err
-	case <-ctx.Done():
-		l.protocolState = ProtocolStateFailed
-		return false, ctx.Err()
+			// Enable features based on negotiation
+			l.compressionEnabled = (l.negotiatedFeatures & FeatureCompression) != 0
+			l.encryptionEnabled = (l.negotiatedFeatures & FeatureEncryption) != 0
+			l.flowControlEnabled = (l.negotiatedFeatures & FeatureFlowControl) != 0
+
+			l.protocolState = ProtocolStateNegotiated
+			return true, nil
+		case protocol.OpError:
+			l.protocolState = ProtocolStateFailed
+			return false, errors.New("hqq: negotiation rejected by peer")
+		}
 	}
 }
 
@@ -765,88 +791,63 @@ func (l *AdvancedLink) WaitForNegotiation(ctx context.Context) (bool, error) {
 		rx = l.slink.ring1
 	}
 
-	// Wait for negotiation request
-	done := make(chan bool, 1)
-	errChan := make(chan error, 1)
+	// Wait for negotiation request inline to avoid lingering ring consumers.
+	for {
+		p, ok := rx.DequeueWithContext(ctx)
+		if !ok {
+			l.protocolState = ProtocolStateFailed
+			return false, ctx.Err()
+		}
+		if p.Op() != protocol.OpProtoNegotiate {
+			continue
+		}
 
-	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				l.protocolState = ProtocolStateFailed
-				errChan <- ctx.Err()
-				return
-			default:
-				processed := false
-				rx.DequeueFunc(func(p *protocol.Packet) {
-					processed = true
-					if p.Op == protocol.OpProtoNegotiate {
-						// Extract requested parameters
-						requestedVersion := uint16(p.Operand0)
-						requestedFeatures := uint64(p.Operand1)
-						requestedCapabilities := uint64(p.Operand2)
+		// Extract requested parameters
+		requestedVersion := uint16(p.Operand(0))
+		requestedFeatures := p.Operand(1)
+		requestedCapabilities := p.Operand(2)
 
-						// Determine our capabilities
-						supportedVersion := ProtocolVersion{Major: 1, Minor: 1}
-						supportedFeatures := FeatureCompression | FeatureFlowControl | FeatureStatistics
-						supportedCapabilities := CapabilityLargeBuffers | CapabilityHighThroughput
+		// Determine our capabilities
+		supportedVersion := ProtocolVersion{Major: 1, Minor: 1}
+		supportedFeatures := FeatureCompression | FeatureFlowControl | FeatureStatistics
+		supportedCapabilities := CapabilityLargeBuffers | CapabilityHighThroughput
 
-						// Negotiate version (use the minimum of requested and supported)
-						if uint8(requestedVersion>>8) > supportedVersion.Major ||
-							(uint8(requestedVersion>>8) == supportedVersion.Major && uint8(requestedVersion&0xFF) > supportedVersion.Minor) {
-							// Use our maximum supported version
-							l.negotiatedVersion = supportedVersion
-						} else {
-							// Use requested version
-							l.negotiatedVersion = ProtocolVersion{
-								Major: uint8(requestedVersion >> 8),
-								Minor: uint8(requestedVersion & 0xFF),
-							}
-						}
-
-						// Negotiate features (use intersection of requested and supported)
-						l.negotiatedFeatures = requestedFeatures & supportedFeatures
-
-						// Negotiate capabilities (use intersection of requested and supported)
-						l.negotiatedCapabilities = requestedCapabilities & supportedCapabilities
-
-						// Enable features based on negotiation
-						l.compressionEnabled = (l.negotiatedFeatures & FeatureCompression) != 0
-						l.encryptionEnabled = (l.negotiatedFeatures & FeatureEncryption) != 0
-						l.flowControlEnabled = (l.negotiatedFeatures & FeatureFlowControl) != 0
-
-						// Send acknowledgment
-						versionEncoded := uint64(l.negotiatedVersion.Major)<<8 | uint64(l.negotiatedVersion.Minor)
-						ackPacket := protocol.Packet{
-							Op:       protocol.OpProtoAck,
-							Operand0: uintptr(versionEncoded),
-							Operand1: uintptr(l.negotiatedFeatures),
-							Operand2: uintptr(l.negotiatedCapabilities),
-						}
-
-						tx.Enqueue(ackPacket)
-						l.protocolState = ProtocolStateNegotiated
-						done <- true
-						return
-					}
-				})
-
-				// If no packet was processed, yield to prevent busy waiting
-				if !processed {
-					time.Sleep(time.Millisecond)
-				}
+		// Negotiate version (use the minimum of requested and supported)
+		if uint8(requestedVersion>>8) > supportedVersion.Major ||
+			(uint8(requestedVersion>>8) == supportedVersion.Major && uint8(requestedVersion&0xFF) > supportedVersion.Minor) {
+			// Use our maximum supported version
+			l.negotiatedVersion = supportedVersion
+		} else {
+			// Use requested version
+			l.negotiatedVersion = ProtocolVersion{
+				Major: uint8(requestedVersion >> 8),
+				Minor: uint8(requestedVersion & 0xFF),
 			}
 		}
-	}()
 
-	select {
-	case success := <-done:
-		return success, nil
-	case err := <-errChan:
-		return false, err
-	case <-ctx.Done():
-		l.protocolState = ProtocolStateFailed
-		return false, ctx.Err()
+		// Negotiate features (use intersection of requested and supported)
+		l.negotiatedFeatures = requestedFeatures & supportedFeatures
+
+		// Negotiate capabilities (use intersection of requested and supported)
+		l.negotiatedCapabilities = requestedCapabilities & supportedCapabilities
+
+		// Enable features based on negotiation
+		l.compressionEnabled = (l.negotiatedFeatures & FeatureCompression) != 0
+		l.encryptionEnabled = (l.negotiatedFeatures & FeatureEncryption) != 0
+		l.flowControlEnabled = (l.negotiatedFeatures & FeatureFlowControl) != 0
+
+		// Send acknowledgment
+		versionEncoded := uint64(l.negotiatedVersion.Major)<<8 | uint64(l.negotiatedVersion.Minor)
+		ackPacket := protocol.NewPacket(
+			protocol.OpProtoAck,
+			versionEncoded,
+			l.negotiatedFeatures,
+			l.negotiatedCapabilities,
+		)
+
+		tx.Enqueue(ackPacket)
+		l.protocolState = ProtocolStateNegotiated
+		return true, nil
 	}
 }
 
@@ -936,8 +937,8 @@ func (l *AdvancedLink) Accept(ctx context.Context) (uint64, error) {
 			found := false
 
 			rx.DequeueFunc(func(p *protocol.Packet) {
-				if p.Op == protocol.OpConnCreate {
-					connID := p.Operand0
+				if p.Op() == protocol.OpConnCreate {
+					connID := p.Operand(0)
 
 					// Create connection object
 					conn := &Connection{
@@ -957,10 +958,7 @@ func (l *AdvancedLink) Accept(ctx context.Context) (uint64, error) {
 						tx = l.slink.ring0
 					}
 
-					ackPacket := protocol.Packet{
-						Op:       protocol.OpConnAccept,
-						Operand0: connID,
-					}
+					ackPacket := protocol.NewPacket(protocol.OpConnAccept, connID)
 
 					tx.Enqueue(ackPacket)
 
@@ -1020,10 +1018,7 @@ func (l *AdvancedLink) createConnection(ctx context.Context) (uint64, error) {
 	l.connections.Store(connID, conn)
 
 	// Send connection request
-	packet := protocol.Packet{
-		Op:       protocol.OpConnCreate,
-		Operand0: uintptr(connID),
-	}
+	packet := protocol.NewPacket(protocol.OpConnCreate, connID)
 
 	var tx *mpmc.MPMCRing[protocol.Packet]
 	if l.slink.linkMode == LinkModeSecondary {
@@ -1068,7 +1063,7 @@ func (l *AdvancedLink) handleConnectionRequests(ctx context.Context) {
 			processed := false
 			rx.DequeueFunc(func(p *protocol.Packet) {
 				processed = true
-				if p.Op == protocol.OpConnCreate {
+				if p.Op() == protocol.OpConnCreate {
 					// Notify waiting Accept calls
 					l.connCond.Broadcast()
 					return
@@ -1104,11 +1099,11 @@ func (l *AdvancedLink) waitForConnectionAccept(ctx context.Context, connID uint6
 				processed := false
 				rx.DequeueFunc(func(p *protocol.Packet) {
 					processed = true
-					if p.Op == protocol.OpConnAccept && p.Operand0 == uintptr(connID) {
+					if p.Op() == protocol.OpConnAccept && p.Operand(0) == connID {
 						done <- nil
 						return
 					}
-					if p.Op == protocol.OpError && p.Operand0 == uintptr(connID) {
+					if p.Op() == protocol.OpError && p.Operand(0) == connID {
 						done <- ErrConnNotFound
 						return
 					}
@@ -1128,6 +1123,19 @@ func (l *AdvancedLink) waitForConnectionAccept(ctx context.Context, connID uint6
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+func contextForDeadline(deadline time.Time) (context.Context, context.CancelFunc) {
+	if deadline.IsZero() {
+		return context.Background(), func() {}
+	}
+	timeout := time.Until(deadline)
+	if timeout <= 0 {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		return ctx, func() {}
+	}
+	return context.WithTimeout(context.Background(), timeout)
 }
 
 // min returns the minimum of two integers
@@ -1173,19 +1181,20 @@ func (l *StandardLink) LocalAddr() net.Addr {
 
 // SetDeadline implements net.PacketConn.SetDeadline
 func (l *StandardLink) SetDeadline(t time.Time) error {
-	l.deadline = t
+	l.readDeadline = t
+	l.writeDeadline = t
 	return nil
 }
 
 // SetReadDeadline implements net.PacketConn.SetReadDeadline
 func (l *StandardLink) SetReadDeadline(t time.Time) error {
-	l.deadline = t
+	l.readDeadline = t
 	return nil
 }
 
 // SetWriteDeadline implements net.PacketConn.SetWriteDeadline
 func (l *StandardLink) SetWriteDeadline(t time.Time) error {
-	l.deadline = t
+	l.writeDeadline = t
 	return nil
 }
 

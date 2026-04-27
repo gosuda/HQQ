@@ -32,6 +32,8 @@ type MPMCRing[T any] struct {
 // The memory layout is:
 //
 //	[Header (256 bytes)][Data Elements]
+//
+//go:nocheckptr
 func MPMCInit[T any](h uintptr, size uint64) bool {
 	// Round up size to the next power of 2 for efficient modulo operations
 	size = _RoundUpPowerOf2(size)
@@ -78,6 +80,8 @@ func MPMCInit[T any](h uintptr, size uint64) bool {
 //   - timeout: Maximum time to wait for initialization (0 = wait forever)
 //
 // Returns a pointer to the MPMCRing or nil if timeout occurs
+//
+//go:nocheckptr
 func MPMCAttach[T any](h uintptr, timeout time.Duration) *MPMCRing[T] {
 	_tt := time.Now()
 	_r := (*_mring)(unsafe.Pointer(h))
@@ -116,6 +120,8 @@ func MPMCAttach[T any](h uintptr, timeout time.Duration) *MPMCRing[T] {
 //   - elem: Element to enqueue
 //
 // Returns true if the element was successfully enqueued, false if context was cancelled
+//
+//go:nocheckptr
 func (m *MPMCRing[T]) EnqueueWithContext(ctx context.Context, elem T) bool {
 	done := ctx.Done()
 	_h := (*_mring)(unsafe.Pointer(m._head))
@@ -168,6 +174,8 @@ func (m *MPMCRing[T]) EnqueueWithContext(ctx context.Context, elem T) bool {
 //
 // Parameters:
 //   - elem: Element to enqueue
+//
+//go:nocheckptr
 func (m *MPMCRing[T]) Enqueue(elem T) {
 	_h := (*_mring)(unsafe.Pointer(m._head))
 
@@ -212,6 +220,8 @@ func (m *MPMCRing[T]) Enqueue(elem T) {
 //
 // Parameters:
 //   - fn: Function that initializes the element (receives a pointer to the element)
+//
+//go:nocheckptr
 func (m *MPMCRing[T]) EnqueueFunc(fn func(*T)) {
 	_h := (*_mring)(unsafe.Pointer(m._head))
 
@@ -257,6 +267,8 @@ func (m *MPMCRing[T]) EnqueueFunc(fn func(*T)) {
 //   - ctx: Context for cancellation
 //
 // Returns the dequeued element and true, or zero value and false if context was cancelled
+//
+//go:nocheckptr
 func (m *MPMCRing[T]) DequeueWithContext(ctx context.Context) (elem T, ok bool) {
 	done := ctx.Done()
 	_h := (*_mring)(unsafe.Pointer(m._head))
@@ -312,6 +324,8 @@ func (m *MPMCRing[T]) DequeueWithContext(ctx context.Context) (elem T, ok bool) 
 // This function will block until an element is available.
 //
 // Returns the dequeued element
+//
+//go:nocheckptr
 func (m *MPMCRing[T]) Dequeue() (elem T) {
 	_h := (*_mring)(unsafe.Pointer(m._head))
 
@@ -359,6 +373,8 @@ func (m *MPMCRing[T]) Dequeue() (elem T) {
 //
 // Parameters:
 //   - fn: Function that processes the element (receives a pointer to the element)
+//
+//go:nocheckptr
 func (m *MPMCRing[T]) DequeueFunc(fn func(*T)) {
 	_h := (*_mring)(unsafe.Pointer(m._head))
 

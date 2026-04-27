@@ -2,8 +2,10 @@ package hqq
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"net"
+	"runtime"
 	"sync"
 	"syscall"
 	"testing"
@@ -118,6 +120,158 @@ func TestStandardLinkReadWrite(t *testing.T) {
 
 	if string(readBuffer) != string(testData) {
 		t.Errorf("Data mismatch: expected %s, got %s", string(testData), string(readBuffer))
+	}
+}
+
+func TestStandardLinkBidirectionalReadWrite(t *testing.T) {
+	bufferCount := 16
+	bufferSize := 128
+	size := SizeStandardLink(bufferCount, bufferSize)
+	_, offset := createAlignedBuffer(t, size)
+
+	primary, err := OpenStandardLink(offset, bufferCount, bufferSize)
+	if err != nil {
+		t.Fatalf("Failed to create primary link: %v", err)
+	}
+	defer primary.Close()
+
+	secondary, err := OpenStandardLink(offset, bufferCount, bufferSize)
+	if err != nil {
+		t.Fatalf("Failed to create secondary link: %v", err)
+	}
+	defer secondary.Close()
+
+	fromPrimary := []byte("primary to secondary")
+	fromSecondary := []byte("secondary to primary")
+
+	if n, err := primary.Write(fromPrimary); err != nil || n != len(fromPrimary) {
+		t.Fatalf("primary.Write() = %d, %v", n, err)
+	}
+	if n, err := secondary.Write(fromSecondary); err != nil || n != len(fromSecondary) {
+		t.Fatalf("secondary.Write() = %d, %v", n, err)
+	}
+
+	buf := make([]byte, bufferSize)
+	n, err := secondary.Read(buf)
+	if err != nil {
+		t.Fatalf("secondary.Read() failed: %v", err)
+	}
+	if got := string(buf[:n]); got != string(fromPrimary) {
+		t.Fatalf("secondary received %q, want %q", got, fromPrimary)
+	}
+
+	n, err = primary.Read(buf)
+	if err != nil {
+		t.Fatalf("primary.Read() failed: %v", err)
+	}
+	if got := string(buf[:n]); got != string(fromSecondary) {
+		t.Fatalf("primary received %q, want %q", got, fromSecondary)
+	}
+}
+
+func TestStandardLinkDoesNotOverwriteUnreadBuffers(t *testing.T) {
+	bufferCount := 4
+	bufferSize := 16
+	size := SizeStandardLink(bufferCount, bufferSize)
+	_, offset := createAlignedBuffer(t, size)
+
+	primary, err := OpenStandardLink(offset, bufferCount, bufferSize)
+	if err != nil {
+		t.Fatalf("Failed to create primary link: %v", err)
+	}
+	defer primary.Close()
+
+	secondary, err := OpenStandardLink(offset, bufferCount, bufferSize)
+	if err != nil {
+		t.Fatalf("Failed to create secondary link: %v", err)
+	}
+	defer secondary.Close()
+
+	messages := [][]byte{
+		[]byte("AAAA0001"),
+		[]byte("BBBB0002"),
+		[]byte("CCCC0003"),
+		[]byte("DDDD0004"),
+	}
+
+	for _, msg := range messages {
+		n, err := primary.Write(msg)
+		if err != nil {
+			t.Fatalf("Write(%q) failed: %v", msg, err)
+		}
+		if n != len(msg) {
+			t.Fatalf("Write(%q) = %d, want %d", msg, n, len(msg))
+		}
+	}
+
+	buf := make([]byte, bufferSize)
+	for i, want := range messages {
+		n, err := secondary.Read(buf)
+		if err != nil {
+			t.Fatalf("Read(%d) failed: %v", i, err)
+		}
+		if got := string(buf[:n]); got != string(want) {
+			t.Fatalf("Read(%d) = %q, want %q", i, got, want)
+		}
+	}
+}
+
+func TestStandardLinkPartialReadPreservesRemainderAndReleasesBuffer(t *testing.T) {
+	bufferCount := 2
+	bufferSize := 16
+	size := SizeStandardLink(bufferCount, bufferSize)
+	_, offset := createAlignedBuffer(t, size)
+
+	primary, err := OpenStandardLink(offset, bufferCount, bufferSize)
+	if err != nil {
+		t.Fatalf("Failed to create primary link: %v", err)
+	}
+	defer primary.Close()
+
+	secondary, err := OpenStandardLink(offset, bufferCount, bufferSize)
+	if err != nil {
+		t.Fatalf("Failed to create secondary link: %v", err)
+	}
+	defer secondary.Close()
+
+	first := []byte("0123456789ABCDEF")
+	second := []byte("fedcba9876543210")
+
+	if n, err := primary.Write(first); err != nil || n != len(first) {
+		t.Fatalf("first Write() = %d, %v", n, err)
+	}
+
+	small := make([]byte, 5)
+	n, err := secondary.Read(small)
+	if err != nil {
+		t.Fatalf("partial Read() failed: %v", err)
+	}
+	if got := string(small[:n]); got != "01234" {
+		t.Fatalf("partial Read() = %q, want %q", got, "01234")
+	}
+
+	// The first buffer should already be returned to the free ring even though
+	// the unread tail is served from receiveBuffer.
+	if n, err := primary.Write(second); err != nil || n != len(second) {
+		t.Fatalf("second Write() = %d, %v", n, err)
+	}
+
+	tail := make([]byte, len(first)-5)
+	n, err = secondary.Read(tail)
+	if err != nil {
+		t.Fatalf("tail Read() failed: %v", err)
+	}
+	if got := string(tail[:n]); got != "56789ABCDEF" {
+		t.Fatalf("tail Read() = %q, want %q", got, "56789ABCDEF")
+	}
+
+	full := make([]byte, len(second))
+	n, err = secondary.Read(full)
+	if err != nil {
+		t.Fatalf("second Read() failed: %v", err)
+	}
+	if got := string(full[:n]); got != string(second) {
+		t.Fatalf("second Read() = %q, want %q", got, second)
 	}
 }
 
@@ -387,6 +541,188 @@ func TestStandardLinkErrors(t *testing.T) {
 	if err != ErrMemoryAlign {
 		t.Errorf("Expected ErrMemoryAlign, got %v", err)
 	}
+
+	// Test non-power-of-two buffer count. Standard Protocol requires exact
+	// buffer/free-ring symmetry for lock-free ownership transfer.
+	size = SizeStandardLink(6, 4096)
+	if size != 0 {
+		t.Error("SizeStandardLink should return 0 for non-power-of-two buffer count")
+	}
+}
+
+func TestStandardLinkDeadlines(t *testing.T) {
+	bufferCount := 2
+	bufferSize := 64
+	size := SizeStandardLink(bufferCount, bufferSize)
+	_, offset := createAlignedBuffer(t, size)
+
+	primary, err := OpenStandardLink(offset, bufferCount, bufferSize)
+	if err != nil {
+		t.Fatalf("Failed to create primary link: %v", err)
+	}
+	defer primary.Close()
+
+	secondary, err := OpenStandardLink(offset, bufferCount, bufferSize)
+	if err != nil {
+		t.Fatalf("Failed to create secondary link: %v", err)
+	}
+	defer secondary.Close()
+
+	if err := secondary.SetReadDeadline(time.Now().Add(20 * time.Millisecond)); err != nil {
+		t.Fatalf("SetReadDeadline failed: %v", err)
+	}
+	if _, err := secondary.Read(make([]byte, 8)); err != ErrTimeout {
+		t.Fatalf("Read without data error = %v, want ErrTimeout", err)
+	}
+	if err := secondary.SetReadDeadline(time.Time{}); err != nil {
+		t.Fatalf("reset read deadline failed: %v", err)
+	}
+
+	payload := []byte("01234567")
+	for i := 0; i < bufferCount; i++ {
+		if n, err := primary.Write(payload); err != nil || n != len(payload) {
+			t.Fatalf("filling Write(%d) = %d, %v", i, n, err)
+		}
+	}
+	if err := primary.SetWriteDeadline(time.Now().Add(20 * time.Millisecond)); err != nil {
+		t.Fatalf("SetWriteDeadline failed: %v", err)
+	}
+	if _, err := primary.Write(payload); err != ErrTimeout {
+		t.Fatalf("Write without free buffer error = %v, want ErrTimeout", err)
+	}
+}
+
+func TestStandardLinkHighVolumeOrderedDelivery(t *testing.T) {
+	bufferCount := 64
+	bufferSize := 64
+	messageCount := 4096
+	size := SizeStandardLink(bufferCount, bufferSize)
+	_, offset := createAlignedBuffer(t, size)
+
+	primary, err := OpenStandardLink(offset, bufferCount, bufferSize)
+	if err != nil {
+		t.Fatalf("Failed to create primary link: %v", err)
+	}
+	defer primary.Close()
+
+	secondary, err := OpenStandardLink(offset, bufferCount, bufferSize)
+	if err != nil {
+		t.Fatalf("Failed to create secondary link: %v", err)
+	}
+	defer secondary.Close()
+
+	errCh := make(chan error, 2)
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		payload := make([]byte, bufferSize)
+		for i := 0; i < messageCount; i++ {
+			binary.LittleEndian.PutUint64(payload[:8], uint64(i))
+			for j := 8; j < len(payload); j++ {
+				payload[j] = byte(i + j)
+			}
+			if n, err := primary.Write(payload); err != nil || n != len(payload) {
+				errCh <- fmt.Errorf("Write(%d) = %d, %v", i, n, err)
+				return
+			}
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+		buf := make([]byte, bufferSize)
+		for i := 0; i < messageCount; i++ {
+			n, err := secondary.Read(buf)
+			if err != nil {
+				errCh <- fmt.Errorf("Read(%d) failed: %v", i, err)
+				return
+			}
+			if n != bufferSize {
+				errCh <- fmt.Errorf("Read(%d) size = %d, want %d", i, n, bufferSize)
+				return
+			}
+			if got := binary.LittleEndian.Uint64(buf[:8]); got != uint64(i) {
+				errCh <- fmt.Errorf("Read(%d) sequence = %d", i, got)
+				return
+			}
+		}
+	}()
+
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Fatal(err)
+	}
+}
+
+func TestStandardLinkMultiPProgress(t *testing.T) {
+	oldProcs := runtime.GOMAXPROCS(2)
+	defer runtime.GOMAXPROCS(oldProcs)
+
+	bufferCount := 64
+	bufferSize := 128
+	messageCount := 8192
+	size := SizeStandardLink(bufferCount, bufferSize)
+	_, offset := createAlignedBuffer(t, size)
+
+	primary, err := OpenStandardLink(offset, bufferCount, bufferSize)
+	if err != nil {
+		t.Fatalf("Failed to create primary link: %v", err)
+	}
+	defer primary.Close()
+
+	secondary, err := OpenStandardLink(offset, bufferCount, bufferSize)
+	if err != nil {
+		t.Fatalf("Failed to create secondary link: %v", err)
+	}
+	defer secondary.Close()
+
+	done := make(chan error, 2)
+	go func() {
+		payload := make([]byte, bufferSize)
+		for i := 0; i < messageCount; i++ {
+			binary.LittleEndian.PutUint64(payload[:8], uint64(i))
+			if n, err := primary.Write(payload); err != nil || n != len(payload) {
+				done <- fmt.Errorf("Write(%d) = %d, %v", i, n, err)
+				return
+			}
+		}
+		done <- nil
+	}()
+
+	go func() {
+		buf := make([]byte, bufferSize)
+		for i := 0; i < messageCount; i++ {
+			n, err := secondary.Read(buf)
+			if err != nil {
+				done <- fmt.Errorf("Read(%d) failed: %v", i, err)
+				return
+			}
+			if n != bufferSize {
+				done <- fmt.Errorf("Read(%d) size = %d, want %d", i, n, bufferSize)
+				return
+			}
+			if got := binary.LittleEndian.Uint64(buf[:8]); got != uint64(i) {
+				done <- fmt.Errorf("Read(%d) sequence = %d", i, got)
+				return
+			}
+		}
+		done <- nil
+	}()
+
+	timeout := time.After(5 * time.Second)
+	for i := 0; i < 2; i++ {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatal(err)
+			}
+		case <-timeout:
+			t.Fatal("StandardLink stalled with GOMAXPROCS=2")
+		}
+	}
 }
 
 // TestAdvancedLinkNegotiationTimeout tests timeout handling during negotiation
@@ -574,21 +910,76 @@ func BenchmarkStandardLinkReadWrite(b *testing.B) {
 	b.SetBytes(int64(len(testData)))
 
 	b.ResetTimer()
-	b.RunParallel(func(pb *testing.PB) {
-		for pb.Next() {
-			// Write
-			_, err := primary.Write(testData)
-			if err != nil {
-				b.Errorf("Write failed: %v", err)
-			}
+	for i := 0; i < b.N; i++ {
+		_, err := primary.Write(testData)
+		if err != nil {
+			b.Fatalf("Write failed: %v", err)
+		}
 
-			// Read
-			_, err = secondary.Read(readBuffer)
+		_, err = secondary.Read(readBuffer)
+		if err != nil {
+			b.Fatalf("Read failed: %v", err)
+		}
+	}
+}
+
+func BenchmarkStandardLinkPipeline(b *testing.B) {
+	bufferCount := 1024
+	bufferSize := 1 << 12
+	size := SizeStandardLink(bufferCount, bufferSize)
+	_, offset := createAlignedBuffer(nil, size)
+
+	primary, err := OpenStandardLink(offset, bufferCount, bufferSize)
+	if err != nil {
+		b.Fatalf("Failed to create primary link: %v", err)
+	}
+	defer primary.Close()
+
+	secondary, err := OpenStandardLink(offset, bufferCount, bufferSize)
+	if err != nil {
+		b.Fatalf("Failed to create secondary link: %v", err)
+	}
+	defer secondary.Close()
+
+	testData := make([]byte, bufferSize)
+	readBuffer := make([]byte, bufferSize)
+	for i := range testData {
+		testData[i] = byte(i % 256)
+	}
+	b.SetBytes(int64(len(testData)))
+
+	start := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		<-start
+		for i := 0; i < b.N; i++ {
+			n, err := secondary.Read(readBuffer)
 			if err != nil {
-				b.Errorf("Read failed: %v", err)
+				done <- err
+				return
+			}
+			if n != len(testData) {
+				done <- fmt.Errorf("read size = %d, want %d", n, len(testData))
+				return
 			}
 		}
-	})
+		done <- nil
+	}()
+
+	b.ResetTimer()
+	close(start)
+	for i := 0; i < b.N; i++ {
+		n, err := primary.Write(testData)
+		if err != nil {
+			b.Fatalf("Write failed: %v", err)
+		}
+		if n != len(testData) {
+			b.Fatalf("write size = %d, want %d", n, len(testData))
+		}
+	}
+	if err := <-done; err != nil {
+		b.Fatalf("reader failed: %v", err)
+	}
 }
 
 // TestStandardLinkBufferOverflow tests buffer overflow handling

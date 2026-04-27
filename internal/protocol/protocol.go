@@ -1,113 +1,155 @@
 package protocol
 
-// HQQ Protocol Version Constants
-// These constants define the current protocol version for compatibility checking
+import "encoding/binary"
+
+// HQQ Protocol Version Constants.
+//
+// The Standard Protocol is versioned separately from optional AdvancedLink
+// features. Packets are encoded as fixed-width little-endian words so the
+// shared-memory ABI does not depend on uintptr width, Go struct padding, or the
+// local machine's native byte order.
 const (
-	HQQ_PROTOCOL_MAJOR_VERSION = 1 // Major version for incompatible changes
-	HHQ_PROTOCOL_MINOR_VERSION = 1 // Minor version for backward-compatible additions
+	HQQProtocolMajorVersion = 1
+	HQQProtocolMinorVersion = 1
 )
 
-//go:generate go tool stringer -type=OpCode
-// This generate directive creates string representations of OpCode constants
-// Run "go generate" in this directory to update the stringer file
+const (
+	// PacketWordCount is the number of 64-bit words in every packet:
+	// word 0 stores the opcode and words 1-7 store operands.
+	PacketWordCount = 8
 
-// OpCode represents the operation code for HQQ protocol packets
-// Each operation code defines a specific type of packet or action
-type OpCode uintptr
+	// PacketOperandCount is the number of operand words available after the
+	// opcode word.
+	PacketOperandCount = PacketWordCount - 1
+
+	// PacketSize is the fixed wire/shared-memory size of every HQQ packet.
+	PacketSize = PacketWordCount * 8
+)
+
+//go:generate go tool golang.org/x/tools/cmd/stringer -type=OpCode
+
+// OpCode represents the operation code for HQQ protocol packets.
+//
+// OpCode is encoded in the low byte of little-endian packet word 0. The
+// remaining bytes of word 0 are reserved and must be zero when creating new
+// packets.
+type OpCode uint8
 
 const (
-	// OpError (0x00): Error reporting packet
-	// Used to report errors between processes
+	// OpError (0x00): Error reporting packet.
+	//
 	// Operands:
-	//   Operand0: ContextID (typically connection ID or request ID)
-	//   Operand1: Error Number (ErrorCode)
-	// Direction: Bidirectional
+	//   Operand0: ContextID (connection ID, copy ID, or request ID)
+	//   Operand1: ErrorCode
 	OpError OpCode = 0x00
 
-	// OpConnCreate (0x01): Connection creation request
-	// Sent to establish a new logical connection between processes
+	// OpConnCreate (0x01): Connection creation request.
+	//
 	// Operands:
-	//   Operand0: ConnectionID (unique identifier for the connection)
-	// Response: OpConnAccept with the same ConnectionID or OpError on failure
-	// Direction: Primary → Secondary
+	//   Operand0: ConnectionID
 	OpConnCreate OpCode = 0x01
 
-	// OpConnAccept (0x02): Connection acceptance
-	// Sent in response to OpConnCreate to acknowledge and accept a connection
+	// OpConnAccept (0x02): Connection acceptance.
+	//
 	// Operands:
-	//   Operand0: ConnectionID (matches the OpConnCreate request)
-	// Direction: Secondary → Primary
+	//   Operand0: ConnectionID
 	OpConnAccept OpCode = 0x02
 
-	// OpConnClose (0x03): Connection closure
-	// Sent by either party to terminate an existing connection
+	// OpConnClose (0x03): Connection closure.
+	//
 	// Operands:
-	//   Operand0: ConnectionID (identifier of the connection to close)
-	// Direction: Bidirectional
+	//   Operand0: ConnectionID
 	OpConnClose OpCode = 0x03
 
-	// OpConnCopy (0x04): Connection-oriented data transfer
-	// Used for transferring data over an established connection
-	// Operands:
-	//   Operand0: ConnectionID (identifier of the connection)
-	//   Operand1: CopyID (unique identifier for this transfer)
-	//   Operand2: CopySize (total size of the data to transfer)
-	//   Operand3: TransferSize (size of this specific transfer)
-	//   Operand4: TransferOffset (offset within the total data)
-	//   Operand5: BufferSize (size of the buffer containing data)
-	//   Operand6: BufferOffset (offset within the buffer)
-	// Direction: Bidirectional
+	// OpConnCopy (0x04): Connection-oriented data transfer.
+	//
+	// Connection-oriented transfer is currently reserved for AdvancedLink. The
+	// Standard Protocol uses OpStandardLinkCopy directly.
 	OpConnCopy OpCode = 0x04
 
-	// OpProtoNegotiate (0x05): Protocol negotiation request
-	// Sent to initiate protocol negotiation and feature discovery
+	// OpProtoNegotiate (0x05): Protocol negotiation request.
+	//
 	// Operands:
-	//   Operand0: Protocol Version (encoded as major.minor)
-	//   Operand1: Feature Flags (bitmask of requested features)
-	//   Operand2: Capability Flags (bitmask of supported capabilities)
-	// Version Encoding: (Major << 8) | Minor
-	// Response: OpProtoAck with negotiated parameters
-	// Direction: Primary → Secondary
+	//   Operand0: Protocol version encoded as (major << 8) | minor
+	//   Operand1: Requested feature flags
+	//   Operand2: Supported capability flags
 	OpProtoNegotiate OpCode = 0x05
 
-	// OpProtoAck (0x06): Protocol negotiation acknowledgment
-	// Sent in response to OpProtoNegotiate to complete negotiation
+	// OpProtoAck (0x06): Protocol negotiation acknowledgment.
+	//
 	// Operands:
-	//   Operand0: Accepted Protocol Version (encoded as major.minor)
-	//   Operand1: Accepted Feature Flags (bitmask of negotiated features)
-	//   Operand2: Accepted Capability Flags (bitmask of negotiated capabilities)
-	// Version Encoding: (Major << 8) | Minor
-	// Direction: Secondary → Primary
+	//   Operand0: Accepted protocol version encoded as (major << 8) | minor
+	//   Operand1: Negotiated feature flags
+	//   Operand2: Negotiated capability flags
 	OpProtoAck OpCode = 0x06
 
-	// OpStandardLinkCopy (0xFF): Direct data copy without connection
-	// Used for simple, connection-less data transfer with minimal overhead
+	// OpStandardLinkCopy (0xFF): Standard Protocol data packet.
+	//
 	// Operands:
-	//   Operand0: CopyID (unique identifier for this transfer)
-	//   Operand1: BufferIndex (index of the buffer containing data)
-	//   Operand2: DataSize (actual size of data in the buffer)
-	// Note: This is the lowest overhead data transfer method
-	// Direction: Bidirectional
+	//   Operand0: CopyID, monotonically increasing per endpoint
+	//   Operand1: BufferIndex into the direction-local payload buffer pool
+	//   Operand2: DataSize in bytes, 0 <= DataSize <= BufferSize
+	//
+	// Buffer ownership is not encoded in-band. Each direction has a separate
+	// lock-free free-buffer ring. The receiver returns Operand1 to that free
+	// ring after copying the payload out of shared memory.
 	OpStandardLinkCopy OpCode = 0xFF
-
-	// Note: Operation codes 0x07-0xFE are reserved for future use
 )
 
-// Packet represents the standard HQQ protocol packet structure
-// All communication between processes uses this fixed-size packet format
-type Packet struct {
-	Op       OpCode  // Operation type (1 byte, padded to 8 bytes)
-	Operand0 uintptr // First operand (typically ID or offset)
-	Operand1 uintptr // Second operand (typically size or flags)
-	Operand2 uintptr // Third operand (typically offset or count)
-	Operand3 uintptr // Fourth operand (reserved for future use)
-	Operand4 uintptr // Fifth operand (reserved for future use)
-	Operand5 uintptr // Sixth operand (reserved for future use)
-	Operand6 uintptr // Seventh operand (reserved for future use)
+// Packet is the fixed-size Standard Protocol packet.
+//
+// Layout:
+//
+//	word 0: opcode in the low byte; remaining bits reserved
+//	word 1: operand 0
+//	word 2: operand 1
+//	word 3: operand 2
+//	word 4: operand 3
+//	word 5: operand 4
+//	word 6: operand 5
+//	word 7: operand 6
+//
+// Every word is encoded with binary.LittleEndian.
+type Packet [PacketSize]byte
+
+// NewPacket returns a packet with op and up to seven operands encoded in
+// little-endian form.
+func NewPacket(op OpCode, operands ...uint64) Packet {
+	var p Packet
+	p.SetOp(op)
+	for i, operand := range operands {
+		if i >= PacketOperandCount {
+			break
+		}
+		p.SetOperand(i, operand)
+	}
+	return p
 }
 
-// Packet Structure Notes:
-// - Total size: 56 bytes (7 operands × 8 bytes + 1 byte opcode + padding)
-// - All operands are uintptr for platform independence (4 bytes on 32-bit, 8 bytes on 64-bit)
-// - Fixed size enables efficient memory allocation and cache-friendly access
-// - Reserved operands allow for future protocol extensions without breaking compatibility
+// Op returns the packet opcode.
+func (p Packet) Op() OpCode {
+	return OpCode(binary.LittleEndian.Uint64(p[0:8]) & 0xFF)
+}
+
+// SetOp stores the packet opcode and clears reserved bits in word 0.
+func (p *Packet) SetOp(op OpCode) {
+	binary.LittleEndian.PutUint64(p[0:8], uint64(op))
+}
+
+// Operand returns operand i. It returns zero for out-of-range operand indexes.
+func (p Packet) Operand(i int) uint64 {
+	if i < 0 || i >= PacketOperandCount {
+		return 0
+	}
+	offset := (i + 1) * 8
+	return binary.LittleEndian.Uint64(p[offset : offset+8])
+}
+
+// SetOperand stores operand i. Out-of-range operand indexes are ignored.
+func (p *Packet) SetOperand(i int, value uint64) {
+	if i < 0 || i >= PacketOperandCount {
+		return
+	}
+	offset := (i + 1) * 8
+	binary.LittleEndian.PutUint64(p[offset:offset+8], value)
+}
