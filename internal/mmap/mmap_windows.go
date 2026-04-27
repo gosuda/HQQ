@@ -37,8 +37,14 @@ func nsMapViewOfFile(hFile syscall.Handle, dwDesiredAccess uint32, FileOffset ui
 }
 
 func nsUnmapViewOfFile(lpBaseAddress uintptr) error {
-	_, _, err := _UnmapViewOfFile.Call(lpBaseAddress)
-	return err
+	ret, _, err := _UnmapViewOfFile.Call(lpBaseAddress)
+	if ret == 0 {
+		if err != syscall.Errno(0) {
+			return err
+		}
+		return syscall.EINVAL
+	}
+	return nil
 }
 
 func Map(fd uintptr, offset int, len int, prot int, flags int) ([]byte, error) {

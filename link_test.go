@@ -227,7 +227,7 @@ func waitMultiProcessChild(t *testing.T, cmd *exec.Cmd, output *bytes.Buffer) {
 
 func createNamedStandardLink(t *testing.T, bufferCount, bufferSize int) (string, *shm.SharedMemory, []byte, *StandardLink) {
 	t.Helper()
-	name := fmt.Sprintf("/hqq-mp-%d-%d", os.Getpid(), time.Now().UnixNano())
+	name := newPortableSharedMemoryName()
 	size := int(SizeStandardLink(bufferCount, bufferSize))
 	smem, mapped, offset := mapNamedSharedMemory(t, name, size, os.O_RDWR|os.O_CREATE|os.O_EXCL)
 	link, err := OpenStandardLink(offset, bufferCount, bufferSize)
@@ -242,7 +242,7 @@ func createNamedStandardLink(t *testing.T, bufferCount, bufferSize int) (string,
 
 func createNamedAdvancedLink(t *testing.T, bufferCount, bufferSize int) (string, *shm.SharedMemory, []byte, *AdvancedLink) {
 	t.Helper()
-	name := fmt.Sprintf("/hqq-mp-%d-%d", os.Getpid(), time.Now().UnixNano())
+	name := newPortableSharedMemoryName()
 	size := int(SizeStandardLink(bufferCount, bufferSize))
 	smem, mapped, offset := mapNamedSharedMemory(t, name, size, os.O_RDWR|os.O_CREATE|os.O_EXCL)
 	link, err := NewAdvancedLink(offset, bufferCount, bufferSize)
@@ -253,6 +253,14 @@ func createNamedAdvancedLink(t *testing.T, bufferCount, bufferSize int) (string,
 		t.Fatalf("NewAdvancedLink failed: %v", err)
 	}
 	return name, smem, mapped, link
+}
+
+func newPortableSharedMemoryName() string {
+	// macOS keeps POSIX shm names short. Keep the name comfortably below
+	// common 31-byte limits while preserving a leading slash for shm_open.
+	pidPart := strconv.FormatInt(int64(os.Getpid()&0xfff), 36)
+	timePart := strconv.FormatInt(time.Now().UnixNano()&0xffffff, 36)
+	return "/hq" + pidPart + timePart
 }
 
 func openNamedStandardLink(t *testing.T, name string, size, bufferCount, bufferSize int) (*shm.SharedMemory, []byte, *StandardLink) {
