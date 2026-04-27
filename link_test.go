@@ -409,6 +409,117 @@ func TestStandardLinkReserveCommitReadRelease(t *testing.T) {
 	}
 }
 
+func TestStandardLinkDispatchModesCanMix(t *testing.T) {
+	bufferCount := 16
+	bufferSize := 64
+	size := SizeStandardLink(bufferCount, bufferSize)
+	backing, offset := createAlignedBuffer(t, size)
+	defer runtime.KeepAlive(backing)
+
+	primary, err := OpenStandardLink(offset, bufferCount, bufferSize)
+	if err != nil {
+		t.Fatalf("Failed to create primary link: %v", err)
+	}
+	defer primary.Close()
+
+	secondary, err := OpenStandardLink(offset, bufferCount, bufferSize)
+	if err != nil {
+		t.Fatalf("Failed to create secondary link: %v", err)
+	}
+	defer secondary.Close()
+
+	send := func(mode string, payload []byte) {
+		t.Helper()
+		switch mode {
+		case "Write":
+			n, err := primary.Write(payload)
+			if err != nil || n != len(payload) {
+				t.Fatalf("%s(%q) = %d, %v", mode, payload, n, err)
+			}
+		case "WriteZeroCopy":
+			n, err := primary.WriteZeroCopy(func(buffer []byte) (int, error) {
+				return copy(buffer, payload), nil
+			})
+			if err != nil || n != len(payload) {
+				t.Fatalf("%s(%q) = %d, %v", mode, payload, n, err)
+			}
+		case "ReserveWrite":
+			reservation, err := primary.ReserveWrite()
+			if err != nil {
+				t.Fatalf("%s(%q) failed: %v", mode, payload, err)
+			}
+			n := copy(reservation.Buffer(), payload)
+			if err := reservation.Commit(n); err != nil {
+				t.Fatalf("%s(%q).Commit(%d) failed: %v", mode, payload, n, err)
+			}
+		default:
+			t.Fatalf("unknown send mode %q", mode)
+		}
+	}
+
+	receive := func(mode string) []byte {
+		t.Helper()
+		switch mode {
+		case "Read":
+			buffer := make([]byte, bufferSize)
+			n, err := secondary.Read(buffer)
+			if err != nil {
+				t.Fatalf("%s failed: %v", mode, err)
+			}
+			return append([]byte(nil), buffer[:n]...)
+		case "ReadZeroCopy":
+			var got []byte
+			n, err := secondary.ReadZeroCopy(func(buffer []byte) error {
+				got = append([]byte(nil), buffer...)
+				return nil
+			})
+			if err != nil {
+				t.Fatalf("%s failed: %v", mode, err)
+			}
+			if n != len(got) {
+				t.Fatalf("%s size = %d, copied %d", mode, n, len(got))
+			}
+			return got
+		case "ReserveRead":
+			reservation, err := secondary.ReserveRead()
+			if err != nil {
+				t.Fatalf("%s failed: %v", mode, err)
+			}
+			got := append([]byte(nil), reservation.Buffer()...)
+			if err := reservation.Release(); err != nil {
+				t.Fatalf("%s.Release failed: %v", mode, err)
+			}
+			return got
+		default:
+			t.Fatalf("unknown receive mode %q", mode)
+			return nil
+		}
+	}
+
+	for _, tc := range []struct {
+		sendMode    string
+		receiveMode string
+	}{
+		{"Write", "Read"},
+		{"Write", "ReadZeroCopy"},
+		{"Write", "ReserveRead"},
+		{"WriteZeroCopy", "Read"},
+		{"WriteZeroCopy", "ReadZeroCopy"},
+		{"WriteZeroCopy", "ReserveRead"},
+		{"ReserveWrite", "Read"},
+		{"ReserveWrite", "ReadZeroCopy"},
+		{"ReserveWrite", "ReserveRead"},
+	} {
+		t.Run(tc.sendMode+"To"+tc.receiveMode, func(t *testing.T) {
+			payload := []byte(tc.sendMode + "->" + tc.receiveMode)
+			send(tc.sendMode, payload)
+			if got := receive(tc.receiveMode); string(got) != string(payload) {
+				t.Fatalf("%s -> %s payload = %q, want %q", tc.sendMode, tc.receiveMode, got, payload)
+			}
+		})
+	}
+}
+
 func TestStandardLinkReserveAbortTombstoneIsSkipped(t *testing.T) {
 	bufferCount := 2
 	bufferSize := 32

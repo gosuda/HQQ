@@ -117,8 +117,10 @@ The protocol has one bounded backpressure point per direction:
 
 - `Write` publishes at most one packet and rejects payloads larger than `bufferSize` with `ErrBufferOverflow`.
 - `Read` returns after delivering data from one packet, or from a previously saved local remainder.
+- `Read` and `Write` are automatic-release/automatic-commit hot-path APIs for the same packet stream used by the explicit reservation APIs.
 - `WriteZeroCopy` and `ReadZeroCopy` expose the slot-owned payload buffer directly for the duration of the callback.
 - `ReserveWrite` and `ReserveRead` expose explicit slot lifetime control. `ReserveWrite` must be finished with `Commit` or `Abort`; `ReserveRead` must be finished with `Release`.
+- Dispatch methods can be mixed at message boundaries: `Write`, `WriteZeroCopy`, and `ReserveWrite` publish copy packets; `Read`, `ReadZeroCopy`, and `ReserveRead` consume copy packets and skip tombstones.
 - If the caller's read buffer is smaller than the payload, the unread tail is copied into a local per-link remainder buffer and the shared payload buffer is released as soon as the dequeue callback returns.
 - `ReadFrom` and `WriteTo` are thin `net.PacketConn` adapters over `Read` and `Write`.
 

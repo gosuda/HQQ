@@ -408,8 +408,11 @@ func OpenStandardLink(offset uintptr, bufferCount int, bufferSize int) (*Standar
 	return link, nil
 }
 
-// Read implements io.Reader for the link
-// It reads data from the link into the provided buffer
+// Read implements io.Reader for the link.
+//
+// Read is the automatic-release hot path for the same packet stream consumed
+// by ReadZeroCopy and ReserveRead. It releases the claimed ring slot before
+// returning to the caller.
 func (l *StandardLink) Read(b []byte) (n int, err error) {
 	if len(b) == 0 {
 		return 0, nil
@@ -454,8 +457,11 @@ func (l *StandardLink) Read(b []byte) (n int, err error) {
 	}
 }
 
-// Write implements io.Writer for the link
-// It writes data from the provided buffer to the link
+// Write implements io.Writer for the link.
+//
+// Write is the automatic-commit hot path for the same packet stream produced
+// by WriteZeroCopy and ReserveWrite. It publishes a copy packet before
+// returning to the caller.
 func (l *StandardLink) Write(b []byte) (n int, err error) {
 	bN := len(b)
 	if bN == 0 {

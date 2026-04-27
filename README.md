@@ -133,6 +133,8 @@ func (l *StandardLink) GetType() LinkType
 
 > WARNING: The callback runs while the underlying ring slot is claimed. It must return promptly; if it blocks or never returns, the whole ring can suffer head-of-line (HOL) blocking. Do not retain the buffer after the callback returns.
 
+All dispatch methods interoperate at message boundaries. `Write`, `WriteZeroCopy`, and `ReserveWrite` all publish the same StandardLink copy packet stream; `Read`, `ReadZeroCopy`, and `ReserveRead` all consume that stream and skip tombstones. The simple `Read`/`Write` methods keep a direct automatic-release/automatic-commit hot path instead of layering through public reservation handles.
+
 `ReserveRead` and `ReserveWrite` expose lower-level explicit lifetime control:
 
 ```go
