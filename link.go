@@ -35,6 +35,18 @@ const (
 	LinkTypeAdvanced                 // Advanced link with protocol negotiation
 )
 
+const (
+	// MinBufferCount is the minimum number of ring-slot-owned payload buffers
+	// per direction.
+	MinBufferCount = 2
+
+	// MinBufferSize is the minimum payload buffer size in bytes.
+	MinBufferSize = 8
+
+	// BufferSizeAlignment is the required payload buffer size alignment.
+	BufferSizeAlignment = 8
+)
+
 // Feature flags for Advanced Protocol negotiation.
 const (
 	FeatureNone            uint64 = 0
@@ -100,6 +112,24 @@ var (
 	ErrBufferOverflow = errors.New("hqq: buffer overflow")
 	ErrTimeout        = errors.New("hqq: operation timed out")
 )
+
+// LargeMessageThreshold returns the largest payload size that fits in one
+// Standard Protocol copy packet for a link configured with bufferSize.
+// Advanced Protocol callers should treat payload sizes greater than this value
+// as large messages that require chunking.
+func LargeMessageThreshold(bufferSize int) int {
+	if bufferSize < MinBufferSize || bufferSize%BufferSizeAlignment != 0 {
+		return 0
+	}
+	return bufferSize
+}
+
+// IsLargeMessage reports whether payloadSize is larger than a single Standard
+// Protocol payload buffer for bufferSize.
+func IsLargeMessage(bufferSize int, payloadSize int) bool {
+	threshold := LargeMessageThreshold(bufferSize)
+	return threshold > 0 && payloadSize > threshold
+}
 
 // StandardLink represents a standard HQQ link for inter-process communication
 // It provides basic IPC functionality using shared memory and MPMC queues
@@ -299,7 +329,7 @@ func SizeStandardLink(bufferCount int, bufferSize int) uintptr {
 		return 0
 	}
 
-	if bufferCount < 2 || bufferSize < 8 || bufferSize%8 != 0 {
+	if bufferCount < MinBufferCount || bufferSize < MinBufferSize || bufferSize%BufferSizeAlignment != 0 {
 		return 0
 	}
 
@@ -329,7 +359,7 @@ func isPowerOfTwo(v int) bool {
 //go:nocheckptr
 func OpenStandardLink(offset uintptr, bufferCount int, bufferSize int) (*StandardLink, error) {
 	// Validate inputs
-	if offset%pagesize != 0 || bufferSize%8 != 0 {
+	if offset%pagesize != 0 || bufferSize%BufferSizeAlignment != 0 {
 		return nil, ErrMemoryAlign
 	}
 
@@ -337,7 +367,7 @@ func OpenStandardLink(offset uintptr, bufferCount int, bufferSize int) (*Standar
 		return nil, ErrInvalidSize
 	}
 
-	if bufferCount < 2 || bufferSize < 8 {
+	if bufferCount < MinBufferCount || bufferSize < MinBufferSize {
 		return nil, ErrInvalidSize
 	}
 
@@ -861,6 +891,40 @@ func (l *StandardLink) GetType() LinkType {
 	return l.linkType
 }
 
+// BufferSize returns the configured payload-buffer size in bytes.
+func (l *StandardLink) BufferSize() int {
+	if l == nil {
+		return 0
+	}
+	return l.bufferSize
+}
+
+// BufferCount returns the configured payload-buffer count per direction.
+func (l *StandardLink) BufferCount() int {
+	if l == nil {
+		return 0
+	}
+	return l.bufferCount
+}
+
+// LargeMessageThreshold returns the largest payload size that this StandardLink
+// can publish in one Standard Protocol packet.
+func (l *StandardLink) LargeMessageThreshold() int {
+	if l == nil {
+		return 0
+	}
+	return LargeMessageThreshold(l.bufferSize)
+}
+
+// IsLargeMessage reports whether payloadSize should be sent through the
+// Advanced Protocol large-message path for this link configuration.
+func (l *StandardLink) IsLargeMessage(payloadSize int) bool {
+	if l == nil {
+		return false
+	}
+	return IsLargeMessage(l.bufferSize, payloadSize)
+}
+
 // Close closes the link and cleans up resources
 func (l *StandardLink) Close() error {
 	// Clear buffers
@@ -1030,6 +1094,39 @@ func (l *AdvancedLink) GetMode() LinkMode {
 // GetType returns the type of the advanced link
 func (l *AdvancedLink) GetType() LinkType {
 	return LinkTypeAdvanced
+}
+
+// BufferSize returns the configured payload-buffer size in bytes.
+func (l *AdvancedLink) BufferSize() int {
+	if l == nil {
+		return 0
+	}
+	return l.slink.BufferSize()
+}
+
+// BufferCount returns the configured payload-buffer count per direction.
+func (l *AdvancedLink) BufferCount() int {
+	if l == nil {
+		return 0
+	}
+	return l.slink.BufferCount()
+}
+
+// LargeMessageThreshold returns the largest payload size that fits in one
+// Standard Protocol packet before Advanced chunking is required.
+func (l *AdvancedLink) LargeMessageThreshold() int {
+	if l == nil {
+		return 0
+	}
+	return l.slink.LargeMessageThreshold()
+}
+
+// IsLargeMessage reports whether payloadSize should use Advanced chunking.
+func (l *AdvancedLink) IsLargeMessage(payloadSize int) bool {
+	if l == nil {
+		return false
+	}
+	return l.slink.IsLargeMessage(payloadSize)
 }
 
 // NegotiateProtocol initiates protocol negotiation with the specified features

@@ -113,10 +113,12 @@ func main() {
 
 ```go
 func SizeStandardLink(bufferCount int, bufferSize int) uintptr
+func LargeMessageThreshold(bufferSize int) int
+func IsLargeMessage(bufferSize int, payloadSize int) bool
 func OpenStandardLink(offset uintptr, bufferCount int, bufferSize int) (*StandardLink, error)
 ```
 
-`SizeStandardLink` returns zero for invalid configurations.
+`SizeStandardLink` returns zero for invalid configurations. `LargeMessageThreshold(bufferSize)` returns the largest payload that fits in one Standard Protocol packet; payloads larger than that should use Advanced large-copy/request-response APIs.
 
 ### StandardLink methods
 
@@ -128,6 +130,10 @@ func (l *StandardLink) WriteZeroCopy(func([]byte) (int, error)) (int, error)
 func (l *StandardLink) ReserveRead() (StandardReadReservation, error)
 func (l *StandardLink) ReserveWrite() (StandardWriteReservation, error)
 func (l *StandardLink) Close() error
+func (l *StandardLink) BufferSize() int
+func (l *StandardLink) BufferCount() int
+func (l *StandardLink) LargeMessageThreshold() int
+func (l *StandardLink) IsLargeMessage(payloadSize int) bool
 func (l *StandardLink) GetMode() LinkMode
 func (l *StandardLink) GetType() LinkType
 ```
@@ -173,9 +179,13 @@ func (l *AdvancedLink) Call(ctx context.Context, methodID uint64, request []byte
 func (l *AdvancedLink) CallOn(ctx context.Context, connectionID uint64, methodID uint64, request []byte) (AdvancedMessage, error)
 func (l *AdvancedLink) Respond(ctx context.Context, request AdvancedMessage, status uint64, response []byte) error
 func (l *AdvancedLink) RespondError(ctx context.Context, request AdvancedMessage, status uint64, response []byte) error
+func (l *AdvancedLink) BufferSize() int
+func (l *AdvancedLink) BufferCount() int
+func (l *AdvancedLink) LargeMessageThreshold() int
+func (l *AdvancedLink) IsLargeMessage(payloadSize int) bool
 ```
 
-Advanced feature flags are intentionally narrow: `FeatureLargeCopy` and `FeatureRequestResponse`. `SendLarge` splits payloads larger than `bufferSize` into chunked `OpConnCopy` frames. `Call`/`CallOn` use the same chunking for request and response bodies and correlate responses by `MessageID`. `Receive` assembles complete Advanced messages before returning; future streaming APIs may avoid full assembly for very large payloads. Do not read Advanced traffic through the Standard `Read` APIs.
+Advanced feature flags are intentionally narrow: `FeatureLargeCopy` and `FeatureRequestResponse`. A payload becomes a large message when `payloadSize > link.LargeMessageThreshold()`; the threshold is the configured payload `bufferSize`. `SendLarge` splits payloads larger than `bufferSize` into chunked `OpConnCopy` frames. `Call`/`CallOn` use the same chunking for request and response bodies and correlate responses by `MessageID`. `Receive` assembles complete Advanced messages before returning; future streaming APIs may avoid full assembly for very large payloads. Do not read Advanced traffic through the Standard `Read` APIs.
 
 Minimal request-response flow:
 
@@ -212,6 +222,7 @@ func (l *StandardLink) SetWriteDeadline(t time.Time) error
 
 ```bash
 go test ./...
+go test . -run 'TestMultiProcess|TestLargeMessageThresholdAPI' -v
 go test -bench='(StandardLink|AdvancedLink)' -run '^$' -benchtime=1s
 ```
 

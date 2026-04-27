@@ -206,7 +206,7 @@ Transfers one Advanced chunk. This is the common data frame for both large-data 
 
 ## Advanced Large-Data Copy
 
-Large-data copy sends one logical message as multiple `OpConnCopy` chunks when `TotalSize > bufferSize`.
+Large-data copy sends one logical message as one or more `OpConnCopy` chunks. A payload is considered a large message when `TotalSize > bufferSize`; this value is exposed as `LargeMessageThreshold(bufferSize)` and `link.LargeMessageThreshold()` in the public API.
 
 ### Send path
 
@@ -410,6 +410,8 @@ Implemented and covered by Advanced tests/benchmarks:
 - Advanced Protocol negotiation using only `FeatureLargeCopy` and `FeatureRequestResponse`
 - Advanced large-data copy over `OpConnCopy`
 - Advanced request-response IPC over `OpConnCopy`
+- public large-message threshold APIs
+- multi-process StandardLink and AdvancedLink smoke tests
 - Advanced error responses through `AdvFlagResponse | AdvFlagError`
 - Advanced packet constructor coverage and throughput benchmarks
 

@@ -1,16 +1,24 @@
 package hqq
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"net"
+	"os"
+	"os/exec"
 	"runtime"
+	"strconv"
 	"sync"
 	"syscall"
 	"testing"
 	"time"
 	"unsafe"
+
+	"gosuda.org/hqq/internal/mmap"
+	"gosuda.org/hqq/internal/shm"
 )
 
 // createAlignedBuffer creates a page-aligned buffer for testing
@@ -27,6 +35,359 @@ func createAlignedBuffer(t *testing.T, size uintptr) ([]byte, uintptr) {
 	}
 
 	return buffer, offset
+}
+
+func TestLargeMessageThresholdAPI(t *testing.T) {
+	if got := LargeMessageThreshold(64); got != 64 {
+		t.Fatalf("LargeMessageThreshold(64) = %d, want 64", got)
+	}
+	if got := LargeMessageThreshold(7); got != 0 {
+		t.Fatalf("LargeMessageThreshold(7) = %d, want 0", got)
+	}
+	if IsLargeMessage(64, 64) {
+		t.Fatal("64-byte payload should still fit in a 64-byte Standard payload buffer")
+	}
+	if !IsLargeMessage(64, 65) {
+		t.Fatal("65-byte payload should be large for a 64-byte Standard payload buffer")
+	}
+
+	bufferCount := 8
+	bufferSize := 64
+	size := SizeStandardLink(bufferCount, bufferSize)
+	backing, offset := createAlignedBuffer(t, size)
+	defer runtime.KeepAlive(backing)
+
+	standard, err := OpenStandardLink(offset, bufferCount, bufferSize)
+	if err != nil {
+		t.Fatalf("OpenStandardLink failed: %v", err)
+	}
+	defer standard.Close()
+	if standard.BufferSize() != bufferSize || standard.BufferCount() != bufferCount {
+		t.Fatalf("standard sizing = %d/%d", standard.BufferCount(), standard.BufferSize())
+	}
+	if standard.LargeMessageThreshold() != bufferSize {
+		t.Fatalf("standard threshold = %d, want %d", standard.LargeMessageThreshold(), bufferSize)
+	}
+	if !standard.IsLargeMessage(bufferSize + 1) {
+		t.Fatalf("standard IsLargeMessage(%d) = false", bufferSize+1)
+	}
+
+	advanced, err := NewAdvancedLink(offset, bufferCount, bufferSize)
+	if err != nil {
+		t.Fatalf("NewAdvancedLink failed: %v", err)
+	}
+	defer advanced.Close()
+	if advanced.LargeMessageThreshold() != bufferSize {
+		t.Fatalf("advanced threshold = %d, want %d", advanced.LargeMessageThreshold(), bufferSize)
+	}
+}
+
+const hqqMultiProcessChildEnv = "HQQ_MULTIPROCESS_CHILD"
+
+func TestHQQMultiProcessChild(t *testing.T) {
+	if os.Getenv(hqqMultiProcessChildEnv) != "1" {
+		t.Skip("helper for multi-process tests")
+	}
+
+	args := multiProcessChildArgs(t)
+	if len(args) != 5 {
+		t.Fatalf("child args = %q, want role name size bufferCount bufferSize", args)
+	}
+	role := args[0]
+	name := args[1]
+	size := mustAtoi(t, args[2])
+	bufferCount := mustAtoi(t, args[3])
+	bufferSize := mustAtoi(t, args[4])
+
+	switch role {
+	case "standard":
+		runStandardLinkChildProcess(t, name, size, bufferCount, bufferSize)
+	case "advanced":
+		runAdvancedLinkChildProcess(t, name, size, bufferCount, bufferSize)
+	default:
+		t.Fatalf("unknown child role %q", role)
+	}
+}
+
+func TestMultiProcessStandardLink(t *testing.T) {
+	name, smem, mapped, standard := createNamedStandardLink(t, 16, 128)
+	defer cleanupNamedLink(t, smem, mapped, standard, true)
+
+	child, output := startMultiProcessChild(t, "standard", name, int(SizeStandardLink(16, 128)), 16, 128)
+
+	if err := standard.SetDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("SetDeadline failed: %v", err)
+	}
+	request := []byte("standard parent to child")
+	if n, err := standard.Write(request); err != nil || n != len(request) {
+		t.Fatalf("parent Write = %d, %v", n, err)
+	}
+	buf := make([]byte, 128)
+	n, err := standard.Read(buf)
+	if err != nil {
+		t.Fatalf("parent Read failed: %v\nchild output:\n%s", err, output.String())
+	}
+	if got, want := string(buf[:n]), "standard child ack"; got != want {
+		t.Fatalf("parent Read = %q, want %q", got, want)
+	}
+
+	waitMultiProcessChild(t, child, output)
+}
+
+func TestMultiProcessAdvancedLink(t *testing.T) {
+	const (
+		bufferCount = 16
+		bufferSize  = 64
+	)
+	name, smem, mapped, primary := createNamedAdvancedLink(t, bufferCount, bufferSize)
+	defer cleanupNamedLink(t, smem, mapped, primary.slink, true)
+
+	child, output := startMultiProcessChild(t, "advanced", name, int(SizeStandardLink(bufferCount, bufferSize)), bufferCount, bufferSize)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	ok, err := primary.NegotiateProtocol(ctx, ProtocolVersion{Major: 1, Minor: 0}, FeatureLargeCopy|FeatureRequestResponse)
+	if err != nil || !ok {
+		t.Fatalf("parent negotiation = %v, %v\nchild output:\n%s", ok, err, output.String())
+	}
+
+	request := patternedBytes(bufferSize*3+17, 11)
+	response, err := primary.Call(ctx, 77, request)
+	if err != nil {
+		t.Fatalf("parent Call failed: %v\nchild output:\n%s", err, output.String())
+	}
+	if want := patternedBytes(bufferSize*2+5, 23); !bytes.Equal(response, want) {
+		t.Fatalf("response mismatch len=%d want=%d", len(response), len(want))
+	}
+
+	large := patternedBytes(bufferSize*4+9, 37)
+	if _, err := primary.SendLarge(ctx, 0, large); err != nil {
+		t.Fatalf("parent SendLarge failed: %v\nchild output:\n%s", err, output.String())
+	}
+	ack, err := primary.Receive(ctx)
+	if err != nil {
+		t.Fatalf("parent Receive ack failed: %v\nchild output:\n%s", err, output.String())
+	}
+	if !ack.IsData() || string(ack.Payload) != "advanced child large ack" {
+		t.Fatalf("ack = flags %#x payload %q", ack.Flags, ack.Payload)
+	}
+
+	waitMultiProcessChild(t, child, output)
+}
+
+func multiProcessChildArgs(t *testing.T) []string {
+	t.Helper()
+	for i, arg := range os.Args {
+		if arg == "--" {
+			return os.Args[i+1:]
+		}
+	}
+	t.Fatalf("missing -- child arg separator in %q", os.Args)
+	return nil
+}
+
+func mustAtoi(t *testing.T, s string) int {
+	t.Helper()
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		t.Fatalf("Atoi(%q) failed: %v", s, err)
+	}
+	return n
+}
+
+func startMultiProcessChild(t *testing.T, role, name string, size, bufferCount, bufferSize int) (*exec.Cmd, *bytes.Buffer) {
+	t.Helper()
+	cmd := exec.Command(
+		os.Args[0],
+		"-test.run=^TestHQQMultiProcessChild$",
+		"-test.v",
+		"--",
+		role,
+		name,
+		strconv.Itoa(size),
+		strconv.Itoa(bufferCount),
+		strconv.Itoa(bufferSize),
+	)
+	cmd.Env = append(os.Environ(), hqqMultiProcessChildEnv+"=1")
+	var output bytes.Buffer
+	cmd.Stdout = &output
+	cmd.Stderr = &output
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("starting child failed: %v", err)
+	}
+	return cmd, &output
+}
+
+func waitMultiProcessChild(t *testing.T, cmd *exec.Cmd, output *bytes.Buffer) {
+	t.Helper()
+	if err := cmd.Wait(); err != nil {
+		t.Fatalf("child failed: %v\nchild output:\n%s", err, output.String())
+	}
+}
+
+func createNamedStandardLink(t *testing.T, bufferCount, bufferSize int) (string, *shm.SharedMemory, []byte, *StandardLink) {
+	t.Helper()
+	name := fmt.Sprintf("/hqq-mp-%d-%d", os.Getpid(), time.Now().UnixNano())
+	size := int(SizeStandardLink(bufferCount, bufferSize))
+	smem, mapped, offset := mapNamedSharedMemory(t, name, size, os.O_RDWR|os.O_CREATE|os.O_EXCL)
+	link, err := OpenStandardLink(offset, bufferCount, bufferSize)
+	if err != nil {
+		_ = mmap.UnMap(mapped)
+		_ = smem.Close()
+		_ = smem.Delete()
+		t.Fatalf("OpenStandardLink failed: %v", err)
+	}
+	return name, smem, mapped, link
+}
+
+func createNamedAdvancedLink(t *testing.T, bufferCount, bufferSize int) (string, *shm.SharedMemory, []byte, *AdvancedLink) {
+	t.Helper()
+	name := fmt.Sprintf("/hqq-mp-%d-%d", os.Getpid(), time.Now().UnixNano())
+	size := int(SizeStandardLink(bufferCount, bufferSize))
+	smem, mapped, offset := mapNamedSharedMemory(t, name, size, os.O_RDWR|os.O_CREATE|os.O_EXCL)
+	link, err := NewAdvancedLink(offset, bufferCount, bufferSize)
+	if err != nil {
+		_ = mmap.UnMap(mapped)
+		_ = smem.Close()
+		_ = smem.Delete()
+		t.Fatalf("NewAdvancedLink failed: %v", err)
+	}
+	return name, smem, mapped, link
+}
+
+func openNamedStandardLink(t *testing.T, name string, size, bufferCount, bufferSize int) (*shm.SharedMemory, []byte, *StandardLink) {
+	t.Helper()
+	smem, mapped, offset := mapNamedSharedMemory(t, name, size, os.O_RDWR)
+	link, err := OpenStandardLink(offset, bufferCount, bufferSize)
+	if err != nil {
+		_ = mmap.UnMap(mapped)
+		_ = smem.Close()
+		t.Fatalf("OpenStandardLink child failed: %v", err)
+	}
+	return smem, mapped, link
+}
+
+func openNamedAdvancedLink(t *testing.T, name string, size, bufferCount, bufferSize int) (*shm.SharedMemory, []byte, *AdvancedLink) {
+	t.Helper()
+	smem, mapped, offset := mapNamedSharedMemory(t, name, size, os.O_RDWR)
+	link, err := NewAdvancedLink(offset, bufferCount, bufferSize)
+	if err != nil {
+		_ = mmap.UnMap(mapped)
+		_ = smem.Close()
+		t.Fatalf("NewAdvancedLink child failed: %v", err)
+	}
+	return smem, mapped, link
+}
+
+func mapNamedSharedMemory(t *testing.T, name string, size int, flags int) (*shm.SharedMemory, []byte, uintptr) {
+	t.Helper()
+	smem, err := shm.OpenSharedMemory(name, size, flags, 0600)
+	if err != nil {
+		if errors.Is(err, syscall.ENOSYS) {
+			t.Skipf("shared memory is not supported on this platform: %v", err)
+		}
+		t.Fatalf("OpenSharedMemory(%q) failed: %v", name, err)
+	}
+	mapped, err := mmap.Map(smem.FD(), 0, size, mmap.PROT_READ|mmap.PROT_WRITE, mmap.MAP_SHARED)
+	if err != nil {
+		_ = smem.Close()
+		if flags&os.O_CREATE != 0 {
+			_ = smem.Delete()
+		}
+		t.Fatalf("mmap.Map(%q) failed: %v", name, err)
+	}
+	return smem, mapped, uintptr(unsafe.Pointer(&mapped[0]))
+}
+
+func cleanupNamedLink(t *testing.T, smem *shm.SharedMemory, mapped []byte, link *StandardLink, remove bool) {
+	t.Helper()
+	if link != nil {
+		_ = link.Close()
+	}
+	if mapped != nil {
+		if err := mmap.UnMap(mapped); err != nil {
+			t.Fatalf("mmap.UnMap failed: %v", err)
+		}
+	}
+	if smem != nil {
+		if err := smem.Close(); err != nil {
+			t.Fatalf("shared memory close failed: %v", err)
+		}
+		if remove {
+			if err := smem.Delete(); err != nil && !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("shared memory delete failed: %v", err)
+			}
+		}
+	}
+}
+
+func runStandardLinkChildProcess(t *testing.T, name string, size, bufferCount, bufferSize int) {
+	smem, mapped, link := openNamedStandardLink(t, name, size, bufferCount, bufferSize)
+	defer cleanupNamedLink(t, smem, mapped, link, false)
+
+	if err := link.SetDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("child SetDeadline failed: %v", err)
+	}
+	buf := make([]byte, bufferSize)
+	n, err := link.Read(buf)
+	if err != nil {
+		t.Fatalf("child Read failed: %v", err)
+	}
+	if got, want := string(buf[:n]), "standard parent to child"; got != want {
+		t.Fatalf("child Read = %q, want %q", got, want)
+	}
+	reply := []byte("standard child ack")
+	if n, err := link.Write(reply); err != nil || n != len(reply) {
+		t.Fatalf("child Write = %d, %v", n, err)
+	}
+}
+
+func runAdvancedLinkChildProcess(t *testing.T, name string, size, bufferCount, bufferSize int) {
+	smem, mapped, link := openNamedAdvancedLink(t, name, size, bufferCount, bufferSize)
+	defer cleanupNamedLink(t, smem, mapped, link.slink, false)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	ok, err := link.WaitForNegotiation(ctx)
+	if err != nil || !ok {
+		t.Fatalf("child WaitForNegotiation = %v, %v", ok, err)
+	}
+
+	request, err := link.Receive(ctx)
+	if err != nil {
+		t.Fatalf("child Receive request failed: %v", err)
+	}
+	if !request.IsRequest() || request.MethodID != 77 {
+		t.Fatalf("child request flags=%#x method=%d", request.Flags, request.MethodID)
+	}
+	if want := patternedBytes(bufferSize*3+17, 11); !bytes.Equal(request.Payload, want) {
+		t.Fatalf("child request mismatch len=%d want=%d", len(request.Payload), len(want))
+	}
+	if err := link.Respond(ctx, request, 201, patternedBytes(bufferSize*2+5, 23)); err != nil {
+		t.Fatalf("child Respond failed: %v", err)
+	}
+
+	large, err := link.Receive(ctx)
+	if err != nil {
+		t.Fatalf("child Receive large failed: %v", err)
+	}
+	if !large.IsData() {
+		t.Fatalf("child large flags=%#x, want data", large.Flags)
+	}
+	if want := patternedBytes(bufferSize*4+9, 37); !bytes.Equal(large.Payload, want) {
+		t.Fatalf("child large mismatch len=%d want=%d", len(large.Payload), len(want))
+	}
+	if _, err := link.SendLarge(ctx, 0, []byte("advanced child large ack")); err != nil {
+		t.Fatalf("child SendLarge ack failed: %v", err)
+	}
+}
+
+func patternedBytes(n int, seed byte) []byte {
+	b := make([]byte, n)
+	for i := range b {
+		b[i] = byte(int(seed) + i*31)
+	}
+	return b
 }
 
 // TestStandardLinkCreation tests the creation of standard links
