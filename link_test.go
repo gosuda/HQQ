@@ -356,6 +356,289 @@ func TestStandardLinkZeroCopyReadWrite(t *testing.T) {
 	}
 }
 
+func TestStandardLinkReserveCommitReadRelease(t *testing.T) {
+	bufferCount := 8
+	bufferSize := 64
+	size := SizeStandardLink(bufferCount, bufferSize)
+	backing, offset := createAlignedBuffer(t, size)
+	defer runtime.KeepAlive(backing)
+
+	primary, err := OpenStandardLink(offset, bufferCount, bufferSize)
+	if err != nil {
+		t.Fatalf("Failed to create primary link: %v", err)
+	}
+	defer primary.Close()
+
+	secondary, err := OpenStandardLink(offset, bufferCount, bufferSize)
+	if err != nil {
+		t.Fatalf("Failed to create secondary link: %v", err)
+	}
+	defer secondary.Close()
+
+	payload := []byte("reserve-commit")
+	writeReservation, err := primary.ReserveWrite()
+	if err != nil {
+		t.Fatalf("ReserveWrite failed: %v", err)
+	}
+	if writeReservation.Slot() >= uint64(bufferCount) {
+		t.Fatalf("write slot = %d, want < %d", writeReservation.Slot(), bufferCount)
+	}
+	n := copy(writeReservation.Buffer(), payload)
+	if err := writeReservation.Commit(n); err != nil {
+		t.Fatalf("Commit failed: %v", err)
+	}
+	if err := writeReservation.Commit(n); err != ErrInvalidOp {
+		t.Fatalf("second Commit error = %v, want ErrInvalidOp", err)
+	}
+
+	readReservation, err := secondary.ReserveRead()
+	if err != nil {
+		t.Fatalf("ReserveRead failed: %v", err)
+	}
+	if got := string(readReservation.Buffer()); got != string(payload) {
+		t.Fatalf("ReserveRead payload = %q, want %q", got, payload)
+	}
+	if readReservation.Slot() != writeReservation.Slot() {
+		t.Fatalf("read slot = %d, want %d", readReservation.Slot(), writeReservation.Slot())
+	}
+	if err := readReservation.Release(); err != nil {
+		t.Fatalf("Release failed: %v", err)
+	}
+	if err := readReservation.Release(); err != ErrInvalidOp {
+		t.Fatalf("second Release error = %v, want ErrInvalidOp", err)
+	}
+}
+
+func TestStandardLinkReserveAbortTombstoneIsSkipped(t *testing.T) {
+	bufferCount := 2
+	bufferSize := 32
+	size := SizeStandardLink(bufferCount, bufferSize)
+	backing, offset := createAlignedBuffer(t, size)
+	defer runtime.KeepAlive(backing)
+
+	primary, err := OpenStandardLink(offset, bufferCount, bufferSize)
+	if err != nil {
+		t.Fatalf("Failed to create primary link: %v", err)
+	}
+	defer primary.Close()
+
+	secondary, err := OpenStandardLink(offset, bufferCount, bufferSize)
+	if err != nil {
+		t.Fatalf("Failed to create secondary link: %v", err)
+	}
+	defer secondary.Close()
+
+	for i := 0; i < bufferCount; i++ {
+		reservation, err := primary.ReserveWrite()
+		if err != nil {
+			t.Fatalf("ReserveWrite(%d) failed: %v", i, err)
+		}
+		if err := reservation.Abort(ErrCodeInvalidOp); err != nil {
+			t.Fatalf("Abort(%d) failed: %v", i, err)
+		}
+	}
+
+	if err := secondary.SetReadDeadline(time.Now().Add(20 * time.Millisecond)); err != nil {
+		t.Fatalf("SetReadDeadline failed: %v", err)
+	}
+	if _, err := secondary.Read(make([]byte, bufferSize)); err != ErrTimeout {
+		t.Fatalf("Read after tombstones error = %v, want ErrTimeout", err)
+	}
+	if err := secondary.SetReadDeadline(time.Time{}); err != nil {
+		t.Fatalf("reset read deadline failed: %v", err)
+	}
+
+	payload := []byte("after tombstone")
+	if n, err := primary.Write(payload); err != nil || n != len(payload) {
+		t.Fatalf("Write after tombstone = %d, %v", n, err)
+	}
+	buf := make([]byte, bufferSize)
+	n, err := secondary.Read(buf)
+	if err != nil {
+		t.Fatalf("Read after tombstone failed: %v", err)
+	}
+	if got := string(buf[:n]); got != string(payload) {
+		t.Fatalf("payload = %q, want %q", got, payload)
+	}
+}
+
+func TestStandardLinkReserveInvalidCommitPublishesTombstone(t *testing.T) {
+	bufferCount := 2
+	bufferSize := 32
+	size := SizeStandardLink(bufferCount, bufferSize)
+	backing, offset := createAlignedBuffer(t, size)
+	defer runtime.KeepAlive(backing)
+
+	primary, err := OpenStandardLink(offset, bufferCount, bufferSize)
+	if err != nil {
+		t.Fatalf("Failed to create primary link: %v", err)
+	}
+	defer primary.Close()
+
+	secondary, err := OpenStandardLink(offset, bufferCount, bufferSize)
+	if err != nil {
+		t.Fatalf("Failed to create secondary link: %v", err)
+	}
+	defer secondary.Close()
+
+	reservation, err := primary.ReserveWrite()
+	if err != nil {
+		t.Fatalf("ReserveWrite failed: %v", err)
+	}
+	if err := reservation.Commit(bufferSize + 1); err != ErrBufferOverflow {
+		t.Fatalf("oversized Commit error = %v, want ErrBufferOverflow", err)
+	}
+
+	payload := []byte("valid")
+	if n, err := primary.Write(payload); err != nil || n != len(payload) {
+		t.Fatalf("Write after invalid Commit = %d, %v", n, err)
+	}
+
+	buf := make([]byte, bufferSize)
+	n, err := secondary.Read(buf)
+	if err != nil {
+		t.Fatalf("Read after invalid Commit failed: %v", err)
+	}
+	if got := string(buf[:n]); got != string(payload) {
+		t.Fatalf("payload = %q, want %q", got, payload)
+	}
+}
+
+func TestStandardLinkWriteReservationHoldsSlotUntilAbort(t *testing.T) {
+	bufferCount := 2
+	bufferSize := 32
+	size := SizeStandardLink(bufferCount, bufferSize)
+	backing, offset := createAlignedBuffer(t, size)
+	defer runtime.KeepAlive(backing)
+
+	primary, err := OpenStandardLink(offset, bufferCount, bufferSize)
+	if err != nil {
+		t.Fatalf("Failed to create primary link: %v", err)
+	}
+	defer primary.Close()
+
+	secondary, err := OpenStandardLink(offset, bufferCount, bufferSize)
+	if err != nil {
+		t.Fatalf("Failed to create secondary link: %v", err)
+	}
+	defer secondary.Close()
+
+	first, err := primary.ReserveWrite()
+	if err != nil {
+		t.Fatalf("first ReserveWrite failed: %v", err)
+	}
+	second, err := primary.ReserveWrite()
+	if err != nil {
+		t.Fatalf("second ReserveWrite failed: %v", err)
+	}
+
+	if err := primary.SetWriteDeadline(time.Now().Add(20 * time.Millisecond)); err != nil {
+		t.Fatalf("SetWriteDeadline failed: %v", err)
+	}
+	if _, err := primary.ReserveWrite(); err != ErrTimeout {
+		t.Fatalf("third ReserveWrite error = %v, want ErrTimeout", err)
+	}
+	if err := primary.SetWriteDeadline(time.Time{}); err != nil {
+		t.Fatalf("reset write deadline failed: %v", err)
+	}
+
+	if err := first.Abort(ErrCodeInvalidOp); err != nil {
+		t.Fatalf("first Abort failed: %v", err)
+	}
+	if err := second.Abort(ErrCodeInvalidOp); err != nil {
+		t.Fatalf("second Abort failed: %v", err)
+	}
+
+	if err := secondary.SetReadDeadline(time.Now().Add(20 * time.Millisecond)); err != nil {
+		t.Fatalf("SetReadDeadline failed: %v", err)
+	}
+	if _, err := secondary.ReserveRead(); err != ErrTimeout {
+		t.Fatalf("ReserveRead after abort tombstones error = %v, want ErrTimeout", err)
+	}
+	if err := secondary.SetReadDeadline(time.Time{}); err != nil {
+		t.Fatalf("reset read deadline failed: %v", err)
+	}
+
+	payload := []byte("after abort")
+	if n, err := primary.Write(payload); err != nil || n != len(payload) {
+		t.Fatalf("Write after Abort = %d, %v", n, err)
+	}
+	buf := make([]byte, bufferSize)
+	n, err := secondary.Read(buf)
+	if err != nil {
+		t.Fatalf("Read after Abort failed: %v", err)
+	}
+	if got := string(buf[:n]); got != string(payload) {
+		t.Fatalf("payload = %q, want %q", got, payload)
+	}
+}
+
+func TestStandardLinkReadReservationHoldsSlotUntilRelease(t *testing.T) {
+	bufferCount := 2
+	bufferSize := 32
+	size := SizeStandardLink(bufferCount, bufferSize)
+	backing, offset := createAlignedBuffer(t, size)
+	defer runtime.KeepAlive(backing)
+
+	primary, err := OpenStandardLink(offset, bufferCount, bufferSize)
+	if err != nil {
+		t.Fatalf("Failed to create primary link: %v", err)
+	}
+	defer primary.Close()
+
+	secondary, err := OpenStandardLink(offset, bufferCount, bufferSize)
+	if err != nil {
+		t.Fatalf("Failed to create secondary link: %v", err)
+	}
+	defer secondary.Close()
+
+	for i := 0; i < bufferCount; i++ {
+		payload := []byte{byte('A' + i)}
+		if n, err := primary.Write(payload); err != nil || n != len(payload) {
+			t.Fatalf("Write(%d) = %d, %v", i, n, err)
+		}
+	}
+
+	first, err := secondary.ReserveRead()
+	if err != nil {
+		t.Fatalf("first ReserveRead failed: %v", err)
+	}
+	second, err := secondary.ReserveRead()
+	if err != nil {
+		t.Fatalf("second ReserveRead failed: %v", err)
+	}
+
+	if err := primary.SetWriteDeadline(time.Now().Add(20 * time.Millisecond)); err != nil {
+		t.Fatalf("SetWriteDeadline failed: %v", err)
+	}
+	if _, err := primary.Write([]byte("blocked")); err != ErrTimeout {
+		t.Fatalf("Write while read slots held error = %v, want ErrTimeout", err)
+	}
+	if err := primary.SetWriteDeadline(time.Time{}); err != nil {
+		t.Fatalf("reset write deadline failed: %v", err)
+	}
+
+	if err := first.Release(); err != nil {
+		t.Fatalf("first Release failed: %v", err)
+	}
+	if err := second.Release(); err != nil {
+		t.Fatalf("second Release failed: %v", err)
+	}
+
+	payload := []byte("unblocked")
+	if n, err := primary.Write(payload); err != nil || n != len(payload) {
+		t.Fatalf("Write after Release = %d, %v", n, err)
+	}
+	buf := make([]byte, bufferSize)
+	n, err := secondary.Read(buf)
+	if err != nil {
+		t.Fatalf("Read after Release failed: %v", err)
+	}
+	if got := string(buf[:n]); got != string(payload) {
+		t.Fatalf("payload = %q, want %q", got, payload)
+	}
+}
+
 // TestAdvancedLinkCreation tests the creation of advanced links
 // It verifies that advanced links can be created with proper initialization
 func TestAdvancedLinkCreation(t *testing.T) {
@@ -675,7 +958,7 @@ func TestStandardLinkDeadlines(t *testing.T) {
 		t.Fatalf("SetWriteDeadline failed: %v", err)
 	}
 	if _, err := primary.Write(payload); err != ErrTimeout {
-		t.Fatalf("Write without free buffer error = %v, want ErrTimeout", err)
+		t.Fatalf("Write without an available ring slot error = %v, want ErrTimeout", err)
 	}
 }
 
@@ -1131,6 +1414,65 @@ func benchmarkStandardLinkZeroCopy(b *testing.B, payloadSize int) {
 		}
 		if n != payloadSize {
 			b.Fatalf("ReadZeroCopy size = %d, want %d", n, payloadSize)
+		}
+	}
+}
+
+func BenchmarkStandardLinkReserveCommitSizes(b *testing.B) {
+	for _, payloadSize := range []int{8, 64, 4096} {
+		b.Run(fmt.Sprintf("%dB", payloadSize), func(b *testing.B) {
+			benchmarkStandardLinkReserveCommit(b, payloadSize)
+		})
+	}
+}
+
+func benchmarkStandardLinkReserveCommit(b *testing.B, payloadSize int) {
+	bufferCount := 1024
+	bufferSize := payloadSize
+	if bufferSize < 8 {
+		bufferSize = 8
+	}
+
+	size := SizeStandardLink(bufferCount, bufferSize)
+	backing, offset := createAlignedBuffer(nil, size)
+	defer runtime.KeepAlive(backing)
+
+	primary, err := OpenStandardLink(offset, bufferCount, bufferSize)
+	if err != nil {
+		b.Fatalf("Failed to create primary link: %v", err)
+	}
+	defer primary.Close()
+
+	secondary, err := OpenStandardLink(offset, bufferCount, bufferSize)
+	if err != nil {
+		b.Fatalf("Failed to create secondary link: %v", err)
+	}
+	defer secondary.Close()
+
+	b.SetBytes(int64(payloadSize))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		writeReservation, err := primary.ReserveWrite()
+		if err != nil {
+			b.Fatalf("ReserveWrite failed: %v", err)
+		}
+		buffer := writeReservation.Buffer()
+		buffer[0] = byte(i)
+		buffer[payloadSize-1] = byte(i >> 8)
+		if err := writeReservation.Commit(payloadSize); err != nil {
+			b.Fatalf("Commit failed: %v", err)
+		}
+
+		readReservation, err := secondary.ReserveRead()
+		if err != nil {
+			b.Fatalf("ReserveRead failed: %v", err)
+		}
+		readBuffer := readReservation.Buffer()
+		_ = readBuffer[0]
+		_ = readBuffer[len(readBuffer)-1]
+		if err := readReservation.Release(); err != nil {
+			b.Fatalf("Release failed: %v", err)
 		}
 	}
 }

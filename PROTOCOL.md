@@ -56,6 +56,20 @@ In Go this is represented as `protocol.Packet [64]byte`. Use `protocol.NewPacket
 
 ## Standard Data Operation
 
+### `OpStandardLinkTombstone` (`0xFE`)
+
+Marks a claimed slot as intentionally empty.
+
+| Operand | Meaning |
+| --- | --- |
+| `Operand0` | `CopyID` or reservation ID |
+| `Operand1` | `BufferIndex`, diagnostic mirror of the claimed data-ring slot index |
+| `Operand2` | `ErrorCode` or reason code |
+| `Operand3..6` | Reserved, must be zero |
+
+Tombstones preserve ring progress when a producer reserves a slot but cannot
+publish a payload. Readers skip tombstones and release the slot immediately.
+
 ### `OpStandardLinkCopy` (`0xFF`)
 
 Transfers one payload stored in a direction-local buffer pool.
@@ -77,14 +91,14 @@ Each direction starts with every data-ring slot available. Slot `i` owns `BUFFER
 
 1. Sender claims one producer slot from the direction's data ring.
 2. Sender writes the payload into the same-index payload buffer, `BUFFERS[slot]`.
-3. Sender stores `OpStandardLinkCopy` in the claimed packet slot. `Operand1` mirrors `slot`.
+3. Sender stores `OpStandardLinkCopy` in the claimed packet slot. `Operand1` mirrors `slot`. If the reserved write cannot be completed, sender stores `OpStandardLinkTombstone` instead.
 4. Sender publishes the packet by advancing the slot sequence.
 
 ### Receive path
 
 1. Receiver claims one consumer slot from the direction's data ring.
 2. Receiver uses the claimed slot index to locate `BUFFERS[slot]` and validates `DataSize`.
-3. Receiver either copies payload bytes out of shared memory (`Read`) or passes the shared buffer directly to the callback (`ReadZeroCopy`).
+3. Receiver skips tombstones. For copy packets, it either copies payload bytes out of shared memory (`Read`) or passes the shared buffer directly to the callback (`ReadZeroCopy`/`ReserveRead`).
 4. Returning from the dequeue callback releases the packet slot and `BUFFERS[slot]` back to producers.
 
 This ties payload lifetime to ring-slot lifetime and prevents a producer from overwriting unread payloads.
@@ -104,6 +118,7 @@ The protocol has one bounded backpressure point per direction:
 - `Write` publishes at most one packet and rejects payloads larger than `bufferSize` with `ErrBufferOverflow`.
 - `Read` returns after delivering data from one packet, or from a previously saved local remainder.
 - `WriteZeroCopy` and `ReadZeroCopy` expose the slot-owned payload buffer directly for the duration of the callback.
+- `ReserveWrite` and `ReserveRead` expose explicit slot lifetime control. `ReserveWrite` must be finished with `Commit` or `Abort`; `ReserveRead` must be finished with `Release`.
 - If the caller's read buffer is smaller than the payload, the unread tail is copied into a local per-link remainder buffer and the shared payload buffer is released as soon as the dequeue callback returns.
 - `ReadFrom` and `WriteTo` are thin `net.PacketConn` adapters over `Read` and `Write`.
 
@@ -128,6 +143,8 @@ Implemented and covered by tests:
 - bidirectional StandardLink read/write
 - slot-owned payload-buffer transfer
 - zero-copy read/write callback APIs
+- Reserve/Commit read/write APIs
+- tombstone packets for abandoned write reservations
 - unread-buffer overwrite regression coverage
 - partial-read remainder handling
 - read/write deadline timeout behavior

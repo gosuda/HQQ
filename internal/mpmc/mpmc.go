@@ -21,6 +21,97 @@ type MPMCRing[T any] struct {
 	_data uintptr // Pointer to the ring data in shared memory
 }
 
+// ProducerSlot is a claimed producer-side ring slot.
+//
+// WARNING: A ProducerSlot holds a ring slot until Commit is called. It must be
+// committed promptly; if it is dropped, copied, or retained without committing,
+// the whole ring can suffer head-of-line (HOL) blocking. The pointer returned
+// by Value is invalid after Commit returns.
+type ProducerSlot[T any] struct {
+	slot uint64
+	pos  uint64
+	elem *_melem[T]
+	done bool
+}
+
+// Valid reports whether the slot was successfully reserved.
+func (s *ProducerSlot[T]) Valid() bool {
+	return s != nil && s.elem != nil && !s.done
+}
+
+// Slot returns the ring slot index.
+func (s *ProducerSlot[T]) Slot() uint64 {
+	if s == nil {
+		return 0
+	}
+	return s.slot
+}
+
+// Value returns a pointer to the slot element while the slot is reserved.
+func (s *ProducerSlot[T]) Value() *T {
+	if !s.Valid() {
+		return nil
+	}
+	return &s.elem._data
+}
+
+// Commit publishes the reserved producer slot. It returns false if the slot was
+// already committed or is invalid.
+func (s *ProducerSlot[T]) Commit() bool {
+	if !s.Valid() {
+		return false
+	}
+	atomic.StoreUint64(&s.elem._seq, s.pos+1)
+	s.done = true
+	return true
+}
+
+// ConsumerSlot is a claimed consumer-side ring slot.
+//
+// WARNING: A ConsumerSlot holds a ring slot until Release is called. It must be
+// released promptly; if it is dropped, copied, or retained without releasing,
+// the whole ring can suffer head-of-line (HOL) blocking. The pointer returned
+// by Value is invalid after Release returns.
+type ConsumerSlot[T any] struct {
+	slot uint64
+	pos  uint64
+	mask uint64
+	elem *_melem[T]
+	done bool
+}
+
+// Valid reports whether the slot was successfully reserved.
+func (s *ConsumerSlot[T]) Valid() bool {
+	return s != nil && s.elem != nil && !s.done
+}
+
+// Slot returns the ring slot index.
+func (s *ConsumerSlot[T]) Slot() uint64 {
+	if s == nil {
+		return 0
+	}
+	return s.slot
+}
+
+// Value returns a pointer to the slot element while the slot is reserved.
+func (s *ConsumerSlot[T]) Value() *T {
+	if !s.Valid() {
+		return nil
+	}
+	return &s.elem._data
+}
+
+// Release returns the reserved consumer slot to producers. It returns false if
+// the slot was already released or is invalid.
+func (s *ConsumerSlot[T]) Release() bool {
+	if !s.Valid() {
+		return false
+	}
+	atomic.StoreUint64(&s.elem._seq, s.pos+s.mask+1)
+	s.done = true
+	return true
+}
+
 // MPMCInit initializes a new MPMC ring buffer in shared memory
 // This function should be called only once per shared memory region.
 // Returns true if initialization was successful, false if already initialized.
@@ -258,6 +349,97 @@ func (m *MPMCRing[T]) EnqueueFunc(fn func(*T)) {
 	// Memory barrier to ensure the write to c._data happens before
 	// we update the sequence number
 	atomic.StoreUint64(&c._seq, p+1)
+}
+
+// ReserveProducer claims one producer slot and returns it to the caller.
+//
+// WARNING: The returned slot must be committed promptly. Failing to call Commit
+// can cause head-of-line (HOL) blocking for the whole ring.
+//
+//go:nocheckptr
+func (m *MPMCRing[T]) ReserveProducer() ProducerSlot[T] {
+	_h := (*_mring)(unsafe.Pointer(m._head))
+
+	var c *_melem[T]
+	p := atomic.LoadUint64(&_h.w) // Get current write position
+
+	for {
+		slot := p & m._mask
+		c = (*_melem[T])(unsafe.Pointer(m._data + unsafe.Sizeof(_melem[T]{})*uintptr(slot)))
+		seq := atomic.LoadUint64(&c._seq)
+		diff := seq - p
+
+		// Check if we can claim this slot
+		if diff == 0 {
+			// Try to atomically claim the slot by incrementing the write position
+			if atomic.CompareAndSwapUint64(&_h.w, p, p+1) {
+				return ProducerSlot[T]{
+					slot: slot,
+					pos:  p,
+					elem: c,
+				}
+			}
+		} else if diff > 0 {
+			// Another producer has claimed this slot, try again
+			p = atomic.LoadUint64(&_h.w)
+		} else {
+			// This should never happen in a correctly implemented ring buffer
+			panic("unreachable")
+		}
+
+		// Yield to other goroutines
+		runtime.Gosched()
+	}
+}
+
+// ReserveProducerWithContext is ReserveProducer with context cancellation
+// before a producer slot is claimed.
+//
+// WARNING: Once this returns a valid slot, context cancellation is no longer
+// checked. The returned slot must still be committed promptly.
+//
+//go:nocheckptr
+func (m *MPMCRing[T]) ReserveProducerWithContext(ctx context.Context) (ProducerSlot[T], bool) {
+	done := ctx.Done()
+	_h := (*_mring)(unsafe.Pointer(m._head))
+
+	var c *_melem[T]
+	p := atomic.LoadUint64(&_h.w) // Get current write position
+
+	for {
+		// Check for context cancellation
+		select {
+		case <-done:
+			return ProducerSlot[T]{}, false
+		default:
+		}
+
+		slot := p & m._mask
+		c = (*_melem[T])(unsafe.Pointer(m._data + unsafe.Sizeof(_melem[T]{})*uintptr(slot)))
+		seq := atomic.LoadUint64(&c._seq)
+		diff := seq - p
+
+		// Check if we can claim this slot
+		if diff == 0 {
+			// Try to atomically claim the slot by incrementing the write position
+			if atomic.CompareAndSwapUint64(&_h.w, p, p+1) {
+				return ProducerSlot[T]{
+					slot: slot,
+					pos:  p,
+					elem: c,
+				}, true
+			}
+		} else if diff > 0 {
+			// Another producer has claimed this slot, try again
+			p = atomic.LoadUint64(&_h.w)
+		} else {
+			// This should never happen in a correctly implemented ring buffer
+			panic("unreachable")
+		}
+
+		// Yield to other goroutines
+		runtime.Gosched()
+	}
 }
 
 // EnqueueZeroCopy claims one producer slot, passes the slot index and in-place
@@ -505,6 +687,105 @@ func (m *MPMCRing[T]) DequeueFunc(fn func(*T)) {
 	// Update the sequence number to make the slot available for producers
 	atomic.StoreUint64(&c._seq, p+m._mask+1)
 	return
+}
+
+// ReserveConsumer claims one consumer slot and returns it to the caller.
+//
+// WARNING: The returned slot must be released promptly. Failing to call Release
+// can cause head-of-line (HOL) blocking for the whole ring.
+//
+//go:nocheckptr
+func (m *MPMCRing[T]) ReserveConsumer() ConsumerSlot[T] {
+	_h := (*_mring)(unsafe.Pointer(m._head))
+
+	var c *_melem[T]
+	p := atomic.LoadUint64(&_h.r) // Get current read position
+
+	for {
+		slot := p & m._mask
+		c = (*_melem[T])(unsafe.Pointer(m._data + unsafe.Sizeof(_melem[T]{})*uintptr(slot)))
+		seq := atomic.LoadUint64(&c._seq)
+		diff := seq - (p + 1)
+
+		// Check if this element is ready to be consumed
+		if diff == 0 {
+			// Try to atomically claim the slot by incrementing the read position
+			if atomic.CompareAndSwapUint64(&_h.r, p, p+1) {
+				// Memory barrier to ensure the read of c._data happens after
+				// we've successfully claimed the slot
+				atomic.LoadUint64(&c._seq) // This acts as a memory barrier
+				return ConsumerSlot[T]{
+					slot: slot,
+					pos:  p,
+					mask: m._mask,
+					elem: c,
+				}
+			}
+		} else if diff > 0 {
+			// The element is not ready yet, try again
+			p = atomic.LoadUint64(&_h.r)
+		} else {
+			// This should never happen in a correctly implemented ring buffer
+			panic("unreachable")
+		}
+
+		// Yield to other goroutines
+		runtime.Gosched()
+	}
+}
+
+// ReserveConsumerWithContext is ReserveConsumer with context cancellation
+// before a consumer slot is claimed.
+//
+// WARNING: Once this returns a valid slot, context cancellation is no longer
+// checked. The returned slot must still be released promptly.
+//
+//go:nocheckptr
+func (m *MPMCRing[T]) ReserveConsumerWithContext(ctx context.Context) (ConsumerSlot[T], bool) {
+	done := ctx.Done()
+	_h := (*_mring)(unsafe.Pointer(m._head))
+
+	var c *_melem[T]
+	p := atomic.LoadUint64(&_h.r) // Get current read position
+
+	for {
+		// Check for context cancellation
+		select {
+		case <-done:
+			return ConsumerSlot[T]{}, false
+		default:
+		}
+
+		slot := p & m._mask
+		c = (*_melem[T])(unsafe.Pointer(m._data + unsafe.Sizeof(_melem[T]{})*uintptr(slot)))
+		seq := atomic.LoadUint64(&c._seq)
+		diff := seq - (p + 1)
+
+		// Check if this element is ready to be consumed
+		if diff == 0 {
+			// Try to atomically claim the slot by incrementing the read position
+			if atomic.CompareAndSwapUint64(&_h.r, p, p+1) {
+				// Memory barrier to ensure the read of c._data happens after
+				// we've successfully claimed the slot
+				atomic.LoadUint64(&c._seq) // This acts as a memory barrier
+				return ConsumerSlot[T]{
+					slot: slot,
+					pos:  p,
+					mask: m._mask,
+					elem: c,
+				}, true
+			}
+		} else if diff > 0 {
+			// The element is not ready yet, try again
+			p = atomic.LoadUint64(&_h.r)
+		} else {
+			// This should never happen in a correctly implemented ring buffer
+			panic("unreachable")
+		}
+
+		// Yield to other goroutines
+		runtime.Gosched()
+	}
 }
 
 // DequeueZeroCopy claims one consumer slot, passes the slot index and in-place

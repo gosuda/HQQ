@@ -127,6 +127,130 @@ type StandardLink struct {
 	writeDeadline time.Time // Deadline for PacketConn write operations
 }
 
+// StandardWriteReservation is a reserved StandardLink write slot.
+//
+// WARNING: A reservation holds an underlying ring slot. Commit or Abort must be
+// called promptly; if the reservation is dropped, copied, or retained without
+// finishing, the whole direction can suffer head-of-line (HOL) blocking. The
+// buffer returned by Buffer is invalid after Commit or Abort returns.
+type StandardWriteReservation struct {
+	slot   mpmc.ProducerSlot[protocol.Packet]
+	buffer []byte
+	copyID uint64
+	done   bool
+}
+
+// Slot returns the data-ring slot index owned by this reservation.
+func (r *StandardWriteReservation) Slot() uint64 {
+	if r == nil {
+		return 0
+	}
+	return r.slot.Slot()
+}
+
+// Buffer returns the slot-owned payload buffer while the reservation is active.
+func (r *StandardWriteReservation) Buffer() []byte {
+	if r == nil || r.done {
+		return nil
+	}
+	return r.buffer
+}
+
+// Commit publishes n bytes from the reserved payload buffer.
+func (r *StandardWriteReservation) Commit(n int) error {
+	if r == nil || r.done || !r.slot.Valid() {
+		return ErrInvalidOp
+	}
+	switch {
+	case n <= 0:
+		r.publishTombstone(ErrCodeInvalidSize)
+		return ErrInvalidSize
+	case n > len(r.buffer):
+		r.publishTombstone(ErrCodeBufferOverflow)
+		return ErrBufferOverflow
+	default:
+		*r.slot.Value() = protocol.NewStandardLinkCopyPacket(
+			r.copyID,
+			r.slot.Slot(),
+			uint64(n),
+		)
+		r.slot.Commit()
+		r.done = true
+		return nil
+	}
+}
+
+// Abort publishes a tombstone for the reserved slot. Readers skip tombstones.
+// Use Abort when a reserved write cannot be completed but ring progress must be
+// preserved.
+func (r *StandardWriteReservation) Abort(reason ErrorCode) error {
+	if r == nil || r.done || !r.slot.Valid() {
+		return ErrInvalidOp
+	}
+	if reason == 0 {
+		reason = ErrCodeInvalidOp
+	}
+	r.publishTombstone(reason)
+	return nil
+}
+
+func (r *StandardWriteReservation) publishTombstone(reason ErrorCode) {
+	*r.slot.Value() = protocol.NewStandardLinkTombstonePacket(
+		r.copyID,
+		r.slot.Slot(),
+		uint64(reason),
+	)
+	r.slot.Commit()
+	r.done = true
+}
+
+// StandardReadReservation is a reserved StandardLink read slot.
+//
+// WARNING: A reservation holds an underlying ring slot. Release must be called
+// promptly; if the reservation is dropped, copied, or retained without
+// releasing, the whole direction can suffer head-of-line (HOL) blocking. The
+// buffer returned by Buffer is invalid after Release returns.
+type StandardReadReservation struct {
+	slot   mpmc.ConsumerSlot[protocol.Packet]
+	link   *StandardLink
+	buffer []byte
+	local  bool
+	done   bool
+}
+
+// Slot returns the data-ring slot index owned by this reservation.
+func (r *StandardReadReservation) Slot() uint64 {
+	if r == nil || r.local {
+		return 0
+	}
+	return r.slot.Slot()
+}
+
+// Buffer returns the reserved payload buffer while the reservation is active.
+func (r *StandardReadReservation) Buffer() []byte {
+	if r == nil || r.done {
+		return nil
+	}
+	return r.buffer
+}
+
+// Release releases the reserved read slot.
+func (r *StandardReadReservation) Release() error {
+	if r == nil || r.done {
+		return ErrInvalidOp
+	}
+	if r.local {
+		r.link.receiveBuffer = r.link.receiveBuffer[:0]
+		r.done = true
+		return nil
+	}
+	if !r.slot.Release() {
+		return ErrInvalidOp
+	}
+	r.done = true
+	return nil
+}
+
 // Connection represents an active connection between processes
 type Connection struct {
 	id        uint64          // Unique connection identifier
@@ -287,35 +411,17 @@ func OpenStandardLink(offset uintptr, bufferCount int, bufferSize int) (*Standar
 // Read implements io.Reader for the link
 // It reads data from the link into the provided buffer
 func (l *StandardLink) Read(b []byte) (n int, err error) {
-	bN := len(b)
-	bOffset := 0
-
-	// Determine which ring and buffers to use based on link mode
-	var rx *mpmc.MPMCRing[protocol.Packet]
-	var rxBuffers [][]byte
-
-	if l.linkMode == LinkModeSecondary {
-		// Secondary reads from ring0 (Primary to Secondary)
-		rx = l.ring0
-		rxBuffers = l.buffers0
-	} else {
-		// Primary reads from ring1 (Secondary to Primary)
-		rx = l.ring1
-		rxBuffers = l.buffers1
+	if len(b) == 0 {
+		return 0, nil
 	}
-
-	// First, consume any remaining data in receiveBuffer
 	if len(l.receiveBuffer) > 0 {
 		copied := copy(b, l.receiveBuffer)
-		bOffset += copied
 		l.receiveBuffer = l.receiveBuffer[copied:]
-		if bOffset > 0 {
-			return bOffset, nil
-		}
+		return copied, nil
 	}
 
-	// If we still need more data, try to dequeue from the ring
-	for bOffset < bN {
+	rx, rxBuffers := l.rx()
+	for {
 		var readErr error
 		ok := l.dequeuePacketZeroCopy(rx, func(slot int, p *protocol.Packet) {
 			if slot < 0 || slot >= len(rxBuffers) {
@@ -323,13 +429,13 @@ func (l *StandardLink) Read(b []byte) (n int, err error) {
 				return
 			}
 
-			// Handle different packet types. For payload packets, the ring
-			// slot itself owns the payload buffer until this callback returns.
 			switch p.Op() {
+			case protocol.OpStandardLinkTombstone:
+				return
 			case protocol.OpStandardLinkCopy:
-				readErr = l.handleStandardLinkCopy(p, rxBuffers[slot], b[bOffset:], &bOffset)
+				readErr = l.handleStandardLinkCopy(p, rxBuffers[slot], b, &n)
 			case protocol.OpConnCopy:
-				readErr = l.handleConnCopy(p, rxBuffers[slot], b[bOffset:], &bOffset)
+				readErr = l.handleConnCopy(p, rxBuffers[slot], b, &n)
 			case protocol.OpError:
 				readErr = l.handleError(p)
 			default:
@@ -337,18 +443,15 @@ func (l *StandardLink) Read(b []byte) (n int, err error) {
 			}
 		})
 		if !ok {
-			return bOffset, ErrTimeout
+			return 0, ErrTimeout
 		}
 		if readErr != nil {
-			err = readErr
-			break
+			return n, readErr
 		}
-		if bOffset > 0 {
-			break
+		if n > 0 {
+			return n, nil
 		}
 	}
-
-	return bOffset, err
 }
 
 // Write implements io.Writer for the link
@@ -364,45 +467,105 @@ func (l *StandardLink) Write(b []byte) (n int, err error) {
 		return 0, ErrBufferOverflow
 	}
 
-	bOffset := 0
-
-	// Determine which ring and buffers to use based on link mode
-	var tx *mpmc.MPMCRing[protocol.Packet]
-	var txBuffers [][]byte
-
-	if l.linkMode == LinkModeSecondary {
-		// Secondary writes to ring1 (Secondary to Primary)
-		tx = l.ring1
-		txBuffers = l.buffers1
-	} else {
-		// Primary writes to ring0 (Primary to Secondary)
-		tx = l.ring0
-		txBuffers = l.buffers0
-	}
-
+	tx, txBuffers := l.tx()
 	copyID := l.idGenerator.Add(1)
 	ok := l.enqueuePacketZeroCopy(tx, func(slot int, p *protocol.Packet) {
 		if slot < 0 || slot >= len(txBuffers) {
-			*p = protocol.NewPacket(protocol.OpError, copyID, uint64(ErrCodeInvalidSize))
+			*p = protocol.NewStandardLinkTombstonePacket(copyID, uint64(slot), uint64(ErrCodeInvalidSize))
 			return
 		}
 
-		// The claimed ring slot owns the same-index payload buffer. The slot
-		// is not reusable until the receiver dequeues this packet.
-		copySize := min(bN, l.bufferSize)
-		race.Copy(txBuffers[slot], b[bOffset:bOffset+copySize])
-		bOffset += copySize
+		n = race.Copy(txBuffers[slot], b)
 		*p = protocol.NewStandardLinkCopyPacket(
 			copyID,
 			uint64(slot),
-			uint64(copySize),
+			uint64(n),
 		)
 	})
 	if !ok {
 		return 0, ErrTimeout
 	}
+	return n, nil
+}
 
-	return bOffset, nil
+// ReserveWrite reserves one ring-slot-owned payload buffer for writing.
+//
+// WARNING: Commit or Abort must be called promptly on the returned reservation;
+// otherwise the whole direction can suffer head-of-line (HOL) blocking.
+func (l *StandardLink) ReserveWrite() (StandardWriteReservation, error) {
+	tx, txBuffers := l.tx()
+	slot, ok := l.reservePacketProducer(tx)
+	if !ok {
+		return StandardWriteReservation{}, ErrTimeout
+	}
+
+	slotIndex := int(slot.Slot())
+	copyID := l.idGenerator.Add(1)
+	if slotIndex < 0 || slotIndex >= len(txBuffers) {
+		reservation := StandardWriteReservation{
+			slot:   slot,
+			copyID: copyID,
+		}
+		_ = reservation.Abort(ErrCodeInvalidSize)
+		return StandardWriteReservation{}, ErrInvalidSize
+	}
+
+	return StandardWriteReservation{
+		slot:   slot,
+		buffer: txBuffers[slotIndex],
+		copyID: copyID,
+	}, nil
+}
+
+// ReserveRead reserves one readable payload buffer.
+//
+// WARNING: Release must be called promptly on the returned reservation;
+// otherwise the whole direction can suffer head-of-line (HOL) blocking.
+func (l *StandardLink) ReserveRead() (StandardReadReservation, error) {
+	if len(l.receiveBuffer) > 0 {
+		return StandardReadReservation{
+			link:   l,
+			buffer: l.receiveBuffer,
+			local:  true,
+		}, nil
+	}
+
+	rx, rxBuffers := l.rx()
+	for {
+		slot, ok := l.reservePacketConsumer(rx)
+		if !ok {
+			return StandardReadReservation{}, ErrTimeout
+		}
+		slotIndex := int(slot.Slot())
+		if slotIndex < 0 || slotIndex >= len(rxBuffers) {
+			slot.Release()
+			return StandardReadReservation{}, ErrInvalidSize
+		}
+
+		p := slot.Value()
+		switch p.Op() {
+		case protocol.OpStandardLinkTombstone:
+			slot.Release()
+			continue
+		case protocol.OpStandardLinkCopy, protocol.OpConnCopy:
+			size := int(p.Operand(2))
+			if size <= 0 || size > len(rxBuffers[slotIndex]) {
+				slot.Release()
+				return StandardReadReservation{}, ErrInvalidSize
+			}
+			return StandardReadReservation{
+				slot:   slot,
+				buffer: rxBuffers[slotIndex][:size:size],
+			}, nil
+		case protocol.OpError:
+			err := l.handleError(p)
+			slot.Release()
+			return StandardReadReservation{}, err
+		default:
+			slot.Release()
+			return StandardReadReservation{}, ErrInvalidOp
+		}
+	}
 }
 
 // WriteZeroCopy writes one message by letting fn fill the ring-slot-owned
@@ -420,43 +583,29 @@ func (l *StandardLink) WriteZeroCopy(fn func(buffer []byte) (int, error)) (n int
 		return 0, ErrInvalidOp
 	}
 
-	var tx *mpmc.MPMCRing[protocol.Packet]
-	var txBuffers [][]byte
-	if l.linkMode == LinkModeSecondary {
-		tx = l.ring1
-		txBuffers = l.buffers1
-	} else {
-		tx = l.ring0
-		txBuffers = l.buffers0
-	}
-
+	tx, txBuffers := l.tx()
 	copyID := l.idGenerator.Add(1)
 	var callbackErr error
 	ok := l.enqueuePacketZeroCopy(tx, func(slot int, p *protocol.Packet) {
 		if slot < 0 || slot >= len(txBuffers) {
 			callbackErr = ErrInvalidSize
-			*p = protocol.NewPacket(protocol.OpError, copyID, uint64(ErrCodeInvalidSize))
+			*p = protocol.NewStandardLinkTombstonePacket(copyID, uint64(slot), uint64(ErrCodeInvalidSize))
 			return
 		}
 
-		buffer := txBuffers[slot]
-		n, callbackErr = fn(buffer)
-		if callbackErr != nil {
-			*p = protocol.NewPacket(protocol.OpError, copyID, uint64(ErrCodeInvalidOp))
-			return
-		}
-		if n <= 0 {
+		n, callbackErr = fn(txBuffers[slot])
+		switch {
+		case callbackErr != nil:
+			*p = protocol.NewStandardLinkTombstonePacket(copyID, uint64(slot), uint64(ErrCodeInvalidOp))
+		case n <= 0:
 			callbackErr = ErrInvalidSize
-			*p = protocol.NewPacket(protocol.OpError, copyID, uint64(ErrCodeInvalidSize))
-			return
-		}
-		if n > len(buffer) {
+			*p = protocol.NewStandardLinkTombstonePacket(copyID, uint64(slot), uint64(ErrCodeInvalidSize))
+		case n > len(txBuffers[slot]):
 			callbackErr = ErrBufferOverflow
-			*p = protocol.NewPacket(protocol.OpError, copyID, uint64(ErrCodeBufferOverflow))
-			return
+			*p = protocol.NewStandardLinkTombstonePacket(copyID, uint64(slot), uint64(ErrCodeBufferOverflow))
+		default:
+			*p = protocol.NewStandardLinkCopyPacket(copyID, uint64(slot), uint64(n))
 		}
-
-		*p = protocol.NewStandardLinkCopyPacket(copyID, uint64(slot), uint64(n))
 	})
 	if !ok {
 		return 0, ErrTimeout
@@ -486,49 +635,81 @@ func (l *StandardLink) ReadZeroCopy(fn func(buffer []byte) error) (n int, err er
 		n = len(buffer)
 		err = fn(buffer)
 		l.receiveBuffer = l.receiveBuffer[:0]
-		return n, err
-	}
-
-	var rx *mpmc.MPMCRing[protocol.Packet]
-	var rxBuffers [][]byte
-	if l.linkMode == LinkModeSecondary {
-		rx = l.ring0
-		rxBuffers = l.buffers0
-	} else {
-		rx = l.ring1
-		rxBuffers = l.buffers1
-	}
-
-	var readErr error
-	ok := l.dequeuePacketZeroCopy(rx, func(slot int, p *protocol.Packet) {
-		if slot < 0 || slot >= len(rxBuffers) {
-			readErr = ErrInvalidSize
-			return
+		if err != nil {
+			return 0, err
 		}
+		return n, nil
+	}
 
-		switch p.Op() {
-		case protocol.OpStandardLinkCopy, protocol.OpConnCopy:
-			size := int(p.Operand(2))
-			if size <= 0 || size > len(rxBuffers[slot]) {
+	rx, rxBuffers := l.rx()
+	for {
+		var readErr error
+		ok := l.dequeuePacketZeroCopy(rx, func(slot int, p *protocol.Packet) {
+			if slot < 0 || slot >= len(rxBuffers) {
 				readErr = ErrInvalidSize
 				return
 			}
-			buffer := rxBuffers[slot][:size:size]
-			n = size
-			readErr = fn(buffer)
-		case protocol.OpError:
-			readErr = l.handleError(p)
-		default:
-			readErr = ErrInvalidOp
+
+			switch p.Op() {
+			case protocol.OpStandardLinkTombstone:
+				return
+			case protocol.OpStandardLinkCopy, protocol.OpConnCopy:
+				size := int(p.Operand(2))
+				if size <= 0 || size > len(rxBuffers[slot]) {
+					readErr = ErrInvalidSize
+					return
+				}
+				buffer := rxBuffers[slot][:size:size]
+				n = size
+				readErr = fn(buffer)
+			case protocol.OpError:
+				readErr = l.handleError(p)
+			default:
+				readErr = ErrInvalidOp
+			}
+		})
+		if !ok {
+			return 0, ErrTimeout
 		}
-	})
-	if !ok {
-		return 0, ErrTimeout
+		if readErr != nil {
+			return 0, readErr
+		}
+		if n > 0 {
+			return n, nil
+		}
 	}
-	if readErr != nil {
-		return 0, readErr
+}
+
+func (l *StandardLink) tx() (*mpmc.MPMCRing[protocol.Packet], [][]byte) {
+	if l.linkMode == LinkModeSecondary {
+		return l.ring1, l.buffers1
 	}
-	return n, nil
+	return l.ring0, l.buffers0
+}
+
+func (l *StandardLink) rx() (*mpmc.MPMCRing[protocol.Packet], [][]byte) {
+	if l.linkMode == LinkModeSecondary {
+		return l.ring0, l.buffers0
+	}
+	return l.ring1, l.buffers1
+}
+
+func (l *StandardLink) reservePacketProducer(r *mpmc.MPMCRing[protocol.Packet]) (mpmc.ProducerSlot[protocol.Packet], bool) {
+	if l.writeDeadline.IsZero() {
+		return r.ReserveProducer(), true
+	}
+	ctx, cancel := contextForDeadline(l.writeDeadline)
+	defer cancel()
+	return r.ReserveProducerWithContext(ctx)
+}
+
+func (l *StandardLink) reservePacketConsumer(r *mpmc.MPMCRing[protocol.Packet]) (mpmc.ConsumerSlot[protocol.Packet], bool) {
+	if l.readDeadline.IsZero() {
+		return r.ReserveConsumer(), true
+	}
+	ctx, cancel := contextForDeadline(l.readDeadline)
+	defer cancel()
+	return r.ReserveConsumerWithContext(ctx)
 }
 
 func (l *StandardLink) dequeuePacketZeroCopy(r *mpmc.MPMCRing[protocol.Packet], fn func(slot int, p *protocol.Packet)) bool {

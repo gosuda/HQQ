@@ -1,8 +1,10 @@
 package mpmc_test
 
 import (
+	"context"
 	"sync"
 	"testing"
+	"time"
 	"unsafe"
 
 	"gosuda.org/hqq/internal/mpmc"
@@ -140,6 +142,88 @@ func TestMPMCZeroCopySlot(t *testing.T) {
 				t.Fatalf("value = %d, want %d", *v, i+100)
 			}
 		})
+	}
+}
+
+func TestMPMCReserveCommitRelease(t *testing.T) {
+	const size = 8
+	buffer := make([]byte, mpmc.SizeMPMCRing[uintptr](size))
+	b := uintptr(unsafe.Pointer(&buffer[0]))
+	if !mpmc.MPMCInit[uintptr](b, size) {
+		panic("failed to initialize offheap mpmc ring")
+	}
+	r := mpmc.MPMCAttach[uintptr](b, 0)
+
+	for i := uintptr(0); i < size; i++ {
+		slot := r.ReserveProducer()
+		if !slot.Valid() {
+			t.Fatalf("producer slot %d is invalid", i)
+		}
+		if slot.Slot() != uint64(i) {
+			t.Fatalf("producer slot = %d, want %d", slot.Slot(), i)
+		}
+		*slot.Value() = i + 1000
+		if !slot.Commit() {
+			t.Fatalf("producer slot %d did not commit", i)
+		}
+		if slot.Commit() {
+			t.Fatalf("producer slot %d committed twice", i)
+		}
+	}
+
+	for i := uintptr(0); i < size; i++ {
+		slot := r.ReserveConsumer()
+		if !slot.Valid() {
+			t.Fatalf("consumer slot %d is invalid", i)
+		}
+		if slot.Slot() != uint64(i) {
+			t.Fatalf("consumer slot = %d, want %d", slot.Slot(), i)
+		}
+		if got := *slot.Value(); got != i+1000 {
+			t.Fatalf("value = %d, want %d", got, i+1000)
+		}
+		if !slot.Release() {
+			t.Fatalf("consumer slot %d did not release", i)
+		}
+		if slot.Release() {
+			t.Fatalf("consumer slot %d released twice", i)
+		}
+	}
+}
+
+func TestMPMCReserveContextTimeout(t *testing.T) {
+	const size = 2
+	buffer := make([]byte, mpmc.SizeMPMCRing[uintptr](size))
+	b := uintptr(unsafe.Pointer(&buffer[0]))
+	if !mpmc.MPMCInit[uintptr](b, size) {
+		panic("failed to initialize offheap mpmc ring")
+	}
+	r := mpmc.MPMCAttach[uintptr](b, 0)
+
+	for i := uintptr(0); i < size; i++ {
+		slot := r.ReserveProducer()
+		*slot.Value() = i
+		slot.Commit()
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	if _, ok := r.ReserveProducerWithContext(ctx); ok {
+		t.Fatal("ReserveProducerWithContext succeeded on a full ring")
+	}
+
+	for i := uintptr(0); i < size; i++ {
+		slot := r.ReserveConsumer()
+		if got := *slot.Value(); got != i {
+			t.Fatalf("value = %d, want %d", got, i)
+		}
+		slot.Release()
+	}
+
+	ctx, cancel = context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	if _, ok := r.ReserveConsumerWithContext(ctx); ok {
+		t.Fatal("ReserveConsumerWithContext succeeded on an empty ring")
 	}
 }
 
@@ -356,6 +440,56 @@ func BenchmarkMPMCZeroCopyPayloadTypes(b *testing.B) {
 				r.DequeueZeroCopy(func(slot uint64, packet *protocol.Packet) {
 					_ = packet.Operand(1) + slot
 				})
+			}
+		})
+	})
+}
+
+func BenchmarkMPMCReservePayloadTypes(b *testing.B) {
+	const size = 128
+
+	b.Run("chunk16", func(b *testing.B) {
+		buffer := make([]byte, mpmc.SizeMPMCRing[_chunk](size))
+		bb := uintptr(unsafe.Pointer(&buffer[0]))
+		if !mpmc.MPMCInit[_chunk](bb, size) {
+			b.Fatal("failed to initialize offheap mpmc ring")
+		}
+
+		b.ReportAllocs()
+		b.RunParallel(func(p *testing.PB) {
+			r := mpmc.MPMCAttach[_chunk](bb, 0)
+			for p.Next() {
+				producer := r.ReserveProducer()
+				c := producer.Value()
+				c._pointer = uintptr(producer.Slot())
+				c._size = 2
+				producer.Commit()
+
+				consumer := r.ReserveConsumer()
+				_ = consumer.Value()._pointer + uintptr(consumer.Slot())
+				consumer.Release()
+			}
+		})
+	})
+
+	b.Run("packet64", func(b *testing.B) {
+		buffer := make([]byte, mpmc.SizeMPMCRing[protocol.Packet](size))
+		bb := uintptr(unsafe.Pointer(&buffer[0]))
+		if !mpmc.MPMCInit[protocol.Packet](bb, size) {
+			b.Fatal("failed to initialize offheap mpmc ring")
+		}
+
+		b.ReportAllocs()
+		b.RunParallel(func(p *testing.PB) {
+			r := mpmc.MPMCAttach[protocol.Packet](bb, 0)
+			for p.Next() {
+				producer := r.ReserveProducer()
+				*producer.Value() = protocol.NewStandardLinkCopyPacket(1, producer.Slot(), 3)
+				producer.Commit()
+
+				consumer := r.ReserveConsumer()
+				_ = consumer.Value().Operand(1) + consumer.Slot()
+				consumer.Release()
 			}
 		})
 	})

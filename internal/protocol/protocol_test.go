@@ -46,8 +46,27 @@ func TestPacketLittleEndianLayout(t *testing.T) {
 }
 
 func TestOpCodeStringIncludesStandardCopy(t *testing.T) {
+	if got := protocol.OpStandardLinkTombstone.String(); got != "OpStandardLinkTombstone" {
+		t.Fatalf("OpStandardLinkTombstone.String() = %q", got)
+	}
 	if got := protocol.OpStandardLinkCopy.String(); got != "OpStandardLinkCopy" {
 		t.Fatalf("OpStandardLinkCopy.String() = %q", got)
+	}
+}
+
+func TestTombstonePacketLayout(t *testing.T) {
+	p := protocol.NewStandardLinkTombstonePacket(11, 22, 33)
+	if got := p.Op(); got != protocol.OpStandardLinkTombstone {
+		t.Fatalf("Op() = %v, want %v", got, protocol.OpStandardLinkTombstone)
+	}
+	if got := p.Operand(0); got != 11 {
+		t.Fatalf("operand 0 = %d, want 11", got)
+	}
+	if got := p.Operand(1); got != 22 {
+		t.Fatalf("operand 1 = %d, want 22", got)
+	}
+	if got := p.Operand(2); got != 33 {
+		t.Fatalf("operand 2 = %d, want 33", got)
 	}
 }
 

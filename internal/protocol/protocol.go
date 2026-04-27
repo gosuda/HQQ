@@ -83,6 +83,18 @@ const (
 	//   Operand2: Negotiated capability flags
 	OpProtoAck OpCode = 0x06
 
+	// OpStandardLinkTombstone (0xFE): Empty Standard Protocol slot marker.
+	//
+	// Tombstones are published when a reserved producer slot must be abandoned
+	// after the ring write cursor has advanced. They keep the ring progressing
+	// without exposing a payload to readers.
+	//
+	// Operands:
+	//   Operand0: CopyID or reservation ID
+	//   Operand1: BufferIndex, diagnostic mirror of the claimed data-ring slot
+	//   Operand2: ErrorCode or reason code
+	OpStandardLinkTombstone OpCode = 0xFE
+
 	// OpStandardLinkCopy (0xFF): Standard Protocol data packet.
 	//
 	// Operands:
@@ -137,6 +149,16 @@ func NewStandardLinkCopyPacket(copyID, bufferIndex, size uint64) Packet {
 	binary.LittleEndian.PutUint64(p[8:16], copyID)
 	binary.LittleEndian.PutUint64(p[16:24], bufferIndex)
 	binary.LittleEndian.PutUint64(p[24:32], size)
+	return p
+}
+
+// NewStandardLinkTombstonePacket returns a StandardLink tombstone packet.
+func NewStandardLinkTombstonePacket(copyID, bufferIndex, reason uint64) Packet {
+	var p Packet
+	binary.LittleEndian.PutUint64(p[0:8], uint64(OpStandardLinkTombstone))
+	binary.LittleEndian.PutUint64(p[8:16], copyID)
+	binary.LittleEndian.PutUint64(p[16:24], bufferIndex)
+	binary.LittleEndian.PutUint64(p[24:32], reason)
 	return p
 }
 

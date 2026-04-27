@@ -11,6 +11,7 @@ Implemented for `StandardLink`:
 - bidirectional primary/secondary data transfer
 - lock-free data rings with ring-slot-owned payload buffers
 - zero-copy callback APIs for direct shared-buffer access
+- Reserve/Commit APIs for explicit slot lifetime control
 - implicit payload-buffer ownership transfer to prevent unread-buffer overwrite
 - `io.Reader`, `io.Writer`, and `net.PacketConn` style APIs
 - read/write deadline timeout behavior
@@ -121,6 +122,8 @@ func (l *StandardLink) Read(b []byte) (int, error)
 func (l *StandardLink) Write(b []byte) (int, error)
 func (l *StandardLink) ReadZeroCopy(func([]byte) error) (int, error)
 func (l *StandardLink) WriteZeroCopy(func([]byte) (int, error)) (int, error)
+func (l *StandardLink) ReserveRead() (StandardReadReservation, error)
+func (l *StandardLink) ReserveWrite() (StandardWriteReservation, error)
 func (l *StandardLink) Close() error
 func (l *StandardLink) GetMode() LinkMode
 func (l *StandardLink) GetType() LinkType
@@ -129,6 +132,28 @@ func (l *StandardLink) GetType() LinkType
 `ReadZeroCopy` and `WriteZeroCopy` expose the shared payload buffer directly for the duration of the callback.
 
 > WARNING: The callback runs while the underlying ring slot is claimed. It must return promptly; if it blocks or never returns, the whole ring can suffer head-of-line (HOL) blocking. Do not retain the buffer after the callback returns.
+
+`ReserveRead` and `ReserveWrite` expose lower-level explicit lifetime control:
+
+```go
+write, err := primary.ReserveWrite()
+if err != nil {
+    panic(err)
+}
+n := copy(write.Buffer(), []byte("hello"))
+if err := write.Commit(n); err != nil {
+    panic(err)
+}
+
+read, err := secondary.ReserveRead()
+if err != nil {
+    panic(err)
+}
+fmt.Println(string(read.Buffer()))
+_ = read.Release()
+```
+
+> WARNING: Reserved slots must be finished. Writers must call `Commit` or `Abort`; readers must call `Release`. Dropping a reservation can cause head-of-line (HOL) blocking for the whole direction. `Abort` publishes a tombstone packet so readers can skip the abandoned slot and preserve ring progress.
 
 `StandardLink` also implements `net.PacketConn`:
 
