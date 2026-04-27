@@ -34,7 +34,7 @@ DATA_RING_1   protocol.Packet ring, Secondary -> Primary
 BUFFERS_1     fixed payload buffers for direction 1
 ```
 
-Each data-ring slot owns the same-index payload buffer. Senders claim a ring slot, fill `BUFFERS[slot]`, then publish an `OpStandardLinkCopy` packet. Receivers claim the packet slot and either copy the payload out (`Read`) or process it in-place (`ReadZeroCopy`); returning from the dequeue callback releases the slot and its buffer for reuse. This keeps the hot path lock-free without a separate free-buffer ring.
+Each data-ring slot owns the same-index payload buffer. Senders claim a ring slot, fill `BUFFERS[slot]`, then publish an `OpStandardLinkCopy` packet. Receivers claim the packet slot and either copy the payload out (`Read`) or process it in-place (`ReadZeroCopy`); returning from the dequeue callback releases the slot and its buffer for reuse.
 
 See [PROTOCOL.md](PROTOCOL.md) for the full Standard Protocol specification.
 

@@ -9,7 +9,7 @@ import "encoding/binary"
 // shared-memory ABI does not depend on uintptr width, Go struct padding, or the
 // local machine's native byte order.
 const (
-	HQQProtocolMajorVersion = 2
+	HQQProtocolMajorVersion = 1
 	HQQProtocolMinorVersion = 0
 )
 

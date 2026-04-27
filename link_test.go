@@ -414,7 +414,7 @@ func TestAdvancedLinkProtocolNegotiation(t *testing.T) {
 
 	// Test negotiation
 	ctx := context.Background()
-	version := ProtocolVersion{Major: 1, Minor: 1}
+	version := ProtocolVersion{Major: 1, Minor: 0}
 	features := FeatureCompression | FeatureFlowControl
 
 	// Start negotiation in goroutines
@@ -464,8 +464,8 @@ func TestAdvancedLinkProtocolNegotiation(t *testing.T) {
 
 	// Check negotiated version
 	negotiatedVersion := primary.GetNegotiatedVersion()
-	if negotiatedVersion.Major != 1 || negotiatedVersion.Minor != 1 {
-		t.Errorf("Expected version 1.1, got %d.%d", negotiatedVersion.Major, negotiatedVersion.Minor)
+	if negotiatedVersion.Major != 1 || negotiatedVersion.Minor != 0 {
+		t.Errorf("Expected version 1.0, got %d.%d", negotiatedVersion.Major, negotiatedVersion.Minor)
 	}
 
 	// Check negotiated features
@@ -514,7 +514,7 @@ func TestAdvancedLinkReadWrite(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	version := ProtocolVersion{Major: 1, Minor: 1}
+	version := ProtocolVersion{Major: 1, Minor: 0}
 	features := FeatureCompression | FeatureFlowControl
 
 	var wg sync.WaitGroup
@@ -560,8 +560,8 @@ func TestAdvancedLinkReadWrite(t *testing.T) {
 
 	// Check negotiated version
 	negotiatedVersion := primary.GetNegotiatedVersion()
-	if negotiatedVersion.Major != 1 || negotiatedVersion.Minor != 1 {
-		t.Errorf("Expected version 1.1, got %d.%d", negotiatedVersion.Major, negotiatedVersion.Minor)
+	if negotiatedVersion.Major != 1 || negotiatedVersion.Minor != 0 {
+		t.Errorf("Expected version 1.0, got %d.%d", negotiatedVersion.Major, negotiatedVersion.Minor)
 	}
 
 	// Check negotiated features
@@ -836,7 +836,7 @@ func TestAdvancedLinkNegotiationTimeout(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
 	defer cancel()
 
-	version := ProtocolVersion{Major: 1, Minor: 1}
+	version := ProtocolVersion{Major: 1, Minor: 0}
 	features := FeatureCompression
 
 	success, err := advLink.NegotiateProtocol(ctx, version, features)

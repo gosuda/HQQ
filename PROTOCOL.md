@@ -4,7 +4,7 @@
 
 This document defines the **Standard Protocol** used by `StandardLink`. The goal is a fast, lock-free, shared-memory data path for one primary endpoint and one secondary endpoint.
 
-Current Standard Protocol version: **2.0**. Version 2.0 removes the separate free-buffer ring and derives payload ownership from the claimed data-ring slot.
+Current Standard Protocol version: **1.0**.
 
 Advanced features such as protocol negotiation, logical connections, compression, encryption, QoS, and reliable delivery are outside the Standard Protocol data path. They may be layered later, but `StandardLink` is intentionally kept small and deterministic.
 
@@ -12,7 +12,7 @@ Advanced features such as protocol negotiation, logical connections, compression
 
 1. **Fixed ABI**: packets have a stable byte layout independent of Go struct padding or `uintptr` width.
 2. **Little-endian encoding**: all packet words are encoded with `binary.LittleEndian`.
-3. **Lock-free ownership transfer**: data ring slots own same-index payload buffers; no mutex or separate free-buffer ring is required for the StandardLink hot path.
+3. **Lock-free ownership transfer**: data ring slots own same-index payload buffers; no mutex is required for the StandardLink hot path.
 4. **No unread-buffer overwrite**: a payload buffer is recycled only after the receiver releases the owning ring slot.
 5. **Bounded memory**: all rings and payload buffers are allocated up front.
 
@@ -87,7 +87,7 @@ Each direction starts with every data-ring slot available. Slot `i` owns `BUFFER
 3. Receiver either copies payload bytes out of shared memory (`Read`) or passes the shared buffer directly to the callback (`ReadZeroCopy`).
 4. Returning from the dequeue callback releases the packet slot and `BUFFERS[slot]` back to producers.
 
-This ties payload lifetime to ring-slot lifetime and prevents a producer from overwriting unread payloads without paying for a second free-buffer ring.
+This ties payload lifetime to ring-slot lifetime and prevents a producer from overwriting unread payloads.
 
 > WARNING: Zero-copy callbacks run while the underlying ring slot is claimed. They must return promptly; if they block or never return, the whole ring can suffer head-of-line (HOL) blocking. The shared buffer must not be retained after the callback returns.
 
@@ -126,7 +126,7 @@ Implemented and covered by tests:
 - fixed-size little-endian packet ABI
 - StandardLink primary/secondary creation
 - bidirectional StandardLink read/write
-- slot-owned payload-buffer transfer without a free-buffer ring
+- slot-owned payload-buffer transfer
 - zero-copy read/write callback APIs
 - unread-buffer overwrite regression coverage
 - partial-read remainder handling
