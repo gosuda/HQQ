@@ -15,8 +15,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  standardlink:
-    name: StandardLink benchmarks
+  benchmarks:
+    name: HQQ benchmarks
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
@@ -31,27 +31,29 @@ jobs:
           check-latest: true
           cache: true
 
-      - name: Install profiling dependencies
+      - name: Install Linux profiling dependencies
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y graphviz
+          dot -V
 
       - name: Restore benchmark history
         id: benchmark-history
         uses: actions/cache/restore@v5.0.5
         with:
           path: benchmark-data.json
-          key: ${{ runner.os }}-standardlink-benchmark-${{ github.run_id }}
+          key: ${{ runner.os }}-hqq-benchmark-${{ github.run_id }}
           restore-keys: |
-            ${{ runner.os }}-standardlink-benchmark-
+            ${{ runner.os }}-hqq-benchmark-
 
-      - name: Run StandardLink benchmarks
+      - name: Run HQQ benchmarks
         run: |
           mkdir -p benchmark-artifacts/pprof
           go test . \
             -timeout 2m \
             -run '^$' \
-            -bench 'BenchmarkStandardLink' \
+            -bench 'Benchmark(StandardLink|AdvancedLink)' \
             -benchmem \
             -benchtime 1000x \
             -count 3 \
@@ -68,7 +70,7 @@ jobs:
       - name: Publish benchmark summary
         uses: benchmark-action/github-action-benchmark@v1.22.0
         with:
-          name: StandardLink Go Benchmark
+          name: HQQ Go Benchmark
           tool: go
           output-file-path: benchmark.txt
           external-data-json-path: benchmark-data.json
@@ -79,6 +81,7 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Render pprof reports
+        if: runner.os == 'Linux'
         run: |
           go tool pprof -top -nodecount=50 \
             benchmark-artifacts/pprof/hqq.test \
@@ -101,7 +104,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7.0.1
         with:
-          name: standardlink-benchmark-artifacts
+          name: hqq-benchmark-artifacts-${{ runner.os }}
           path: |
             benchmark.txt
             benchmark-data.json
@@ -114,4 +117,4 @@ jobs:
         uses: actions/cache/save@v5.0.5
         with:
           path: benchmark-data.json
-          key: ${{ runner.os }}-standardlink-benchmark-${{ github.run_id }}
+          key: ${{ runner.os }}-hqq-benchmark-${{ github.run_id }}
