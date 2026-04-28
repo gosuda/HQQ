@@ -22,10 +22,10 @@ const (
 	fileMapRead  = 0x0004
 )
 
-func nsCreateFileMapping(hFile syscall.Handle, lpFileMappingAttributes uintptr, flProtect uint32, MaximumSize uint64, lpName string) (syscall.Handle, error) {
+func nsCreateFileMapping(hFile syscall.Handle, lpFileMappingAttributes uintptr, flProtect uint32, MaximumSize uint64, lpName string) (syscall.Handle, bool, error) {
 	b, err := syscall.UTF16PtrFromString(lpName)
 	if err != nil {
-		return syscall.InvalidHandle, err
+		return syscall.InvalidHandle, false, err
 	}
 
 	high := uint32(MaximumSize >> 32)
@@ -45,10 +45,10 @@ func nsCreateFileMapping(hFile syscall.Handle, lpFileMappingAttributes uintptr, 
 		if err == syscall.Errno(0) {
 			err = syscall.EINVAL
 		}
-		return syscall.InvalidHandle, err
+		return syscall.InvalidHandle, false, err
 	}
 
-	return syscall.Handle(ret), err
+	return syscall.Handle(ret), err == ERROR_ALREADY_EXISTS, nil
 }
 
 func nsOpenFileMapping(dwDesiredAccess uint32, bInheritHandle bool, lpName string) (syscall.Handle, error) {
@@ -92,21 +92,21 @@ func OpenSharedMemory(name string, size int, flags int, mode os.FileMode) (*Shar
 		prot := 0
 		if flags&os.O_RDWR != 0 {
 			prot = syscall.PAGE_READWRITE
-		} else if flags == os.O_RDONLY {
+		} else {
 			prot = syscall.PAGE_READONLY
 		}
 
-		fd, err := nsCreateFileMapping(
+		fd, alreadyExists, err := nsCreateFileMapping(
 			syscall.InvalidHandle,
 			0,
 			uint32(prot),
 			uint64(size),
 			name,
 		)
-		if err != nil && err != ERROR_ALREADY_EXISTS {
+		if err != nil {
 			return nil, err
 		}
-		if err == ERROR_ALREADY_EXISTS {
+		if alreadyExists {
 			if flags&os.O_EXCL != 0 {
 				_ = syscall.CloseHandle(fd)
 				return nil, os.ErrExist

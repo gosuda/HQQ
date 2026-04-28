@@ -31,6 +31,9 @@ func nsMapViewOfFile(hFile syscall.Handle, dwDesiredAccess uint32, FileOffset ui
 		uintptr(dwNumberOfBytesToMap),
 	)
 	if ret == 0 {
+		if err == syscall.Errno(0) {
+			err = syscall.EINVAL
+		}
 		return 0, err
 	}
 	return ret, nil
