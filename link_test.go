@@ -82,6 +82,24 @@ func TestLargeMessageThresholdAPI(t *testing.T) {
 	}
 }
 
+func TestAdvancedProtocolBitValuesMatchSpec(t *testing.T) {
+	if FeatureLargeCopy != 1<<0 {
+		t.Fatalf("FeatureLargeCopy = %d, want %d", FeatureLargeCopy, 1<<0)
+	}
+	if FeatureRequestResponse != 1<<1 {
+		t.Fatalf("FeatureRequestResponse = %d, want %d", FeatureRequestResponse, 1<<1)
+	}
+	if CapabilityLargeBuffers != 1<<0 {
+		t.Fatalf("CapabilityLargeBuffers = %d, want %d", CapabilityLargeBuffers, 1<<0)
+	}
+	if CapabilityHighThroughput != 1<<1 {
+		t.Fatalf("CapabilityHighThroughput = %d, want %d", CapabilityHighThroughput, 1<<1)
+	}
+	if CapabilityLowLatency != 1<<2 {
+		t.Fatalf("CapabilityLowLatency = %d, want %d", CapabilityLowLatency, 1<<2)
+	}
+}
+
 const hqqMultiProcessChildEnv = "HQQ_MULTIPROCESS_CHILD"
 
 func TestHQQMultiProcessChild(t *testing.T) {
@@ -140,7 +158,7 @@ func TestMultiProcessAdvancedLink(t *testing.T) {
 		bufferSize  = 64
 	)
 	name, smem, mapped, primary := createNamedAdvancedLink(t, bufferCount, bufferSize)
-	defer cleanupNamedLink(t, smem, mapped, primary.slink, true)
+	defer cleanupNamedAdvancedLink(t, smem, mapped, primary, true)
 
 	child, output := startMultiProcessChild(t, "advanced", name, int(SizeStandardLink(bufferCount, bufferSize)), bufferCount, bufferSize)
 
@@ -329,6 +347,28 @@ func cleanupNamedLink(t *testing.T, smem *shm.SharedMemory, mapped []byte, link 
 	}
 }
 
+func cleanupNamedAdvancedLink(t *testing.T, smem *shm.SharedMemory, mapped []byte, link *AdvancedLink, remove bool) {
+	t.Helper()
+	if link != nil {
+		_ = link.Close()
+	}
+	if mapped != nil {
+		if err := mmap.UnMap(mapped); err != nil {
+			t.Fatalf("mmap.UnMap failed: %v", err)
+		}
+	}
+	if smem != nil {
+		if err := smem.Close(); err != nil {
+			t.Fatalf("shared memory close failed: %v", err)
+		}
+		if remove {
+			if err := smem.Delete(); err != nil && !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("shared memory delete failed: %v", err)
+			}
+		}
+	}
+}
+
 func runStandardLinkChildProcess(t *testing.T, name string, size, bufferCount, bufferSize int) {
 	smem, mapped, link := openNamedStandardLink(t, name, size, bufferCount, bufferSize)
 	defer cleanupNamedLink(t, smem, mapped, link, false)
@@ -352,7 +392,7 @@ func runStandardLinkChildProcess(t *testing.T, name string, size, bufferCount, b
 
 func runAdvancedLinkChildProcess(t *testing.T, name string, size, bufferCount, bufferSize int) {
 	smem, mapped, link := openNamedAdvancedLink(t, name, size, bufferCount, bufferSize)
-	defer cleanupNamedLink(t, smem, mapped, link.slink, false)
+	defer cleanupNamedAdvancedLink(t, smem, mapped, link, false)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -1396,6 +1436,48 @@ func newAdvancedPair(t *testing.T, bufferCount, bufferSize int) ([]byte, *Advanc
 	return backing, primary, secondary
 }
 
+func newAdvancedPairWithOptions(t *testing.T, bufferCount, bufferSize int, primaryOptions, secondaryOptions AdvancedOptions) ([]byte, *AdvancedLink, *AdvancedLink) {
+	t.Helper()
+	size := SizeStandardLink(bufferCount, bufferSize)
+	backing, offset := createAlignedBuffer(t, size)
+
+	primary, err := NewAdvancedLinkWithOptions(offset, bufferCount, bufferSize, primaryOptions)
+	if err != nil {
+		t.Fatalf("Failed to create primary advanced link: %v", err)
+	}
+	secondary, err := NewAdvancedLinkWithOptions(offset, bufferCount, bufferSize, secondaryOptions)
+	if err != nil {
+		primary.Close()
+		t.Fatalf("Failed to create secondary advanced link: %v", err)
+	}
+	return backing, primary, secondary
+}
+
+func TestAdvancedLinkRequiresNegotiation(t *testing.T) {
+	backing, link, peer := newAdvancedPair(t, 8, 32)
+	defer runtime.KeepAlive(backing)
+	defer link.Close()
+	defer peer.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if _, err := link.SendLarge(ctx, 0, []byte("payload")); err != ErrInvalidOp {
+		t.Fatalf("SendLarge before negotiation = %v, want ErrInvalidOp", err)
+	}
+	if _, err := link.Call(ctx, 1, []byte("payload")); err != ErrInvalidOp {
+		t.Fatalf("Call before negotiation = %v, want ErrInvalidOp", err)
+	}
+	if _, err := link.Receive(ctx); err != ErrInvalidOp {
+		t.Fatalf("Receive before negotiation = %v, want ErrInvalidOp", err)
+	}
+	if err := link.Listen(ctx); err != ErrInvalidOp {
+		t.Fatalf("Listen before negotiation = %v, want ErrInvalidOp", err)
+	}
+	if _, err := link.Dial(ctx); err != ErrInvalidOp {
+		t.Fatalf("Dial before negotiation = %v, want ErrInvalidOp", err)
+	}
+}
+
 func TestAdvancedLinkLargeCopy(t *testing.T) {
 	backing, primary, secondary := newAdvancedPair(t, 8, 16)
 	defer runtime.KeepAlive(backing)
@@ -1547,6 +1629,168 @@ func TestAdvancedLinkEmptyRequestResponse(t *testing.T) {
 	}
 }
 
+func TestAdvancedLinkConcurrentCallsUsePendingTable(t *testing.T) {
+	const requestCount = 16
+	backing, client, server := newAdvancedPair(t, 64, 32)
+	defer runtime.KeepAlive(backing)
+	defer client.Close()
+	defer server.Close()
+	negotiateAdvancedPair(t, client, server)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	serverErr := make(chan error, 1)
+	go func() {
+		requests := make([]AdvancedMessage, 0, requestCount)
+		for i := 0; i < requestCount; i++ {
+			request, err := server.Receive(ctx)
+			if err != nil {
+				serverErr <- err
+				return
+			}
+			if !request.IsRequest() {
+				serverErr <- fmt.Errorf("message flags %#x, want request", request.Flags)
+				return
+			}
+			requests = append(requests, request)
+		}
+		for i := len(requests) - 1; i >= 0; i-- {
+			request := requests[i]
+			response := []byte(fmt.Sprintf("response-%02d", request.MethodID))
+			if err := server.Respond(ctx, request, 200, response); err != nil {
+				serverErr <- err
+				return
+			}
+		}
+		serverErr <- nil
+	}()
+
+	var wg sync.WaitGroup
+	errCh := make(chan error, requestCount)
+	for i := 0; i < requestCount; i++ {
+		i := i
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			request := []byte(fmt.Sprintf("request-%02d", i))
+			response, err := client.Call(ctx, uint64(i), request)
+			if err != nil {
+				errCh <- fmt.Errorf("Call(%d) failed: %w", i, err)
+				return
+			}
+			want := fmt.Sprintf("response-%02d", i)
+			if string(response) != want {
+				errCh <- fmt.Errorf("Call(%d) response = %q, want %q", i, response, want)
+			}
+		}()
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatalf("server failed: %v", err)
+	}
+}
+
+func TestAdvancedLinkLogicalStreamDialAcceptAndCallOn(t *testing.T) {
+	backing, client, server := newAdvancedPair(t, 16, 32)
+	defer runtime.KeepAlive(backing)
+	defer client.Close()
+	defer server.Close()
+	negotiateAdvancedPair(t, client, server)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := server.Listen(ctx); err != nil {
+		t.Fatalf("Listen failed: %v", err)
+	}
+	accepted := make(chan uint64, 1)
+	acceptErr := make(chan error, 1)
+	go func() {
+		connID, err := server.Accept(ctx)
+		if err != nil {
+			acceptErr <- err
+			return
+		}
+		accepted <- connID
+	}()
+
+	connID, err := client.Dial(ctx)
+	if err != nil {
+		t.Fatalf("Dial failed: %v", err)
+	}
+	select {
+	case got := <-accepted:
+		if got != connID {
+			t.Fatalf("accepted connection = %d, want %d", got, connID)
+		}
+	case err := <-acceptErr:
+		t.Fatalf("Accept failed: %v", err)
+	case <-ctx.Done():
+		t.Fatalf("Accept timed out: %v", ctx.Err())
+	}
+
+	serverErr := make(chan error, 1)
+	go func() {
+		request, err := server.Receive(ctx)
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		if request.ConnectionID != connID || !request.IsRequest() {
+			serverErr <- fmt.Errorf("request conn=%d flags=%#x", request.ConnectionID, request.Flags)
+			return
+		}
+		serverErr <- server.Respond(ctx, request, 0, []byte("stream-ok"))
+	}()
+	response, err := client.CallOn(ctx, connID, 9, []byte("stream-ping"))
+	if err != nil {
+		t.Fatalf("CallOn failed: %v", err)
+	}
+	if !response.IsResponse() || string(response.Payload) != "stream-ok" {
+		t.Fatalf("response flags=%#x payload=%q", response.Flags, response.Payload)
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatalf("server failed: %v", err)
+	}
+}
+
+func TestAdvancedLinkMaxMessageSizeGuardsSendAndReceive(t *testing.T) {
+	t.Run("send", func(t *testing.T) {
+		backing, primary, secondary := newAdvancedPairWithOptions(t, 8, 16, AdvancedOptions{MaxMessageSize: 32}, AdvancedOptions{})
+		defer runtime.KeepAlive(backing)
+		defer primary.Close()
+		defer secondary.Close()
+		negotiateAdvancedPair(t, primary, secondary)
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if _, err := primary.SendLarge(ctx, 0, make([]byte, 33)); err != ErrBufferOverflow {
+			t.Fatalf("SendLarge oversized error = %v, want ErrBufferOverflow", err)
+		}
+	})
+
+	t.Run("receive", func(t *testing.T) {
+		backing, primary, secondary := newAdvancedPairWithOptions(t, 16, 16, AdvancedOptions{}, AdvancedOptions{MaxMessageSize: 32})
+		defer runtime.KeepAlive(backing)
+		defer primary.Close()
+		defer secondary.Close()
+		negotiateAdvancedPair(t, primary, secondary)
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if _, err := primary.SendLarge(ctx, 0, make([]byte, 33)); err != nil {
+			t.Fatalf("SendLarge failed: %v", err)
+		}
+		if _, err := secondary.Receive(ctx); err != ErrBufferOverflow {
+			t.Fatalf("Receive oversized error = %v, want ErrBufferOverflow", err)
+		}
+	})
+}
+
 // TestAdvancedLinkStatistics tests statistics collection for advanced links
 // It verifies that statistics are properly initialized and tracked
 func TestAdvancedLinkStatistics(t *testing.T) {
@@ -1598,6 +1842,56 @@ func TestStandardLinkErrors(t *testing.T) {
 	size = SizeStandardLink(6, 4096)
 	if size != 0 {
 		t.Error("SizeStandardLink should return 0 for non-power-of-two buffer count")
+	}
+}
+
+func TestStandardLinkSuperblockRejectsMismatchedConfig(t *testing.T) {
+	size := SizeStandardLink(8, 64)
+	backing, offset := createAlignedBuffer(t, size)
+	defer runtime.KeepAlive(backing)
+
+	primary, err := OpenStandardLink(offset, 8, 64)
+	if err != nil {
+		t.Fatalf("OpenStandardLink primary failed: %v", err)
+	}
+	defer primary.Close()
+
+	if _, err := OpenStandardLink(offset, 16, 64); err != ErrInvalidSize {
+		t.Fatalf("OpenStandardLink with mismatched bufferCount = %v, want ErrInvalidSize", err)
+	}
+	if _, err := OpenStandardLink(offset, 8, 128); err != ErrInvalidSize {
+		t.Fatalf("OpenStandardLink with mismatched bufferSize = %v, want ErrInvalidSize", err)
+	}
+}
+
+func TestNamedStandardLinkAPI(t *testing.T) {
+	name := newPortableSharedMemoryName()
+	primary, err := CreateStandardLink(name, 8, 64, 0600)
+	if err != nil {
+		if errors.Is(err, syscall.ENOSYS) {
+			t.Skipf("shared memory is not supported on this platform: %v", err)
+		}
+		t.Fatalf("CreateStandardLink failed: %v", err)
+	}
+	defer primary.Close()
+
+	secondary, err := OpenNamedStandardLink(name, 8, 64)
+	if err != nil {
+		t.Fatalf("OpenNamedStandardLink failed: %v", err)
+	}
+	defer secondary.Close()
+
+	payload := []byte("named standard link")
+	if n, err := primary.Write(payload); err != nil || n != len(payload) {
+		t.Fatalf("Write = %d, %v", n, err)
+	}
+	buf := make([]byte, 64)
+	n, err := secondary.Read(buf)
+	if err != nil {
+		t.Fatalf("Read failed: %v", err)
+	}
+	if string(buf[:n]) != string(payload) {
+		t.Fatalf("Read = %q, want %q", buf[:n], payload)
 	}
 }
 

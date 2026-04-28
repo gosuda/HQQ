@@ -686,7 +686,6 @@ func (m *MPMCRing[T]) DequeueFunc(fn func(*T)) {
 
 	// Update the sequence number to make the slot available for producers
 	atomic.StoreUint64(&c._seq, p+m._mask+1)
-	return
 }
 
 // ReserveConsumer claims one consumer slot and returns it to the caller.

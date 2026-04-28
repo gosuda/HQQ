@@ -10,6 +10,7 @@ Implemented:
 - little-endian packet encoding
 - bidirectional primary/secondary data transfer
 - lock-free data rings with ring-slot-owned payload buffers
+- page-aligned superblock for deterministic shared-memory initialization
 - zero-copy callback APIs for direct shared-buffer access
 - Reserve/Commit APIs for explicit slot lifetime control
 - implicit payload-buffer ownership transfer to prevent unread-buffer overwrite
@@ -17,13 +18,15 @@ Implemented:
 - read/write deadline timeout behavior
 - StandardLink functional and benchmark coverage
 - `AdvancedLink` protocol negotiation
+- background Advanced dispatcher with pending-call response routing
 - Advanced Protocol large-data copy over chunked `OpConnCopy` frames
 - Advanced Protocol request-response IPC
+- logical Advanced stream `Dial`/`Listen`/`Accept`
+- bounded Advanced message assembly through `AdvancedOptions.MaxMessageSize`
 - AdvancedLink functional and benchmark coverage
 
 Planned or experimental:
 
-- explicit logical stream lifecycle APIs
 - streaming Advanced receive callbacks that avoid full message assembly
 - production hardening of unsafe shared-memory internals
 
@@ -32,6 +35,7 @@ Planned or experimental:
 Shared memory is split into two independent directions:
 
 ```text
+SUPERBLOCK    protocol/configuration/init-state metadata
 DATA_RING_0   protocol.Packet ring, Primary -> Secondary
 BUFFERS_0     fixed payload buffers for direction 0
 DATA_RING_1   protocol.Packet ring, Secondary -> Primary
@@ -116,9 +120,13 @@ func SizeStandardLink(bufferCount int, bufferSize int) uintptr
 func LargeMessageThreshold(bufferSize int) int
 func IsLargeMessage(bufferSize int, payloadSize int) bool
 func OpenStandardLink(offset uintptr, bufferCount int, bufferSize int) (*StandardLink, error)
+func CreateStandardLink(name string, bufferCount int, bufferSize int, mode os.FileMode) (*NamedStandardLink, error)
+func OpenNamedStandardLink(name string, bufferCount int, bufferSize int) (*NamedStandardLink, error)
 ```
 
-`SizeStandardLink` returns zero for invalid configurations. `LargeMessageThreshold(bufferSize)` returns the largest payload that fits in one Standard Protocol packet; payloads larger than that should use Advanced large-copy/request-response APIs.
+`SizeStandardLink` returns zero for invalid configurations and includes the first-page superblock plus all page-aligned rings and payload regions. `LargeMessageThreshold(bufferSize)` returns the largest payload that fits in one Standard Protocol packet; payloads larger than that should use Advanced large-copy/request-response APIs.
+
+`OpenStandardLink` is the low-level API for callers that already own a page-aligned mapping. `CreateStandardLink` and `OpenNamedStandardLink` create/map named shared memory and enforce page-aligned mappings for typical IPC use.
 
 ### StandardLink methods
 
@@ -171,6 +179,9 @@ _ = read.Release()
 
 ```go
 func NewAdvancedLink(offset uintptr, bufferCount int, bufferSize int) (*AdvancedLink, error)
+func NewAdvancedLinkWithOptions(offset uintptr, bufferCount int, bufferSize int, opts AdvancedOptions) (*AdvancedLink, error)
+func CreateAdvancedLink(name string, bufferCount int, bufferSize int, mode os.FileMode) (*NamedAdvancedLink, error)
+func OpenNamedAdvancedLink(name string, bufferCount int, bufferSize int) (*NamedAdvancedLink, error)
 func (l *AdvancedLink) NegotiateProtocol(ctx context.Context, version ProtocolVersion, features uint64) (bool, error)
 func (l *AdvancedLink) WaitForNegotiation(ctx context.Context) (bool, error)
 func (l *AdvancedLink) SendLarge(ctx context.Context, connectionID uint64, payload []byte) (messageID uint64, err error)
@@ -179,13 +190,20 @@ func (l *AdvancedLink) Call(ctx context.Context, methodID uint64, request []byte
 func (l *AdvancedLink) CallOn(ctx context.Context, connectionID uint64, methodID uint64, request []byte) (AdvancedMessage, error)
 func (l *AdvancedLink) Respond(ctx context.Context, request AdvancedMessage, status uint64, response []byte) error
 func (l *AdvancedLink) RespondError(ctx context.Context, request AdvancedMessage, status uint64, response []byte) error
+func (l *AdvancedLink) Listen(ctx context.Context) error
+func (l *AdvancedLink) Accept(ctx context.Context) (uint64, error)
+func (l *AdvancedLink) Dial(ctx context.Context) (uint64, error)
 func (l *AdvancedLink) BufferSize() int
 func (l *AdvancedLink) BufferCount() int
 func (l *AdvancedLink) LargeMessageThreshold() int
 func (l *AdvancedLink) IsLargeMessage(payloadSize int) bool
 ```
 
-Advanced feature flags are intentionally narrow: `FeatureLargeCopy` and `FeatureRequestResponse`. A payload becomes a large message when `payloadSize > link.LargeMessageThreshold()`; the threshold is the configured payload `bufferSize`. `SendLarge` splits payloads larger than `bufferSize` into chunked `OpConnCopy` frames. `Call`/`CallOn` use the same chunking for request and response bodies and correlate responses by `MessageID`. `Receive` assembles complete Advanced messages before returning; future streaming APIs may avoid full assembly for very large payloads. Do not read Advanced traffic through the Standard `Read` APIs.
+Advanced feature flags are intentionally narrow: `FeatureLargeCopy` and `FeatureRequestResponse`. Advanced APIs require successful negotiation first. A payload becomes a large message when `payloadSize > link.LargeMessageThreshold()`; the threshold is the configured payload `bufferSize`. `SendLarge` splits payloads larger than `bufferSize` into chunked `OpConnCopy` frames. `Call`/`CallOn` use the same chunking for request and response bodies and correlate responses by `MessageID`.
+
+After negotiation, `AdvancedLink` uses a single dispatcher path for Advanced traffic. Direct `Receive` can drive that path synchronously for low latency, and a background dispatcher is started when asynchronous pending-call or stream-control routing is needed. The dispatcher assembles chunks, routes responses to a pending-call table keyed by `(ConnectionID, MessageID)`, and delivers data/request messages to `Receive`. This supports multiple concurrent outstanding calls and out-of-order responses without frame stealing. `Receive` assembles complete Advanced messages before returning; future streaming APIs may avoid full assembly for very large payloads. Do not read Advanced traffic through the Standard `Read` APIs.
+
+`AdvancedOptions.MaxMessageSize` bounds full-message assembly and defaults to `DefaultMaxAdvancedMessageSize`. Oversized sends or receives fail with `ErrBufferOverflow`.
 
 Minimal request-response flow:
 

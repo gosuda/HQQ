@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -50,16 +51,16 @@ const (
 // Feature flags for Advanced Protocol negotiation.
 const (
 	FeatureNone            uint64 = 0
-	FeatureLargeCopy       uint64 = 1 << iota // Enable OpConnCopy chunking for payloads larger than bufferSize.
-	FeatureRequestResponse                    // Enable request-response IPC over OpConnCopy.
+	FeatureLargeCopy       uint64 = 1 << 0 // Enable OpConnCopy chunking for payloads larger than bufferSize.
+	FeatureRequestResponse uint64 = 1 << 1 // Enable request-response IPC over OpConnCopy.
 )
 
 // Capability flags for Advanced Protocol negotiation.
 const (
 	CapabilityNone           uint64 = 0
-	CapabilityLargeBuffers   uint64 = 1 << iota // Endpoint supports large configured payload buffers.
-	CapabilityHighThroughput                    // Endpoint is optimized for high-throughput chunk streams.
-	CapabilityLowLatency                        // Endpoint is optimized for low-latency request-response calls.
+	CapabilityLargeBuffers   uint64 = 1 << 0 // Endpoint supports large configured payload buffers.
+	CapabilityHighThroughput uint64 = 1 << 1 // Endpoint is optimized for high-throughput chunk streams.
+	CapabilityLowLatency     uint64 = 1 << 2 // Endpoint is optimized for low-latency request-response calls.
 )
 
 // Advanced Protocol frame flags stored in OpConnCopy operand 5.
@@ -70,6 +71,12 @@ const (
 	AdvFlagRequest
 	AdvFlagResponse
 	AdvFlagError
+)
+
+const (
+	DefaultMaxAdvancedMessageSize uint64 = 64 << 20
+
+	advancedKnownFlags = AdvFlagBegin | AdvFlagEnd | AdvFlagAbort | AdvFlagRequest | AdvFlagResponse | AdvFlagError
 )
 
 // ProtocolVersion represents a protocol version using semantic versioning
@@ -303,11 +310,32 @@ const (
 	ConnectionStateClosing                        // Connection is being closed
 )
 
+const (
+	standardSuperblockMagic uint64 = 0x4851515f53544c31 // "HQQ_STL1"
+
+	standardSuperblockStateEmpty        uint64 = 0
+	standardSuperblockStateInitializing uint64 = 1
+	standardSuperblockStateReady        uint64 = 2
+)
+
+type standardSuperblock struct {
+	magic       uint64
+	state       uint64
+	major       uint64
+	minor       uint64
+	pageSize    uint64
+	bufferCount uint64
+	bufferSize  uint64
+	layoutSize  uint64
+}
+
 // Standard Link Memory Layout:
 //
 // The shared memory region is organized as follows:
 //
 // <<<< PAGE_START
+// SUPERBLOCK                           // Link metadata and initialization state
+// <<<< PAGE_BREAK
 // MPMC_RING (Primary to Secondary)     // Ring buffer for packets from primary to secondary
 // <<<< PAGE_BREAK
 // BUFFERS (Primary to Secondary)       // Data buffers for primary to secondary communication
@@ -337,6 +365,7 @@ func SizeStandardLink(bufferCount int, bufferSize int) uintptr {
 	buffersSize := uintptr(bufferSize) * uintptr(bufferCount)
 
 	var size uintptr
+	size = alignPage(size + unsafe.Sizeof(standardSuperblock{}))
 	size = alignPage(size + dataRingSize)
 	size = alignPage(size + buffersSize)
 	size = alignPage(size + dataRingSize)
@@ -353,11 +382,54 @@ func isPowerOfTwo(v int) bool {
 	return v > 0 && v&(v-1) == 0
 }
 
+//go:nocheckptr
+func claimStandardSuperblock(offset uintptr, bufferCount int, bufferSize int, layoutSize uintptr) (LinkMode, *standardSuperblock, error) {
+	sb := (*standardSuperblock)(unsafe.Pointer(offset))
+	if atomic.CompareAndSwapUint64(&sb.state, standardSuperblockStateEmpty, standardSuperblockStateInitializing) {
+		return LinkModePrimary, sb, nil
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		state := atomic.LoadUint64(&sb.state)
+		magic := atomic.LoadUint64(&sb.magic)
+		if state == standardSuperblockStateReady && magic == standardSuperblockMagic {
+			if atomic.LoadUint64(&sb.bufferCount) != uint64(bufferCount) ||
+				atomic.LoadUint64(&sb.bufferSize) != uint64(bufferSize) ||
+				atomic.LoadUint64(&sb.layoutSize) != uint64(layoutSize) ||
+				atomic.LoadUint64(&sb.pageSize) != uint64(pagesize) {
+				return LinkModeSecondary, sb, ErrInvalidSize
+			}
+			return LinkModeSecondary, sb, nil
+		}
+		if state == standardSuperblockStateEmpty &&
+			atomic.CompareAndSwapUint64(&sb.state, standardSuperblockStateEmpty, standardSuperblockStateInitializing) {
+			return LinkModePrimary, sb, nil
+		}
+		if time.Now().After(deadline) {
+			return LinkModeSecondary, sb, ErrFailedInit
+		}
+		runtime.Gosched()
+	}
+}
+
+func publishStandardSuperblock(sb *standardSuperblock, bufferCount int, bufferSize int, layoutSize uintptr) {
+	atomic.StoreUint64(&sb.major, protocol.HQQProtocolMajorVersion)
+	atomic.StoreUint64(&sb.minor, protocol.HQQProtocolMinorVersion)
+	atomic.StoreUint64(&sb.pageSize, uint64(pagesize))
+	atomic.StoreUint64(&sb.bufferCount, uint64(bufferCount))
+	atomic.StoreUint64(&sb.bufferSize, uint64(bufferSize))
+	atomic.StoreUint64(&sb.layoutSize, uint64(layoutSize))
+	atomic.StoreUint64(&sb.magic, standardSuperblockMagic)
+	atomic.StoreUint64(&sb.state, standardSuperblockStateReady)
+}
+
 // OpenStandardLink creates or attaches to a standard link
 // This function initializes a StandardLink instance in shared memory
 //
 //go:nocheckptr
 func OpenStandardLink(offset uintptr, bufferCount int, bufferSize int) (*StandardLink, error) {
+	baseOffset := offset
 	// Validate inputs
 	if offset%pagesize != 0 || bufferSize%BufferSizeAlignment != 0 {
 		return nil, ErrMemoryAlign
@@ -376,10 +448,14 @@ func OpenStandardLink(offset uintptr, bufferCount int, bufferSize int) (*Standar
 	if requiredSize == 0 {
 		return nil, ErrInvalidSize
 	}
+	linkMode, superblock, err := claimStandardSuperblock(baseOffset, bufferCount, bufferSize, requiredSize)
+	if err != nil {
+		return nil, err
+	}
 
 	// Initialize link structure
 	link := &StandardLink{
-		linkMode:      LinkModeSecondary,
+		linkMode:      linkMode,
 		linkType:      LinkTypeStandard,
 		bufferCount:   bufferCount,
 		bufferSize:    bufferSize,
@@ -392,10 +468,14 @@ func OpenStandardLink(offset uintptr, bufferCount int, bufferSize int) (*Standar
 	dataRingSize := mpmc.SizeMPMCRing[protocol.Packet](uintptr(bufferCount))
 	buffersSize := uintptr(bufferCount) * uintptr(bufferSize)
 
+	offset = alignPage(baseOffset + unsafe.Sizeof(standardSuperblock{}))
+
 	// Initialize or attach to first ring (Primary to Secondary)
 	ring0Offset := offset
-	if mpmc.MPMCInit[protocol.Packet](offset, uint64(bufferCount)) {
-		link.linkMode = LinkModePrimary
+	if link.linkMode == LinkModePrimary {
+		if !mpmc.MPMCInit[protocol.Packet](offset, uint64(bufferCount)) {
+			return nil, ErrFailedInit
+		}
 	}
 	offset = alignPage(offset + dataRingSize)
 
@@ -405,12 +485,15 @@ func OpenStandardLink(offset uintptr, bufferCount int, bufferSize int) (*Standar
 
 	// Initialize or attach to second ring (Secondary to Primary)
 	ring1Offset := offset
-	mpmc.MPMCInit[protocol.Packet](offset, uint64(bufferCount))
+	if link.linkMode == LinkModePrimary {
+		if !mpmc.MPMCInit[protocol.Packet](offset, uint64(bufferCount)) {
+			return nil, ErrFailedInit
+		}
+	}
 	offset = alignPage(offset + dataRingSize)
 
 	// Setup second buffer pool
 	link.buffers1Offset = offset
-	offset = alignPage(offset + buffersSize)
 
 	// Attach to rings
 	link.ring0 = mpmc.MPMCAttach[protocol.Packet](ring0Offset, time.Second)
@@ -427,6 +510,7 @@ func OpenStandardLink(offset uintptr, bufferCount int, bufferSize int) (*Standar
 	if link.linkMode == LinkModePrimary {
 		race.Zero(buffers0)
 		race.Zero(buffers1)
+		publishStandardSuperblock(superblock, bufferCount, bufferSize, requiredSize)
 	}
 
 	// Create buffer slices for indexed access
@@ -949,6 +1033,7 @@ type AdvancedLink struct {
 	slink *StandardLink // Wrapped standard link
 
 	// Protocol negotiation state
+	protocolMu             sync.RWMutex
 	protocolState          ProtocolState   // Current negotiation state
 	negotiatedVersion      ProtocolVersion // Negotiated protocol version
 	negotiatedFeatures     uint64          // Negotiated feature flags
@@ -960,17 +1045,41 @@ type AdvancedLink struct {
 	messageIDGenerator atomic.Uint64
 
 	// Connection management
-	connections sync.Map   // map[uint64]*Connection - Active connections
-	listening   bool       // Whether the link is listening for connections
-	connCond    *sync.Cond // Condition variable for connection notifications
+	connections           sync.Map // map[uint64]*Connection - Active connections
+	connectionIDGenerator atomic.Uint64
+	controlMu             sync.Mutex
+	listening             bool // Whether the link is listening for connections
+	acceptCh              chan uint64
+	pendingConnections    map[uint64]chan error
 
-	receiveMu       sync.Mutex
-	assemblies      map[advancedMessageKey]*advancedAssembly
-	pendingMessages []AdvancedMessage
+	receiveMu  sync.Mutex
+	assemblies map[advancedMessageKey]*advancedAssembly
+
+	maxMessageSize uint64
+
+	dispatchOnce    sync.Once
+	dispatchStarted atomic.Bool
+	dispatchCancel  context.CancelFunc
+	dispatchDone    chan struct{}
+	dispatchErrMu   sync.RWMutex
+	dispatchErr     error
+	incoming        chan advancedDispatchResult
+	pendingMu       sync.Mutex
+	pendingCalls    map[advancedCallKey]chan advancedDispatchResult
 
 	// Statistics
 	advancedStats AdvancedStats // Advanced statistics
 	statsMutex    sync.RWMutex  // Mutex for statistics access
+}
+
+type AdvancedOptions struct {
+	// MaxMessageSize bounds full Advanced message assembly. Zero uses
+	// DefaultMaxAdvancedMessageSize.
+	MaxMessageSize uint64
+
+	// IncomingQueueSize controls the buffered queue for dispatcher-delivered
+	// non-response messages and accepted stream IDs. Zero uses bufferCount.
+	IncomingQueueSize int
 }
 
 // AdvancedStats contains advanced statistics for the AdvancedLink
@@ -1028,6 +1137,16 @@ type advancedMessageKey struct {
 	kind         uint64
 }
 
+type advancedCallKey struct {
+	connectionID uint64
+	messageID    uint64
+}
+
+type advancedDispatchResult struct {
+	message AdvancedMessage
+	err     error
+}
+
 type advancedAssembly struct {
 	message AdvancedMessage
 	data    []byte
@@ -1037,19 +1156,38 @@ type advancedAssembly struct {
 // NewAdvancedLink creates a new advanced link
 // It wraps a StandardLink with additional negotiation capabilities
 func NewAdvancedLink(offset uintptr, bufferCount int, bufferSize int) (*AdvancedLink, error) {
+	return NewAdvancedLinkWithOptions(offset, bufferCount, bufferSize, AdvancedOptions{})
+}
+
+// NewAdvancedLinkWithOptions creates a new advanced link with explicit safety
+// and queue options. Zero-valued options select production-safe defaults.
+func NewAdvancedLinkWithOptions(offset uintptr, bufferCount int, bufferSize int, opts AdvancedOptions) (*AdvancedLink, error) {
 	slink, err := OpenStandardLink(offset, bufferCount, bufferSize)
 	if err != nil {
 		return nil, err
 	}
+	maxMessageSize := opts.MaxMessageSize
+	if maxMessageSize == 0 {
+		maxMessageSize = DefaultMaxAdvancedMessageSize
+	}
+	incomingQueueSize := opts.IncomingQueueSize
+	if incomingQueueSize <= 0 {
+		incomingQueueSize = bufferCount
+	}
 
 	advLink := &AdvancedLink{
-		slink:         slink,
-		protocolState: ProtocolStateNone,
-		listening:     false,
-		assemblies:    make(map[advancedMessageKey]*advancedAssembly),
-		advancedStats: AdvancedStats{},
+		slink:              slink,
+		protocolState:      ProtocolStateNone,
+		listening:          false,
+		acceptCh:           make(chan uint64, incomingQueueSize),
+		pendingConnections: make(map[uint64]chan error),
+		assemblies:         make(map[advancedMessageKey]*advancedAssembly),
+		maxMessageSize:     maxMessageSize,
+		dispatchDone:       make(chan struct{}),
+		incoming:           make(chan advancedDispatchResult, incomingQueueSize),
+		pendingCalls:       make(map[advancedCallKey]chan advancedDispatchResult),
+		advancedStats:      AdvancedStats{},
 	}
-	advLink.connCond = sync.NewCond(&sync.Mutex{})
 
 	return advLink, nil
 }
@@ -1069,6 +1207,15 @@ func (l *AdvancedLink) Write(b []byte) (n int, err error) {
 // Close closes the advanced link
 // It delegates to the underlying standard link
 func (l *AdvancedLink) Close() error {
+	if l.dispatchCancel != nil {
+		l.dispatchCancel()
+	}
+	if l.dispatchStarted.Load() {
+		<-l.dispatchDone
+	}
+	l.failPendingCalls(ErrInvalidOp)
+	l.failPendingConnections(ErrInvalidOp)
+
 	// Close all connections
 	l.connections.Range(func(key, value interface{}) bool {
 		if conn, ok := value.(*Connection); ok {
@@ -1079,7 +1226,9 @@ func (l *AdvancedLink) Close() error {
 	})
 
 	// Stop listening
+	l.controlMu.Lock()
 	l.listening = false
+	l.controlMu.Unlock()
 
 	// Close the underlying standard link
 	return l.slink.Close()
@@ -1129,14 +1278,38 @@ func (l *AdvancedLink) IsLargeMessage(payloadSize int) bool {
 	return l.slink.IsLargeMessage(payloadSize)
 }
 
+func (l *AdvancedLink) beginNegotiation() error {
+	l.protocolMu.Lock()
+	defer l.protocolMu.Unlock()
+	if l.protocolState != ProtocolStateNone {
+		return errors.New("hqq: protocol already negotiated or in progress")
+	}
+	l.protocolState = ProtocolStateNegotiating
+	return nil
+}
+
+func (l *AdvancedLink) setProtocolFailed() {
+	l.protocolMu.Lock()
+	l.protocolState = ProtocolStateFailed
+	l.protocolMu.Unlock()
+}
+
+func (l *AdvancedLink) setNegotiated(version ProtocolVersion, features uint64, capabilities uint64) {
+	l.protocolMu.Lock()
+	l.negotiatedVersion = version
+	l.negotiatedFeatures = features
+	l.negotiatedCapabilities = capabilities
+	l.enableNegotiatedFeatures()
+	l.protocolState = ProtocolStateNegotiated
+	l.protocolMu.Unlock()
+}
+
 // NegotiateProtocol initiates protocol negotiation with the specified features
 // It sends a negotiation request and waits for acknowledgment
 func (l *AdvancedLink) NegotiateProtocol(ctx context.Context, version ProtocolVersion, features uint64) (bool, error) {
-	if l.protocolState != ProtocolStateNone {
-		return false, errors.New("hqq: protocol already negotiated or in progress")
+	if err := l.beginNegotiation(); err != nil {
+		return false, err
 	}
-
-	l.protocolState = ProtocolStateNegotiating
 	startTime := time.Now()
 	defer func() {
 		l.statsMutex.Lock()
@@ -1169,7 +1342,7 @@ func (l *AdvancedLink) NegotiateProtocol(ctx context.Context, version ProtocolVe
 
 	// Send negotiation request
 	if err := l.slink.enqueueWithTimeout(ctx, tx, packet); err != nil {
-		l.protocolState = ProtocolStateFailed
+		l.setProtocolFailed()
 		return false, err
 	}
 
@@ -1178,26 +1351,34 @@ func (l *AdvancedLink) NegotiateProtocol(ctx context.Context, version ProtocolVe
 	for {
 		p, ok := rx.DequeueWithContext(ctx)
 		if !ok {
-			l.protocolState = ProtocolStateFailed
+			l.setProtocolFailed()
 			return false, ctx.Err()
 		}
 		switch p.Op() {
 		case protocol.OpProtoAck:
 			// Extract negotiated parameters
 			negotiatedVersion := uint16(p.Operand(0))
-			l.negotiatedVersion = ProtocolVersion{
+			ackVersion := ProtocolVersion{
 				Major: uint8(negotiatedVersion >> 8),
 				Minor: uint8(negotiatedVersion & 0xFF),
 			}
-			l.negotiatedFeatures = p.Operand(1)
-			l.negotiatedCapabilities = p.Operand(2)
+			ackFeatures := p.Operand(1)
+			ackCapabilities := p.Operand(2)
 
-			l.enableNegotiatedFeatures()
+			supportedFeatures := FeatureLargeCopy | FeatureRequestResponse
+			supportedCapabilities := CapabilityLargeBuffers | CapabilityHighThroughput | CapabilityLowLatency
+			if ackVersion.Major != protocol.HQQProtocolMajorVersion ||
+				ackVersion.Minor > protocol.HQQProtocolMinorVersion ||
+				ackFeatures&^(features&supportedFeatures) != 0 ||
+				ackCapabilities&^supportedCapabilities != 0 {
+				l.setProtocolFailed()
+				return false, ErrInvalidOp
+			}
 
-			l.protocolState = ProtocolStateNegotiated
+			l.setNegotiated(ackVersion, ackFeatures, ackCapabilities)
 			return true, nil
 		case protocol.OpError:
-			l.protocolState = ProtocolStateFailed
+			l.setProtocolFailed()
 			return false, errors.New("hqq: negotiation rejected by peer")
 		}
 	}
@@ -1206,11 +1387,9 @@ func (l *AdvancedLink) NegotiateProtocol(ctx context.Context, version ProtocolVe
 // WaitForNegotiation waits for a protocol negotiation request from the peer
 // It processes incoming negotiation requests and sends appropriate responses
 func (l *AdvancedLink) WaitForNegotiation(ctx context.Context) (bool, error) {
-	if l.protocolState != ProtocolStateNone {
-		return false, errors.New("hqq: protocol already negotiated or in progress")
+	if err := l.beginNegotiation(); err != nil {
+		return false, err
 	}
-
-	l.protocolState = ProtocolStateNegotiating
 	startTime := time.Now()
 	defer func() {
 		l.statsMutex.Lock()
@@ -1234,7 +1413,7 @@ func (l *AdvancedLink) WaitForNegotiation(ctx context.Context) (bool, error) {
 	for {
 		p, ok := rx.DequeueWithContext(ctx)
 		if !ok {
-			l.protocolState = ProtocolStateFailed
+			l.setProtocolFailed()
 			return false, ctx.Err()
 		}
 		if p.Op() != protocol.OpProtoNegotiate {
@@ -1254,59 +1433,68 @@ func (l *AdvancedLink) WaitForNegotiation(ctx context.Context) (bool, error) {
 		supportedFeatures := FeatureLargeCopy | FeatureRequestResponse
 		supportedCapabilities := CapabilityLargeBuffers | CapabilityHighThroughput | CapabilityLowLatency
 
-		// Negotiate version (use the minimum of requested and supported)
-		if uint8(requestedVersion>>8) > supportedVersion.Major ||
-			(uint8(requestedVersion>>8) == supportedVersion.Major && uint8(requestedVersion&0xFF) > supportedVersion.Minor) {
-			// Use our maximum supported version
-			l.negotiatedVersion = supportedVersion
-		} else {
-			// Use requested version
-			l.negotiatedVersion = ProtocolVersion{
-				Major: uint8(requestedVersion >> 8),
-				Minor: uint8(requestedVersion & 0xFF),
-			}
+		requestedMajor := uint8(requestedVersion >> 8)
+		requestedMinor := uint8(requestedVersion & 0xFF)
+		if requestedMajor != supportedVersion.Major {
+			errPacket := protocol.NewPacket(protocol.OpError, 0, uint64(ErrCodeInvalidOp))
+			_ = l.slink.enqueueWithTimeout(ctx, tx, errPacket)
+			l.setProtocolFailed()
+			return false, ErrInvalidOp
 		}
 
-		// Negotiate features (use intersection of requested and supported)
-		l.negotiatedFeatures = requestedFeatures & supportedFeatures
-
-		// Negotiate capabilities (use intersection of requested and supported)
-		l.negotiatedCapabilities = requestedCapabilities & supportedCapabilities
-
-		l.enableNegotiatedFeatures()
+		negotiatedVersion := ProtocolVersion{
+			Major: supportedVersion.Major,
+			Minor: requestedMinor,
+		}
+		if negotiatedVersion.Minor > supportedVersion.Minor {
+			negotiatedVersion.Minor = supportedVersion.Minor
+		}
+		negotiatedFeatures := requestedFeatures & supportedFeatures
+		negotiatedCapabilities := requestedCapabilities & supportedCapabilities
 
 		// Send acknowledgment
-		versionEncoded := uint64(l.negotiatedVersion.Major)<<8 | uint64(l.negotiatedVersion.Minor)
+		versionEncoded := uint64(negotiatedVersion.Major)<<8 | uint64(negotiatedVersion.Minor)
 		ackPacket := protocol.NewPacket(
 			protocol.OpProtoAck,
 			versionEncoded,
-			l.negotiatedFeatures,
-			l.negotiatedCapabilities,
+			negotiatedFeatures,
+			negotiatedCapabilities,
 		)
 
-		tx.Enqueue(ackPacket)
-		l.protocolState = ProtocolStateNegotiated
+		if err := l.slink.enqueueWithTimeout(ctx, tx, ackPacket); err != nil {
+			l.setProtocolFailed()
+			return false, err
+		}
+		l.setNegotiated(negotiatedVersion, negotiatedFeatures, negotiatedCapabilities)
 		return true, nil
 	}
 }
 
 // GetProtocolState returns the current protocol negotiation state
 func (l *AdvancedLink) GetProtocolState() ProtocolState {
+	l.protocolMu.RLock()
+	defer l.protocolMu.RUnlock()
 	return l.protocolState
 }
 
 // GetNegotiatedVersion returns the negotiated protocol version
 func (l *AdvancedLink) GetNegotiatedVersion() ProtocolVersion {
+	l.protocolMu.RLock()
+	defer l.protocolMu.RUnlock()
 	return l.negotiatedVersion
 }
 
 // GetNegotiatedFeatures returns the negotiated feature flags
 func (l *AdvancedLink) GetNegotiatedFeatures() uint64 {
+	l.protocolMu.RLock()
+	defer l.protocolMu.RUnlock()
 	return l.negotiatedFeatures
 }
 
 // GetNegotiatedCapabilities returns the negotiated capability flags
 func (l *AdvancedLink) GetNegotiatedCapabilities() uint64 {
+	l.protocolMu.RLock()
+	defer l.protocolMu.RUnlock()
 	return l.negotiatedCapabilities
 }
 
@@ -1317,11 +1505,15 @@ func (l *AdvancedLink) enableNegotiatedFeatures() {
 
 // IsLargeCopyEnabled returns whether Advanced large-data copy is enabled.
 func (l *AdvancedLink) IsLargeCopyEnabled() bool {
+	l.protocolMu.RLock()
+	defer l.protocolMu.RUnlock()
 	return l.largeCopyEnabled
 }
 
 // IsRequestResponseEnabled returns whether Advanced request-response IPC is enabled.
 func (l *AdvancedLink) IsRequestResponseEnabled() bool {
+	l.protocolMu.RLock()
+	defer l.protocolMu.RUnlock()
 	return l.requestResponseEnabled
 }
 
@@ -1352,7 +1544,38 @@ func (l *AdvancedLink) SendLarge(ctx context.Context, connectionID uint64, paylo
 
 // Receive returns the next complete Advanced Protocol message.
 func (l *AdvancedLink) Receive(ctx context.Context) (AdvancedMessage, error) {
-	return l.receiveMatching(ctx, func(AdvancedMessage) bool { return true })
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := l.requireNegotiated(); err != nil {
+		return AdvancedMessage{}, err
+	}
+	if l.dispatchStarted.Load() {
+		if err := l.startDispatcher(); err != nil {
+			return AdvancedMessage{}, err
+		}
+		select {
+		case result := <-l.incoming:
+			return result.message, result.err
+		case <-ctx.Done():
+			return AdvancedMessage{}, ctx.Err()
+		case <-l.dispatchDone:
+			if err := l.currentDispatchErr(); err != nil {
+				return AdvancedMessage{}, err
+			}
+			return AdvancedMessage{}, ErrInvalidOp
+		}
+	}
+	for {
+		message, err := l.receiveNextAdvancedMessage(ctx)
+		if err != nil {
+			return AdvancedMessage{}, err
+		}
+		if message.IsResponse() && l.routeResponseToPending(ctx, message) {
+			continue
+		}
+		return message, nil
+	}
 }
 
 // Call sends a link-level request and waits for its response.
@@ -1372,19 +1595,38 @@ func (l *AdvancedLink) CallOn(ctx context.Context, connectionID uint64, methodID
 	if err := l.requireNegotiatedFeature(FeatureRequestResponse); err != nil {
 		return AdvancedMessage{}, err
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	messageID := l.nextMessageID()
+	callKey := advancedCallKey{connectionID: connectionID, messageID: messageID}
+	pending, pendingCount := l.registerPendingCall(callKey)
+	defer l.unregisterPendingCall(callKey, pending)
+
 	if err := l.sendAdvancedPayload(ctx, connectionID, messageID, AdvFlagRequest, methodID, request); err != nil {
 		return AdvancedMessage{}, err
 	}
 	l.statsMutex.Lock()
 	l.advancedStats.Requests++
 	l.statsMutex.Unlock()
+	if pendingCount == 1 && !l.dispatchStarted.Load() {
+		return l.receivePendingCall(ctx, callKey, pending)
+	}
+	if err := l.startDispatcher(); err != nil {
+		return AdvancedMessage{}, err
+	}
 
-	return l.receiveMatching(ctx, func(message AdvancedMessage) bool {
-		return message.ConnectionID == connectionID &&
-			message.MessageID == messageID &&
-			message.IsResponse()
-	})
+	select {
+	case result := <-pending:
+		return result.message, result.err
+	case <-ctx.Done():
+		return AdvancedMessage{}, ctx.Err()
+	case <-l.dispatchDone:
+		if err := l.currentDispatchErr(); err != nil {
+			return AdvancedMessage{}, err
+		}
+		return AdvancedMessage{}, ErrInvalidOp
+	}
 }
 
 // Respond sends a successful response for request.
@@ -1425,7 +1667,21 @@ func (l *AdvancedLink) RespondError(ctx context.Context, request AdvancedMessage
 }
 
 func (l *AdvancedLink) requireNegotiatedFeature(feature uint64) error {
-	if l.protocolState == ProtocolStateNegotiated && l.negotiatedFeatures&feature == 0 {
+	if err := l.requireNegotiated(); err != nil {
+		return err
+	}
+	l.protocolMu.RLock()
+	defer l.protocolMu.RUnlock()
+	if l.negotiatedFeatures&feature == 0 {
+		return ErrInvalidOp
+	}
+	return nil
+}
+
+func (l *AdvancedLink) requireNegotiated() error {
+	l.protocolMu.RLock()
+	defer l.protocolMu.RUnlock()
+	if l.protocolState != ProtocolStateNegotiated {
 		return ErrInvalidOp
 	}
 	return nil
@@ -1443,6 +1699,9 @@ func (l *AdvancedLink) sendAdvancedPayload(ctx context.Context, connectionID, me
 		ctx = context.Background()
 	}
 	totalSize := uint64(len(payload))
+	if l.maxMessageSize > 0 && totalSize > l.maxMessageSize {
+		return ErrBufferOverflow
+	}
 	if totalSize == 0 {
 		return l.sendAdvancedChunk(ctx, connectionID, messageID, 0, 0, AdvFlagBegin|AdvFlagEnd|baseFlags, aux, nil)
 	}
@@ -1520,35 +1779,54 @@ func (l *AdvancedLink) sendAdvancedChunk(ctx context.Context, connectionID, mess
 	return nil
 }
 
-func (l *AdvancedLink) receiveMatching(ctx context.Context, match func(AdvancedMessage) bool) (AdvancedMessage, error) {
-	if ctx == nil {
-		ctx = context.Background()
+func (l *AdvancedLink) startDispatcher() error {
+	if err := l.requireNegotiated(); err != nil {
+		return err
 	}
-	l.receiveMu.Lock()
-	defer l.receiveMu.Unlock()
+	l.dispatchOnce.Do(func() {
+		ctx, cancel := context.WithCancel(context.Background())
+		l.dispatchCancel = cancel
+		l.dispatchStarted.Store(true)
+		go l.dispatchLoop(ctx)
+	})
+	return l.currentDispatchErr()
+}
 
+func (l *AdvancedLink) dispatchLoop(ctx context.Context) {
+	defer close(l.dispatchDone)
 	for {
-		for i, message := range l.pendingMessages {
-			if match(message) {
-				copy(l.pendingMessages[i:], l.pendingMessages[i+1:])
-				l.pendingMessages[len(l.pendingMessages)-1] = AdvancedMessage{}
-				l.pendingMessages = l.pendingMessages[:len(l.pendingMessages)-1]
-				return message, nil
-			}
-		}
-
-		message, err := l.receiveAdvancedMessageLocked(ctx)
+		message, err := l.receiveNextAdvancedMessage(ctx)
 		if err != nil {
-			return AdvancedMessage{}, err
+			if ctx.Err() != nil {
+				l.failPendingCalls(ErrInvalidOp)
+				l.failPendingConnections(ErrInvalidOp)
+				return
+			}
+			l.setDispatchErr(err)
+			l.failPendingCalls(err)
+			l.failPendingConnections(err)
+			select {
+			case l.incoming <- advancedDispatchResult{err: err}:
+			default:
+			}
+			return
 		}
-		if match(message) {
-			return message, nil
+		if err := l.routeAdvancedMessage(ctx, message); err != nil {
+			l.setDispatchErr(err)
+			l.failPendingCalls(err)
+			l.failPendingConnections(err)
+			return
 		}
-		l.pendingMessages = append(l.pendingMessages, message)
 	}
 }
 
-func (l *AdvancedLink) receiveAdvancedMessageLocked(ctx context.Context) (AdvancedMessage, error) {
+func (l *AdvancedLink) receiveNextAdvancedMessage(ctx context.Context) (AdvancedMessage, error) {
+	l.receiveMu.Lock()
+	defer l.receiveMu.Unlock()
+	return l.receiveNextAdvancedMessageLocked(ctx)
+}
+
+func (l *AdvancedLink) receiveNextAdvancedMessageLocked(ctx context.Context) (AdvancedMessage, error) {
 	rx, rxBuffers := l.slink.rx()
 	for {
 		slot, ok := reserveConsumerContext(ctx, rx)
@@ -1570,6 +1848,13 @@ func (l *AdvancedLink) receiveAdvancedMessageLocked(ctx context.Context) (Advanc
 		case protocol.OpStandardLinkTombstone:
 			slot.Release()
 			continue
+		case protocol.OpConnCreate, protocol.OpConnAccept, protocol.OpConnClose:
+			packet := *p
+			slot.Release()
+			if err := l.handleControlPacket(ctx, &packet); err != nil {
+				return AdvancedMessage{}, err
+			}
+			continue
 		case protocol.OpConnCopy:
 			message, complete, err := l.consumeAdvancedChunk(p, rxBuffers[slotIndex])
 			slot.Release()
@@ -1580,12 +1865,244 @@ func (l *AdvancedLink) receiveAdvancedMessageLocked(ctx context.Context) (Advanc
 				return message, nil
 			}
 		case protocol.OpError:
-			err := l.slink.handleError(p)
+			packet := *p
 			slot.Release()
-			return AdvancedMessage{}, err
+			if l.routeControlError(&packet) {
+				continue
+			}
+			return AdvancedMessage{}, l.slink.handleError(&packet)
 		default:
 			slot.Release()
 			return AdvancedMessage{}, ErrInvalidOp
+		}
+	}
+}
+
+func (l *AdvancedLink) routeAdvancedMessage(ctx context.Context, message AdvancedMessage) error {
+	if message.IsResponse() && l.routeResponseToPending(ctx, message) {
+		return nil
+	}
+
+	select {
+	case l.incoming <- advancedDispatchResult{message: message}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (l *AdvancedLink) routeResponseToPending(ctx context.Context, message AdvancedMessage) bool {
+	key := advancedCallKey{connectionID: message.ConnectionID, messageID: message.MessageID}
+	l.pendingMu.Lock()
+	pending := l.pendingCalls[key]
+	if pending != nil {
+		delete(l.pendingCalls, key)
+	}
+	l.pendingMu.Unlock()
+	if pending == nil {
+		return false
+	}
+	select {
+	case pending <- advancedDispatchResult{message: message}:
+	case <-ctx.Done():
+		select {
+		case pending <- advancedDispatchResult{err: ctx.Err()}:
+		default:
+		}
+	}
+	return true
+}
+
+func (l *AdvancedLink) registerPendingCall(key advancedCallKey) (chan advancedDispatchResult, int) {
+	ch := make(chan advancedDispatchResult, 1)
+	l.pendingMu.Lock()
+	l.pendingCalls[key] = ch
+	count := len(l.pendingCalls)
+	l.pendingMu.Unlock()
+	return ch, count
+}
+
+func (l *AdvancedLink) unregisterPendingCall(key advancedCallKey, ch chan advancedDispatchResult) {
+	l.pendingMu.Lock()
+	if l.pendingCalls[key] == ch {
+		delete(l.pendingCalls, key)
+	}
+	l.pendingMu.Unlock()
+}
+
+func (l *AdvancedLink) receivePendingCall(ctx context.Context, callKey advancedCallKey, pending chan advancedDispatchResult) (AdvancedMessage, error) {
+	for {
+		select {
+		case result := <-pending:
+			return result.message, result.err
+		default:
+		}
+		if l.dispatchStarted.Load() {
+			select {
+			case result := <-pending:
+				return result.message, result.err
+			case <-ctx.Done():
+				return AdvancedMessage{}, ctx.Err()
+			case <-l.dispatchDone:
+				if err := l.currentDispatchErr(); err != nil {
+					return AdvancedMessage{}, err
+				}
+				return AdvancedMessage{}, ErrInvalidOp
+			}
+		}
+
+		if !l.receiveMu.TryLock() {
+			runtime.Gosched()
+			continue
+		}
+		select {
+		case result := <-pending:
+			l.receiveMu.Unlock()
+			return result.message, result.err
+		default:
+		}
+		message, err := l.receiveNextAdvancedMessageLocked(ctx)
+		l.receiveMu.Unlock()
+		if err != nil {
+			return AdvancedMessage{}, err
+		}
+		if message.IsResponse() {
+			if message.ConnectionID == callKey.connectionID && message.MessageID == callKey.messageID {
+				return message, nil
+			}
+			if l.routeResponseToPending(ctx, message) {
+				continue
+			}
+		}
+		select {
+		case l.incoming <- advancedDispatchResult{message: message}:
+		case <-ctx.Done():
+			return AdvancedMessage{}, ctx.Err()
+		}
+	}
+}
+
+func (l *AdvancedLink) failPendingCalls(err error) {
+	l.pendingMu.Lock()
+	defer l.pendingMu.Unlock()
+	for key, ch := range l.pendingCalls {
+		delete(l.pendingCalls, key)
+		select {
+		case ch <- advancedDispatchResult{err: err}:
+		default:
+		}
+	}
+}
+
+func (l *AdvancedLink) setDispatchErr(err error) {
+	l.dispatchErrMu.Lock()
+	if l.dispatchErr == nil {
+		l.dispatchErr = err
+	}
+	l.dispatchErrMu.Unlock()
+}
+
+func (l *AdvancedLink) currentDispatchErr() error {
+	l.dispatchErrMu.RLock()
+	defer l.dispatchErrMu.RUnlock()
+	return l.dispatchErr
+}
+
+func (l *AdvancedLink) handleControlPacket(ctx context.Context, p *protocol.Packet) error {
+	switch p.Op() {
+	case protocol.OpConnCreate:
+		return l.handleConnCreate(ctx, p.Operand(0))
+	case protocol.OpConnAccept:
+		return l.handleConnAccept(p.Operand(0))
+	case protocol.OpConnClose:
+		l.connections.Delete(p.Operand(0))
+		return nil
+	default:
+		return ErrInvalidOp
+	}
+}
+
+func (l *AdvancedLink) handleConnCreate(ctx context.Context, connID uint64) error {
+	l.controlMu.Lock()
+	listening := l.listening
+	l.controlMu.Unlock()
+	if !listening {
+		return l.sendControlPacket(ctx, protocol.NewPacket(protocol.OpError, connID, uint64(ErrCodeConnNotFound)))
+	}
+
+	conn := &Connection{
+		id:        connID,
+		state:     ConnectionStateOpen,
+		createdAt: time.Now(),
+		lastUsed:  time.Now(),
+	}
+	l.connections.Store(connID, conn)
+	if err := l.sendControlPacket(ctx, protocol.NewPacket(protocol.OpConnAccept, connID)); err != nil {
+		l.connections.Delete(connID)
+		return err
+	}
+	select {
+	case l.acceptCh <- connID:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (l *AdvancedLink) handleConnAccept(connID uint64) error {
+	l.controlMu.Lock()
+	pending := l.pendingConnections[connID]
+	if pending != nil {
+		delete(l.pendingConnections, connID)
+	}
+	l.controlMu.Unlock()
+	if pending == nil {
+		return nil
+	}
+	if value, ok := l.connections.Load(connID); ok {
+		if conn, ok := value.(*Connection); ok {
+			conn.state = ConnectionStateOpen
+			conn.lastUsed = time.Now()
+		}
+	}
+	pending <- nil
+	return nil
+}
+
+func (l *AdvancedLink) routeControlError(p *protocol.Packet) bool {
+	connID := p.Operand(0)
+	err := l.slink.handleError(p)
+	l.controlMu.Lock()
+	pending := l.pendingConnections[connID]
+	if pending != nil {
+		delete(l.pendingConnections, connID)
+	}
+	l.controlMu.Unlock()
+	if pending == nil {
+		return false
+	}
+	l.connections.Delete(connID)
+	pending <- err
+	return true
+}
+
+func (l *AdvancedLink) sendControlPacket(ctx context.Context, packet protocol.Packet) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	tx, _ := l.slink.tx()
+	return l.slink.enqueueWithTimeout(ctx, tx, packet)
+}
+
+func (l *AdvancedLink) failPendingConnections(err error) {
+	l.controlMu.Lock()
+	defer l.controlMu.Unlock()
+	for connID, ch := range l.pendingConnections {
+		delete(l.pendingConnections, connID)
+		l.connections.Delete(connID)
+		select {
+		case ch <- err:
+		default:
 		}
 	}
 }
@@ -1598,6 +2115,15 @@ func (l *AdvancedLink) consumeAdvancedChunk(p *protocol.Packet, buffer []byte) (
 	chunkSize := p.Operand(4)
 	flags := p.Operand(5)
 	aux := p.Operand(6)
+	if flags&^advancedKnownFlags != 0 {
+		return AdvancedMessage{}, false, ErrInvalidOp
+	}
+	if flags&AdvFlagRequest != 0 && flags&AdvFlagResponse != 0 {
+		return AdvancedMessage{}, false, ErrInvalidOp
+	}
+	if flags&AdvFlagError != 0 && flags&AdvFlagResponse == 0 {
+		return AdvancedMessage{}, false, ErrInvalidOp
+	}
 	kind := advancedKind(flags)
 	key := advancedMessageKey{connectionID: connectionID, messageID: messageID, kind: kind}
 
@@ -1616,6 +2142,10 @@ func (l *AdvancedLink) consumeAdvancedChunk(p *protocol.Packet, buffer []byte) (
 		delete(l.assemblies, key)
 		return AdvancedMessage{}, false, ErrInvalidSize
 	}
+	if l.maxMessageSize > 0 && totalSize > l.maxMessageSize {
+		delete(l.assemblies, key)
+		return AdvancedMessage{}, false, ErrBufferOverflow
+	}
 	if totalSize == 0 && (chunkOffset != 0 || chunkSize != 0 || flags&(AdvFlagBegin|AdvFlagEnd) != AdvFlagBegin|AdvFlagEnd) {
 		delete(l.assemblies, key)
 		return AdvancedMessage{}, false, ErrInvalidSize
@@ -1624,10 +2154,18 @@ func (l *AdvancedLink) consumeAdvancedChunk(p *protocol.Packet, buffer []byte) (
 		delete(l.assemblies, key)
 		return AdvancedMessage{}, false, ErrInvalidSize
 	}
+	if chunkOffset != 0 && aux != 0 {
+		delete(l.assemblies, key)
+		return AdvancedMessage{}, false, ErrInvalidSize
+	}
 
 	assembly := l.assemblies[key]
 	if flags&AdvFlagBegin != 0 {
 		if chunkOffset != 0 {
+			return AdvancedMessage{}, false, ErrInvalidSize
+		}
+		if assembly != nil {
+			delete(l.assemblies, key)
 			return AdvancedMessage{}, false, ErrInvalidSize
 		}
 		if totalSize > uint64(^uint(0)>>1) {
@@ -1706,117 +2244,81 @@ func reserveConsumerContext(ctx context.Context, r *mpmc.MPMCRing[protocol.Packe
 // Listen starts listening for incoming connection requests
 // This puts the AdvancedLink into a listening mode where it can accept connections
 func (l *AdvancedLink) Listen(ctx context.Context) error {
+	if err := l.requireNegotiated(); err != nil {
+		return err
+	}
+	if err := l.startDispatcher(); err != nil {
+		return err
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	l.controlMu.Lock()
 	if l.listening {
+		l.controlMu.Unlock()
 		return errors.New("hqq: already listening for connections")
 	}
-
 	l.listening = true
+	l.controlMu.Unlock()
 
-	// Start a goroutine to handle incoming connection requests
-	go l.handleConnectionRequests(ctx)
-
+	if done := ctx.Done(); done != nil {
+		go func() {
+			<-done
+			l.controlMu.Lock()
+			l.listening = false
+			l.controlMu.Unlock()
+		}()
+	}
 	return nil
 }
 
 // Accept waits for and accepts an incoming connection request
 // It returns the connection ID when a connection is established
 func (l *AdvancedLink) Accept(ctx context.Context) (uint64, error) {
-	if !l.listening {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := l.requireNegotiated(); err != nil {
+		return 0, err
+	}
+	if err := l.startDispatcher(); err != nil {
+		return 0, err
+	}
+	l.controlMu.Lock()
+	listening := l.listening
+	l.controlMu.Unlock()
+	if !listening {
 		return 0, errors.New("hqq: not listening for connections")
 	}
-
-	// Use condition variable for efficient waiting
-	resultChan := make(chan uint64, 1)
-	errChan := make(chan error, 1)
-
-	go func() {
-		l.connCond.L.Lock()
-		defer l.connCond.L.Unlock()
-
-		for {
-			// Check if we have any pending connection requests
-			var rx *mpmc.MPMCRing[protocol.Packet]
-			if l.slink.linkMode == LinkModeSecondary {
-				rx = l.slink.ring0
-			} else {
-				rx = l.slink.ring1
-			}
-
-			var foundConnID uint64
-			found := false
-
-			rx.DequeueFunc(func(p *protocol.Packet) {
-				if p.Op() == protocol.OpConnCreate {
-					connID := p.Operand(0)
-
-					// Create connection object
-					conn := &Connection{
-						id:        uint64(connID),
-						state:     ConnectionStateOpening,
-						createdAt: time.Now(),
-						lastUsed:  time.Now(),
-					}
-
-					l.connections.Store(uint64(connID), conn)
-
-					// Send acceptance
-					var tx *mpmc.MPMCRing[protocol.Packet]
-					if l.slink.linkMode == LinkModeSecondary {
-						tx = l.slink.ring1
-					} else {
-						tx = l.slink.ring0
-					}
-
-					ackPacket := protocol.NewPacket(protocol.OpConnAccept, connID)
-
-					tx.Enqueue(ackPacket)
-
-					// Update connection state
-					conn.state = ConnectionStateOpen
-					foundConnID = uint64(connID)
-					found = true
-				}
-			})
-
-			if found {
-				resultChan <- foundConnID
-				return
-			}
-
-			// Wait for notification or timeout
-			done := make(chan struct{})
-			go func() {
-				l.connCond.Wait()
-				close(done)
-			}()
-
-			select {
-			case <-done:
-				// Woke up, try again
-				continue
-			case <-ctx.Done():
-				errChan <- ctx.Err()
-				return
-			}
-		}
-	}()
-
 	select {
-	case connID := <-resultChan:
+	case connID := <-l.acceptCh:
 		return connID, nil
-	case err := <-errChan:
-		return 0, err
 	case <-ctx.Done():
 		return 0, ctx.Err()
+	case <-l.dispatchDone:
+		if err := l.currentDispatchErr(); err != nil {
+			return 0, err
+		}
+		return 0, ErrInvalidOp
 	}
 }
 
-// createConnection creates a new connection to a listening peer
-// It sends a connection request and waits for acceptance
-// This is a private method used internally by the link
-func (l *AdvancedLink) createConnection(ctx context.Context) (uint64, error) {
-	connID := l.slink.idGenerator.Add(1)
-
+// Dial creates a logical Advanced stream by sending OpConnCreate and waiting
+// for the peer's OpConnAccept.
+func (l *AdvancedLink) Dial(ctx context.Context) (uint64, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := l.requireNegotiated(); err != nil {
+		return 0, err
+	}
+	if err := l.startDispatcher(); err != nil {
+		return 0, err
+	}
+	connID := l.connectionIDGenerator.Add(1)
+	if connID == 0 {
+		connID = l.connectionIDGenerator.Add(1)
+	}
 	conn := &Connection{
 		id:        connID,
 		state:     ConnectionStateOpening,
@@ -1825,112 +2327,42 @@ func (l *AdvancedLink) createConnection(ctx context.Context) (uint64, error) {
 	}
 
 	l.connections.Store(connID, conn)
-
-	// Send connection request
-	packet := protocol.NewPacket(protocol.OpConnCreate, connID)
-
-	var tx *mpmc.MPMCRing[protocol.Packet]
-	if l.slink.linkMode == LinkModeSecondary {
-		tx = l.slink.ring1
-	} else {
-		tx = l.slink.ring0
-	}
-
-	if err := l.slink.enqueueWithTimeout(ctx, tx, packet); err != nil {
-		l.connections.Delete(connID)
-		return 0, err
-	}
-
-	// Wait for acceptance
-	if err := l.waitForConnectionAccept(ctx, connID); err != nil {
-		l.connections.Delete(connID)
-		return 0, err
-	}
-
-	conn.state = ConnectionStateOpen
-
-	return connID, nil
-}
-
-// handleConnectionRequests continuously processes incoming connection requests
-// This runs in a separate goroutine when Listen is called
-func (l *AdvancedLink) handleConnectionRequests(ctx context.Context) {
-	for {
-		select {
-		case <-ctx.Done():
-			l.listening = false
-			return
-		default:
-			var rx *mpmc.MPMCRing[protocol.Packet]
-
-			if l.slink.linkMode == LinkModeSecondary {
-				rx = l.slink.ring0
-			} else {
-				rx = l.slink.ring1
-			}
-
-			processed := false
-			rx.DequeueFunc(func(p *protocol.Packet) {
-				processed = true
-				if p.Op() == protocol.OpConnCreate {
-					// Notify waiting Accept calls
-					l.connCond.Broadcast()
-					return
-				}
-			})
-
-			// If no packet was processed, yield to prevent busy waiting
-			if !processed {
-				time.Sleep(time.Millisecond)
-			}
+	accepted := make(chan error, 1)
+	l.controlMu.Lock()
+	l.pendingConnections[connID] = accepted
+	l.controlMu.Unlock()
+	defer func() {
+		l.controlMu.Lock()
+		if l.pendingConnections[connID] == accepted {
+			delete(l.pendingConnections, connID)
 		}
-	}
-}
-
-// waitForConnectionAccept waits for a connection to be accepted
-// It monitors the receive ring for an acceptance packet
-func (l *AdvancedLink) waitForConnectionAccept(ctx context.Context, connID uint64) error {
-	var rx *mpmc.MPMCRing[protocol.Packet]
-	if l.slink.linkMode == LinkModeSecondary {
-		rx = l.slink.ring0
-	} else {
-		rx = l.slink.ring1
-	}
-
-	done := make(chan error, 1)
-	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				done <- ctx.Err()
-				return
-			default:
-				processed := false
-				rx.DequeueFunc(func(p *protocol.Packet) {
-					processed = true
-					if p.Op() == protocol.OpConnAccept && p.Operand(0) == connID {
-						done <- nil
-						return
-					}
-					if p.Op() == protocol.OpError && p.Operand(0) == connID {
-						done <- ErrConnNotFound
-						return
-					}
-				})
-
-				// If no packet was processed, yield to prevent busy waiting
-				if !processed {
-					time.Sleep(time.Millisecond)
-				}
-			}
-		}
+		l.controlMu.Unlock()
 	}()
 
+	packet := protocol.NewPacket(protocol.OpConnCreate, connID)
+	if err := l.sendControlPacket(ctx, packet); err != nil {
+		l.connections.Delete(connID)
+		return 0, err
+	}
+
 	select {
-	case err := <-done:
-		return err
+	case err := <-accepted:
+		if err != nil {
+			l.connections.Delete(connID)
+			return 0, err
+		}
+		conn.state = ConnectionStateOpen
+		conn.lastUsed = time.Now()
+		return connID, nil
 	case <-ctx.Done():
-		return ctx.Err()
+		l.connections.Delete(connID)
+		return 0, ctx.Err()
+	case <-l.dispatchDone:
+		l.connections.Delete(connID)
+		if err := l.currentDispatchErr(); err != nil {
+			return 0, err
+		}
+		return 0, ErrInvalidOp
 	}
 }
 
@@ -1945,15 +2377,6 @@ func contextForDeadline(deadline time.Time) (context.Context, context.CancelFunc
 		return ctx, func() {}
 	}
 	return context.WithTimeout(context.Background(), timeout)
-}
-
-// min returns the minimum of two integers
-// This is a helper function for buffer size calculations
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }
 
 // PacketConn interface implementation

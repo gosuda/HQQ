@@ -27,6 +27,8 @@ The protocol allocates two independent directions. Each direction has:
 
 ```text
 PAGE_START
+  SUPERBLOCK    one page of protocol/configuration/init-state metadata
+PAGE_BREAK
   DATA_RING_0   protocol.Packet ring, Primary -> Secondary
 PAGE_BREAK
   BUFFERS_0     bufferCount * bufferSize bytes, Primary -> Secondary payloads
@@ -38,6 +40,22 @@ PAGE_END
 ```
 
 All regions are page-aligned. `bufferCount` must be a power of two and at least 2. `bufferSize` must be at least 8 bytes and a multiple of 8. For each direction, `BUFFERS[i]` is owned by data-ring slot `i`.
+
+### Superblock
+
+The first page is a shared initialization/configuration superblock. It is intentionally outside the hot path and is used to make attachment deterministic:
+
+| Field | Meaning |
+| --- | --- |
+| `Magic` | HQQ StandardLink layout magic |
+| `State` | `Empty`, `Initializing`, or `Ready` |
+| `Major` / `Minor` | Standard layout/protocol version |
+| `PageSize` | Page size used to compute region boundaries |
+| `BufferCount` | Configured ring-slot/buffer count per direction |
+| `BufferSize` | Configured bytes per slot-owned payload buffer |
+| `LayoutSize` | Total bytes returned by `SizeStandardLink` |
+
+The primary endpoint claims an empty superblock, initializes both rings, zeros both payload regions, writes the configuration, and only then publishes `State=Ready`. Secondary endpoints wait for `Ready` and reject mismatched configuration. This preserves the page-alignment rule and prevents attachers from observing a half-initialized payload region.
 
 ## Packet ABI
 
@@ -226,6 +244,8 @@ The receiver may choose either assembly or streaming:
 
 A receiver must discard partial state if it receives `AdvFlagAbort`, invalid bounds, duplicate chunk ranges, or a stream close for the chunk's `ConnectionID`.
 
+Implementations must bound `TotalSize` before allocation. The Go implementation exposes this as `AdvancedOptions.MaxMessageSize` and rejects oversized sends or receives with `ErrBufferOverflow`.
+
 ### Ordering
 
 The underlying ring preserves dequeue order per direction, but different `MessageID`s may be interleaved. Receivers must key reassembly state by `(ConnectionID, MessageID)` and must not assume only one large copy is active.
@@ -271,6 +291,8 @@ A successful response uses `AdvFlagResponse`. A failed call uses `AdvFlagRespons
 ### Concurrency
 
 Multiple requests may be outstanding on the same `ConnectionID`. Responses may arrive in a different order than requests. The caller must maintain a pending-call table keyed by `(ConnectionID, MessageID)`.
+
+The Go implementation uses a single dispatcher path per negotiated `AdvancedLink`. Direct `Receive` can drive that path synchronously for low latency, and a background dispatcher is started when asynchronous pending-call or stream-control routing is needed. The dispatcher assembles chunks, routes responses to a pending-call table keyed by `(ConnectionID, MessageID)`, and delivers non-response messages to `Receive`. This prevents concurrent `Call`/`Receive` operations from stealing each other's frames.
 
 ## Advanced Protocol FSM Model
 
@@ -335,6 +357,8 @@ The implementation may optimize these flows without materializing state-machine 
 ## Protocol Negotiation
 
 `OpProtoNegotiate` and `OpProtoAck` are reserved for enabling the Advanced Protocol over a `StandardLink` pair.
+
+Negotiation is mandatory before using Advanced large-copy, request-response, or logical-stream APIs. Peers reject incompatible major versions, clamp minor versions to the supported range, and acknowledge only the intersection of requested/supported feature and capability bits. Undefined feature bits are ignored and must not be echoed in `OpProtoAck`.
 
 ### `OpProtoNegotiate` (`0x05`)
 
@@ -408,8 +432,13 @@ Implemented and covered by tests:
 Implemented and covered by Advanced tests/benchmarks:
 
 - Advanced Protocol negotiation using only `FeatureLargeCopy` and `FeatureRequestResponse`
+- fixed feature/capability bit values matching this specification
+- background Advanced dispatcher with pending-call response routing
 - Advanced large-data copy over `OpConnCopy`
 - Advanced request-response IPC over `OpConnCopy`
+- concurrent out-of-order request-response matching
+- logical stream `Listen`/`Accept`/`Dial` over `OpConnCreate` and `OpConnAccept`
+- max-message-size enforcement for send and receive paths
 - public large-message threshold APIs
 - multi-process StandardLink and AdvancedLink smoke tests
 - Advanced error responses through `AdvFlagResponse | AdvFlagError`
@@ -417,6 +446,5 @@ Implemented and covered by Advanced tests/benchmarks:
 
 Designed but not implemented yet:
 
-- explicit logical stream lifecycle APIs for Advanced `ConnectionID`s
 - streaming large-copy receive callbacks that avoid full message assembly
 - cross-endian mixed-architecture process pairs beyond the packet ABI
