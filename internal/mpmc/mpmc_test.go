@@ -494,3 +494,62 @@ func BenchmarkMPMCReservePayloadTypes(b *testing.B) {
 		})
 	})
 }
+
+func TestMPMCQueueFullBlockAndCancel(t *testing.T) {
+	const size = 2
+	buffer := make([]byte, mpmc.SizeMPMCRing[uintptr](size))
+	b := uintptr(unsafe.Pointer(&buffer[0]))
+	if !mpmc.MPMCInit[uintptr](b, size) {
+		t.Fatal("failed to initialize offheap mpmc ring")
+	}
+	r := mpmc.MPMCAttach[uintptr](b, 0)
+
+	// 1, 2번째 Enqueue (성공)
+	if !r.EnqueueWithContext(context.Background(), 10) {
+		t.Fatal("Enqueue 1 failed")
+	}
+	if !r.EnqueueWithContext(context.Background(), 20) {
+		t.Fatal("Enqueue 2 failed")
+	}
+
+	// 3번째 Enqueue (Queue Full, timeout 100ms 적용)
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	ok := r.EnqueueWithContext(ctx, 30)
+	duration := time.Since(start)
+
+	if ok {
+		t.Fatal("Enqueue 3 should have failed due to queue full")
+	}
+	if duration < 100*time.Millisecond {
+		t.Fatalf("Enqueue 3 returned too early: %v", duration)
+	}
+}
+
+func TestMPMCQueueEmptyBlockAndCancel(t *testing.T) {
+	const size = 2
+	buffer := make([]byte, mpmc.SizeMPMCRing[uintptr](size))
+	b := uintptr(unsafe.Pointer(&buffer[0]))
+	if !mpmc.MPMCInit[uintptr](b, size) {
+		t.Fatal("failed to initialize offheap mpmc ring")
+	}
+	r := mpmc.MPMCAttach[uintptr](b, 0)
+
+	// Dequeue (Queue Empty, timeout 100ms 적용)
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	_, ok := r.DequeueWithContext(ctx)
+	duration := time.Since(start)
+
+	if ok {
+		t.Fatal("Dequeue should have failed due to queue empty")
+	}
+	if duration < 100*time.Millisecond {
+		t.Fatalf("Dequeue returned too early: %v", duration)
+	}
+}
+

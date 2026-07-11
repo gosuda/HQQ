@@ -231,7 +231,7 @@ func (m *MPMCRing[T]) EnqueueWithContext(ctx context.Context, elem T) bool {
 		// Get the element at the current write position
 		c = (*_melem[T])(unsafe.Pointer(m._data + unsafe.Sizeof(_melem[T]{})*uintptr(p&m._mask)))
 		seq := atomic.LoadUint64(&c._seq)
-		diff := seq - p
+		diff := int64(seq - p)
 
 		// Check if we can claim this slot
 		if diff == 0 {
@@ -239,12 +239,12 @@ func (m *MPMCRing[T]) EnqueueWithContext(ctx context.Context, elem T) bool {
 			if atomic.CompareAndSwapUint64(&_h.w, p, p+1) {
 				break
 			}
-		} else if diff > 0 {
+		} else if diff < 0 {
+			// Queue is full, spin-yield and wait
+			runtime.Gosched()
+		} else {
 			// Another producer has claimed this slot, try again
 			p = atomic.LoadUint64(&_h.w)
-		} else {
-			// This should never happen in a correctly implemented ring buffer
-			panic("unreachable")
 		}
 
 		// Yield to other goroutines
@@ -277,7 +277,7 @@ func (m *MPMCRing[T]) Enqueue(elem T) {
 		// Get the element at the current write position
 		c = (*_melem[T])(unsafe.Pointer(m._data + unsafe.Sizeof(_melem[T]{})*uintptr(p&m._mask)))
 		seq := atomic.LoadUint64(&c._seq)
-		diff := seq - p
+		diff := int64(seq - p)
 
 		// Check if we can claim this slot
 		if diff == 0 {
@@ -285,12 +285,12 @@ func (m *MPMCRing[T]) Enqueue(elem T) {
 			if atomic.CompareAndSwapUint64(&_h.w, p, p+1) {
 				break
 			}
-		} else if diff > 0 {
+		} else if diff < 0 {
+			// Queue is full, spin-yield and wait
+			runtime.Gosched()
+		} else {
 			// Another producer has claimed this slot, try again
 			p = atomic.LoadUint64(&_h.w)
-		} else {
-			// This should never happen in a correctly implemented ring buffer
-			panic("unreachable")
 		}
 
 		// Yield to other goroutines
@@ -323,7 +323,7 @@ func (m *MPMCRing[T]) EnqueueFunc(fn func(*T)) {
 		// Get the element at the current write position
 		c = (*_melem[T])(unsafe.Pointer(m._data + unsafe.Sizeof(_melem[T]{})*uintptr(p&m._mask)))
 		seq := atomic.LoadUint64(&c._seq)
-		diff := seq - p
+		diff := int64(seq - p)
 
 		// Check if we can claim this slot
 		if diff == 0 {
@@ -331,12 +331,12 @@ func (m *MPMCRing[T]) EnqueueFunc(fn func(*T)) {
 			if atomic.CompareAndSwapUint64(&_h.w, p, p+1) {
 				break
 			}
-		} else if diff > 0 {
+		} else if diff < 0 {
+			// Queue is full, spin-yield and wait
+			runtime.Gosched()
+		} else {
 			// Another producer has claimed this slot, try again
 			p = atomic.LoadUint64(&_h.w)
-		} else {
-			// This should never happen in a correctly implemented ring buffer
-			panic("unreachable")
 		}
 
 		// Yield to other goroutines
@@ -367,7 +367,7 @@ func (m *MPMCRing[T]) ReserveProducer() ProducerSlot[T] {
 		slot := p & m._mask
 		c = (*_melem[T])(unsafe.Pointer(m._data + unsafe.Sizeof(_melem[T]{})*uintptr(slot)))
 		seq := atomic.LoadUint64(&c._seq)
-		diff := seq - p
+		diff := int64(seq - p)
 
 		// Check if we can claim this slot
 		if diff == 0 {
@@ -379,12 +379,12 @@ func (m *MPMCRing[T]) ReserveProducer() ProducerSlot[T] {
 					elem: c,
 				}
 			}
-		} else if diff > 0 {
+		} else if diff < 0 {
+			// Queue is full, spin-yield and wait
+			runtime.Gosched()
+		} else {
 			// Another producer has claimed this slot, try again
 			p = atomic.LoadUint64(&_h.w)
-		} else {
-			// This should never happen in a correctly implemented ring buffer
-			panic("unreachable")
 		}
 
 		// Yield to other goroutines
@@ -417,7 +417,7 @@ func (m *MPMCRing[T]) ReserveProducerWithContext(ctx context.Context) (ProducerS
 		slot := p & m._mask
 		c = (*_melem[T])(unsafe.Pointer(m._data + unsafe.Sizeof(_melem[T]{})*uintptr(slot)))
 		seq := atomic.LoadUint64(&c._seq)
-		diff := seq - p
+		diff := int64(seq - p)
 
 		// Check if we can claim this slot
 		if diff == 0 {
@@ -429,12 +429,12 @@ func (m *MPMCRing[T]) ReserveProducerWithContext(ctx context.Context) (ProducerS
 					elem: c,
 				}, true
 			}
-		} else if diff > 0 {
+		} else if diff < 0 {
+			// Queue is full, spin-yield and wait
+			runtime.Gosched()
+		} else {
 			// Another producer has claimed this slot, try again
 			p = atomic.LoadUint64(&_h.w)
-		} else {
-			// This should never happen in a correctly implemented ring buffer
-			panic("unreachable")
 		}
 
 		// Yield to other goroutines
@@ -460,7 +460,7 @@ func (m *MPMCRing[T]) EnqueueZeroCopy(fn func(slot uint64, elem *T)) {
 		slot := p & m._mask
 		c = (*_melem[T])(unsafe.Pointer(m._data + unsafe.Sizeof(_melem[T]{})*uintptr(slot)))
 		seq := atomic.LoadUint64(&c._seq)
-		diff := seq - p
+		diff := int64(seq - p)
 
 		// Check if we can claim this slot
 		if diff == 0 {
@@ -470,12 +470,12 @@ func (m *MPMCRing[T]) EnqueueZeroCopy(fn func(slot uint64, elem *T)) {
 				atomic.StoreUint64(&c._seq, p+1)
 				return
 			}
-		} else if diff > 0 {
+		} else if diff < 0 {
+			// Queue is full, spin-yield and wait
+			runtime.Gosched()
+		} else {
 			// Another producer has claimed this slot, try again
 			p = atomic.LoadUint64(&_h.w)
-		} else {
-			// This should never happen in a correctly implemented ring buffer
-			panic("unreachable")
 		}
 
 		// Yield to other goroutines
@@ -510,7 +510,7 @@ func (m *MPMCRing[T]) EnqueueZeroCopyWithContext(ctx context.Context, fn func(sl
 		slot := p & m._mask
 		c = (*_melem[T])(unsafe.Pointer(m._data + unsafe.Sizeof(_melem[T]{})*uintptr(slot)))
 		seq := atomic.LoadUint64(&c._seq)
-		diff := seq - p
+		diff := int64(seq - p)
 
 		// Check if we can claim this slot
 		if diff == 0 {
@@ -520,12 +520,12 @@ func (m *MPMCRing[T]) EnqueueZeroCopyWithContext(ctx context.Context, fn func(sl
 				atomic.StoreUint64(&c._seq, p+1)
 				return true
 			}
-		} else if diff > 0 {
+		} else if diff < 0 {
+			// Queue is full, spin-yield and wait
+			runtime.Gosched()
+		} else {
 			// Another producer has claimed this slot, try again
 			p = atomic.LoadUint64(&_h.w)
-		} else {
-			// This should never happen in a correctly implemented ring buffer
-			panic("unreachable")
 		}
 
 		// Yield to other goroutines
@@ -561,7 +561,7 @@ func (m *MPMCRing[T]) DequeueWithContext(ctx context.Context) (elem T, ok bool) 
 		// Get the element at the current read position
 		c = (*_melem[T])(unsafe.Pointer(m._data + unsafe.Sizeof(_melem[T]{})*uintptr(p&m._mask)))
 		seq := atomic.LoadUint64(&c._seq)
-		diff := seq - (p + 1)
+		diff := int64(seq - (p + 1))
 
 		// Check if this element is ready to be consumed
 		if diff == 0 {
@@ -572,12 +572,12 @@ func (m *MPMCRing[T]) DequeueWithContext(ctx context.Context) (elem T, ok bool) 
 				atomic.LoadUint64(&c._seq) // This acts as a memory barrier
 				break
 			}
-		} else if diff > 0 {
-			// The element is not ready yet, try again
-			p = atomic.LoadUint64(&_h.r)
+		} else if diff < 0 {
+			// The element is not ready yet, wait
+			runtime.Gosched()
 		} else {
-			// This should never happen in a correctly implemented ring buffer
-			panic("unreachable")
+			// Another consumer has claimed this slot, try again
+			p = atomic.LoadUint64(&_h.r)
 		}
 
 		// Yield to other goroutines
@@ -609,7 +609,7 @@ func (m *MPMCRing[T]) Dequeue() (elem T) {
 		// Get the element at the current read position
 		c = (*_melem[T])(unsafe.Pointer(m._data + unsafe.Sizeof(_melem[T]{})*uintptr(p&m._mask)))
 		seq := atomic.LoadUint64(&c._seq)
-		diff := seq - (p + 1)
+		diff := int64(seq - (p + 1))
 
 		// Check if this element is ready to be consumed
 		if diff == 0 {
@@ -620,12 +620,12 @@ func (m *MPMCRing[T]) Dequeue() (elem T) {
 				atomic.LoadUint64(&c._seq) // This acts as a memory barrier
 				break
 			}
-		} else if diff > 0 {
-			// The element is not ready yet, try again
-			p = atomic.LoadUint64(&_h.r)
+		} else if diff < 0 {
+			// The element is not ready yet, wait
+			runtime.Gosched()
 		} else {
-			// This should never happen in a correctly implemented ring buffer
-			panic("unreachable")
+			// Another consumer has claimed this slot, try again
+			p = atomic.LoadUint64(&_h.r)
 		}
 
 		// Yield to other goroutines
@@ -658,7 +658,7 @@ func (m *MPMCRing[T]) DequeueFunc(fn func(*T)) {
 		// Get the element at the current read position
 		c = (*_melem[T])(unsafe.Pointer(m._data + unsafe.Sizeof(_melem[T]{})*uintptr(p&m._mask)))
 		seq := atomic.LoadUint64(&c._seq)
-		diff := seq - (p + 1)
+		diff := int64(seq - (p + 1))
 
 		// Check if this element is ready to be consumed
 		if diff == 0 {
@@ -669,12 +669,12 @@ func (m *MPMCRing[T]) DequeueFunc(fn func(*T)) {
 				atomic.LoadUint64(&c._seq) // This acts as a memory barrier
 				break
 			}
-		} else if diff > 0 {
-			// The element is not ready yet, try again
-			p = atomic.LoadUint64(&_h.r)
+		} else if diff < 0 {
+			// The element is not ready yet, wait
+			runtime.Gosched()
 		} else {
-			// This should never happen in a correctly implemented ring buffer
-			panic("unreachable")
+			// Another consumer has claimed this slot, try again
+			p = atomic.LoadUint64(&_h.r)
 		}
 
 		// Yield to other goroutines
@@ -704,7 +704,7 @@ func (m *MPMCRing[T]) ReserveConsumer() ConsumerSlot[T] {
 		slot := p & m._mask
 		c = (*_melem[T])(unsafe.Pointer(m._data + unsafe.Sizeof(_melem[T]{})*uintptr(slot)))
 		seq := atomic.LoadUint64(&c._seq)
-		diff := seq - (p + 1)
+		diff := int64(seq - (p + 1))
 
 		// Check if this element is ready to be consumed
 		if diff == 0 {
@@ -720,12 +720,12 @@ func (m *MPMCRing[T]) ReserveConsumer() ConsumerSlot[T] {
 					elem: c,
 				}
 			}
-		} else if diff > 0 {
-			// The element is not ready yet, try again
-			p = atomic.LoadUint64(&_h.r)
+		} else if diff < 0 {
+			// The element is not ready yet, wait
+			runtime.Gosched()
 		} else {
-			// This should never happen in a correctly implemented ring buffer
-			panic("unreachable")
+			// Another consumer has claimed this slot, try again
+			p = atomic.LoadUint64(&_h.r)
 		}
 
 		// Yield to other goroutines
@@ -758,7 +758,7 @@ func (m *MPMCRing[T]) ReserveConsumerWithContext(ctx context.Context) (ConsumerS
 		slot := p & m._mask
 		c = (*_melem[T])(unsafe.Pointer(m._data + unsafe.Sizeof(_melem[T]{})*uintptr(slot)))
 		seq := atomic.LoadUint64(&c._seq)
-		diff := seq - (p + 1)
+		diff := int64(seq - (p + 1))
 
 		// Check if this element is ready to be consumed
 		if diff == 0 {
@@ -774,12 +774,12 @@ func (m *MPMCRing[T]) ReserveConsumerWithContext(ctx context.Context) (ConsumerS
 					elem: c,
 				}, true
 			}
-		} else if diff > 0 {
-			// The element is not ready yet, try again
-			p = atomic.LoadUint64(&_h.r)
+		} else if diff < 0 {
+			// The element is not ready yet, wait
+			runtime.Gosched()
 		} else {
-			// This should never happen in a correctly implemented ring buffer
-			panic("unreachable")
+			// Another consumer has claimed this slot, try again
+			p = atomic.LoadUint64(&_h.r)
 		}
 
 		// Yield to other goroutines
@@ -806,7 +806,7 @@ func (m *MPMCRing[T]) DequeueZeroCopy(fn func(slot uint64, elem *T)) {
 		slot := p & m._mask
 		c = (*_melem[T])(unsafe.Pointer(m._data + unsafe.Sizeof(_melem[T]{})*uintptr(slot)))
 		seq := atomic.LoadUint64(&c._seq)
-		diff := seq - (p + 1)
+		diff := int64(seq - (p + 1))
 
 		// Check if this element is ready to be consumed
 		if diff == 0 {
@@ -819,12 +819,12 @@ func (m *MPMCRing[T]) DequeueZeroCopy(fn func(slot uint64, elem *T)) {
 				atomic.StoreUint64(&c._seq, p+m._mask+1)
 				return
 			}
-		} else if diff > 0 {
-			// The element is not ready yet, try again
-			p = atomic.LoadUint64(&_h.r)
+		} else if diff < 0 {
+			// The element is not ready yet, wait
+			runtime.Gosched()
 		} else {
-			// This should never happen in a correctly implemented ring buffer
-			panic("unreachable")
+			// Another consumer has claimed this slot, try again
+			p = atomic.LoadUint64(&_h.r)
 		}
 
 		// Yield to other goroutines
@@ -859,7 +859,7 @@ func (m *MPMCRing[T]) DequeueZeroCopyWithContext(ctx context.Context, fn func(sl
 		slot := p & m._mask
 		c = (*_melem[T])(unsafe.Pointer(m._data + unsafe.Sizeof(_melem[T]{})*uintptr(slot)))
 		seq := atomic.LoadUint64(&c._seq)
-		diff := seq - (p + 1)
+		diff := int64(seq - (p + 1))
 
 		// Check if this element is ready to be consumed
 		if diff == 0 {
@@ -872,12 +872,12 @@ func (m *MPMCRing[T]) DequeueZeroCopyWithContext(ctx context.Context, fn func(sl
 				atomic.StoreUint64(&c._seq, p+m._mask+1)
 				return true
 			}
-		} else if diff > 0 {
-			// The element is not ready yet, try again
-			p = atomic.LoadUint64(&_h.r)
+		} else if diff < 0 {
+			// The element is not ready yet, wait
+			runtime.Gosched()
 		} else {
-			// This should never happen in a correctly implemented ring buffer
-			panic("unreachable")
+			// Another consumer has claimed this slot, try again
+			p = atomic.LoadUint64(&_h.r)
 		}
 
 		// Yield to other goroutines
