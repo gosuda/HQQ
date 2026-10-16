@@ -311,12 +311,18 @@ func createNamedAdvancedLink(t *testing.T, bufferCount, bufferSize int) (string,
 	return name, smem, mapped, link
 }
 
+// sharedMemoryNameSeq makes names unique within the test process: the wall
+// clock alone is too coarse on some platforms (Windows), and two tests that
+// got the same name would collide on objects a failing test left open.
+var sharedMemoryNameSeq atomic.Uint32
+
 func newPortableSharedMemoryName() string {
 	// macOS keeps POSIX shm names short. Keep the name comfortably below
 	// common 31-byte limits while preserving a leading slash for shm_open.
 	pidPart := strconv.FormatInt(int64(os.Getpid()&0xfff), 36)
+	seqPart := strconv.FormatInt(int64(sharedMemoryNameSeq.Add(1)), 36)
 	timePart := strconv.FormatInt(time.Now().UnixNano()&0xffffff, 36)
-	return "/hq" + pidPart + timePart
+	return "/hq" + pidPart + "-" + seqPart + "-" + timePart
 }
 
 func openNamedStandardLink(t *testing.T, name string, size, bufferCount, bufferSize int) (*shm.SharedMemory, []byte, *StandardLink) {

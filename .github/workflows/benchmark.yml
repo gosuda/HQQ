@@ -65,7 +65,7 @@ jobs:
             -run '^$' \
             -bench 'Benchmark(StandardLink|AdvancedLink)' \
             -benchmem \
-            -benchtime 1000x \
+            -benchtime 100ms \
             -count 3 \
             -cpuprofile benchmark-artifacts/pprof/cpu.pprof \
             -memprofile benchmark-artifacts/pprof/mem.pprof \
@@ -85,8 +85,12 @@ jobs:
           output-file-path: benchmark.txt
           external-data-json-path: benchmark-data.json
           summary-always: true
-          fail-on-alert: true
-          alert-threshold: '115%'
+          # Informational only. Shared runners are noisy, and the action
+          # treats every extra metric as smaller-is-better, so a throughput
+          # (MB/s) improvement is reported as a regression; failing the job on
+          # alerts would therefore flag improvements too.
+          fail-on-alert: false
+          alert-threshold: '130%'
           auto-push: false
           github-token: ${{ secrets.GITHUB_TOKEN }}
 

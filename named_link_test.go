@@ -164,7 +164,9 @@ func TestCreateOverLiveSegmentIsBusy(t *testing.T) {
 }
 
 // createForeignObject creates the name as an object that is not a segment and
-// returns a function that reads back its first page.
+// returns a function that reads back its first page. Where names do not
+// outlive their handles (Windows) the object's handle stays open until the
+// test ends, like the process that owns the object would keep it.
 func createForeignObject(t *testing.T, name string, size int, fill func(page []byte)) func() []byte {
 	t.Helper()
 	smem, mapped := mapNamedSharedMemory(t, name, size, os.O_RDWR|os.O_CREATE|os.O_EXCL)
@@ -172,8 +174,12 @@ func createForeignObject(t *testing.T, name string, size int, fill func(page []b
 	if err := mmap.UnMap(mapped); err != nil {
 		t.Fatal(err)
 	}
-	if err := smem.Close(); err != nil {
-		t.Fatal(err)
+	if shm.NamesPersist {
+		if err := smem.Close(); err != nil {
+			t.Fatal(err)
+		}
+	} else {
+		t.Cleanup(func() { _ = smem.Close() })
 	}
 	t.Cleanup(func() { _ = Unlink(name) })
 	return func() []byte {
@@ -181,6 +187,14 @@ func createForeignObject(t *testing.T, name string, size int, fill func(page []b
 		defer smem.Close()
 		defer mmap.UnMap(mapped)
 		return append([]byte(nil), mapped[:pagesize]...)
+	}
+}
+
+// closeUnexpected closes a link that a failing assertion did not expect to
+// be opened, so that it cannot keep its name alive for later tests.
+func closeUnexpected(l *NamedStandardLink) {
+	if l != nil {
+		_ = l.Close()
 	}
 }
 
@@ -193,11 +207,13 @@ func TestCreateNeverTouchesForeignObject(t *testing.T) {
 			copy(page[100:], "somebody else's data")
 		})
 		before := snapshot()
-		if _, err := CreateStandardLink(name, 4, 64, 0o600, LinkOptions{}); !errors.Is(err, ErrIncompatibleLayout) {
+		if l, err := CreateStandardLink(name, 4, 64, 0o600, LinkOptions{}); !errors.Is(err, ErrIncompatibleLayout) {
+			closeUnexpected(l)
 			t.Fatalf("Create over foreign data = %v, want ErrIncompatibleLayout", err)
 		}
 		start := time.Now()
-		if _, err := OpenStandardLink(name, 4, 64, LinkOptions{}); !errors.Is(err, ErrIncompatibleLayout) {
+		if l, err := OpenStandardLink(name, 4, 64, LinkOptions{}); !errors.Is(err, ErrIncompatibleLayout) {
+			closeUnexpected(l)
 			t.Fatalf("Open over foreign data = %v, want ErrIncompatibleLayout", err)
 		}
 		if time.Since(start) > time.Second {
@@ -214,7 +230,8 @@ func TestCreateNeverTouchesForeignObject(t *testing.T) {
 	t.Run("smaller than the segment", func(t *testing.T) {
 		name := newPortableSharedMemoryName()
 		createForeignObject(t, name, int(pagesize), func([]byte) {})
-		if _, err := CreateStandardLink(name, 4, 64, 0o600, LinkOptions{}); !errors.Is(err, ErrInvalidSize) {
+		if l, err := CreateStandardLink(name, 4, 64, 0o600, LinkOptions{}); !errors.Is(err, ErrInvalidSize) {
+			closeUnexpected(l)
 			t.Fatalf("Create over a small object = %v, want ErrInvalidSize", err)
 		}
 		if !nameExists(t, name) {
@@ -230,10 +247,18 @@ func TestCreateNeverTouchesForeignObject(t *testing.T) {
 		}
 		t.Cleanup(func() { _ = Unlink(name) })
 		atomic.StoreUint64(&(*standardSuperblock)(unsafe.Pointer(&a.mapping[0])).magic, layoutV2Magic)
+		if !shm.NamesPersist {
+			// Keep the object alive after its endpoint closes, as a
+			// process still holding it would.
+			holder, holderMap := mapNamedSharedMemory(t, name, size, os.O_RDWR)
+			_ = mmap.UnMap(holderMap)
+			t.Cleanup(func() { _ = holder.Close() })
+		}
 		a.unlinkOnClose = false
 		a.Close() // both endpoints gone: a v3 segment would be reused
 
-		if _, err := CreateStandardLink(name, 4, 64, 0o600, LinkOptions{}); !errors.Is(err, ErrIncompatibleLayout) {
+		if l, err := CreateStandardLink(name, 4, 64, 0o600, LinkOptions{}); !errors.Is(err, ErrIncompatibleLayout) {
+			closeUnexpected(l)
 			t.Fatalf("Create over a v2 segment = %v, want ErrIncompatibleLayout", err)
 		}
 		smem, mapped := mapNamedSharedMemory(t, name, size, os.O_RDWR)
@@ -251,7 +276,8 @@ func TestFailedCreateRemovesItsName(t *testing.T) {
 	name := newPortableSharedMemoryName()
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err := openNamedStandard(ctx, name, 4, 64, true, 0o600, LinkOptions{}); !errors.Is(err, context.Canceled) {
+	if l, err := openNamedStandard(ctx, name, 4, 64, true, 0o600, LinkOptions{}); !errors.Is(err, context.Canceled) {
+		closeUnexpected(l)
 		t.Fatalf("create with a canceled context = %v", err)
 	}
 	if nameExists(t, name) {
@@ -281,8 +307,11 @@ func TestDialStopsWithContextOnStuckInitializer(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 	start := time.Now()
-	_, err := Dial(ctx, name, cfg)
+	l, err := Dial(ctx, name, cfg)
 	if !errors.Is(err, context.DeadlineExceeded) {
+		if l != nil {
+			_ = l.Close()
+		}
 		t.Fatalf("Dial = %v, want context.DeadlineExceeded", err)
 	}
 	if elapsed := time.Since(start); elapsed > time.Second {
@@ -298,7 +327,10 @@ func TestDialOnForeignObjectFailsFast(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	start := time.Now()
-	if _, err := Dial(ctx, name, cfg); !errors.Is(err, ErrIncompatibleLayout) {
+	if l, err := Dial(ctx, name, cfg); !errors.Is(err, ErrIncompatibleLayout) {
+		if l != nil {
+			_ = l.Close()
+		}
 		t.Fatalf("Dial over foreign data = %v, want ErrIncompatibleLayout", err)
 	}
 	if time.Since(start) > time.Second {
