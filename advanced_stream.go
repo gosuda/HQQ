@@ -39,50 +39,54 @@ func (l *AdvancedLink) ListenStreams(ctx context.Context) error {
 	return nil
 }
 
-// AcceptStream waits for and accepts an incoming stream and returns its
-// connection ID, to be used with CallOn and SendLarge.
-func (l *AdvancedLink) AcceptStream(ctx context.Context) (uint64, error) {
+// AcceptStream waits for and accepts an incoming stream. The stream is
+// registered when its OpConnCreate arrives, so messages the peer sends on it
+// are queued (and, under OverflowBlock, applying backpressure) even before
+// AcceptStream returns it.
+func (l *AdvancedLink) AcceptStream(ctx context.Context) (*Stream, error) {
 	ctx = orBackground(ctx)
 	if err := l.requireNegotiated(); err != nil {
-		return 0, err
+		return nil, err
 	}
 	if err := l.startDispatcher(); err != nil {
-		return 0, err
+		return nil, err
 	}
 	l.controlMu.Lock()
 	listening := l.listening
 	l.controlMu.Unlock()
 	if !listening {
-		return 0, ErrNotListening
+		return nil, ErrNotListening
 	}
 	select {
-	case connID := <-l.acceptCh:
+	case st := <-l.acceptCh:
 		l.releaseAcceptSlot()
-		return connID, nil
+		return st, nil
 	case <-ctx.Done():
-		return 0, ctx.Err()
+		return nil, ctx.Err()
 	case <-l.dispatchDone:
-		return 0, l.dispatchFailure()
+		return nil, l.dispatchFailure()
 	}
 }
 
-// OpenStream creates a logical Advanced stream by sending OpConnCreate and
-// waiting for the peer's OpConnAccept. It returns the new connection ID:
-// Primary endpoints allocate even non-zero IDs (2, 4, ...) and Secondary
-// endpoints odd IDs (1, 3, ...), so both sides can OpenStream concurrently
-// without colliding. ID 0 is reserved for link-level traffic.
-func (l *AdvancedLink) OpenStream(ctx context.Context) (uint64, error) {
+// OpenStream creates a logical stream by sending OpConnCreate and waiting for
+// the peer's OpConnAccept; the peer must have called ListenStreams and
+// accepts it with AcceptStream. Primary endpoints allocate even non-zero
+// stream IDs (2, 4, ...) and Secondary endpoints odd IDs (1, 3, ...), so
+// both sides can OpenStream concurrently without colliding. ID 0 is the
+// link-level stream.
+func (l *AdvancedLink) OpenStream(ctx context.Context) (*Stream, error) {
 	ctx = orBackground(ctx)
 	if err := l.requireNegotiated(); err != nil {
-		return 0, err
+		return nil, err
 	}
 	if err := l.startDispatcher(); err != nil {
-		return 0, err
+		return nil, err
 	}
 	connID := l.nextConnectionID()
+	st := newStream(l, connID)
 	accepted := make(chan error, 1)
 	l.controlMu.Lock()
-	l.connections[connID] = struct{}{}
+	l.streams[connID] = st
 	l.pendingConnections[connID] = accepted
 	l.controlMu.Unlock()
 
@@ -91,75 +95,46 @@ func (l *AdvancedLink) OpenStream(ctx context.Context) (uint64, error) {
 		if l.pendingConnections[connID] == accepted {
 			delete(l.pendingConnections, connID)
 		}
-		delete(l.connections, connID)
+		delete(l.streams, connID)
 		l.controlMu.Unlock()
 	}
 
 	if err := l.sendPacket(ctx, protocol.NewPacket(protocol.OpConnCreate, connID)); err != nil {
 		cleanup()
-		return 0, err
+		return nil, err
 	}
 
 	select {
 	case err := <-accepted:
 		if err != nil {
 			cleanup()
-			return 0, err
+			return nil, err
 		}
-		return connID, nil
+		return st, nil
 	case <-ctx.Done():
 		cleanup()
-		return 0, ctx.Err()
+		return nil, ctx.Err()
 	case <-l.dispatchDone:
 		cleanup()
-		return 0, l.dispatchFailure()
+		return nil, l.dispatchFailure()
 	}
 }
 
-// CloseStream closes the stream connectionID, which must have been returned
-// by OpenStream or AcceptStream and not closed since. It removes the local
-// registration and then sends OpConnClose (reason 0) to the peer, which
-// removes its registration when it receives it. The registration is removed
-// even if sending fails (for example, ctx ends first); the peer then keeps
-// its registration until the link is closed.
-//
-// Connection IDs are never reused, so a closed ID stays invalid: CallOn,
-// SendLarge and CloseStream on it return ErrConnNotFound. Requests already
-// in flight on the stream are not affected: their responses are still
-// routed, and Respond to a request received on the stream still works.
-// CloseStream returns ErrConnNotFound for an ID that is not an open stream
-// (including 0), and ErrNotNegotiated before negotiation.
-func (l *AdvancedLink) CloseStream(ctx context.Context, connectionID uint64) error {
-	if err := l.requireNegotiated(); err != nil {
-		return err
-	}
+// handlePeerClose processes the peer's OpConnClose: the stream is removed
+// and reports ErrPeerClosed once its queued messages are consumed. An ID
+// that is unknown or still opening is ignored.
+func (l *AdvancedLink) handlePeerClose(connID uint64) {
 	l.controlMu.Lock()
-	_, open := l.connections[connectionID]
-	if open && l.pendingConnections[connectionID] == nil {
-		delete(l.connections, connectionID)
+	st := l.streams[connID]
+	if st != nil && l.pendingConnections[connID] == nil {
+		delete(l.streams, connID)
 	} else {
-		open = false
+		st = nil
 	}
 	l.controlMu.Unlock()
-	if !open {
-		return ErrConnNotFound
+	if st != nil {
+		st.markClosed(streamPeerClosed)
 	}
-	return l.sendPacket(orBackground(ctx), protocol.NewPacket(protocol.OpConnClose, connectionID, 0))
-}
-
-// requireStream rejects a connection ID that is neither 0 (link-level
-// traffic) nor an open stream.
-func (l *AdvancedLink) requireStream(connectionID uint64) error {
-	if connectionID == 0 {
-		return nil
-	}
-	l.controlMu.Lock()
-	_, open := l.connections[connectionID]
-	l.controlMu.Unlock()
-	if !open {
-		return ErrConnNotFound
-	}
-	return nil
 }
 
 func (l *AdvancedLink) handleControlPacket(ctx context.Context, p *protocol.Packet) error {
@@ -170,9 +145,7 @@ func (l *AdvancedLink) handleControlPacket(ctx context.Context, p *protocol.Pack
 		l.handleConnAccept(p.Operand(0))
 		return nil
 	case protocol.OpConnClose:
-		l.controlMu.Lock()
-		delete(l.connections, p.Operand(0))
-		l.controlMu.Unlock()
+		l.handlePeerClose(p.Operand(0))
 		return nil
 	default:
 		return ErrUnexpectedPacket
@@ -223,12 +196,13 @@ func (l *AdvancedLink) handleConnCreate(ctx context.Context, connID uint64) erro
 	}
 	// Refuse an ID the peer may not allocate and never replace a live
 	// stream: either would be a protocol violation by the peer.
-	if _, exists := l.connections[connID]; exists || !l.peerOwnsConnectionID(connID) {
+	if _, exists := l.streams[connID]; exists || !l.peerOwnsConnectionID(connID) {
 		l.controlMu.Unlock()
 		l.refuseStream(connID, ErrCodeInvalidOp)
 		return nil
 	}
-	l.connections[connID] = struct{}{}
+	st := newStream(l, connID)
+	l.streams[connID] = st
 	l.controlMu.Unlock()
 
 	switch l.overflow {
@@ -256,7 +230,7 @@ func (l *AdvancedLink) handleConnCreate(ctx context.Context, connID uint64) erro
 			return ctx.Err()
 		}
 	}
-	if !l.enqueueControl(controlJob{packet: protocol.NewPacket(protocol.OpConnAccept, connID), kind: controlAccept}) {
+	if !l.enqueueControl(controlJob{packet: protocol.NewPacket(protocol.OpConnAccept, connID), kind: controlAccept, stream: st}) {
 		l.forgetConnection(connID)
 		l.releaseAcceptSlot()
 		l.stats.droppedMessages.Add(1)
@@ -282,7 +256,7 @@ func (l *AdvancedLink) routeControlError(p *protocol.Packet) bool {
 	pending := l.pendingConnections[connID]
 	if pending != nil {
 		delete(l.pendingConnections, connID)
-		delete(l.connections, connID)
+		delete(l.streams, connID)
 	}
 	l.controlMu.Unlock()
 	if pending == nil {
@@ -297,7 +271,7 @@ func (l *AdvancedLink) failPendingConnections(err error) {
 	defer l.controlMu.Unlock()
 	for connID, ch := range l.pendingConnections {
 		delete(l.pendingConnections, connID)
-		delete(l.connections, connID)
+		delete(l.streams, connID)
 		select {
 		case ch <- err:
 		default:

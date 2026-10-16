@@ -27,7 +27,7 @@ type Config struct {
 	// Default: 0600.
 	Perm os.FileMode
 
-	// Features to negotiate. Default: FeatureLargeCopy|FeatureRequestResponse.
+	// Features to negotiate. Default: FeatureMessages|FeatureRequestResponse.
 	Features uint64
 
 	// Advanced configures the link.
@@ -51,9 +51,10 @@ func (c Config) normalized() Config {
 }
 
 // Listen creates the named segment, waits until a peer Dials it, and
-// negotiates the Advanced Protocol. The returned link is ready for Call,
-// Serve, SendLarge and Receive. Closing it removes the name, unless the name
-// was removed and created again by somebody else meanwhile.
+// negotiates the Advanced Protocol. The returned link is ready for Send,
+// Recv, Call, Serve and streams (OpenStream, AcceptStream). Closing it
+// removes the name, unless the name was removed and created again by
+// somebody else meanwhile.
 //
 // If the name already exists, Listen reuses it when both endpoints of the
 // existing segment are closed or dead (for example after a crash of the

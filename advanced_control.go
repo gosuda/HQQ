@@ -28,6 +28,7 @@ const (
 type controlJob struct {
 	packet protocol.Packet
 	kind   controlKind
+	stream *Stream // controlAccept: the accepted stream
 }
 
 // The receive path (the dispatcher, or a goroutine receiving synchronously
@@ -59,11 +60,9 @@ func (l *AdvancedLink) controlQueue() chan controlJob {
 		return nil
 	}
 	if !l.ctrlStarted.Load() {
-		ctx, cancel := context.WithCancel(context.Background())
 		l.ctrlQueue = make(chan controlJob, max(l.slink.bufferCount, minControlQueue))
-		l.ctrlCancel = cancel
 		l.ctrlStarted.Store(true)
-		go l.controlLoop(ctx, l.ctrlQueue)
+		go l.controlLoop(l.lifeCtx, l.ctrlQueue)
 	}
 	return l.ctrlQueue
 }
@@ -108,7 +107,7 @@ func (l *AdvancedLink) runControlJob(ctx context.Context, job controlJob) {
 			return
 		}
 		// The slot reserved when the create was received guarantees room.
-		l.acceptCh <- connID
+		l.acceptCh <- job.stream
 	}
 }
 
@@ -121,7 +120,7 @@ func (l *AdvancedLink) releaseAcceptSlot() {
 
 func (l *AdvancedLink) forgetConnection(connID uint64) {
 	l.controlMu.Lock()
-	delete(l.connections, connID)
+	delete(l.streams, connID)
 	l.controlMu.Unlock()
 }
 
@@ -136,13 +135,13 @@ func (l *AdvancedLink) refuseStream(connID uint64, code ErrorCode) {
 // refuseRequest queues the error response (ErrCodeBufferOverflow) of a
 // request refused by MaxReassemblyBytes. It is best effort: the response is
 // not sent if FeatureRequestResponse is not negotiated or the queue is full.
-func (l *AdvancedLink) refuseRequest(request AdvancedMessage) {
+func (l *AdvancedLink) refuseRequest(request advHeader) {
 	if l.requireFeature(FeatureRequestResponse) != nil {
 		return
 	}
 	const flags = AdvFlagBegin | AdvFlagEnd | AdvFlagResponse | AdvFlagError
 	l.enqueueControl(controlJob{
-		packet: protocol.NewConnCopyPacket(request.ConnectionID, request.MessageID, 0, 0, 0, flags, uint64(ErrCodeBufferOverflow)),
+		packet: protocol.NewConnCopyPacket(request.streamID, request.messageID, 0, 0, 0, flags, uint64(ErrCodeBufferOverflow)),
 		kind:   controlRefusedRequest,
 	})
 }

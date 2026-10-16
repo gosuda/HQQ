@@ -529,7 +529,7 @@ func TestStandardReadsRejectAdvancedFrames(t *testing.T) {
 		func() error { _, err := std.ReadZeroCopy(func([]byte) error { return nil }); return err },
 		func() error { _, err := std.ReserveRead(); return err },
 	} {
-		if _, err := adv.SendLarge(ctx, 0, []byte("tiny")); err != nil {
+		if err := adv.Send(ctx, []byte("tiny")); err != nil {
 			t.Fatal(err)
 		}
 		if err := read(); !errors.Is(err, ErrUnexpectedPacket) || !errors.Is(err, ErrInvalidOp) {
@@ -565,18 +565,12 @@ func newNegotiatedPair(t testing.TB, bufferCount, bufferSize int, primaryOpts, s
 func TestNegotiateChoosesRolesAutomatically(t *testing.T) {
 	primary, secondary := newNegotiatedPair(t, 8, 32, AdvancedOptions{}, AdvancedOptions{})
 	for _, l := range []*AdvancedLink{primary, secondary} {
-		if l.ProtocolState() != ProtocolStateNegotiated || l.NegotiatedFeatures()&FeatureLargeCopy == 0 || l.NegotiatedFeatures()&FeatureRequestResponse == 0 {
+		if l.ProtocolState() != ProtocolStateNegotiated || l.NegotiatedFeatures()&FeatureMessages == 0 || l.NegotiatedFeatures()&FeatureRequestResponse == 0 {
 			t.Fatalf("%v: state=%v features=%#x", l.Mode(), l.ProtocolState(), l.NegotiatedFeatures())
 		}
 	}
 	if err := primary.Negotiate(context.Background(), 0); !errors.Is(err, ErrAlreadyNegotiated) {
 		t.Fatalf("second Negotiate = %v, want ErrAlreadyNegotiated", err)
-	}
-	if _, err := primary.Write([]byte("x")); !errors.Is(err, ErrAdvancedActive) {
-		t.Fatalf("Standard Write after negotiation = %v, want ErrAdvancedActive", err)
-	}
-	if _, err := secondary.Read(make([]byte, 8)); !errors.Is(err, ErrAdvancedActive) {
-		t.Fatalf("Standard Read after negotiation = %v, want ErrAdvancedActive", err)
 	}
 }
 
@@ -585,15 +579,15 @@ func TestNegotiateFeatureIntersection(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	errCh := make(chan error, 1)
-	go func() { errCh <- secondary.Negotiate(ctx, FeatureLargeCopy) }()
+	go func() { errCh <- secondary.Negotiate(ctx, FeatureMessages) }()
 	if err := primary.Negotiate(ctx, 0); err != nil {
 		t.Fatal(err)
 	}
 	if err := <-errCh; err != nil {
 		t.Fatal(err)
 	}
-	if primary.NegotiatedFeatures()&FeatureRequestResponse != 0 || primary.NegotiatedFeatures()&FeatureLargeCopy == 0 {
-		t.Fatalf("negotiated features = %#x, want only FeatureLargeCopy", primary.NegotiatedFeatures())
+	if primary.NegotiatedFeatures()&FeatureRequestResponse != 0 || primary.NegotiatedFeatures()&FeatureMessages == 0 {
+		t.Fatalf("negotiated features = %#x, want only FeatureMessages", primary.NegotiatedFeatures())
 	}
 	if _, err := primary.Call(ctx, 1, nil); !errors.Is(err, ErrNotNegotiated) {
 		t.Fatalf("Call without FeatureRequestResponse = %v, want ErrNotNegotiated", err)
@@ -685,15 +679,14 @@ func TestSimultaneousNegotiateProtocolDoesNotDeadlock(t *testing.T) {
 	}
 	// The link is usable afterwards (the Secondary's own request must not
 	// be left behind as garbage in the Primary's receive direction).
-	go func() {
-		req, err := secondary.Receive(ctx)
-		if err == nil {
-			secondary.Respond(ctx, req, 0, []byte("pong"))
-		}
-	}()
-	if resp, err := primary.Call(ctx, 1, []byte("ping")); err != nil || string(resp) != "pong" {
-		t.Fatalf("Call after simultaneous negotiation = %q, %v", resp, err)
+	go secondary.Serve(ctx, HandlerFunc(func(_ context.Context, w *ResponseWriter, _ *Request) {
+		w.Write([]byte("pong"))
+	}))
+	resp, err := primary.Call(ctx, 1, []byte("ping"))
+	if err != nil || string(resp.Bytes()) != "pong" {
+		t.Fatalf("Call after simultaneous negotiation = %v, %v", resp, err)
 	}
+	resp.Release()
 }
 
 func TestCanceledCallLateResponseIsDiscarded(t *testing.T) {
@@ -701,30 +694,32 @@ func TestCanceledCallLateResponseIsDiscarded(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	go server.Serve(ctx, HandlerFunc(func(_ context.Context, w *ResponseWriter, _ *Request) {
+		started <- struct{}{}
+		<-release
+		w.Write([]byte("too late"))
+	}))
+
 	callCtx, callCancel := context.WithTimeout(ctx, 50*time.Millisecond)
 	defer callCancel()
-	requests := make(chan AdvancedMessage, 1)
-	go func() {
-		req, err := server.Receive(ctx)
-		if err == nil {
-			requests <- req
-		}
-	}()
 	if _, err := client.Call(callCtx, 5, []byte("slow")); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("Call = %v, want deadline exceeded", err)
 	}
-	req := <-requests
-	if err := server.Respond(ctx, req, 0, []byte("too late")); err != nil {
-		t.Fatal(err)
-	}
+	<-started
+	close(release)
 
 	recvCtx, recvCancel := context.WithTimeout(ctx, 100*time.Millisecond)
 	defer recvCancel()
-	if msg, err := client.Receive(recvCtx); !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("Receive got %+v, %v; the late response must be discarded", msg, err)
+	if msg, err := client.Recv(recvCtx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Recv got %v, %v; the late response must be discarded", msg, err)
 	}
 	if got := client.Stats().AbandonedResponses; got != 1 {
 		t.Fatalf("AbandonedResponses = %d, want 1", got)
+	}
+	if got := client.Stats().DroppedMessages; got != 0 {
+		t.Fatalf("DroppedMessages = %d, want 0 (the late response is abandoned, not unmatched)", got)
 	}
 }
 
@@ -734,27 +729,25 @@ func TestOverflowDropKeepsResponsesFlowing(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	go func() {
-		req, err := server.Receive(ctx)
-		if err != nil {
-			return
-		}
+	go server.Serve(ctx, HandlerFunc(func(_ context.Context, w *ResponseWriter, _ *Request) {
 		for i := 0; i < 3; i++ {
-			server.SendLarge(ctx, 0, []byte("unsolicited"))
+			server.Send(ctx, []byte("unsolicited"))
 		}
-		server.Respond(ctx, req, 0, []byte("answer"))
-	}()
+		w.Write([]byte("answer"))
+	}))
 	resp, err := client.Call(ctx, 1, []byte("question"))
-	if err != nil || string(resp) != "answer" {
-		t.Fatalf("Call = %q, %v", resp, err)
+	if err != nil || string(resp.Bytes()) != "answer" {
+		t.Fatalf("Call = %v, %v", resp, err)
 	}
+	resp.Release()
 	if got := client.Stats().DroppedMessages; got != 2 {
 		t.Fatalf("DroppedMessages = %d, want 2", got)
 	}
-	msg, err := client.Receive(ctx)
-	if err != nil || string(msg.Payload) != "unsolicited" {
-		t.Fatalf("queued message = %q, %v", msg.Payload, err)
+	msg, err := client.Recv(ctx)
+	if err != nil || string(msg.Bytes()) != "unsolicited" {
+		t.Fatalf("queued message = %v, %v", msg, err)
 	}
+	msg.Release()
 }
 
 func TestOverflowFailStopsDispatcher(t *testing.T) {
@@ -762,12 +755,10 @@ func TestOverflowFailStopsDispatcher(t *testing.T) {
 		AdvancedOptions{IncomingQueueSize: 1, IncomingOverflow: OverflowFail}, AdvancedOptions{})
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	go func() {
-		if _, err := server.Receive(ctx); err == nil {
-			server.SendLarge(ctx, 0, []byte("one"))
-			server.SendLarge(ctx, 0, []byte("two"))
-		}
-	}()
+	go server.Serve(ctx, HandlerFunc(func(context.Context, *ResponseWriter, *Request) {
+		server.Send(ctx, []byte("one"))
+		server.Send(ctx, []byte("two"))
+	}))
 	if _, err := client.Call(ctx, 1, nil); !errors.Is(err, ErrIncomingOverflow) {
 		t.Fatalf("Call = %v, want ErrIncomingOverflow", err)
 	}
@@ -778,39 +769,54 @@ func TestMuxServe(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
-	messages := make(chan []byte, 4)
 	mux := NewMux()
-	mux.HandleFunc(1, func(_ context.Context, req AdvancedMessage) ([]byte, error) {
-		return append([]byte("echo:"), req.Payload...), nil
+	mux.HandleFunc(1, func(_ context.Context, w *ResponseWriter, req *Request) {
+		w.Write([]byte("echo:"))
+		w.Write(req.Payload())
 	})
-	mux.HandleFunc(2, func(context.Context, AdvancedMessage) ([]byte, error) {
-		return nil, AdvancedResponseError{Status: 404, Payload: []byte("not here")}
+	mux.HandleFunc(2, func(_ context.Context, w *ResponseWriter, _ *Request) {
+		w.WriteError(404, []byte("not here"))
 	})
-	mux.HandleFunc(3, func(context.Context, AdvancedMessage) ([]byte, error) {
-		return nil, errors.New("boom")
+	mux.HandleFunc(3, func(_ context.Context, w *ResponseWriter, _ *Request) {
+		w.WriteError(uint64(ErrCodeInvalidOp), []byte("boom"))
 	})
-	mux.OnMessage = func(_ context.Context, m AdvancedMessage) { messages <- m.Payload }
+	mux.HandleFunc(4, func(_ context.Context, w *ResponseWriter, _ *Request) {
+		w.Write([]byte("discarded"))
+		w.WriteError(7, []byte("fail"))
+		w.Write([]byte("-more"))
+	})
+	mux.HandleFunc(5, func(context.Context, *ResponseWriter, *Request) {})
 
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- server.Serve(ctx, mux) }()
 
 	large := bytes.Repeat([]byte("x"), 1000)
-	if resp, err := client.Call(ctx, 1, large); err != nil || !bytes.Equal(resp, append([]byte("echo:"), large...)) {
-		t.Fatalf("method 1 = %d bytes, %v", len(resp), err)
+	resp, err := client.Call(ctx, 1, large)
+	if err != nil || !bytes.Equal(resp.Bytes(), append([]byte("echo:"), large...)) {
+		t.Fatalf("method 1 = %v, %v", resp, err)
 	}
-	var re AdvancedResponseError
+	resp.Release()
+	var re ResponseError
 	if _, err := client.Call(ctx, 2, nil); !errors.As(err, &re) || re.Status != 404 || string(re.Payload) != "not here" {
 		t.Fatalf("method 2 = %v", err)
 	}
 	if !strings.Contains(re.Error(), "404") {
-		t.Fatalf("AdvancedResponseError.Error() = %q, want the status", re.Error())
+		t.Fatalf("ResponseError.Error() = %q, want the status", re.Error())
 	}
 	if _, err := client.Call(ctx, 3, nil); !errors.As(err, &re) || re.Status != uint64(ErrCodeInvalidOp) || string(re.Payload) != "boom" {
 		t.Fatalf("method 3 = %v", err)
 	}
+	if _, err := client.Call(ctx, 4, nil); !errors.As(err, &re) || re.Status != 7 || string(re.Payload) != "fail-more" {
+		t.Fatalf("method 4 = %v, want WriteError to replace the written bytes and later writes to append", err)
+	}
 	if _, err := client.Call(ctx, 99, nil); !errors.As(err, &re) || re.Status != uint64(ErrCodeInvalidOp) {
 		t.Fatalf("unknown method = %v", err)
 	}
+	resp, err = client.Call(ctx, 5, nil)
+	if err != nil || resp.Len() != 0 {
+		t.Fatalf("method 5 = %v, %v, want an empty success response", resp, err)
+	}
+	resp.Release()
 
 	// Concurrent calls are served concurrently.
 	var wg sync.WaitGroup
@@ -819,32 +825,29 @@ func TestMuxServe(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			want := fmt.Sprintf("echo:%d", i)
-			if resp, err := client.Call(ctx, 1, []byte(fmt.Sprint(i))); err != nil || string(resp) != want {
-				t.Errorf("concurrent call %d = %q, %v", i, resp, err)
+			resp, err := client.Call(ctx, 1, []byte(fmt.Sprint(i)))
+			if err != nil || string(resp.Bytes()) != want {
+				t.Errorf("concurrent call %d = %v, %v", i, resp, err)
+				return
 			}
+			resp.Release()
 		}(i)
 	}
 	wg.Wait()
 
-	if _, err := client.SendLarge(ctx, 0, []byte("note")); err != nil {
+	// Serve consumes only requests: a plain message stays available to Recv.
+	if err := client.Send(ctx, []byte("note")); err != nil {
 		t.Fatal(err)
 	}
-	select {
-	case payload := <-messages:
-		if string(payload) != "note" {
-			t.Fatalf("OnMessage payload = %q, want %q", payload, "note")
-		}
-	case <-ctx.Done():
-		t.Fatal("OnMessage was not called")
+	note, err := server.Recv(ctx)
+	if err != nil || string(note.Bytes()) != "note" {
+		t.Fatalf("Recv while serving = %v, %v, want %q", note, err, "note")
 	}
+	note.Release()
 
 	client.Close()
 	if err := waitErr(t, serveErr, 2*time.Second); err != nil {
 		t.Fatalf("Serve after peer Close = %v, want nil", err)
-	}
-	// Serve calls OnMessage inline and has returned: the count is final.
-	if len(messages) != 0 {
-		t.Fatalf("OnMessage called %d more times, want exactly once", len(messages))
 	}
 }
 
@@ -876,14 +879,15 @@ func TestListenDial(t *testing.T) {
 	}
 	client := r.link
 
-	go server.Serve(ctx, HandlerFunc(func(_ context.Context, req AdvancedMessage) ([]byte, error) {
-		return bytes.ToUpper(req.Payload), nil
+	go server.Serve(ctx, HandlerFunc(func(_ context.Context, w *ResponseWriter, req *Request) {
+		w.Write(bytes.ToUpper(req.Payload()))
 	}))
 	payload := bytes.Repeat([]byte("hqq"), 100) // larger than BufferSize
 	resp, err := client.Call(ctx, 1, payload)
-	if err != nil || !bytes.Equal(resp, bytes.ToUpper(payload)) {
-		t.Fatalf("Call = %d bytes, %v", len(resp), err)
+	if err != nil || !bytes.Equal(resp.Bytes(), bytes.ToUpper(payload)) {
+		t.Fatalf("Call = %v, %v", resp, err)
 	}
+	resp.Release()
 	if _, err := Listen(ctx, name, cfg); !errors.Is(err, ErrLinkBusy) {
 		t.Fatalf("second Listen while the first is alive = %v, want ErrLinkBusy", err)
 	}

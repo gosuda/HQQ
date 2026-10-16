@@ -13,10 +13,10 @@ import (
 // Feature flags for Advanced Protocol negotiation.
 const (
 	FeatureNone            uint64 = 0
-	FeatureLargeCopy       uint64 = 1 << 0 // Enable OpConnCopy chunking for payloads larger than bufferSize.
+	FeatureMessages        uint64 = 1 << 0 // Enable OpConnCopy messages (Stream.Send and Recv), chunked when larger than bufferSize.
 	FeatureRequestResponse uint64 = 1 << 1 // Enable request-response IPC over OpConnCopy.
 
-	supportedFeatures = FeatureLargeCopy | FeatureRequestResponse
+	supportedFeatures = FeatureMessages | FeatureRequestResponse
 )
 
 // Advanced Protocol frame flags stored in OpConnCopy operand 5.
@@ -100,23 +100,26 @@ const (
 	ProtocolStateFailed
 )
 
-// OverflowPolicy selects what the Advanced dispatcher does when the incoming
-// queue (messages for Receive, or streams for AcceptStream) is full.
+// OverflowPolicy selects what the receive path does when the destination
+// queue of a message is full: the queue of a stream (Stream.Recv), the
+// request queue (Serve) or the queue of accepted streams (AcceptStream).
 type OverflowPolicy uint8
 
 const (
-	// OverflowBlock (the default) applies backpressure: the dispatcher waits
-	// for Receive/AcceptStream. While it waits, responses to Call are not routed
-	// either, so an application that only calls Call must not let the peer
-	// send it unsolicited messages under this policy.
+	// OverflowBlock (the default) applies backpressure: the receive path
+	// waits until the consumer of that queue (Stream.Recv, Serve or
+	// AcceptStream) makes room, and the wait propagates into the
+	// shared-memory ring. While it waits nothing else is routed, not even
+	// responses to Call, so an application must consume every stream it uses
+	// and run Serve if the peer sends requests.
 	OverflowBlock OverflowPolicy = iota
 
 	// OverflowDrop discards messages that do not fit (counted in
 	// AdvancedStats.DroppedMessages) and refuses streams with OpError. The
-	// dispatcher never blocks, so responses are always routed.
+	// receive path never blocks, so responses are always routed.
 	OverflowDrop
 
-	// OverflowFail stops the dispatcher with ErrIncomingOverflow: pending
+	// OverflowFail stops the receive path with ErrIncomingOverflow: pending
 	// and future calls fail with that error.
 	OverflowFail
 )
@@ -129,9 +132,10 @@ type AdvancedOptions struct {
 	MaxMessageSize uint64
 
 	// MaxReassemblyBytes bounds the memory held by incomplete multi-chunk
-	// messages (the full announced size is allocated when the first chunk
-	// arrives, plus a small fixed bookkeeping overhead per message). A
-	// message whose first chunk would exceed the bound is refused without
+	// messages (a pooled buffer of the announced size, rounded up to a
+	// power of two, is taken when the first chunk arrives; each message is
+	// charged its announced size plus a small fixed bookkeeping overhead).
+	// A message whose first chunk would exceed the bound is refused without
 	// allocating: its remaining chunks are drained and discarded, a waiting
 	// Call fails with ErrReassemblyLimit, a refused request is answered with
 	// an error response (status ErrCodeBufferOverflow), and a refused data
@@ -142,11 +146,13 @@ type AdvancedOptions struct {
 	// even when nothing else is in flight.
 	MaxReassemblyBytes uint64
 
-	// IncomingQueueSize controls the buffered queue for dispatcher-delivered
-	// non-response messages and accepted stream IDs. Zero uses bufferCount.
+	// IncomingQueueSize is the capacity of every incoming queue: the queue
+	// of each stream (messages for Stream.Recv), the request queue consumed
+	// by Serve, and the queue of accepted streams. Zero uses bufferCount.
 	IncomingQueueSize int
 
-	// IncomingOverflow selects the behavior when that queue is full.
+	// IncomingOverflow selects the behavior when the queue a message is
+	// routed to is full.
 	IncomingOverflow OverflowPolicy
 
 	// Link configures the underlying StandardLink.
@@ -156,36 +162,51 @@ type AdvancedOptions struct {
 // AdvancedStats contains advanced statistics for the AdvancedLink.
 type AdvancedStats struct {
 	NegotiationTime    time.Duration
-	LargeMessages      uint64
-	LargeBytes         uint64
+	Messages           uint64 // messages sent with Stream.Send
+	MessageBytes       uint64 // payload bytes of those messages
 	Requests           uint64
 	Responses          uint64
-	DroppedMessages    uint64 // messages discarded by OverflowDrop, refused by MaxReassemblyBytes, or whose control reply was dropped because the control queue was full
+	DroppedMessages    uint64 // messages discarded by OverflowDrop, for an unknown or closed stream, as a response without a waiting call, refused by MaxReassemblyBytes, or whose control reply was dropped because the control queue was full
 	AbandonedResponses uint64 // late responses to canceled calls that were discarded
 }
 
 type advancedCounters struct {
 	negotiationTime    atomic.Int64
-	largeMessages      atomic.Uint64
-	largeBytes         atomic.Uint64
+	messages           atomic.Uint64
+	messageBytes       atomic.Uint64
 	requests           atomic.Uint64
 	responses          atomic.Uint64
 	droppedMessages    atomic.Uint64
 	abandonedResponses atomic.Uint64
+
+	// Serve execution model (see Serve): handlers handed to worker
+	// goroutines, and times the receiver role moved on because an inline
+	// handler outlived inlineLimit. Internal, used by tests.
+	servePooled      atomic.Uint64
+	serveEscalations atomic.Uint64
 }
 
 // AdvancedLink implements the Advanced Protocol overlay on top of a
-// StandardLink: protocol negotiation, large messages (chunked over
-// OpConnCopy), request-response calls and logical streams.
+// StandardLink: protocol negotiation, messages of up to MaxMessageSize
+// (chunked over OpConnCopy), request-response calls and logical streams.
+//
+// Messages travel on Streams. The link itself is stream 0: Send, Recv and
+// Call are shortcuts for l.Stream().Send, Recv and Call, and OpenStream and
+// AcceptStream create further streams. Received messages are pooled: see
+// Message.
 //
 // Concurrency: all methods are safe for concurrent use. After negotiation a
-// single dispatcher path consumes the receive direction: Receive may drive it
-// synchronously, and a background dispatcher is started when concurrent calls
-// or streams need asynchronous routing. The receive path never waits for the
-// tx ring: the replies it generates (stream accepts and refusals, error
-// responses to requests refused by MaxReassemblyBytes) are sent by a separate
-// control-sender goroutine through a bounded queue; a reply that does not fit
-// is dropped and counted in AdvancedStats.DroppedMessages.
+// single receive path consumes the receive direction and routes every
+// complete message: data to its stream's queue, requests to the request
+// queue consumed by Serve, responses to the waiting Call. A goroutine that
+// finds no dispatcher may receive synchronously (lowest latency) and route
+// messages for others; a background dispatcher is started as soon as
+// several goroutines wait concurrently or streams are used. The receive path
+// never waits for the tx ring: the replies it generates (stream accepts and
+// refusals, error responses to requests refused by MaxReassemblyBytes) are
+// sent by a separate control-sender goroutine through a bounded queue; a
+// reply that does not fit is dropped and counted in
+// AdvancedStats.DroppedMessages.
 type AdvancedLink struct {
 	slink *StandardLink // Wrapped standard link
 
@@ -198,13 +219,15 @@ type AdvancedLink struct {
 
 	messageIDGenerator atomic.Uint64
 
-	// Connection management (guarded by controlMu)
+	// Streams (guarded by controlMu). stream0 is the always-open link-level
+	// stream; streams holds the open and opening streams with a non-zero ID.
 	connectionIDGenerator atomic.Uint64
 	controlMu             sync.Mutex
-	listening             bool                // Whether the link is listening for connections
-	connections           map[uint64]struct{} // IDs of open and opening streams
+	listening             bool // Whether the link is listening for connections
+	stream0               *Stream
+	streams               map[uint64]*Stream
 	pendingConnections    map[uint64]chan error
-	acceptCh              chan uint64
+	acceptCh              chan *Stream
 	// acceptSlots reserves room in acceptCh for streams whose accept reply is
 	// queued on the control sender: a slot is taken when OpConnCreate is
 	// received and released by AcceptStream (or when the accept fails).
@@ -224,23 +247,28 @@ type AdvancedLink struct {
 
 	maxMessageSize uint64
 	overflow       OverflowPolicy
+	queueSize      int      // capacity of every incoming queue
+	pool           *msgPool // buffers of received messages and responses
+
+	// lifeCtx is canceled by Close; the dispatcher, the control sender and
+	// deliveries handed over by a synchronous receiver run under it.
+	lifeCtx    context.Context
+	lifeCancel context.CancelFunc
 
 	// Dispatcher
 	dispatchMu      sync.Mutex
 	closing         bool
 	dispatchStarted atomic.Bool
-	dispatchCancel  context.CancelFunc
 	dispatchDone    chan struct{}
 	dispatchErrMu   sync.RWMutex
 	dispatchErr     error
-	incoming        chan advancedDispatchResult
+	requests        chan *Message // requests, consumed only by Serve
 
 	// Control sender: sends the replies generated by the receive path (see
-	// controlJob). ctrlQueue, ctrlCancel and ctrlStarted's transition are
-	// guarded by dispatchMu; ctrlQueue is read lock-free once ctrlStarted.
+	// controlJob). ctrlQueue and ctrlStarted's transition are guarded by
+	// dispatchMu; ctrlQueue is read lock-free once ctrlStarted.
 	ctrlStarted atomic.Bool
 	ctrlQueue   chan controlJob
-	ctrlCancel  context.CancelFunc
 	ctrlDone    chan struct{}
 
 	// Pending calls (guarded by pendingMu)
@@ -282,62 +310,42 @@ func newAdvancedLink(slink *StandardLink, opts AdvancedOptions) *AdvancedLink {
 	if incomingQueueSize <= 0 {
 		incomingQueueSize = slink.bufferCount
 	}
-	return &AdvancedLink{
+	l := &AdvancedLink{
 		slink:              slink,
-		connections:        make(map[uint64]struct{}),
+		streams:            make(map[uint64]*Stream),
 		pendingConnections: make(map[uint64]chan error),
-		acceptCh:           make(chan uint64, incomingQueueSize),
+		acceptCh:           make(chan *Stream, incomingQueueSize),
 		acceptSlots:        make(chan struct{}, incomingQueueSize),
 		assemblies:         make(map[advancedMessageKey]*advancedAssembly),
 		maxMessageSize:     maxMessageSize,
 		maxReassemblyBytes: maxReassemblyBytes,
 		overflow:           opts.IncomingOverflow,
+		queueSize:          incomingQueueSize,
+		pool:               newMsgPool(maxMessageSize),
 		dispatchDone:       make(chan struct{}),
 		ctrlDone:           make(chan struct{}),
-		incoming:           make(chan advancedDispatchResult, incomingQueueSize),
+		requests:           make(chan *Message, incomingQueueSize),
 		pendingCalls:       make(map[advancedCallKey]chan advancedDispatchResult),
 		abandoned:          make(map[advancedCallKey]struct{}),
 	}
-}
-
-// Read reads Standard Protocol messages. It is only allowed before
-// negotiation starts; afterwards it returns ErrAdvancedActive because it
-// would steal Advanced frames from the dispatcher.
-func (l *AdvancedLink) Read(b []byte) (n int, err error) {
-	if ProtocolState(l.state.Load()) != ProtocolStateNone {
-		return 0, ErrAdvancedActive
-	}
-	return l.slink.Read(b)
-}
-
-// Write writes a Standard Protocol message. It is only allowed before
-// negotiation starts; afterwards it returns ErrAdvancedActive.
-func (l *AdvancedLink) Write(b []byte) (n int, err error) {
-	if ProtocolState(l.state.Load()) != ProtocolStateNone {
-		return 0, ErrAdvancedActive
-	}
-	return l.slink.Write(b)
+	l.lifeCtx, l.lifeCancel = context.WithCancel(context.Background())
+	l.stream0 = newStream(l, 0)
+	return l
 }
 
 // Close stops the dispatcher and the control sender, fails pending calls and
 // dials with ErrClosed, and closes the underlying StandardLink. Control
-// replies still queued are discarded. Close is idempotent.
+// replies still queued are discarded. Receive operations blocked on the link
+// or on one of its streams return ErrClosed. Close is idempotent.
 func (l *AdvancedLink) Close() error {
 	l.closeOnce.Do(func() {
 		l.dispatchMu.Lock()
 		l.closing = true
-		cancel := l.dispatchCancel
 		started := l.dispatchStarted.Load()
-		ctrlCancel := l.ctrlCancel
 		ctrlStarted := l.ctrlStarted.Load()
 		l.dispatchMu.Unlock()
 
-		if cancel != nil {
-			cancel()
-		}
-		if ctrlCancel != nil {
-			ctrlCancel()
-		}
+		l.lifeCancel()
 		l.closeErr = l.slink.Close()
 		if started {
 			<-l.dispatchDone
@@ -350,7 +358,7 @@ func (l *AdvancedLink) Close() error {
 
 		l.controlMu.Lock()
 		l.listening = false
-		clear(l.connections)
+		clear(l.streams)
 		l.controlMu.Unlock()
 	})
 	return l.closeErr
@@ -406,6 +414,20 @@ func mapCtxErr(ctx context.Context, err error) error {
 	return mapWaitErr(err)
 }
 
+// ringCancel returns the ring wait conditions for an operation bounded by
+// ctx. Waits under the link's own lifetime context (the dispatcher, the
+// control sender) leave Ctx unset: Close closes the Standard link, whose
+// Closed channel already wakes them, and a cancelable Ctx would arm a
+// context wake-up (and allocate) every time such a wait parks.
+func (l *AdvancedLink) ringCancel(ctx context.Context) mpmc.Cancel {
+	s := l.slink
+	c := mpmc.Cancel{Closed: s.closeCh, Check: s.checkFn}
+	if ctx != l.lifeCtx {
+		c.Ctx = ctx
+	}
+	return c
+}
+
 // sendPacket publishes one control packet.
 func (l *AdvancedLink) sendPacket(ctx context.Context, packet protocol.Packet) error {
 	s := l.slink
@@ -413,7 +435,7 @@ func (l *AdvancedLink) sendPacket(ctx context.Context, packet protocol.Packet) e
 		return err
 	}
 	defer s.exitTx()
-	c := mpmc.Cancel{Ctx: ctx, Closed: s.closeCh, Check: s.checkFn}
+	c := l.ringCancel(ctx)
 	return mapCtxErr(ctx, s.txRing.EnqueueZeroCopyCancel(&c, func(_ uint64, p *protocol.Packet) {
 		*p = packet
 	}))
@@ -437,7 +459,7 @@ func (l *AdvancedLink) dequeue(ctx context.Context, fn func(slot uint64, p *prot
 		return err
 	}
 	defer s.exitRx()
-	c := mpmc.Cancel{Ctx: ctx, Closed: s.closeCh, Check: s.checkFn}
+	c := l.ringCancel(ctx)
 	if err := dequeueDrained(s.rxRing, &c, fn); err != nil {
 		return mapCtxErr(ctx, err)
 	}
@@ -637,8 +659,8 @@ func (l *AdvancedLink) NegotiatedFeatures() uint64 {
 func (l *AdvancedLink) Stats() AdvancedStats {
 	return AdvancedStats{
 		NegotiationTime:    time.Duration(l.stats.negotiationTime.Load()),
-		LargeMessages:      l.stats.largeMessages.Load(),
-		LargeBytes:         l.stats.largeBytes.Load(),
+		Messages:           l.stats.messages.Load(),
+		MessageBytes:       l.stats.messageBytes.Load(),
 		Requests:           l.stats.requests.Load(),
 		Responses:          l.stats.responses.Load(),
 		DroppedMessages:    l.stats.droppedMessages.Load(),

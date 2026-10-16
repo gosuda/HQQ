@@ -33,8 +33,9 @@ func ExampleListen() {
 		}
 		defer server.Close()
 		mux := hqq.NewMux()
-		mux.HandleFunc(1, func(_ context.Context, req hqq.AdvancedMessage) ([]byte, error) {
-			return append([]byte("hello, "), req.Payload...), nil
+		mux.HandleFunc(1, func(_ context.Context, w *hqq.ResponseWriter, req *hqq.Request) {
+			w.Write([]byte("hello, "))
+			w.Write(req.Payload())
 		})
 		serverDone <- server.Serve(ctx, mux) // returns nil when the client closes
 	}()
@@ -50,7 +51,8 @@ func ExampleListen() {
 		fmt.Println("call:", err)
 		return
 	}
-	fmt.Println(string(resp))
+	fmt.Println(string(resp.Bytes()))
+	resp.Release()
 	client.Close()
 	fmt.Println("server:", <-serverDone)
 	// Output:
@@ -132,4 +134,68 @@ func ExampleStandardLink_ReserveWrite() {
 	fmt.Println(string(in.Buffer()))
 	in.Release()
 	// Output: built in place
+}
+
+// Streams multiplex independent, ordered message channels over one link. The
+// acceptor calls ListenStreams and AcceptStream; every received Message is
+// released when the application is done with it.
+func ExampleAdvancedLink_OpenStream() {
+	const bufferCount, bufferSize = 16, 256
+	mem := hqq.AlignedBuffer(hqq.SizeStandardLink(bufferCount, bufferSize))
+	server, err := hqq.NewAdvancedLink(mem, bufferCount, bufferSize, hqq.AdvancedOptions{})
+	if err != nil {
+		panic(err)
+	}
+	defer server.Close()
+	client, err := hqq.NewAdvancedLink(mem, bufferCount, bufferSize, hqq.AdvancedOptions{})
+	if err != nil {
+		panic(err)
+	}
+	defer client.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	negotiated := make(chan error, 1)
+	go func() { negotiated <- server.Negotiate(ctx, 0) }()
+	if err := client.Negotiate(ctx, 0); err != nil {
+		panic(err)
+	}
+	if err := <-negotiated; err != nil {
+		panic(err)
+	}
+
+	if err := server.ListenStreams(ctx); err != nil {
+		panic(err)
+	}
+	go func() {
+		s, err := server.AcceptStream(ctx)
+		if err != nil {
+			return
+		}
+		m, err := s.Recv(ctx)
+		if err != nil {
+			return
+		}
+		_ = s.Send(ctx, append([]byte("echo: "), m.Bytes()...))
+		m.Release()
+	}()
+
+	s, err := client.OpenStream(ctx)
+	if err != nil {
+		panic(err)
+	}
+	if err := s.Send(ctx, []byte("hello")); err != nil {
+		panic(err)
+	}
+	reply, err := s.Recv(ctx)
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println(s.ID(), string(reply.Bytes()))
+	reply.Release()
+	fmt.Println(s.Close())
+	// Output:
+	// 1 echo: hello
+	// <nil>
 }

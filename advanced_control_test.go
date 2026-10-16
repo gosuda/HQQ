@@ -15,14 +15,14 @@ import (
 func streamCount(l *AdvancedLink) int {
 	l.controlMu.Lock()
 	defer l.controlMu.Unlock()
-	return len(l.connections)
+	return len(l.streams)
 }
 
 func TestNegotiationFailedIsTerminal(t *testing.T) {
 	link := newTestAdvancedLink(t, 8, 32, AdvancedOptions{})
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err := link.NegotiateProtocol(ctx, currentProtocolVersion, FeatureLargeCopy); err == nil {
+	if _, err := link.NegotiateProtocol(ctx, currentProtocolVersion, FeatureMessages); err == nil {
 		t.Fatal("NegotiateProtocol with a canceled context succeeded")
 	}
 	if got := link.ProtocolState(); got != ProtocolStateFailed {
@@ -30,7 +30,7 @@ func TestNegotiationFailedIsTerminal(t *testing.T) {
 	}
 
 	live := context.Background()
-	if _, err := link.NegotiateProtocol(live, currentProtocolVersion, FeatureLargeCopy); !errors.Is(err, ErrNegotiationFailed) || errors.Is(err, ErrAlreadyNegotiated) {
+	if _, err := link.NegotiateProtocol(live, currentProtocolVersion, FeatureMessages); !errors.Is(err, ErrNegotiationFailed) || errors.Is(err, ErrAlreadyNegotiated) {
 		t.Fatalf("NegotiateProtocol after failure = %v, want ErrNegotiationFailed", err)
 	}
 	if _, err := link.WaitForNegotiation(live); !errors.Is(err, ErrNegotiationFailed) || errors.Is(err, ErrAlreadyNegotiated) {
@@ -50,7 +50,7 @@ func TestNegotiationRepeatIsAlreadyNegotiated(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	first := make(chan error, 1)
 	go func() {
-		_, err := link.NegotiateProtocol(ctx, currentProtocolVersion, FeatureLargeCopy)
+		_, err := link.NegotiateProtocol(ctx, currentProtocolVersion, FeatureMessages)
 		first <- err
 	}()
 	for link.ProtocolState() != ProtocolStateNegotiating {
@@ -97,7 +97,7 @@ func TestCloseStream(t *testing.T) {
 		t.Fatal(err)
 	}
 	mux := NewMux()
-	mux.HandleFunc(1, func(_ context.Context, req AdvancedMessage) ([]byte, error) { return req.Payload, nil })
+	mux.HandleFunc(1, func(_ context.Context, w *ResponseWriter, req *Request) { w.Write(req.Payload()) })
 	for _, l := range []*AdvancedLink{primary, secondary} {
 		go l.Serve(ctx, mux)
 	}
@@ -107,92 +107,110 @@ func TestCloseStream(t *testing.T) {
 	// and received after, everything that preceded the request.
 	settle := func(from *AdvancedLink) {
 		t.Helper()
-		if _, err := from.Call(ctx, 1, []byte("sync")); err != nil {
+		resp, err := from.Call(ctx, 1, []byte("sync"))
+		if err != nil {
 			t.Fatalf("sync call: %v", err)
 		}
+		resp.Release()
 	}
-	checkClosed := func(l *AdvancedLink, id uint64) {
+	// checkUnusable verifies that st fails every operation with want.
+	checkUnusable := func(st *Stream, want error) {
 		t.Helper()
-		if _, err := l.CallOn(ctx, id, 1, nil); !errors.Is(err, ErrConnNotFound) {
-			t.Fatalf("CallOn closed stream = %v, want ErrConnNotFound", err)
+		if _, err := st.Call(ctx, 1, nil); !errors.Is(err, want) {
+			t.Fatalf("Call on stream %d = %v, want %v", st.ID(), err, want)
 		}
-		if _, err := l.SendLarge(ctx, id, []byte("x")); !errors.Is(err, ErrConnNotFound) {
-			t.Fatalf("SendLarge closed stream = %v, want ErrConnNotFound", err)
+		if err := st.Send(ctx, []byte("x")); !errors.Is(err, want) {
+			t.Fatalf("Send on stream %d = %v, want %v", st.ID(), err, want)
 		}
-		if err := l.CloseStream(ctx, id); !errors.Is(err, ErrConnNotFound) {
-			t.Fatalf("CloseStream closed stream = %v, want ErrConnNotFound", err)
+		if m, err := st.Recv(ctx); !errors.Is(err, want) {
+			t.Fatalf("Recv on stream %d = %v, want %v", st.ID(), err, want)
+		} else if m != nil {
+			t.Fatalf("Recv on stream %d returned a message with error %v", st.ID(), err)
 		}
 	}
 
 	// The opener closes.
-	id, err := primary.OpenStream(ctx)
+	opened, err := primary.OpenStream(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
 	accepted, err := secondary.AcceptStream(ctx)
-	if err != nil || accepted != id {
-		t.Fatalf("AcceptStream = %d, %v; want %d", accepted, err, id)
+	if err != nil || accepted.ID() != opened.ID() {
+		t.Fatalf("AcceptStream = %v, %v; want stream %d", accepted, err, opened.ID())
 	}
 	if streamCount(primary) != 1 || streamCount(secondary) != 1 {
 		t.Fatalf("open stream registered %d/%d times, want 1/1", streamCount(primary), streamCount(secondary))
 	}
-	if resp, err := primary.CallOn(ctx, id, 1, []byte("hi")); err != nil || string(resp.Payload) != "hi" {
-		t.Fatalf("CallOn open stream = %q, %v", resp.Payload, err)
+	resp, err := opened.Call(ctx, 1, []byte("hi"))
+	if err != nil || string(resp.Bytes()) != "hi" {
+		t.Fatalf("Call on open stream = %v, %v", resp, err)
 	}
-	if err := primary.CloseStream(ctx, id); err != nil {
+	resp.Release()
+	if err := opened.Close(); err != nil {
 		t.Fatal(err)
 	}
 	if n := streamCount(primary); n != 0 {
-		t.Fatalf("opener registry after CloseStream = %d, want 0", n)
+		t.Fatalf("opener registry after Close = %d, want 0", n)
 	}
 	settle(primary)
 	if n := streamCount(secondary); n != 0 {
 		t.Fatalf("peer registry after OpConnClose = %d, want 0", n)
 	}
-	checkClosed(primary, id)
-	checkClosed(secondary, id)
+	if err := opened.Close(); !errors.Is(err, ErrClosed) {
+		t.Fatalf("second Close = %v, want ErrClosed", err)
+	}
+	checkUnusable(opened, ErrClosed)
+	checkUnusable(accepted, ErrPeerClosed)
+	if err := accepted.Close(); err != nil {
+		t.Fatalf("Close of a stream the peer closed = %v, want nil", err)
+	}
+	if err := accepted.Close(); !errors.Is(err, ErrClosed) {
+		t.Fatalf("second Close of a stream the peer closed = %v, want ErrClosed", err)
+	}
+	checkUnusable(accepted, ErrClosed)
 
 	// The acceptor closes.
-	id2, err := primary.OpenStream(ctx)
+	opened2, err := primary.OpenStream(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if id2 == id {
-		t.Fatalf("stream ID %d was reused", id)
+	if opened2.ID() == opened.ID() {
+		t.Fatalf("stream ID %d was reused", opened.ID())
 	}
-	if accepted, err := secondary.AcceptStream(ctx); err != nil || accepted != id2 {
-		t.Fatalf("AcceptStream = %d, %v; want %d", accepted, err, id2)
+	accepted2, err := secondary.AcceptStream(ctx)
+	if err != nil || accepted2.ID() != opened2.ID() {
+		t.Fatalf("AcceptStream = %v, %v; want stream %d", accepted2, err, opened2.ID())
 	}
-	if err := secondary.CloseStream(ctx, id2); err != nil {
+	if err := accepted2.Close(); err != nil {
 		t.Fatal(err)
 	}
 	if n := streamCount(secondary); n != 0 {
-		t.Fatalf("acceptor registry after CloseStream = %d, want 0", n)
+		t.Fatalf("acceptor registry after Close = %d, want 0", n)
 	}
 	settle(secondary)
 	if n := streamCount(primary); n != 0 {
 		t.Fatalf("opener registry after the peer's OpConnClose = %d, want 0", n)
 	}
-	checkClosed(primary, id2)
-	checkClosed(secondary, id2)
+	checkUnusable(accepted2, ErrClosed)
+	checkUnusable(opened2, ErrPeerClosed)
 
-	// IDs that were never streams.
-	for _, bad := range []uint64{0, 12345} {
-		if err := primary.CloseStream(ctx, bad); !errors.Is(err, ErrConnNotFound) {
-			t.Fatalf("CloseStream(%d) = %v, want ErrConnNotFound", bad, err)
+	// The link-level stream is always open and cannot be closed.
+	for _, l := range []*AdvancedLink{primary, secondary} {
+		for range 2 {
+			if err := l.Stream().Close(); !errors.Is(err, ErrInvalidOp) {
+				t.Fatalf("Close of stream 0 = %v, want ErrInvalidOp", err)
+			}
 		}
-	}
-	if _, err := primary.CallOn(ctx, 12345, 1, nil); !errors.Is(err, ErrConnNotFound) {
-		t.Fatalf("CallOn unknown stream = %v, want ErrConnNotFound", err)
 	}
 	// Link-level traffic on ID 0 is unaffected.
 	settle(primary)
+	settle(secondary)
 }
 
 func TestCloseStreamBeforeNegotiation(t *testing.T) {
 	link := newTestAdvancedLink(t, 8, 32, AdvancedOptions{})
-	if err := link.CloseStream(context.Background(), 2); !errors.Is(err, ErrNotNegotiated) {
-		t.Fatalf("CloseStream before negotiation = %v, want ErrNotNegotiated", err)
+	if err := newStream(link, 2).Close(); !errors.Is(err, ErrNotNegotiated) {
+		t.Fatalf("Close before negotiation = %v, want ErrNotNegotiated", err)
 	}
 }
 
@@ -206,35 +224,41 @@ func TestAcceptedStreamIsVisibleAfterAccept(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	opened := make(chan uint64, 1)
+	type openResult struct {
+		st  *Stream
+		err error
+	}
+	opened := make(chan openResult, 1)
 	go func() {
-		id, err := primary.OpenStream(ctx)
-		if err != nil {
-			t.Error(err)
-		}
-		opened <- id
+		st, err := primary.OpenStream(ctx)
+		opened <- openResult{st, err}
 	}()
-	id, err := secondary.AcceptStream(ctx)
+	accepted, err := secondary.AcceptStream(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := secondary.SendLarge(ctx, id, []byte("first")); err != nil {
+	if err := accepted.Send(ctx, []byte("first")); err != nil {
 		t.Fatal(err)
 	}
-	message, err := primary.Receive(ctx)
+	res := <-opened
+	if res.err != nil {
+		t.Fatal(res.err)
+	}
+	message, err := res.st.Recv(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer message.Release()
 	// The dispatcher processed the accept before the data frame it
 	// delivered: no OpenStream is pending any more.
 	primary.controlMu.Lock()
 	pending := len(primary.pendingConnections)
 	primary.controlMu.Unlock()
-	if message.ConnectionID != id || pending != 0 {
-		t.Fatalf("data on stream %d arrived with %d pending OpenStream calls (message on %d)", id, pending, message.ConnectionID)
+	if message.StreamID() != accepted.ID() || pending != 0 || string(message.Bytes()) != "first" {
+		t.Fatalf("data on stream %d arrived with %d pending OpenStream calls (message %q on %d)", accepted.ID(), pending, message.Bytes(), message.StreamID())
 	}
-	if got := <-opened; got != id {
-		t.Fatalf("OpenStream = %d, want %d", got, id)
+	if res.st.ID() != accepted.ID() {
+		t.Fatalf("OpenStream = %d, want %d", res.st.ID(), accepted.ID())
 	}
 }
 
@@ -306,7 +330,7 @@ func TestStreamAndCallFloodBothDirections(t *testing.T) {
 	defer cancel()
 
 	mux := NewMux()
-	mux.HandleFunc(1, func(_ context.Context, req AdvancedMessage) ([]byte, error) { return req.Payload, nil })
+	mux.HandleFunc(1, func(_ context.Context, w *ResponseWriter, req *Request) { w.Write(req.Payload()) })
 	var serving sync.WaitGroup
 	for _, l := range []*AdvancedLink{a, b} {
 		if err := l.ListenStreams(ctx); err != nil {
@@ -335,22 +359,30 @@ func TestStreamAndCallFloodBothDirections(t *testing.T) {
 			go func() {
 				defer wg.Done()
 				for r := range rounds {
-					id, err := l.OpenStream(ctx)
+					st, err := l.OpenStream(ctx)
 					if err != nil {
 						t.Errorf("%v worker %d round %d: OpenStream: %v", l.Mode(), w, r, err)
 						return
 					}
-					resp, err := l.CallOn(ctx, id, 1, payload)
-					if err != nil || !bytes.Equal(resp.Payload, payload) {
-						t.Errorf("%v worker %d round %d: CallOn: %d bytes, %v", l.Mode(), w, r, len(resp.Payload), err)
+					resp, err := st.Call(ctx, 1, payload)
+					if err != nil {
+						t.Errorf("%v worker %d round %d: stream Call: %v", l.Mode(), w, r, err)
 						return
 					}
-					if _, err := l.Call(ctx, 1, payload); err != nil {
+					ok := bytes.Equal(resp.Bytes(), payload)
+					resp.Release()
+					if !ok {
+						t.Errorf("%v worker %d round %d: stream Call: wrong echo", l.Mode(), w, r)
+						return
+					}
+					resp, err = l.Call(ctx, 1, payload)
+					if err != nil {
 						t.Errorf("%v worker %d round %d: Call: %v", l.Mode(), w, r, err)
 						return
 					}
-					if err := l.CloseStream(ctx, id); err != nil {
-						t.Errorf("%v worker %d round %d: CloseStream: %v", l.Mode(), w, r, err)
+					resp.Release()
+					if err := st.Close(); err != nil {
+						t.Errorf("%v worker %d round %d: Close: %v", l.Mode(), w, r, err)
 						return
 					}
 				}

@@ -43,13 +43,14 @@ var (
 // Refined errors. Each one wraps the base error it used to be reported as,
 // so existing errors.Is checks against the base errors keep working.
 var (
-	// ErrClosed is returned by operations on a link that has been closed
-	// locally. It matches net.ErrClosed.
+	// ErrClosed is returned by operations on a link, or on a Stream, that has
+	// been closed locally. It matches net.ErrClosed.
 	ErrClosed = &hqqError{msg: "hqq: link closed", base: net.ErrClosed}
 
 	// ErrPeerClosed is returned by blocking operations after the peer
-	// endpoint closed the link gracefully and no buffered data remains.
-	// It matches io.EOF.
+	// endpoint closed the link gracefully and no buffered data remains, and
+	// by Send, Recv and Call of a Stream the peer closed (Recv after the
+	// messages queued before the close were consumed). It matches io.EOF.
 	ErrPeerClosed = &hqqError{msg: "hqq: peer closed the link", base: io.EOF}
 
 	// ErrPeerGone is returned when the peer endpoint stopped heartbeating
@@ -92,34 +93,29 @@ var (
 	// chunk ordering).
 	ErrProtocol = &hqqError{msg: "hqq: protocol violation", base: ErrInvalidOp}
 
-	// ErrAdvancedActive is returned by the Standard Read/Write methods of an
-	// AdvancedLink after negotiation, because they would steal Advanced
-	// frames from the dispatcher.
-	ErrAdvancedActive = &hqqError{msg: "hqq: standard I/O is disabled on a negotiated advanced link", base: ErrInvalidOp}
-
-	// ErrNotListening is returned by Accept before Listen.
+	// ErrNotListening is returned by AcceptStream before ListenStreams.
 	ErrNotListening = &hqqError{msg: "hqq: not listening for connections", base: ErrInvalidOp}
 
-	// ErrAlreadyListening is returned by a second Listen.
+	// ErrAlreadyListening is returned by a second ListenStreams.
 	ErrAlreadyListening = &hqqError{msg: "hqq: already listening for connections", base: ErrInvalidOp}
 
-	// ErrIncomingOverflow is returned when the incoming queue is full and
-	// AdvancedOptions.IncomingOverflow is OverflowFail.
+	// ErrIncomingOverflow is returned when the queue a message is routed to
+	// is full and AdvancedOptions.IncomingOverflow is OverflowFail.
 	ErrIncomingOverflow = &hqqError{msg: "hqq: incoming message queue overflow", base: ErrBufferOverflow}
 
-	// ErrMessageAborted is returned by Call and CallOn when the peer
-	// abandoned the response mid-transfer (its multi-chunk send failed). The
-	// call can be retried. Aborted messages that are not responses to a call
-	// never reach Receive or Serve: they are dropped, because they were never
+	// ErrMessageAborted is returned by Stream.Call when the peer abandoned
+	// the response mid-transfer (its multi-chunk send failed). The call can
+	// be retried. Aborted messages that are not responses to a call never
+	// reach Stream.Recv or Serve: they are dropped, because they were never
 	// complete.
 	ErrMessageAborted = &hqqError{msg: "hqq: message aborted by sender", base: ErrProtocol}
 
-	// ErrReassemblyLimit is returned by Call and CallOn when this endpoint
+	// ErrReassemblyLimit is returned by Stream.Call when this endpoint
 	// refused to assemble the response because incomplete messages already
 	// held AdvancedOptions.MaxReassemblyBytes. A request refused for the same
 	// reason is answered with an error response whose status is
-	// ErrCodeBufferOverflow, so the peer's Call fails with an
-	// AdvancedResponseError.
+	// ErrCodeBufferOverflow, so the peer's Call fails with a
+	// ResponseError.
 	ErrReassemblyLimit = &hqqError{msg: "hqq: reassembly memory limit exceeded", base: ErrBufferOverflow}
 
 	// ErrInvalidName is returned for shared-memory names that are empty,
@@ -223,17 +219,17 @@ func errorFromCode(code ErrorCode) error {
 	}
 }
 
-// AdvancedResponseError reports an error response to an Advanced request.
-// Call returns it when the peer answered with RespondError; RPC handlers may
-// return it to choose the status and payload of the error response.
-type AdvancedResponseError struct {
+// ResponseError reports an error response to a request. Stream.Call returns
+// it when the peer's handler answered with ResponseWriter.WriteError. Payload
+// is a copy owned by the caller.
+type ResponseError struct {
 	Status  uint64
 	Payload []byte
 }
 
-func (e AdvancedResponseError) Error() string {
+func (e ResponseError) Error() string {
 	if len(e.Payload) > 0 && len(e.Payload) <= 256 {
-		return fmt.Sprintf("hqq: advanced response error (status %d): %s", e.Status, e.Payload)
+		return fmt.Sprintf("hqq: response error (status %d): %s", e.Status, e.Payload)
 	}
-	return fmt.Sprintf("hqq: advanced response error (status %d, %d byte payload)", e.Status, len(e.Payload))
+	return fmt.Sprintf("hqq: response error (status %d, %d byte payload)", e.Status, len(e.Payload))
 }

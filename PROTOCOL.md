@@ -5,7 +5,7 @@
 This document defines the HQQ shared-memory protocol family:
 
 - **Standard Protocol 1.0**: the [`StandardLink`](standard.go) data path. It provides the fixed 64-byte packet ABI, bidirectional lock-free MPMC rings, ring-slot-owned payload buffers, tombstones, endpoint liveness/crash detection, and the basic `Read`/`Write`/zero-copy/reservation APIs.
-- **Advanced Protocol 1.0**: an optional negotiated overlay on top of the Standard Protocol. It keeps the same shared-memory layout and packet ABI, and adds multi-chunk large-data copy, concurrent request-response IPC, and logical stream multiplexing.
+- **Advanced Protocol 1.0**: an optional negotiated overlay on top of the Standard Protocol. It keeps the same shared-memory layout and packet ABI, and adds multi-chunk messages, concurrent request-response IPC, and logical stream multiplexing.
 
 The Advanced Protocol preserves Standard Protocol ownership rules: every payload byte lives in the same-index buffer owned by the claimed data-ring slot, and every reader releases the claimed slot promptly.
 
@@ -283,15 +283,15 @@ A closed or dead peer does not lose messages: when a read fails because the peer
 
 ## Advanced Protocol 1.0 Design
 
-The Advanced Protocol is an overlay over Standard Protocol 1.0. It publishes Advanced packets through the same direction-local packet rings, and each Advanced payload chunk uses the same-index buffer owned by the claimed ring slot. Once negotiation of an `AdvancedLink` has started, direct `AdvancedLink.Read` and `AdvancedLink.Write` calls on that link are rejected with `ErrAdvancedActive`.
+The Advanced Protocol is an overlay over Standard Protocol 1.0. It publishes Advanced packets through the same direction-local packet rings, and each Advanced payload chunk uses the same-index buffer owned by the claimed ring slot. Once negotiation of an `AdvancedLink` has started, the Advanced receive path owns the receive direction of that link.
 
 ### Advanced IDs
 
 | ID | Scope | Purpose |
 | --- | --- | --- |
-| `ConnectionID` | Per link pair | Logical stream or endpoint (`0` is reserved for link-level calls and large transfers). Even non-zero IDs are allocated by Primary (`2, 4, ...`); odd IDs by Secondary (`1, 3, ...`). IDs are never reused on a link. |
-| `MessageID` | Per sender | Large-copy transfer ID or request correlation ID, starting at `1` (never `0`). Responses reuse the request's `MessageID`. |
-| `MethodID` | Application-defined | Numeric function/procedure selector for request packets. |
+| `ConnectionID` | Per link pair | Logical stream (`Stream.ID`); `0` is the link-level stream, which is always open. Even non-zero IDs are allocated by Primary (`2, 4, ...`); odd IDs by Secondary (`1, 3, ...`). IDs are never reused on a link. |
+| `MessageID` | Per sender | Identifies a data message, or correlates a request with its response; starts at `1` (never `0`). Responses reuse the request's `MessageID`. |
+| `MethodID` | Application-defined | Numeric function/procedure selector for request packets (`Request.Method`). |
 
 A message is identified on the receive side by `(ConnectionID, MessageID, kind)` where `kind` is request, response, or plain data.
 
@@ -301,7 +301,7 @@ A message is identified on the receive side by `(ConnectionID, MessageID, kind)`
 | --- | ---: | --- |
 | `AdvFlagBegin` | `1 << 0` | First chunk of a logical message. |
 | `AdvFlagEnd` | `1 << 1` | Final chunk of a logical message. |
-| `AdvFlagAbort` | `1 << 2` | Sender abandoned this logical message; receiver discards partial state. Aborted requests and data messages are never delivered to `Receive`, `Serve`, or a `MessageHandler`; an aborted response fails the waiting call with `ErrMessageAborted`. |
+| `AdvFlagAbort` | `1 << 2` | Sender abandoned this logical message; receiver discards partial state. Aborted requests and data messages are never delivered to `Stream.Recv` or `Serve`; an aborted response fails the waiting call with `ErrMessageAborted`. |
 | `AdvFlagRequest` | `1 << 3` | Chunk belongs to a request message. |
 | `AdvFlagResponse` | `1 << 4` | Chunk belongs to a response message. |
 | `AdvFlagError` | `1 << 5` | Response represents an application/protocol error. |
@@ -316,19 +316,19 @@ For single-chunk messages, both `AdvFlagBegin` and `AdvFlagEnd` are set. A frame
   | --- | --- |
   | not listening (`ListenStreams` not called) | `ErrCodeConnNotFound` |
   | ID `0`, wrong parity for the sender's role, or already in use (the existing stream is left untouched) | `ErrCodeInvalidOp` |
-  | incoming queue full under `OverflowDrop` | `ErrCodeBufferOverflow` |
+  | accept queue full under `OverflowDrop` | `ErrCodeBufferOverflow` |
 
-  Under `OverflowFail` a full queue fails the dispatcher with `ErrIncomingOverflow` instead of replying.
-- `OpConnClose`: `Operand0 = ConnectionID`, `Operand1 = reason` (`CloseStream` sends `0`). The receiver deletes its registration of the stream.
+  Under `OverflowFail` a full accept queue fails the receive path with `ErrIncomingOverflow` instead of replying.
+- `OpConnClose`: `Operand0 = ConnectionID`, `Operand1 = reason` (`Stream.Close` sends `0`). The receiver unregisters the stream and marks it closed by the peer; an unknown ID, or one whose `OpenStream` is still pending, is ignored.
 - An `OpError` that matches no pending `OpenStream` fails the receiving side with the error of its code (an unknown code yields an error matching `ErrProtocol`).
 
-**`CloseStream(ctx, id)`** removes the local registration first and then sends `OpConnClose`; the registration is removed even if sending fails (the peer then keeps its registration until the link closes). An ID that is not an open stream (including `0` and a stream that is still opening) returns `ErrConnNotFound`. After closing, `CallOn`, `SendLarge`, and `CloseStream` on the ID return `ErrConnNotFound`, because every use checks that a nonzero ID is an open stream. `Respond` and `RespondError` do not check: a server can still answer a request it received on a stream it has since closed, and responses to requests already in flight are still routed.
+**`Stream.Close()`** takes no context. It marks the stream closed locally first (a second `Close` returns `ErrClosed`), unregisters it, discards its queued messages, and then sends `OpConnClose`, unless the peer closed the stream first; the stream stays closed locally even if sending fails, in which case the peer keeps its registration until the link closes. Closing stream `0` returns `ErrInvalidOp`, and the first `Close` after a peer close returns nil. Stream IDs are never reused. Requests the peer already sent on the stream are not affected: `Serve` still answers them on that stream.
 
 **Accept ordering.** An incoming stream is registered immediately but becomes visible to `AcceptStream` only after its `OpConnAccept` has been enqueued on the tx ring, so data the acceptor sends on the stream cannot overtake the accept.
 
 ### `OpConnCopy` (`0x04`)
 
-Transfers one Advanced chunk for large-data copy or request-response IPC:
+Transfers one Advanced chunk of a message (plain data, request, or response):
 
 | Operand | Meaning |
 | --- | --- |
@@ -340,35 +340,43 @@ Transfers one Advanced chunk for large-data copy or request-response IPC:
 | `Operand5` | Advanced frame flags |
 | `Operand6` | `MethodID` for request begin frames; status/error code for response/error frames; otherwise zero. Non-zero only in the chunk at offset `0` |
 
-Chunks of one message are sent in order with `ChunkSize <= bufferSize`. A zero-length message is a single frame with `TotalSize = ChunkOffset = ChunkSize = 0` and both `Begin` and `End`. `SendLarge` requires `FeatureLargeCopy`; `CallOn`, `Call`, `Respond`, and `RespondError` require `FeatureRequestResponse`; otherwise `ErrNotNegotiated`. A payload larger than `MaxMessageSize` is refused locally with `ErrBufferOverflow`.
+Chunks of one message are sent in order with `ChunkSize <= bufferSize`. A zero-length message is a single frame with `TotalSize = ChunkOffset = ChunkSize = 0` and both `Begin` and `End`. `Stream.Send` requires `FeatureMessages`; `Stream.Call` and `Serve` (which sends the responses) require `FeatureRequestResponse`; otherwise `ErrNotNegotiated`. A payload larger than `MaxMessageSize` is refused locally with `ErrBufferOverflow`.
 
 ### Protocol Negotiation (`OpProtoNegotiate` `0x05`, `OpProtoAck` `0x06`)
 
 Negotiation is mandatory before using Advanced APIs (`ErrNotNegotiated` otherwise).
 
-- **Features**: `FeatureLargeCopy = 1 << 0`, `FeatureRequestResponse = 1 << 1`. Operand 0 encodes the protocol version as `(major << 8) | minor`; operand 2 (capabilities) is always sent as `0` and ignored on receipt.
+- **Features**: `FeatureMessages = 1 << 0` (plain messages, `OpConnCopy` without request/response flags), `FeatureRequestResponse = 1 << 1`. Operand 0 encodes the protocol version as `(major << 8) | minor`; operand 2 (capabilities) is always sent as `0` and ignored on receipt.
 - **Role-agnostic negotiation**: `AdvancedLink.Negotiate(ctx, features)` initiates negotiation on the Primary endpoint and waits for negotiation on the Secondary endpoint (`features = 0` requests everything supported).
 - **Answer rules**: the responder rejects (with `OpError(0, ErrCodeInvalidOp)`) a request whose major version differs from `1`; otherwise it answers with the requested minor version capped at its own (`0`) and the intersection of requested, supported, and allowed features. The initiator rejects (`ErrNegotiationRejected`) an ack whose major differs, whose minor is higher than its own, or which contains a feature it did not request or does not support. Tombstones are skipped; an `OpError` fails negotiation with `ErrNegotiationRejected`; any other opcode with `ErrUnexpectedPacket`.
 - **Simultaneous initiation resolution**: If both endpoints call `NegotiateProtocol` concurrently, the Primary's request wins: the Secondary answers the Primary's `OpProtoNegotiate` with `OpProtoAck` (intersection of features), and the Primary ignores the Secondary's request.
 - **`ProtocolStateFailed` is terminal.** Any error during an attempt (peer rejection, invalid packets, a canceled or expired context, a closed link) moves the link to `ProtocolStateFailed`. Every later `Negotiate`, `NegotiateProtocol`, or `WaitForNegotiation` returns `ErrNegotiationFailed`, because negotiation frames of the failed attempt may still be in flight; the link must be closed and a new one opened. `ErrAlreadyNegotiated` is returned only while an attempt is in progress or after it succeeded.
 
-### Dispatcher, Control Sender, and Overflow Policy
+### Receive Path, Routing, Control Sender, and Overflow Policy
 
-After negotiation the receive direction has a single consumer path: `Receive` and synchronous `Call` may drive it directly, and a background **dispatcher** is started when concurrent calls or streams need asynchronous routing (`ListenStreams`, `AcceptStream`, and `OpenStream` start it). The dispatcher assembles messages, routes responses to pending calls, handles stream control frames, and queues everything else for `Receive`.
+After negotiation the receive direction has a single consumer path. A goroutine that waits for a message (`Stream.Recv`, `Stream.Call`, `Serve`) and finds no dispatcher receives synchronously, which gives the lowest latency, and routes every message it receives to its destination. A background **dispatcher** is started when several goroutines wait concurrently or when streams need asynchronous routing (`ListenStreams`, `AcceptStream`, and `OpenStream` start it). Either way the receive path assembles messages, handles stream control frames, and routes each complete message in the order it was received:
+
+| Message | Destination |
+| --- | --- |
+| response (`AdvFlagResponse`) | the pending `Call` with the same `(ConnectionID, MessageID)`; a response without a waiting call is dropped and counted in `AdvancedStats.DroppedMessages`, unless its call was canceled (below) |
+| request (`AdvFlagRequest`) | the request queue of the link, consumed only by `Serve`, for every stream |
+| data (neither flag) | the queue of its stream, consumed by `Stream.Recv`; data for a stream that is unknown or closed is dropped and counted in `DroppedMessages` |
 
 - **The receive path never waits for the tx ring.** If two peers flood each other, both tx rings fill up, and a receiver that waited for its tx ring would wait for a peer that no longer drains. The replies the receive path generates (`OpConnAccept`, `OpError` refusals of `OpConnCreate`, error responses to requests refused by `MaxReassemblyBytes`) are queued on a **control sender**: a goroutine started lazily on the first reply and stopped by `Close`, fed by a bounded queue of `max(BufferCount, 16)` jobs. It is the only goroutine that waits for the tx ring on behalf of the receive path. A full queue never blocks the receiver: the reply is dropped. A dropped reply to an `OpConnCreate` is counted in `AdvancedStats.DroppedMessages` and leaves the peer's `OpenStream` waiting until its own context ends; a dropped error response to a refused request (already counted when the request was refused) leaves the peer's `Call` waiting likewise.
-- **Single-chunk fast path**: single-frame messages (`AdvFlagBegin | AdvFlagEnd`) allocate and copy directly without inserting into the multi-chunk reassembly map.
-- **Late responses to canceled calls**: when `Call` or `CallOn` times out or its `context.Context` is canceled while waiting for a response, the `(ConnectionID, MessageID)` key is recorded in a bounded set of canceled calls (4096 entries, oldest evicted). Subsequent response chunks for that call are silently drained and discarded (counted in `AbandonedResponses`) rather than aborting the dispatcher. A response that matches no pending call and no canceled call is delivered to `Receive`.
-- **Incoming queue backpressure (`OverflowPolicy`)**: the queue holds `AdvancedOptions.IncomingQueueSize` entries (default `bufferCount`) of messages for `Receive` and, separately sized the same, accepted streams for `AcceptStream`. A slot for a stream is reserved when its `OpConnCreate` arrives, so the accept reply can always be delivered.
-  - `OverflowBlock` (default): the dispatcher blocks until the application consumes from `Receive` or `AcceptStream`, propagating backpressure into the shared-memory ring. While it blocks, responses are not routed either. This is the only wait left on the receive path, and it depends on the application, not on the tx ring.
-  - `OverflowDrop`: drops the newest message that would be queued for `Receive` (a response that matches no waiting call counts as such a message), counted in `DroppedMessages`. A stream whose `OpConnCreate` finds the queue full is **refused**: the stream is not registered and the peer receives `OpError` with `ErrCodeBufferOverflow` (previously: accept followed by `OpConnClose`); this is also counted in `DroppedMessages`. The dispatcher never blocks, so responses are always routed.
-  - `OverflowFail`: fails the dispatcher with `ErrIncomingOverflow`; pending and future calls fail with that error.
+- **Single-chunk fast path**: single-frame messages (`AdvFlagBegin | AdvFlagEnd`) take a pooled buffer and copy the payload directly, without inserting into the multi-chunk reassembly map.
+- **Late responses to canceled calls**: when `Call` times out, its `context.Context` is canceled, or its stream is closed while it waits for a response, the `(ConnectionID, MessageID)` key is recorded in a bounded set of canceled calls (4096 entries, oldest evicted). Subsequent response chunks for that call are silently drained and discarded (counted in `AbandonedResponses`) rather than aborting the receive path.
+- **Per-queue backpressure (`OverflowPolicy`)**: every destination queue has `AdvancedOptions.IncomingQueueSize` entries (default `bufferCount`): the queue of each stream, the request queue, and the queue of accepted streams. A slot in the accept queue is reserved when a stream's `OpConnCreate` arrives, so the accept reply can always be delivered. The policy applies to the queue a message is routed to:
+  - `OverflowBlock` (default): the receive path waits until the consumer of that queue (`Stream.Recv`, `Serve`, `AcceptStream`) makes room, propagating backpressure into the shared-memory ring. While it waits, nothing else is routed, not even responses, so an application must consume every stream it uses and run `Serve` if the peer sends requests. This is the only wait left on the receive path, and it depends on the application, not on the tx ring. A synchronous receiver does not wait itself: it hands the delivery to a helper goroutine that keeps the order, and a dispatcher takes over, so a caller's `Recv` or `Call` timeout cannot lose another goroutine's message.
+  - `OverflowDrop`: drops the message that does not fit, counted in `DroppedMessages`. A stream whose `OpConnCreate` finds the accept queue full is **refused**: the stream is not registered and the peer receives `OpError` with `ErrCodeBufferOverflow`; this is also counted in `DroppedMessages`. The receive path never blocks, so responses are always routed.
+  - `OverflowFail`: fails the receive path with `ErrIncomingOverflow`; pending and future calls fail with that error, and `Stream.Recv` returns the messages still queued before it.
+- **Stream close.** The peer, on receiving `OpConnClose`, unregisters the stream and marks it closed: the messages it routed before the close are still queued and `Recv` returns them before `ErrPeerClosed`; `Send` and `Call` return `ErrPeerClosed` at once, and a waiting `Recv` or `Call` wakes. A local `Stream.Close` unregisters the stream, discards its queued messages, and wakes blocked operations, which return `ErrClosed`. Data that arrives for a closed stream is dropped and counted. Requests already in flight are not affected: `Serve` still answers them on the stream they arrived on.
+- **`Serve` execution.** `Serve` consumes the request queue with one receiver goroutine at a time. While no handler is running, the receiver runs each handler inline; if an inline handler is still running after 200 µs, the receiver role passes to a new goroutine. While any handler is running, requests go to pooled worker goroutines, started on demand up to `BufferCount` and kept until `Serve` returns; when all are busy, receiving stops until one finishes, and the overflow policy of the request queue applies. When a request arrives and nothing is running, it runs inline again. `Serve` returns `ctx.Err()` when its context ends, nil when the peer closed the link gracefully, and the receive error otherwise.
 
 ### Reassembly and Bounds
 
 - `AdvancedOptions.MaxMessageSize` (default 64 MiB) bounds one message's `TotalSize` (`ErrBufferOverflow`).
 - Per-frame validation (`ErrInvalidSize` unless noted): `ChunkSize <= bufferSize`; `ChunkOffset <= TotalSize` and `ChunkSize <= TotalSize - ChunkOffset`; `TotalSize == 0` only as the single frame described above; `TotalSize > 0` requires `ChunkSize > 0`; `Operand6` is zero in chunks with a non-zero offset; a `Begin` frame has `ChunkOffset == 0`, no assembly or refusal already exists for its key, and (single chunk) `ChunkSize == TotalSize`; later chunks must continue exactly at the previous end (`ChunkOffset` equals the bytes received so far) and use the announced `TotalSize`; the `End` chunk must complete `TotalSize`. A non-`Begin` chunk with no assembly and no refusal is `ErrProtocol`. A validation failure drops the partial message and fails the receive path with the error.
-- **Memory bound**: the first chunk of a multi-chunk message allocates `TotalSize` bytes and is charged `TotalSize + 256` against `AdvancedOptions.MaxReassemblyBytes` (default `4 × MaxMessageSize`, saturating). A first chunk that would exceed the budget (alone, or together with the messages already being assembled) is refused without allocating; its remaining chunks are drained. A refused request is answered with an error response (status `ErrCodeBufferOverflow`, queued on the control sender), a refused response fails the waiting call with `ErrReassemblyLimit`, and a refused data message is dropped; all are counted in `AdvancedStats.DroppedMessages`. At most 1024 refused messages are tracked for draining; a message pushed out of that set fails with `ErrProtocol` on its next chunk.
+- **Memory bound**: the first chunk of a multi-chunk message takes a pooled buffer of `TotalSize` bytes rounded up to a power of two (at most `MaxMessageSize`) and is charged `TotalSize + 256` against `AdvancedOptions.MaxReassemblyBytes` (default `4 × MaxMessageSize`, saturating); the charge is the announced size, so the buffers actually held can exceed it. A first chunk that would exceed the budget (alone, or together with the messages already being assembled) is refused without taking a buffer; its remaining chunks are drained. A refused request is answered with an error response (status `ErrCodeBufferOverflow`, queued on the control sender), a refused response fails the waiting call with `ErrReassemblyLimit`, and a refused data message is dropped; all are counted in `AdvancedStats.DroppedMessages`. At most 1024 refused messages are tracked for draining; a message pushed out of that set fails with `ErrProtocol` on its next chunk.
 
 ## Error Hierarchy
 
@@ -377,8 +385,8 @@ All public errors support `errors.Is` against the sentinel itself and against th
 | Sentinel | Wraps | Meaning |
 | --- | --- | --- |
 | `io.EOF` (returned as is) | — | `StandardLink.Read` and `ReadFrom` after the peer closed gracefully and every buffered message was consumed |
-| `ErrClosed` | `net.ErrClosed` | Local link was closed |
-| `ErrPeerClosed` | `io.EOF` | Remote peer closed its link gracefully (all APIs except `StandardLink.Read` and `ReadFrom`) |
+| `ErrClosed` | `net.ErrClosed` | Local link was closed, or the stream was closed locally (`Stream.Close`) |
+| `ErrPeerClosed` | `io.EOF` | Remote peer closed its link gracefully (all APIs except `StandardLink.Read` and `ReadFrom`), or closed the stream (`Send` and `Call` of that stream, `Recv` once its queued messages are consumed) |
 | `ErrPeerGone` | `ErrConnNotFound` | Remote peer stopped heartbeating (crashed or hung), or the segment was re-initialized under this endpoint |
 | `ErrTimeout` | `os.ErrDeadlineExceeded` | Deadline passed (implements `net.Error` with `Timeout() == true`) |
 | `ErrLinkBusy` | `ErrFailedInit` | Two live endpoints are attached, the live endpoint's earlier peer already left, or a creator (`Create*`, `Listen`) found a live segment |
@@ -389,20 +397,19 @@ All public errors support `errors.Is` against the sentinel itself and against th
 | `ErrMemorySmall` | — | Caller-owned memory is empty or shorter than `SizeStandardLink` |
 | `ErrFailedInit` | — | Base of initialization failures, including transient ones for openers (an object that is not sized yet or an `Empty` segment whose creator never claimed it; an initializer that did not finish within `AttachTimeout`; a segment without any live endpoint) |
 | `ErrInvalidName` | — | Shared memory name is empty, contains separators/NUL, or exceeds the platform limit; on Linux also a name that is a symbolic link or not a regular file |
-| `ErrConnNotFound` | — | Base of `ErrPeerGone`; also `CallOn`, `SendLarge`, and `CloseStream` for an ID that is not an open stream, and a refusal because the peer was not listening |
-| `ErrInvalidOp` | — | Base of the protocol-state errors below |
-| `ErrBufferOverflow` | — | Payload larger than `bufferSize` (`StandardLink.Write`) or `MaxMessageSize` (`SendLarge`, incoming frame) |
+| `ErrConnNotFound` | — | Base of `ErrPeerGone`; also the refusal of `OpenStream` because the peer was not listening. Not returned for unknown or closed stream IDs (those give `ErrClosed` or `ErrPeerClosed`) |
+| `ErrInvalidOp` | — | Base of the protocol-state errors below; also `Stream.Close` on stream 0 and `Serve` with a nil handler |
+| `ErrBufferOverflow` | — | Payload larger than `bufferSize` (`StandardLink.Write`) or `MaxMessageSize` (`Stream.Send`, `ResponseWriter.Write`, incoming frame) |
 | `ErrNotNegotiated` | `ErrInvalidOp` | Advanced API called before protocol negotiation succeeded, or the required feature was not negotiated |
 | `ErrAlreadyNegotiated` | `ErrInvalidOp` | Protocol negotiation attempted while one is in progress or after one succeeded |
 | `ErrNegotiationFailed` | `ErrInvalidOp` | Protocol negotiation attempted after an earlier attempt failed (`ProtocolStateFailed` is terminal; reopen the link) |
 | `ErrNegotiationRejected` | `ErrInvalidOp` | Peer rejected negotiation or acknowledged an incompatible version/feature set |
 | `ErrUnexpectedPacket` | `ErrInvalidOp` | Packet that the calling API cannot consume (for example an Advanced frame on `StandardLink.Read`) |
 | `ErrProtocol` | `ErrInvalidOp` | Malformed frame bounds or flags, protocol state violation, or a peer error with an unknown code |
-| `ErrMessageAborted` | `ErrProtocol` | `Call`/`CallOn`: the peer abandoned the response mid-transfer |
-| `ErrAdvancedActive` | `ErrInvalidOp` | `AdvancedLink.Read`/`Write` called after negotiation started |
+| `ErrMessageAborted` | `ErrProtocol` | `Stream.Call`: the peer abandoned the response mid-transfer |
 | `ErrNotListening` / `ErrAlreadyListening` | `ErrInvalidOp` | `AcceptStream` before `ListenStreams` / second `ListenStreams` |
-| `ErrIncomingOverflow` | `ErrBufferOverflow` | Incoming queue exceeded `IncomingQueueSize` under `OverflowFail` |
-| `ErrReassemblyLimit` | `ErrBufferOverflow` | `Call`/`CallOn`: the response was refused under `MaxReassemblyBytes` |
-| `AdvancedResponseError` (`errors.As`) | — | `Call` returns it when the peer answered with an error response; carries `Status` and `Payload` |
+| `ErrIncomingOverflow` | `ErrBufferOverflow` | The queue a message is routed to (a stream, the request queue, or the accept queue) is full under `OverflowFail` |
+| `ErrReassemblyLimit` | `ErrBufferOverflow` | `Stream.Call`: the response was refused under `MaxReassemblyBytes` |
+| `ResponseError` (`errors.As`) | — | `Stream.Call` returns it by value when the peer's handler answered with `ResponseWriter.WriteError`; carries `Status` and a copy of the payload |
 
 `ErrorCode` values carried in `OpError`, tombstones, and error statuses: `0x01` memory alignment, `0x02` invalid size, `0x03` memory too small, `0x04` failed init, `0x05` connection not found, `0x06` invalid operation, `0x07` buffer overflow; each maps back to the base error above.

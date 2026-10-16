@@ -25,19 +25,20 @@
 //     [net.PacketConn] support with deadlines ([StandardLink.ReadFrom] has
 //     datagram semantics, [StandardLink.WriteTo] ignores its address).
 //   - Advanced Protocol ([AdvancedLink], [NamedAdvancedLink]): an optional
-//     negotiated overlay supporting multi-chunk large payload transfers
-//     ([AdvancedLink.SendLarge], [AdvancedLink.Receive]), concurrent
-//     request-response RPC ([AdvancedLink.Call], [AdvancedLink.CallOn],
-//     [AdvancedLink.Respond], [AdvancedLink.Serve], [Mux]), and logical
-//     stream multiplexing ([AdvancedLink.ListenStreams],
-//     [AdvancedLink.AcceptStream], [AdvancedLink.OpenStream],
-//     [AdvancedLink.CloseStream]). A failed negotiation is terminal: later
+//     negotiated overlay supporting messages of up to MaxMessageSize bytes
+//     (chunked over the ring, pooled on receipt: [AdvancedLink.Send],
+//     [AdvancedLink.Recv], [Message]), concurrent request-response RPC with a
+//     net/http-like server ([AdvancedLink.Call], [AdvancedLink.Serve],
+//     [Handler], [Mux]), and logical streams ([Stream], created with
+//     [AdvancedLink.ListenStreams], [AdvancedLink.AcceptStream] and
+//     [AdvancedLink.OpenStream]). A failed negotiation is terminal: later
 //     attempts return [ErrNegotiationFailed].
 //
 // # Quick Start
 //
 // For most inter-process RPC or large-message workloads, use [Listen] on the
-// primary process and [Dial] on the secondary process:
+// primary process and [Dial] on the secondary process, then serve requests on
+// one side and call them from the other:
 //
 //	// Primary process (creates or reuses the shared memory segment)
 //	server, err := hqq.Listen(ctx, "my-ipc", hqq.Config{})
@@ -46,6 +47,12 @@
 //	}
 //	defer server.Close()
 //
+//	mux := hqq.NewMux()
+//	mux.HandleFunc(1, func(ctx context.Context, w *hqq.ResponseWriter, req *hqq.Request) {
+//	    w.Write(req.Payload())
+//	})
+//	go server.Serve(ctx, mux)
+//
 //	// Secondary process (attaches to the segment)
 //	client, err := hqq.Dial(ctx, "my-ipc", hqq.Config{})
 //	if err != nil {
@@ -53,10 +60,65 @@
 //	}
 //	defer client.Close()
 //
+//	m, err := client.Call(ctx, 1, []byte("hello"))
+//	if err != nil {
+//	    log.Fatal(err)
+//	}
+//	fmt.Println(string(m.Bytes()))
+//	m.Release()
+//
 // For in-process testing or custom memory mappings, pass page-aligned memory
 // (for example from [AlignedBuffer]) to [NewStandardLink] or [NewAdvancedLink].
 // For named segments without negotiation use [CreateStandardLink] and
 // [OpenStandardLink] (or the Advanced variants).
+//
+// # Messages, Streams and Serve
+//
+// A [Stream] is a reliable, ordered, message-oriented channel. The link itself
+// is stream 0 ([AdvancedLink.Stream]); [AdvancedLink.Send], [AdvancedLink.Recv]
+// and [AdvancedLink.Call] are shortcuts for its methods. A message of up to
+// MaxMessageSize bytes is split into chunks of at most bufferSize bytes and
+// reassembled by the receiver. [Stream.Send] and [Stream.Recv] carry plain
+// messages; [Stream.Call] and [AdvancedLink.Serve] carry request-response
+// pairs, answered by a [Handler] in the manner of net/http: the handler gets a
+// [ResponseWriter] and a [Request], and [Mux] dispatches by method.
+// Stream.Recv never returns a request or a response, and Serve is the only
+// consumer of requests.
+//
+// Each destination has its own bounded queue (IncomingQueueSize): every
+// stream, the request queue consumed by Serve, and the queue of accepted
+// streams. [AdvancedOptions].IncomingOverflow selects per queue what happens
+// when it is full. A response without a waiting call and data for an unknown
+// or closed stream are dropped and counted in [AdvancedStats].DroppedMessages.
+// Messages sent one after the other on a stream arrive in that order;
+// concurrent Sends and different streams are not ordered relative to each
+// other.
+//
+// [Stream.Close] sends OpConnClose. Afterwards the closing side gets
+// [ErrClosed] from every operation, and the peer's Recv returns the messages
+// still queued and then [ErrPeerClosed], while its Send and Call return
+// [ErrPeerClosed]. Blocked operations on the stream wake up.
+//
+// [AdvancedLink.Serve] has one receiver goroutine at a time. While no handler
+// is running, the receiver runs each handler itself, which saves a goroutine
+// hand-off per request. If a handler is still running after 200 µs, the
+// receiver role passes to a new goroutine; while any handler is running,
+// requests go to pooled worker goroutines (at most BufferCount handlers run
+// at a time). When nothing is running any more, the next request runs inline
+// again. It returns ctx.Err() when ctx ends, nil when the peer closed the
+// link gracefully, and the receive error otherwise.
+//
+// # Buffer Ownership and Allocations
+//
+// A [Message] returned by Stream.Recv or Stream.Call owns a pooled buffer.
+// [Message.Bytes] is valid until [Message.Release], which must be called at
+// most once and before which the message must not be reused; calling it is
+// optional, only the reuse of the buffer is lost. [Request] and
+// [ResponseWriter] are pooled and valid only during ServeHQQ. The pools belong
+// to the link and hold buffers in power-of-two size classes, the largest being
+// exactly MaxMessageSize. In steady state Send, Recv with Release, Call with
+// Release and Serve allocate nothing when the context cannot be canceled; a
+// cancelable context may allocate when a wait parks.
 //
 // # Concurrency Contract
 //
@@ -69,16 +131,15 @@
 //     most one message; the unread tail of a partially read message is queued
 //     (first in, first out) and served, one tail per call, before newer
 //     messages.
-//   - Once negotiation of an [AdvancedLink] has started, the Advanced
-//     dispatcher owns the receive direction. Direct calls to
-//     [AdvancedLink.Read] or [AdvancedLink.Write] return [ErrAdvancedActive].
-//   - [AdvancedLink.Call], [AdvancedLink.CallOn], [AdvancedLink.SendLarge],
-//     [AdvancedLink.Respond], and [AdvancedLink.Receive] are safe for
-//     concurrent use across goroutines. The receive path never waits for the
-//     tx ring: stream accepts and refusals and refusal responses go through a
-//     bounded control-sender queue and are dropped (and counted in
-//     [AdvancedStats].DroppedMessages) when it is full, so always pass a
-//     context with a deadline to [AdvancedLink.OpenStream] and calls.
+//   - All [AdvancedLink] and [Stream] methods are safe for concurrent use. After
+//     negotiation a single receive path owns the receive direction and routes
+//     every complete message: data to its stream's queue, requests to the
+//     request queue consumed by [AdvancedLink.Serve], responses to the waiting
+//     Call. The receive path never waits for the tx ring: stream accepts and
+//     refusals and refusal responses go through a bounded control-sender queue
+//     and are dropped (and counted in [AdvancedStats].DroppedMessages) when it
+//     is full, so always pass a context with a deadline to
+//     [AdvancedLink.OpenStream] and calls.
 //   - [StandardLink.Close] and [NamedStandardLink.Close] wake all blocked
 //     readers and writers and wait for in-flight ring operations, including
 //     running zero-copy callbacks, to drain before returning (and before

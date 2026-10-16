@@ -4,6 +4,82 @@ All notable changes to **HQQ** (`gosuda.org/hqq`) are documented in this file.
 
 The project follows [Semantic Versioning](https://semver.org/). While in `v0.x`, minor versions may introduce breaking wire-layout improvements accompanied by migration notes below.
 
+## v0.5.0 — 2026-10-16
+
+The Advanced API is redesigned around `Stream` and pooled `Message`s, with a `net/http`-like server (`Handler`, `ResponseWriter`, `Request`, `Mux`, `Serve`). Send, receive, and request-response allocate nothing in steady state. **The Go API of the Advanced layer changes incompatibly; the wire protocol (Advanced Protocol 1.0), the packet ABI, and the shared-memory layout (`HQQ_STL3`) are unchanged.** The `StandardLink` API is unchanged.
+
+### Breaking
+
+- **Streams are objects.** `OpenStream` and `AcceptStream` return `*Stream` (previously `uint64` IDs). `Stream` has `ID`, `Send`, `Recv`, `Call`, and `Close`. Stream 0 is the link itself (`AdvancedLink.Stream()`); `AdvancedLink.Send`, `Recv`, and `Call` are exactly `Stream().Send`, `Recv`, and `Call`.
+- **Received data is a pooled `*Message`** (`Bytes`, `Len`, `StreamID`, `Release`). `Recv` and `Call` return `*Message`; `Release` is called at most once and the message must not be used afterwards. `Recv` returns data messages of its stream only, never requests or responses.
+- **Servers use `Serve` with a `Handler`.** `Handler.ServeHQQ(ctx, w *ResponseWriter, req *Request)` replaces `ServeHQQ(ctx, AdvancedMessage) ([]byte, error)`. `Request` has `Method`, `Payload`, and `StreamID`; `ResponseWriter` has `Write` and `WriteError`. `Request` and `ResponseWriter` are valid only during `ServeHQQ`. Requests are consumed only by `Serve`.
+- **`AdvancedResponseError` is now `ResponseError`** (`Status`, `Payload`), returned by value from `Call`, with `Payload` a copy. The message text is `hqq: response error …`.
+- **`FeatureLargeCopy` is now `FeatureMessages`** (same value, `1<<0`); `Stats.LargeMessages` and `LargeBytes` are now `Stats.Messages` and `MessageBytes`. `Config.Features` defaults to `FeatureMessages|FeatureRequestResponse`.
+- **`Stream.Close()` takes no context.** It waits for room in the tx ring and returns the error of sending `OpConnClose`; the stream is closed locally even if that fails. A second `Close` returns `ErrClosed`, and `Close` on stream 0 returns `ErrInvalidOp`.
+- **Close semantics.** After a local close, `Send`, `Recv`, and `Call` return `ErrClosed`. After the peer closes a stream, `Recv` returns the queued messages and then `ErrPeerClosed`, and `Send` and `Call` return `ErrPeerClosed`; blocked calls wake. `ErrConnNotFound` is no longer returned for unknown or closed stream IDs (it remains the base of `ErrPeerGone` and the refusal when the peer is not listening).
+- **Unmatched traffic is dropped.** A response without a waiting call is no longer delivered to a receiver: it is dropped and counted in `Stats().DroppedMessages` (a late response to a canceled call still goes to `AbandonedResponses`). Data for an unknown or closed stream is dropped and counted as well.
+- **Overflow is decided per destination queue.** `OverflowPolicy` applies to each stream's queue, the request queue consumed by `Serve`, and the accept queue; `IncomingQueueSize` sizes all of them. Under `OverflowBlock`, requests fill the request queue when no `Serve` runs, and then stall the receive path. `OverflowFail` makes `Recv` return queued messages first and then `ErrIncomingOverflow`. `ErrIncomingOverflow` now refers to the queue a message is routed to.
+- **A success response always has status 0.** A non-zero status exists only on error responses (`WriteError`).
+- **Removed:** `AdvancedMessage`, `SendLarge`, `Receive`, `CallOn`, `Respond`, `RespondError`, `MessageHandler`, `Mux.OnMessage`, `CloseStream`, `AdvancedLink.Read` and `Write`, `ErrAdvancedActive`, `AdvancedResponseError`, `FeatureLargeCopy`, `Stats.LargeMessages` and `LargeBytes`. A `StandardLink` is the way to use raw `Read`/`Write`.
+
+### Added
+
+- `Stream`, `AdvancedLink.Stream`, `Message`, `Handler`, `HandlerFunc`, `Request`, `ResponseWriter`, `ResponseError`, `FeatureMessages`, `Stats.Messages`, and `Stats.MessageBytes`.
+- `ResponseWriter.WriteError(status, p)`: replaces the body written so far and sets the error status; a later `Write` appends to that body. Status 0 is sent as `ErrCodeInvalidOp`; a payload larger than `MaxMessageSize` becomes status `ErrCodeBufferOverflow` with an empty payload. `ResponseWriter.Write` beyond `MaxMessageSize` writes nothing and returns `ErrBufferOverflow`. A handler that writes nothing answers with an empty success response.
+- `Mux.NotFound` handles unregistered methods; without it the answer is status `ErrCodeInvalidOp` with payload `hqq: unknown method`.
+- Tests: `alloc_test.go` (zero-allocation checks for `Send`/`Recv`/`Release` and `Call`/`Release` against `Serve`), `stream_test.go` (stream isolation, drop accounting, close and peer-close semantics, per-queue overflow, ordering, `Serve` escalation); `advanced_bench_test.go` (three benchmarks). The multi-process test, the fuzz target, and the examples use the new API; a stream example was added.
+
+### Changed
+
+- **Receive path and routing.** One receive path assembles messages and routes them: responses to the waiting `Call`, requests to the request queue consumed by `Serve`, data to the queue of its stream. A goroutine that finds no dispatcher receives synchronously; a background dispatcher starts when several goroutines wait concurrently or streams are used. A synchronous receiver never waits for a full queue under `OverflowBlock`: it hands the delivery to a helper goroutine that keeps the order, and the dispatcher takes over, so a caller's `Recv` or `Call` timeout cannot lose another goroutine's message.
+- **`Serve` is adaptive.** One receiver goroutine at a time takes requests. While no handler is running, it runs each handler inline, which saves a goroutine hand-off per request. A handler still running after 200 µs hands the receiver role to a new goroutine, so a handler that waits for a later request cannot deadlock `Serve`; while any handler is running, requests go to pooled workers (started on demand, at most `BufferCount`, kept until `Serve` returns). The switch is per episode: as soon as a request arrives with nothing running, it runs inline again. A request that arrives behind a slow inline handler waits up to about 200 µs. `Serve` still returns `ctx.Err()`, nil on a graceful peer close, and otherwise the receive error.
+- **Pooled buffers per link.** Messages, request and response bodies, reassembly bookkeeping, and pending-call channels are pooled per link; message buffers come in power-of-two size classes from 64 B up to exactly `MaxMessageSize`. Reassembly accounting is unchanged (each message is charged its announced size plus 256 bytes), but the buffer is rounded up to a power of two, so the memory held can reach twice the charge.
+- **Streams other than 0 exist only on a link whose dispatcher is running** (`OpenStream`, `AcceptStream`, and `ListenStreams` start it), so a `Recv` or `Call` blocked on a stream always wakes through the stream's close signal.
+- **The dispatcher and control-sender ring waits no longer pass the link-lifetime context to the ring**; `Close` wakes them through the closed channel of the `StandardLink`, so parked dispatcher waits do not allocate.
+- `ErrClosed` keeps the message `hqq: link closed`, also when it is returned for a locally closed stream.
+- `Stats.DroppedMessages` now also counts unmatched responses and data for unknown or closed streams.
+- The wire protocol is unchanged. `PROTOCOL.md` describes the routing, overflow, `Serve`, and stream-close behavior of the Go API; `README.md` has an API guide and a section on buffer ownership and zero-allocation operation.
+
+### Performance
+
+Measured on `darwin/arm64` with v0.4.1 and v0.5.0 run interleaved (9 runs each, `benchstat`); request-response for v0.5.0 is the median of a separate quiet run after the final `Serve` change.
+
+| Benchmark | v0.4.1 | v0.5.0 | Change |
+| --- | --- | --- | --- |
+| Large message (4 KiB over 256 B chunks, `bufferCount` 1024) | 1.577 µs, 4192 B/op, 2 allocs/op | 1.399 µs, 0 B/op, 0 allocs/op | −11% |
+| Request-response (1 KiB + 1 KiB, 256 B chunks) | 1.508 µs, 2240 B/op, 4 allocs/op | 1.29 µs, 0 B/op, 0 allocs/op | −14% |
+| Small message (64 B) | — | 145.5 ns, 0 B/op, 0 allocs/op | new |
+
+- The v0.4.1 request-response benchmark used a hand-written `Receive`/`Respond` loop, which no longer exists; the v0.5.0 benchmark runs `Serve`. For the same `Serve`-based shape, v0.4.1 measured 5.2 µs, 2313 B/op, 5 allocs/op, so `Serve` is about 4.5× faster.
+- A cancelable context on `Send`, `Call`, or `Serve` can still allocate occasionally when a wait parks and arms the context wake-up. The allocation tests use `context.Background()`, and they are skipped under `-race`, where `sync.Pool` drops items at random.
+
+### Migration (v0.4.1 → v0.5.0)
+
+| v0.4.1 | v0.5.0 |
+| --- | --- |
+| `FeatureLargeCopy` | `FeatureMessages` |
+| `Stats.LargeMessages` / `LargeBytes` | `Stats.Messages` / `MessageBytes` |
+| `l.SendLarge(ctx, 0, p)` → `(msgID, err)` | `l.Send(ctx, p)` → `err` |
+| `l.SendLarge(ctx, id, p)` | `s.Send(ctx, p)` |
+| `l.Receive(ctx)` → `AdvancedMessage` | `l.Recv(ctx)` / `s.Recv(ctx)` → `*Message` (data only), then `m.Release()` |
+| `msg.Payload` / `msg.ConnectionID` | `m.Bytes()` / `m.StreamID()` |
+| `l.Call(ctx, method, req)` → `[]byte` | `m, err := l.Call(...)`, read `m.Bytes()`, `m.Release()` |
+| `l.CallOn(ctx, id, method, req)` → `AdvancedMessage` | `s.Call(ctx, method, req)` → `*Message` |
+| `l.OpenStream(ctx)` / `AcceptStream(ctx)` → `uint64` | → `*Stream` |
+| `l.CloseStream(ctx, id)` | `s.Close()` (no context; a second call returns `ErrClosed`) |
+| `Handler.ServeHQQ(ctx, AdvancedMessage) ([]byte, error)` | `ServeHQQ(ctx, w *ResponseWriter, req *Request)` |
+| handler returns `payload, nil` | `w.Write(payload)` |
+| handler returns `AdvancedResponseError{S, P}` or an `error` | `w.WriteError(S, P)` |
+| `req.MethodID` / `req.Payload` / `req.ConnectionID` | `req.Method()` / `req.Payload()` / `req.StreamID()` |
+| `l.Respond` / `l.RespondError` after `Receive` | removed: run `Serve` with a `Handler` |
+| `MessageHandler` / `Mux.OnMessage` | removed: use `Stream.Recv` |
+| `mux.HandleFunc(id, func(ctx, AdvancedMessage) ([]byte, error))` | `mux.HandleFunc(id, func(ctx, *ResponseWriter, *Request))` |
+| `errors.As(err, &AdvancedResponseError{})` | `errors.As(err, &ResponseError{})` |
+| `AdvancedLink.Read` / `Write`, `ErrAdvancedActive` | removed: use a `StandardLink` before negotiating |
+| `ErrConnNotFound` for a closed stream ID | `ErrClosed` (local close) / `ErrPeerClosed` (peer close) |
+| unmatched response delivered to `Receive` | dropped, counted in `DroppedMessages` |
+| `Respond(…, status≠0, …)` success with a status | not expressible: success is status 0, `WriteError` carries a status |
+
 ## v0.4.1 — 2026-10-16
 
 A hardening pass over the public API, the shared-memory ABI, segment lifecycle, the MPMC ring, and the Advanced dispatcher. **Both the Go API and the shared-memory ABI change incompatibly**: all endpoints of a link must be upgraded together, and segments created by earlier revisions are rejected. This is the first tagged release; the migration table below is relative to the previous, untagged revision (v0.2.0).

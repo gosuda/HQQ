@@ -35,11 +35,7 @@ func FuzzConsumeAdvancedChunk(f *testing.F) {
 		frame(0, 2, 4000, 64, 64, AdvFlagAbort|AdvFlagResponse, 0, 0)...))
 
 	f.Fuzz(func(t *testing.T, data []byte) {
-		l := &AdvancedLink{
-			assemblies:         make(map[advancedMessageKey]*advancedAssembly),
-			maxMessageSize:     4096,
-			maxReassemblyBytes: 6000,
-		}
+		l := newAdvancedLink(&StandardLink{bufferCount: 4}, AdvancedOptions{MaxMessageSize: 4096, MaxReassemblyBytes: 6000})
 		buffer := make([]byte, bufferSize)
 		const frameLen = 7*8 + 1
 		for len(data) >= frameLen {
@@ -53,24 +49,28 @@ func FuzzConsumeAdvancedChunk(f *testing.F) {
 			}
 			data = data[frameLen:]
 
-			msg, outcome, err := l.consumeAdvancedChunk(&p, buffer)
-			if err == nil && outcome == chunkComplete && msg.IsAbort() {
-				t.Fatalf("complete message carries the abort flag: %+v", msg)
+			msg, hdr, outcome, err := l.consumeAdvancedChunk(&p, buffer)
+			if err == nil && outcome == chunkComplete && hdr.isAbort() {
+				t.Fatalf("complete message carries the abort flag: %+v", hdr)
 			}
 			if err != nil || outcome != chunkComplete {
+				if msg != nil {
+					t.Fatalf("message returned with outcome %v, err %v", outcome, err)
+				}
 				continue
 			}
-			if uint64(len(msg.Payload)) != p.Operand(2) {
-				t.Fatalf("payload length %d != total size %d", len(msg.Payload), p.Operand(2))
+			if uint64(msg.Len()) != p.Operand(2) || uint64(len(msg.Bytes())) != p.Operand(2) {
+				t.Fatalf("payload length %d != total size %d", msg.Len(), p.Operand(2))
 			}
-			if uint64(len(msg.Payload)) > l.maxMessageSize {
-				t.Fatalf("payload length %d exceeds MaxMessageSize", len(msg.Payload))
+			if uint64(msg.Len()) > l.maxMessageSize {
+				t.Fatalf("payload length %d exceeds MaxMessageSize", msg.Len())
 			}
+			msg.Release()
 		}
 		var held uint64
 		for key, a := range l.assemblies {
-			if uint64(len(a.data)) > l.maxMessageSize {
-				t.Fatalf("assembly %+v holds %d bytes", key, len(a.data))
+			if a.size > l.maxMessageSize || uint64(a.msg.Len()) != a.size {
+				t.Fatalf("assembly %+v holds %d bytes (size %d)", key, a.msg.Len(), a.size)
 			}
 			held += a.charge()
 		}

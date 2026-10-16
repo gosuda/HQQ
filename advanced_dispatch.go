@@ -5,8 +5,7 @@ import (
 )
 
 // startDispatcher starts the background dispatcher once. The dispatcher owns
-// the receive direction: it assembles messages, routes responses to pending
-// calls and queues everything else for Receive.
+// the receive direction: it assembles messages and routes them (see route).
 func (l *AdvancedLink) startDispatcher() error {
 	if err := l.requireNegotiated(); err != nil {
 		return err
@@ -17,10 +16,8 @@ func (l *AdvancedLink) startDispatcher() error {
 		return ErrClosed
 	}
 	if !l.dispatchStarted.Load() {
-		ctx, cancel := context.WithCancel(context.Background())
-		l.dispatchCancel = cancel
 		l.dispatchStarted.Store(true)
-		go l.dispatchLoop(ctx)
+		go l.dispatchLoop(l.lifeCtx)
 	}
 	return l.currentDispatchErr()
 }
@@ -29,13 +26,10 @@ func (l *AdvancedLink) dispatchLoop(ctx context.Context) {
 	defer close(l.dispatchDone)
 	for {
 		l.receiveMu.Lock()
-		message, abortErr, err := l.receiveNextLocked(ctx)
+		m, hdr, abortErr, err := l.receiveNextLocked(ctx)
 		l.receiveMu.Unlock()
 		if err == nil {
-			if message.IsResponse() && l.routeResponse(message, abortErr) {
-				continue
-			}
-			err = l.deliverIncoming(ctx, message)
+			_, err = l.route(ctx, m, hdr, abortErr, true)
 		}
 		if err != nil {
 			if ctx.Err() != nil {
@@ -71,44 +65,119 @@ func (l *AdvancedLink) dispatchFailure() error {
 	return ErrClosed
 }
 
-// deliverIncoming queues a non-response message for Receive according to the
-// overflow policy.
-func (l *AdvancedLink) deliverIncoming(ctx context.Context, message AdvancedMessage) error {
-	result := advancedDispatchResult{message: message}
+// stalledDelivery is a message that found its queue full under
+// OverflowBlock while the receiver was not allowed to wait (m == nil: none).
+type stalledDelivery struct {
+	m  *Message
+	q  chan *Message
+	st *Stream // owner of q, nil for the request queue
+}
+
+// route hands one received message to its destination:
+//
+//   - a response goes to the waiting Call; one without a waiting call (and
+//     not an abandoned one) is dropped and counted in DroppedMessages;
+//   - a request goes to the request queue consumed by Serve;
+//   - a data message goes to the queue of its stream; one for an unknown or
+//     closed stream is dropped and counted.
+//
+// m == nil denotes a response that was aborted or refused (hdr, abortErr),
+// which fails the waiting call. blocking tells whether the caller may wait
+// for the consumer of a full queue under OverflowBlock; if it may not, the
+// message is returned as the stall.
+func (l *AdvancedLink) route(ctx context.Context, m *Message, hdr advHeader, abortErr error, blocking bool) (stalledDelivery, error) {
+	switch {
+	case m == nil:
+		l.routeResponse(hdr, nil, abortErr)
+		return stalledDelivery{}, nil
+	case m.isResponse():
+		l.routeResponse(m.advHeader, m, nil)
+		return stalledDelivery{}, nil
+	case m.isRequest():
+		return l.deliver(ctx, l.requests, nil, m, blocking)
+	}
+	st := l.lookupStream(m.streamID)
+	if st == nil || st.state.Load() != 0 {
+		l.dropMessage(m)
+		return stalledDelivery{}, nil
+	}
+	return l.deliver(ctx, st.queue, st, m, blocking)
+}
+
+// lookupStream returns the open stream id, or nil.
+func (l *AdvancedLink) lookupStream(id uint64) *Stream {
+	if id == 0 {
+		return l.stream0
+	}
+	l.controlMu.Lock()
+	st := l.streams[id]
+	l.controlMu.Unlock()
+	return st
+}
+
+// dropMessage discards a message that has no destination and counts it.
+func (l *AdvancedLink) dropMessage(m *Message) {
+	l.stats.droppedMessages.Add(1)
+	m.Release()
+}
+
+// deliver queues m on q according to the overflow policy.
+func (l *AdvancedLink) deliver(ctx context.Context, q chan *Message, st *Stream, m *Message, blocking bool) (stalledDelivery, error) {
+	select {
+	case q <- m:
+		return stalledDelivery{}, nil
+	default:
+	}
 	switch l.overflow {
 	case OverflowDrop:
-		select {
-		case l.incoming <- result:
-		default:
-			l.stats.droppedMessages.Add(1)
-		}
-		return nil
+		l.dropMessage(m)
+		return stalledDelivery{}, nil
 	case OverflowFail:
-		select {
-		case l.incoming <- result:
-			return nil
-		default:
-			return ErrIncomingOverflow
-		}
-	default:
-		select {
-		case l.incoming <- result:
-			return nil
-		case <-ctx.Done():
-			return ctx.Err()
-		}
+		m.Release()
+		return stalledDelivery{}, ErrIncomingOverflow
+	}
+	if !blocking {
+		return stalledDelivery{m: m, q: q, st: st}, nil
+	}
+	return stalledDelivery{}, l.deliverBlocking(ctx, q, st, m)
+}
+
+// deliverBlocking waits until q has room for m. The message is dropped if
+// its stream is closed meanwhile, and released if ctx ends first.
+func (l *AdvancedLink) deliverBlocking(ctx context.Context, q chan *Message, st *Stream, m *Message) error {
+	var closed <-chan struct{}
+	if st != nil {
+		closed = st.done
+	}
+	select {
+	case q <- m:
+		return nil
+	case <-closed:
+		l.dropMessage(m)
+		return nil
+	case <-ctx.Done():
+		m.Release()
+		return ctx.Err()
 	}
 }
 
-// routeResponse hands a response to its pending call. It returns false if no
-// call is waiting for it (the response is then delivered to Receive), and
-// true if it was routed or recognized as a late response to a canceled call
-// and discarded. abortErr is non-nil for an aborted response (one whose
-// sender abandoned it, or that was refused by the reassembly limit): it fails
-// the pending call with abortErr and is always consumed, because without a
-// waiting call there is nothing to fail and nothing to deliver.
-func (l *AdvancedLink) routeResponse(message AdvancedMessage, abortErr error) bool {
-	key := advancedCallKey{connectionID: message.ConnectionID, messageID: message.MessageID}
+// finishDelivery completes a delivery a synchronous receiver could not wait
+// for (see receiveRoute) and then releases receiveMu, which the receiver
+// passed on to this goroutine so that no later message overtakes it.
+func (l *AdvancedLink) finishDelivery(s stalledDelivery) {
+	defer l.receiveMu.Unlock()
+	_ = l.deliverBlocking(l.lifeCtx, s.q, s.st, s.m)
+}
+
+// routeResponse hands a response to its pending call and reports whether it
+// found one. A response of an abandoned (canceled) call is discarded and
+// counted in AbandonedResponses; any other response without a waiting call
+// is dropped and counted in DroppedMessages. abortErr is non-nil for an
+// aborted response (m == nil: one whose sender abandoned it, or that was
+// refused by the reassembly limit): it fails the pending call with abortErr
+// and is silently consumed when no call waits.
+func (l *AdvancedLink) routeResponse(hdr advHeader, m *Message, abortErr error) bool {
+	key := advancedCallKey{streamID: hdr.streamID, messageID: hdr.messageID}
 	l.pendingMu.Lock()
 	pending := l.pendingCalls[key]
 	if pending != nil {
@@ -117,19 +186,19 @@ func (l *AdvancedLink) routeResponse(message AdvancedMessage, abortErr error) bo
 		delete(l.abandoned, key)
 		l.pendingMu.Unlock()
 		l.stats.abandonedResponses.Add(1)
-		return true
+		m.Release()
+		return false
 	}
 	l.pendingMu.Unlock()
 	if pending == nil {
-		return abortErr != nil
-	}
-	result := advancedDispatchResult{message: message}
-	if abortErr != nil {
-		result = advancedDispatchResult{err: abortErr}
+		if m != nil {
+			l.dropMessage(m)
+		}
+		return false
 	}
 	// The channel has capacity 1 and only the goroutine that removed the
 	// entry sends on it, so this never blocks.
-	pending <- result
+	pending <- advancedDispatchResult{msg: m, err: abortErr}
 	return true
 }
 
@@ -161,8 +230,8 @@ func (l *AdvancedLink) unregisterPendingCall(key advancedCallKey, ch chan advanc
 }
 
 // abandonCall removes a call that gives up before its response arrived and
-// remembers its key so that a late response is discarded instead of being
-// delivered to Receive.
+// remembers its key so that a late response is discarded (and counted in
+// AbandonedResponses) instead of being dropped as unmatched.
 func (l *AdvancedLink) abandonCall(key advancedCallKey, ch chan advancedDispatchResult) {
 	l.pendingMu.Lock()
 	defer l.pendingMu.Unlock()
