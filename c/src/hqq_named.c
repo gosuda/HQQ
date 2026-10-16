@@ -220,6 +220,9 @@ hqq_status hqq_named_open(const char *name, uint64_t count, uint64_t size, int c
         (void)hqq_named_release(opt_alloc(&req), n);
         return st;
     }
+    /* The segment is claimed or joined now: it is no longer an object nobody initialized,
+     * so a later Empty object under the same name is not ours (SPEC 11.4; named_link.go:309). */
+    n->fresh = 0;
     if (create) {
         /* We initialized the segment under a new creatorToken: the name is ours to remove. */
         n->unlink_on_close = 1;

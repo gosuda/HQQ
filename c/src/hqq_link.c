@@ -1012,3 +1012,99 @@ hqq_status hqq_link_unlink(hqq_link *l) {
     }
     return hqq_named_unlink(l->named);
 }
+
+/* ---- Frame access for the Advanced layer (internal, see hqq_internal.h) ---------------------- */
+
+hqq_status hqq_link_rx_frame(hqq_link *l, const hqq_wait *w, hqq_packet *pkt, uint64_t *pos) {
+    hqq_call c;
+    hqq_ring *r = l->rx;
+    int peer_failed = 0;
+    hqq_status peer_err = HQQ_OK;
+    hqq_status st = enter_rx(l);
+
+    if (st != HQQ_OK) {
+        return st;
+    }
+    call_init(&c, l, w);
+    for (;;) {
+        uint64_t p;
+
+        hqq_spin_lock(&l->rx_lock);
+        if (hqq_ring_peek_consumer(r, &p)) {
+            hqq_packet tmp;
+
+            memcpy(&tmp, hqq_ring_slot(r, p)->packet, sizeof tmp);
+            if (hqq_packet_op(&tmp) == HQQ_OP_STD_TOMBSTONE) {
+                if (hqq_ring_claim_consumer_at(r, p)) {
+                    hqq_ring_release(r, p);
+                }
+                hqq_spin_unlock(&l->rx_lock);
+                continue;
+            }
+            if (hqq_ring_claim_consumer_at(r, p)) {
+                hqq_spin_unlock(&l->rx_lock);
+                *pkt = tmp;
+                *pos = p;
+                exit_rx(l);
+                return HQQ_OK;
+            }
+            hqq_spin_unlock(&l->rx_lock);
+            continue;
+        }
+        hqq_spin_unlock(&l->rx_lock);
+        if (peer_failed) {
+            exit_rx(l);
+            return peer_err; /* drained: report the failure (SPEC 6.4) */
+        }
+        st = call_wait_step(&c, r, HQQ_RING_NOT_EMPTY, p, p + 1);
+        if (st == HQQ_ERR_PEER_CLOSED || st == HQQ_ERR_PEER_GONE) {
+            peer_failed = 1;
+            peer_err = st;
+            continue;
+        }
+        if (st != HQQ_OK) {
+            exit_rx(l);
+            return st;
+        }
+    }
+}
+
+void hqq_link_rx_release(hqq_link *l, uint64_t pos) { hqq_ring_release(l->rx, pos); }
+
+unsigned char *hqq_link_rx_payload(hqq_link *l, uint64_t pos) { return rx_buffer(l, pos); }
+
+hqq_status hqq_link_tx_frame(hqq_link *l, const hqq_wait *w, unsigned op, const uint64_t ops[7],
+                             const void *p1, size_t n1, const void *p2, size_t n2, int check_peer) {
+    hqq_call c;
+    hqq_packet pkt;
+    uint64_t pos;
+    hqq_status st;
+
+    if (n1 + n2 > l->buffer_size || n1 + n2 < n1) {
+        return HQQ_ERR_BUFFER_OVERFLOW;
+    }
+    st = enter_tx(l, check_peer);
+    if (st != HQQ_OK) {
+        return st;
+    }
+    call_init(&c, l, w);
+    st = tx_claim(l, &c, &pos);
+    if (st == HQQ_OK) {
+        unsigned i;
+        if (n1 != 0) {
+            memcpy(tx_buffer(l, pos), p1, n1);
+        }
+        if (n2 != 0) {
+            memcpy(tx_buffer(l, pos) + n1, p2, n2);
+        }
+        memset(&pkt, 0, sizeof pkt);
+        pkt.w[0] = op;
+        for (i = 0; i < 7; i++) {
+            pkt.w[1u + i] = ops != NULL ? ops[i] : 0;
+        }
+        store_packet(l->tx, pos, &pkt);
+        hqq_ring_publish(l->tx, pos);
+    }
+    exit_tx(l);
+    return st;
+}

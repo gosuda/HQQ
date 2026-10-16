@@ -77,28 +77,75 @@ const char *hqq_strerror(hqq_status s) {
     case HQQ_ERR_NO_MEMORY: return "hqq: out of memory";
     case HQQ_ERR_INVALID_ARGUMENT: return "hqq: invalid argument";
     case HQQ_ERR_UNSUPPORTED: return "hqq: not supported on this platform";
+    case HQQ_ERR_NOT_NEGOTIATED: return "hqq: advanced protocol not negotiated";
+    case HQQ_ERR_ALREADY_NEGOTIATED: return "hqq: advanced protocol already negotiated";
+    case HQQ_ERR_NEGOTIATION_FAILED: return "hqq: advanced protocol negotiation failed earlier";
+    case HQQ_ERR_NEGOTIATION_REJECTED: return "hqq: advanced protocol negotiation rejected";
+    case HQQ_ERR_MESSAGE_ABORTED: return "hqq: peer aborted the message";
+    case HQQ_ERR_INCOMING_OVERFLOW: return "hqq: incoming queue overflow";
+    case HQQ_ERR_REASSEMBLY_LIMIT: return "hqq: message refused by the reassembly limit";
+    case HQQ_ERR_SHUTTING_DOWN: return "hqq: endpoint is shutting down";
+    case HQQ_ERR_RESPONSE: return "hqq: error response from the peer";
+    case HQQ_ERR_NOT_LISTENING: return "hqq: stream listening is not enabled";
+    case HQQ_ERR_ALREADY_LISTENING: return "hqq: stream listening is already enabled";
+    case HQQ_ERR_LISTENER_BUSY: return "hqq: listener is served by a live acceptor";
+    case HQQ_ERR_LISTENER_GONE: return "hqq: listener was replaced or re-initialized";
+    case HQQ_ERR_LISTENER_CLOSED: return "hqq: acceptor closed the listener";
+    case HQQ_ERR_ACCEPTOR_CLOSED: return "hqq: acceptor closed";
+    case HQQ_ERR_LISTENER_NOT_READY: return "hqq: listener is not ready";
     }
     return "hqq: unknown status";
 }
 
-int hqq_error_is(hqq_status err, hqq_status base) {
-    if (err == base) {
-        return 1;
-    }
-    switch (base) {
-    case HQQ_ERR_FAILED_INIT:
-        return err == HQQ_ERR_LINK_BUSY || err == HQQ_ERR_INCOMPATIBLE_LAYOUT ||
-               err == HQQ_ERR_SEGMENT_NOT_READY || err == HQQ_ERR_INIT_CONTENDED ||
-               err == HQQ_ERR_NO_LIVE_ENDPOINT;
-    case HQQ_ERR_INVALID_SIZE:
-        return err == HQQ_ERR_GEOMETRY_MISMATCH;
-    case HQQ_ERR_CONN_NOT_FOUND:
-        return err == HQQ_ERR_PEER_GONE;
-    case HQQ_ERR_INVALID_OP:
-        return err == HQQ_ERR_UNEXPECTED_PACKET || err == HQQ_ERR_PROTOCOL;
+/* Direct base of an error in the Go wrap hierarchy, or HQQ_OK for a root. */
+static hqq_status hqq_error_parent(hqq_status err) {
+    switch (err) {
+    case HQQ_ERR_LINK_BUSY:
+    case HQQ_ERR_INCOMPATIBLE_LAYOUT:
+    case HQQ_ERR_SEGMENT_NOT_READY:
+    case HQQ_ERR_INIT_CONTENDED:
+    case HQQ_ERR_NO_LIVE_ENDPOINT:
+    case HQQ_ERR_LISTENER_NOT_READY:
+        return HQQ_ERR_FAILED_INIT;
+    case HQQ_ERR_LISTENER_BUSY:
+        return HQQ_ERR_LINK_BUSY;
+    case HQQ_ERR_GEOMETRY_MISMATCH:
+        return HQQ_ERR_INVALID_SIZE;
+    case HQQ_ERR_PEER_GONE:
+        return HQQ_ERR_CONN_NOT_FOUND;
+    case HQQ_ERR_LISTENER_GONE:
+        return HQQ_ERR_PEER_GONE;
+    case HQQ_ERR_LISTENER_CLOSED:
+        return HQQ_ERR_PEER_CLOSED;
+    case HQQ_ERR_ACCEPTOR_CLOSED:
+        return HQQ_ERR_CLOSED;
+    case HQQ_ERR_UNEXPECTED_PACKET:
+    case HQQ_ERR_PROTOCOL:
+    case HQQ_ERR_NOT_NEGOTIATED:
+    case HQQ_ERR_ALREADY_NEGOTIATED:
+    case HQQ_ERR_NEGOTIATION_FAILED:
+    case HQQ_ERR_NEGOTIATION_REJECTED:
+    case HQQ_ERR_SHUTTING_DOWN:
+        return HQQ_ERR_INVALID_OP;
+    case HQQ_ERR_MESSAGE_ABORTED:
+        return HQQ_ERR_PROTOCOL;
+    case HQQ_ERR_INCOMING_OVERFLOW:
+    case HQQ_ERR_REASSEMBLY_LIMIT:
+        return HQQ_ERR_BUFFER_OVERFLOW;
     default:
-        return 0;
+        return HQQ_OK;
     }
+}
+
+int hqq_error_is(hqq_status err, hqq_status base) {
+    /* Bounded: the hierarchy is at most four levels deep. */
+    for (int depth = 0; depth < 8 && err != HQQ_OK; depth++) {
+        if (err == base) {
+            return 1;
+        }
+        err = hqq_error_parent(err);
+    }
+    return err == base;
 }
 
 int hqq_error_is_transient_open(hqq_status err) {

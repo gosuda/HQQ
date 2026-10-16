@@ -267,6 +267,10 @@ void hqq_plat_event_signal(hqq_plat_event *e) {
     (void)SetEvent(e->handle);
 }
 
+void hqq_plat_event_reset(hqq_plat_event *e) {
+    (void)ResetEvent(e->handle);
+}
+
 int hqq_plat_event_wait(hqq_plat_event *e, uint64_t timeout_ns) {
     return WaitForSingleObject(e->handle, ceil_ms(timeout_ns, 0)) == WAIT_OBJECT_0;
 }

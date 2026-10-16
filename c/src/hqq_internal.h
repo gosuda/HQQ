@@ -251,4 +251,20 @@ hqq_status hqq_named_unlink(hqq_named *n);
 /* Normalized options, shared by the memory and named entry points. */
 hqq_status hqq_options_normalize(const hqq_options *opts, hqq_open_req *req, hqq_open_info *info);
 
+/* ---- Advanced-layer frame access (hqq_link.c). The receive functions are used by one
+ * consumer (the dispatcher, or the negotiating caller before it starts); the transmit
+ * function may be called from any thread. Waits follow `w` (hqq.h hqq_wait). */
+
+/* Claims the next non-tombstone packet. The caller MUST release it with
+ * hqq_link_rx_release() after it consumed the payload. */
+hqq_status hqq_link_rx_frame(hqq_link *l, const hqq_wait *w, hqq_packet *pkt, uint64_t *pos);
+void hqq_link_rx_release(hqq_link *l, uint64_t pos);
+unsigned char *hqq_link_rx_payload(hqq_link *l, uint64_t pos);
+
+/* Publishes one packet with operands ops[0..6] (NULL: zeros) and n payload bytes
+ * copied into the slot's transmit buffer (n <= buffer_size). check_peer: fail with
+ * the peer status when the peer is gone or closed. */
+hqq_status hqq_link_tx_frame(hqq_link *l, const hqq_wait *w, unsigned op, const uint64_t ops[7],
+                             const void *p1, size_t n1, const void *p2, size_t n2, int check_peer);
+
 #endif /* HQQ_INTERNAL_H */

@@ -195,7 +195,27 @@ typedef enum hqq_status {
     HQQ_ERR_CANCELED = 25,           /* the hqq_cancel token was signalled (Go context.Canceled) */
     HQQ_ERR_NO_MEMORY = 26,          /* the allocator failed */
     HQQ_ERR_INVALID_ARGUMENT = 27,   /* NULL pointer, bad option, struct_size too small */
-    HQQ_ERR_UNSUPPORTED = 28         /* not available on this platform */
+    HQQ_ERR_UNSUPPORTED = 28,        /* not available on this platform */
+
+    /* Advanced protocol (SPEC 10, 1.1 draft), appended in 1.1. */
+    HQQ_ERR_NOT_NEGOTIATED = 29,        /* Go ErrNotNegotiated (matches HQQ_ERR_INVALID_OP) */
+    HQQ_ERR_ALREADY_NEGOTIATED = 30,    /* Go ErrAlreadyNegotiated (matches HQQ_ERR_INVALID_OP) */
+    HQQ_ERR_NEGOTIATION_FAILED = 31,    /* Go ErrNegotiationFailed: terminal Failed state (matches HQQ_ERR_INVALID_OP) */
+    HQQ_ERR_NEGOTIATION_REJECTED = 32,  /* Go ErrNegotiationRejected (matches HQQ_ERR_INVALID_OP) */
+    HQQ_ERR_MESSAGE_ABORTED = 33,       /* Go ErrMessageAborted: peer abandoned a response (matches HQQ_ERR_PROTOCOL) */
+    HQQ_ERR_INCOMING_OVERFLOW = 34,     /* Go ErrIncomingOverflow (matches HQQ_ERR_BUFFER_OVERFLOW) */
+    HQQ_ERR_REASSEMBLY_LIMIT = 35,      /* Go ErrReassemblyLimit (matches HQQ_ERR_BUFFER_OVERFLOW) */
+    HQQ_ERR_SHUTTING_DOWN = 36,         /* Go ErrShuttingDown: refused during graceful shutdown (matches HQQ_ERR_INVALID_OP) */
+    HQQ_ERR_RESPONSE = 37,              /* Go ResponseError: an error response; its status is hqq_msg_status() */
+    HQQ_ERR_NOT_LISTENING = 38,         /* Go ErrNotListening: ListenStreams was not called */
+    HQQ_ERR_ALREADY_LISTENING = 39,     /* Go ErrAlreadyListening */
+
+    /* Acceptor and listener (ext/LISTENER_DRAFT.md). */
+    HQQ_ERR_LISTENER_BUSY = 40,         /* Go ErrListenerBusy (matches HQQ_ERR_LINK_BUSY, HQQ_ERR_FAILED_INIT) */
+    HQQ_ERR_LISTENER_GONE = 41,         /* Go ErrListenerGone (matches HQQ_ERR_PEER_GONE) */
+    HQQ_ERR_LISTENER_CLOSED = 42,       /* Go ErrListenerClosed (matches HQQ_ERR_PEER_CLOSED) */
+    HQQ_ERR_ACCEPTOR_CLOSED = 43,       /* Go ErrAcceptorClosed (matches HQQ_ERR_CLOSED) */
+    HQQ_ERR_LISTENER_NOT_READY = 44     /* transient client open (matches HQQ_ERR_FAILED_INIT) */
 } hqq_status;
 
 /* Human-readable, static, never NULL message for a status. Thread-safe. */

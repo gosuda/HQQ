@@ -69,7 +69,14 @@ set(HQQ_SOURCES
   src/hqq_names.c
   src/hqq_superblock.c
   src/hqq_link.c
-  src/hqq_named.c)
+  src/hqq_named.c
+  src/hqq_adv_core.c
+  src/hqq_adv_rx.c
+  src/hqq_adv_route.c
+  src/hqq_adv_link.c
+  src/hqq_adv_stream.c
+  src/hqq_adv_msg.c
+  src/hqq_listener.c)
 if(WIN32)
   list(APPEND HQQ_SOURCES src/hqq_platform_win32.c)
 else()

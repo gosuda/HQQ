@@ -216,6 +216,12 @@ void hqq_plat_event_signal(hqq_plat_event *e) {
     pthread_mutex_unlock(&e->m);
 }
 
+void hqq_plat_event_reset(hqq_plat_event *e) {
+    pthread_mutex_lock(&e->m);
+    e->set = 0;
+    pthread_mutex_unlock(&e->m);
+}
+
 int hqq_plat_event_wait(hqq_plat_event *e, uint64_t timeout_ns) {
     int set;
 #if defined(__APPLE__)

@@ -79,6 +79,36 @@ hqq_close(l);                                /* removes the name if this is its 
   2 ms). Never registers as a waiter, makes no kernel wait, and still performs
   the waker duty, so Go peers that park on this side are woken promptly.
 
+## Advanced layer (`include/hqq/hqq_advanced.h`, `include/hqq/hqq_listener.h`)
+
+The Advanced layer is an overlay on a Standard link (same segment, rings and packet
+ABI). Its receive direction is owned by a dispatcher thread after negotiation.
+
+* `hqq_adv_create` / `hqq_adv_open` (named) and `hqq_adv_open_memory`: open the link;
+  `hqq_adv_negotiate` (role-agnostic, feature bits of protocol 1.1) must succeed before
+  messages or calls.
+* Streams: `hqq_adv_listen_streams`, `hqq_adv_open_stream`, `hqq_adv_accept_stream`,
+  `hqq_stream_send`, `hqq_stream_recv`, `hqq_stream_close`; stream 0 is `hqq_adv_stream0`.
+* Calls: `hqq_stream_call` / `hqq_stream_call_with` (caller and trace metadata);
+  `hqq_adv_serve` runs a handler callback `(ctx, response, request)` on worker threads;
+  `hqq_adv_shutdown` refuses new requests with status 8 and waits for in-flight ones.
+* Messages are pooled: `hqq_msg_data`, `hqq_msg_len`, `hqq_msg_release`. An error
+  response returns `HQQ_ERR_RESPONSE` with the message; `hqq_msg_status` gives its status.
+* Acceptor: `hqq_acceptor_create` / `hqq_acceptor_accept` / `hqq_acceptor_close`;
+  clients use `hqq_connect` (`ext/LISTENER_DRAFT.md`).
+
+Thread safety: every function may be called from any thread; `hqq_adv_close` waits for
+calls in progress and must not be called from a handler. Messages and request contexts
+are owned by one caller at a time.
+
+Memory: the data path (send, receive, call, serve) takes buffers from per-link size-class
+pools. After warm-up it makes no allocator calls; `test_adv` checks this with a counting
+allocator hook.
+
+Verified: `test_adv` (negotiation, chunking, streams, calls, steady-state allocation),
+`test_listener` (round trips, busy listener, bad records, closed acceptor), and the
+interop matrix (`interop/`, scenarios X-A01..X-A10, all four Go/C pairings).
+
 ## Platforms
 
 | Platform | Named segment | Parking |

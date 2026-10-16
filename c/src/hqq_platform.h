@@ -43,6 +43,7 @@ void hqq_plat_thread_join(const hqq_allocator *a, hqq_plat_thread *t);
 hqq_plat_event *hqq_plat_event_create(const hqq_allocator *a);
 void hqq_plat_event_destroy(const hqq_allocator *a, hqq_plat_event *e);
 void hqq_plat_event_signal(hqq_plat_event *e);
+void hqq_plat_event_reset(hqq_plat_event *e);
 /* Waits up to timeout_ns for the signal; returns 1 if signalled, 0 on timeout. */
 int hqq_plat_event_wait(hqq_plat_event *e, uint64_t timeout_ns);
 
