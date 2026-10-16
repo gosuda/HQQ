@@ -803,8 +803,13 @@ func TestUnlinkRemovesStaleName(t *testing.T) {
 	link.unlinkOnClose = false
 	link.Close()
 
-	if _, err := CreateStandardLink(name, 4, 64, 0o600); err == nil && !isWindows() {
-		t.Fatal("CreateStandardLink succeeded over an existing name")
+	// On Windows the mapping died with its last handle, so this create
+	// succeeds; close it, or the leaked handle keeps the name alive.
+	if dup, err := CreateStandardLink(name, 4, 64, 0o600); err == nil {
+		dup.Close()
+		if !isWindows() {
+			t.Fatal("CreateStandardLink succeeded over an existing name")
+		}
 	}
 	if err := Unlink(name); err != nil && !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("Unlink: %v", err)
