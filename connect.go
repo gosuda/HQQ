@@ -86,10 +86,7 @@ func Dial(ctx context.Context, name string, cfg Config) (*NamedAdvancedLink, err
 			}
 			return link, nil
 		}
-		// The listener may not have created (or finished initializing) the
-		// segment yet. A busy link will not become available by waiting.
-		if errors.Is(err, ErrLinkBusy) ||
-			!errors.Is(err, os.ErrNotExist) && !errors.Is(err, ErrFailedInit) {
+		if !dialRetryable(err) {
 			return nil, err
 		}
 		select {
@@ -99,4 +96,14 @@ func Dial(ctx context.Context, name string, cfg Config) (*NamedAdvancedLink, err
 		}
 		backoff = min(backoff*2, 100*time.Millisecond)
 	}
+}
+
+// dialRetryable reports whether a failed open may succeed later: the
+// listener has not created the name yet, has not sized the segment yet, or
+// is still initializing it. Every other error (a busy link, a geometry or
+// layout mismatch, an invalid name) is permanent.
+func dialRetryable(err error) bool {
+	return errors.Is(err, os.ErrNotExist) ||
+		errors.Is(err, errSegmentNotReady) ||
+		errors.Is(err, errInitContended)
 }

@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unsafe"
 )
 
 // fastLiveness makes peer failures observable within a fraction of a second.
@@ -158,8 +159,8 @@ func TestPeerClosedIsReportedAfterBufferedData(t *testing.T) {
 		t.Fatalf("Read buffered message = %q, %v", buf[:n], err)
 	}
 	_, err = primary.Read(buf)
-	if !errors.Is(err, ErrPeerClosed) || !errors.Is(err, io.EOF) {
-		t.Fatalf("Read after peer Close = %v, want ErrPeerClosed (io.EOF)", err)
+	if err != io.EOF {
+		t.Fatalf("Read after peer Close = %v, want io.EOF", err)
 	}
 	if _, err := primary.Write([]byte("x")); !errors.Is(err, ErrPeerClosed) {
 		t.Fatalf("Write after peer Close = %v, want ErrPeerClosed", err)
@@ -790,6 +791,53 @@ func TestDialTimesOutWithoutListener(t *testing.T) {
 	defer cancel()
 	if _, err := Dial(ctx, newPortableSharedMemoryName(), Config{}); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("Dial without listener = %v, want deadline exceeded", err)
+	}
+}
+
+func TestDialFailsFastOnIncompatibleLayout(t *testing.T) {
+	name := newPortableSharedMemoryName()
+	cfg := Config{BufferCount: 16, BufferSize: 64}
+	link, err := CreateAdvancedLink(name, cfg.BufferCount, cfg.BufferSize, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer link.Close()
+	sb := (*standardSuperblock)(unsafe.Pointer(&link.mapping[0]))
+	atomic.StoreUint64(&sb.magic, 0xbad)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	start := time.Now()
+	if _, err := Dial(ctx, name, cfg); !errors.Is(err, ErrIncompatibleLayout) {
+		t.Fatalf("Dial over a foreign layout = %v, want ErrIncompatibleLayout", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("Dial retried a permanent error for %v", elapsed)
+	}
+}
+
+func TestConcurrentNamedCloseAndUnlink(t *testing.T) {
+	name := newPortableSharedMemoryName()
+	link, err := CreateStandardLink(name, 4, 64, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	for i := range 4 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if i%2 == 0 {
+				_ = link.Unlink()
+			}
+			if err := link.Close(); err != nil {
+				t.Errorf("Close: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+	if _, err := OpenNamedStandardLink(name, 4, 64); err == nil {
+		t.Fatal("segment name still exists after Close")
 	}
 }
 

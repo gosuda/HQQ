@@ -63,8 +63,8 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           go test ./internal/protocol -run '^$' -fuzz=FuzzPacketRoundTrip -fuzztime=5s
-          go test . -run '^$' -fuzz=FuzzStandardLinkReadCorruptedPacket -fuzztime=5s
-          go test . -run '^$' -fuzz=FuzzAdvancedDispatcherCorruptedFrames -fuzztime=5s
+          go test . -run '^$' -fuzz='^FuzzConsumeAdvancedChunk$' -fuzztime=5s
+          go test . -run '^$' -fuzz='^FuzzOpenOverCorruptSuperblock$' -fuzztime=5s
 
   tlc:
     name: TLA+ Model Check

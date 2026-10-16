@@ -88,6 +88,12 @@ type LinkOptions struct {
 	// AttachTimeout bounds how long Open waits for another endpoint that is
 	// initializing the segment. Zero selects DefaultAttachTimeout.
 	AttachTimeout time.Duration
+
+	// parkers, set by the named-segment constructors on platforms whose
+	// waiters cannot park on words inside the shared memory (Windows), are
+	// the cross-process wake objects of ring 0 and ring 1. Nil entries keep
+	// the in-memory wait words.
+	parkers [2]mpmc.Parker
 }
 
 func (o LinkOptions) normalized() LinkOptions {

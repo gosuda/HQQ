@@ -13,6 +13,10 @@ import (
 // processes on this platform.
 const parkingSupported = true
 
+// processLocalParking reports whether futexWait/futexWake block and wake at
+// least between threads of one process. It is implied by parkingSupported.
+const processLocalParking = true
+
 // Darwin ulock interface (xnu bsd/sys/ulock.h). These system calls back
 // os_sync_wait_on_address and libdispatch; the syscall numbers are stable
 // since macOS 10.12.

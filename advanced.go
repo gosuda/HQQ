@@ -53,6 +53,18 @@ const (
 	// maxAbandonedCalls bounds the memory used to recognize late responses
 	// to canceled calls.
 	maxAbandonedCalls = 4096
+
+	// defaultReassemblyFactor sizes the default
+	// AdvancedOptions.MaxReassemblyBytes as a multiple of MaxMessageSize.
+	defaultReassemblyFactor = 4
+
+	// advancedAssemblyOverhead is charged against MaxReassemblyBytes for the
+	// bookkeeping of every incomplete message, on top of its payload size.
+	advancedAssemblyOverhead = 256
+
+	// maxRejectedMessages bounds the memory used to drain the remaining
+	// chunks of messages refused by the reassembly limit.
+	maxRejectedMessages = 1024
 )
 
 // ProtocolVersion represents a protocol version using semantic versioning
@@ -114,6 +126,20 @@ type AdvancedOptions struct {
 	// DefaultMaxAdvancedMessageSize.
 	MaxMessageSize uint64
 
+	// MaxReassemblyBytes bounds the memory held by incomplete multi-chunk
+	// messages (the full announced size is allocated when the first chunk
+	// arrives, plus a small fixed bookkeeping overhead per message). A
+	// message whose first chunk would exceed the bound is refused without
+	// allocating: its remaining chunks are drained and discarded, a waiting
+	// Call fails with ErrReassemblyLimit, a refused request is answered with
+	// an error response (status ErrCodeBufferOverflow), and a refused data
+	// message is dropped. Every refused message is counted in
+	// AdvancedStats.DroppedMessages.
+	// Single-chunk messages are not affected. Zero uses four times
+	// MaxMessageSize. A bound below MaxMessageSize refuses large messages
+	// even when nothing else is in flight.
+	MaxReassemblyBytes uint64
+
 	// IncomingQueueSize controls the buffered queue for dispatcher-delivered
 	// non-response messages and accepted stream IDs. Zero uses bufferCount.
 	IncomingQueueSize int
@@ -132,7 +158,7 @@ type AdvancedStats struct {
 	LargeBytes         uint64
 	Requests           uint64
 	Responses          uint64
-	DroppedMessages    uint64 // messages discarded by OverflowDrop
+	DroppedMessages    uint64 // messages discarded by OverflowDrop or refused by MaxReassemblyBytes
 	AbandonedResponses uint64 // late responses to canceled calls that were discarded
 }
 
@@ -178,6 +204,14 @@ type AdvancedLink struct {
 	// Receive path
 	receiveMu  sync.Mutex
 	assemblies map[advancedMessageKey]*advancedAssembly
+	// assemblyBytes is the memory charged by assemblies against
+	// maxReassemblyBytes. rejected remembers (FIFO, at most
+	// maxRejectedMessages) the messages refused by that limit whose remaining
+	// chunks must be discarded. All of these are guarded by receiveMu.
+	assemblyBytes      uint64
+	maxReassemblyBytes uint64
+	rejected           map[advancedMessageKey]struct{}
+	rejectedOrder      []advancedMessageKey
 
 	maxMessageSize uint64
 	overflow       OverflowPolicy
@@ -257,6 +291,13 @@ func newAdvancedLink(slink *StandardLink, opts AdvancedOptions) *AdvancedLink {
 	if maxMessageSize == 0 {
 		maxMessageSize = DefaultMaxAdvancedMessageSize
 	}
+	maxReassemblyBytes := opts.MaxReassemblyBytes
+	if maxReassemblyBytes == 0 {
+		maxReassemblyBytes = maxMessageSize * defaultReassemblyFactor
+		if maxReassemblyBytes/defaultReassemblyFactor != maxMessageSize {
+			maxReassemblyBytes = ^uint64(0)
+		}
+	}
 	incomingQueueSize := opts.IncomingQueueSize
 	if incomingQueueSize <= 0 {
 		incomingQueueSize = slink.bufferCount
@@ -268,6 +309,7 @@ func newAdvancedLink(slink *StandardLink, opts AdvancedOptions) *AdvancedLink {
 		acceptCh:           make(chan uint64, incomingQueueSize),
 		assemblies:         make(map[advancedMessageKey]*advancedAssembly),
 		maxMessageSize:     maxMessageSize,
+		maxReassemblyBytes: maxReassemblyBytes,
 		overflow:           opts.IncomingOverflow,
 		dispatchDone:       make(chan struct{}),
 		incoming:           make(chan advancedDispatchResult, incomingQueueSize),

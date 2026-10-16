@@ -1,6 +1,7 @@
 package hqq
 
 import (
+	"io"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -199,10 +200,16 @@ func openStandardLink(base unsafe.Pointer, bufferCount int, bufferSize int, opts
 	if ring0 == nil || ring1 == nil ||
 		ring0.Size() != uint64(bufferCount) || ring1.Size() != uint64(bufferCount) {
 		detach()
-		return nil, ErrFailedInit
+		return nil, ErrIncompatibleLayout
 	}
 	ring0.SetWaitPolicy(opts.WaitPolicy.ring())
 	ring1.SetWaitPolicy(opts.WaitPolicy.ring())
+	if opts.parkers[0] != nil {
+		ring0.SetParker(opts.parkers[0])
+	}
+	if opts.parkers[1] != nil {
+		ring1.SetParker(opts.parkers[1])
+	}
 
 	link := &StandardLink{
 		linkMode:    linkMode,
@@ -339,6 +346,10 @@ func (l *StandardLink) enqueue(fn func(slot uint64, p *protocol.Packet)) error {
 
 // Read implements io.Reader. It returns one message (or the unread tail of a
 // previous message); a message larger than b is split across Read calls.
+// After the peer closed the link gracefully and every buffered message was
+// consumed, Read returns io.EOF itself (not ErrPeerClosed), as the io.Reader
+// contract requires, so io.Copy, io.ReadAll and bufio.Scanner treat it as a
+// normal end of stream.
 //
 // Read is the automatic-release hot path for the same packet stream consumed
 // by ReadZeroCopy and ReserveRead. It releases the claimed ring slot before
@@ -370,6 +381,9 @@ func (l *StandardLink) Read(b []byte) (int, error) {
 				readErr = ErrUnexpectedPacket
 			}
 		})
+		if err == ErrPeerClosed {
+			return 0, io.EOF
+		}
 		if err != nil {
 			return 0, err
 		}
@@ -436,7 +450,9 @@ func (l *StandardLink) Write(b []byte) (int, error) {
 //
 // The callback must return a payload size in the range 1..BufferSize. If it
 // returns an error or an invalid size, a tombstone is published to keep the
-// ring moving and the error is returned.
+// ring moving and the error is returned. If it panics, a tombstone is
+// published as well and the panic continues in the caller after the slot
+// is released, so a failing callback cannot wedge the link.
 func (l *StandardLink) WriteZeroCopy(fn func(buffer []byte) (int, error)) (int, error) {
 	if fn == nil {
 		return 0, ErrInvalidOp
@@ -447,30 +463,38 @@ func (l *StandardLink) WriteZeroCopy(fn func(buffer []byte) (int, error)) (int, 
 	defer l.exitTx()
 
 	copyID := l.idGenerator.Add(1)
-	var n int
-	var callbackErr error
-	err := l.enqueue(func(slot uint64, p *protocol.Packet) {
-		buffer := l.txBufs[slot]
-		n, callbackErr = fn(buffer)
-		switch {
-		case callbackErr != nil:
-			*p = protocol.NewStandardLinkTombstonePacket(copyID, slot, uint64(ErrCodeInvalidOp))
-		case n <= 0:
-			callbackErr = ErrInvalidSize
-			*p = protocol.NewStandardLinkTombstonePacket(copyID, slot, uint64(ErrCodeInvalidSize))
-		case n > len(buffer):
-			callbackErr = ErrBufferOverflow
-			*p = protocol.NewStandardLinkTombstonePacket(copyID, slot, uint64(ErrCodeBufferOverflow))
-		default:
-			*p = protocol.NewStandardLinkCopyPacket(copyID, slot, uint64(n))
-		}
-	})
+	c := mpmc.Cancel{Closed: l.closeCh, DeadlineFunc: l.writeDeadlineFn, Check: l.checkFn}
+	slot, err := l.txRing.ReserveProducerCancel(&c)
 	if err != nil {
+		return 0, mapWaitErr(err)
+	}
+	return l.fillSlot(slot, copyID, fn)
+}
+
+// fillSlot lets fn fill the payload buffer of the claimed producer slot and
+// publishes the matching packet. The slot is published even if fn panics or
+// calls runtime.Goexit: the packet is a tombstone until fn returned
+// successfully, so readers skip a slot whose writer failed and the panic
+// continues without wedging the ring.
+func (l *StandardLink) fillSlot(slot mpmc.ProducerSlot[protocol.Packet], copyID uint64, fn func(buffer []byte) (int, error)) (int, error) {
+	idx := slot.Slot()
+	p := slot.Value()
+	*p = protocol.NewStandardLinkTombstonePacket(copyID, idx, uint64(ErrCodeInvalidOp))
+	defer slot.Commit()
+
+	buffer := l.txBufs[idx]
+	n, err := fn(buffer)
+	switch {
+	case err != nil:
 		return 0, err
+	case n <= 0:
+		*p = protocol.NewStandardLinkTombstonePacket(copyID, idx, uint64(ErrCodeInvalidSize))
+		return 0, ErrInvalidSize
+	case n > len(buffer):
+		*p = protocol.NewStandardLinkTombstonePacket(copyID, idx, uint64(ErrCodeBufferOverflow))
+		return 0, ErrBufferOverflow
 	}
-	if callbackErr != nil {
-		return 0, callbackErr
-	}
+	*p = protocol.NewStandardLinkCopyPacket(copyID, idx, uint64(n))
 	return n, nil
 }
 
@@ -482,15 +506,16 @@ func (l *StandardLink) WriteZeroCopy(fn func(buffer []byte) (int, error)) (int, 
 // head-of-line (HOL) blocking. Do not retain the buffer after the callback returns.
 //
 // The buffer is only valid for the duration of fn. Returning from fn releases
-// the ring slot and allows a future writer to overwrite the same memory.
+// the ring slot and allows a future writer to overwrite the same memory. The
+// slot is released, and the message consumed, if fn panics as well.
 func (l *StandardLink) ReadZeroCopy(fn func(buffer []byte) error) (int, error) {
 	if fn == nil {
 		return 0, ErrInvalidOp
 	}
 	if view, backing, ok := l.recv.take(); ok {
-		err := fn(view)
-		l.recv.giveBack(backing)
-		if err != nil {
+		// Give the backing store back even if fn panics.
+		defer l.recv.giveBack(backing)
+		if err := fn(view); err != nil {
 			return 0, err
 		}
 		return len(view), nil

@@ -100,14 +100,39 @@ var (
 	// AdvancedOptions.IncomingOverflow is OverflowFail.
 	ErrIncomingOverflow = &hqqError{msg: "hqq: incoming message queue overflow", base: ErrBufferOverflow}
 
+	// ErrMessageAborted is returned by Call and CallOn when the peer
+	// abandoned the response mid-transfer (its multi-chunk send failed). The
+	// call can be retried. Aborted messages that are not responses to a call
+	// never reach Receive or Serve: they are dropped, because they were never
+	// complete.
+	ErrMessageAborted = &hqqError{msg: "hqq: message aborted by sender", base: ErrProtocol}
+
+	// ErrReassemblyLimit is returned by Call and CallOn when this endpoint
+	// refused to assemble the response because incomplete messages already
+	// held AdvancedOptions.MaxReassemblyBytes. A request refused for the same
+	// reason is answered with an error response whose status is
+	// ErrCodeBufferOverflow, so the peer's Call fails with an
+	// AdvancedResponseError.
+	ErrReassemblyLimit = &hqqError{msg: "hqq: reassembly memory limit exceeded", base: ErrBufferOverflow}
+
 	// ErrInvalidName is returned for shared-memory names that are empty,
 	// contain path separators or NUL bytes, or exceed the platform limit.
 	ErrInvalidName = shm.ErrInvalidName
 )
 
-// errSegmentNotReady is returned while a named segment exists but its
-// creator has not sized it yet. Dial retries on it.
-var errSegmentNotReady = &hqqError{msg: "hqq: shared memory segment is not initialized yet", base: ErrFailedInit}
+// Transient attach errors. Both wrap ErrFailedInit; Dial retries only on
+// these (and on a missing name), never on a permanent ErrFailedInit variant
+// such as ErrIncompatibleLayout.
+var (
+	// errSegmentNotReady is returned while a named segment exists but its
+	// creator has not sized it yet.
+	errSegmentNotReady = &hqqError{msg: "hqq: shared memory segment is not initialized yet", base: ErrFailedInit}
+
+	// errInitContended is returned when another endpoint kept initializing
+	// the segment past AttachTimeout, or took over this endpoint's
+	// initialization.
+	errInitContended = &hqqError{msg: "hqq: shared memory segment initialization did not complete", base: ErrFailedInit}
+)
 
 // hqqError is an error with a stable message that wraps a broader base error.
 type hqqError struct {

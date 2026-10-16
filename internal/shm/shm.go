@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 )
 
 // ErrInvalidName reports a shared-memory name that is empty, contains path
@@ -24,6 +25,38 @@ type SharedMemory struct {
 	name string  // Name/identifier of the shared memory region
 	size int     // Size of the shared memory region in bytes
 	fd   uintptr // File descriptor or handle for the shared memory region
+
+	// sems are the wake semaphores that go with the region on platforms that
+	// need them (Windows); see Semaphore.
+	sems [SemaphoreCount]Semaphore
+}
+
+// SemaphoreCount is the number of wake semaphores that accompany a segment
+// on platforms where waiters cannot park on words inside the shared memory
+// itself (Windows).
+const SemaphoreCount = 4
+
+// Semaphore is a counting semaphore shared between every process that opened
+// the same segment: on Windows, a named kernel semaphore whose name is
+// derived from the mapping's kernel object name.
+type Semaphore interface {
+	// Wait blocks until a token is available, consuming it, or timeout
+	// elapses. Timeouts are rounded up to whole milliseconds.
+	Wait(timeout time.Duration)
+	// Release adds n tokens. It never blocks and ignores a full semaphore.
+	Release(n uint32)
+}
+
+// Semaphore returns the i-th (0 <= i < SemaphoreCount) wake semaphore of the
+// segment, or nil if the platform parks waiters on futex-style words inside
+// the shared memory and the segment has no semaphores. The semaphores are
+// created together with the segment, opened by every other endpoint, and
+// closed by Close; they must not be used after Close.
+func (s *SharedMemory) Semaphore(i int) Semaphore {
+	if i < 0 || i >= SemaphoreCount {
+		return nil
+	}
+	return s.sems[i]
 }
 
 // Name returns the name/identifier of the shared memory region

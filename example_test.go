@@ -3,6 +3,7 @@ package hqq_test
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"time"
 
@@ -103,10 +104,10 @@ func ExampleCreateStandardLink() {
 	n, _ := server.Read(buf)
 	fmt.Println(string(buf[:n]))
 	_, err = server.Read(buf)
-	fmt.Println(err)
+	fmt.Println(err == io.EOF)
 	// Output:
 	// from client
-	// hqq: peer closed the link
+	// true
 }
 
 // Reservations hand out the shared slot buffer for explicit, zero-copy

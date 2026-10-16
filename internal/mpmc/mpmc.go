@@ -12,8 +12,12 @@
 // Blocking operations use an adaptive wait strategy (see WaitPolicy): a short
 // busy spin, then cooperative yielding, then parking on a 32-bit wait word in
 // the ring header. Parking uses futex(2) on Linux and __ulock_wait on macOS,
-// both of which work across processes for shared mappings. Other platforms
-// fall back to bounded exponential sleeps.
+// both of which work across processes for shared mappings. Windows has no
+// cross-process compare-and-wait primitive: a ring handle can be given a
+// Parker (see SetParker, typically named kernel semaphores) for cross-process
+// parking, and otherwise parks on WaitOnAddress, which only wakes waiters of
+// the same process and therefore bounds every park by a short backoff. Other
+// platforms fall back to bounded exponential sleeps.
 package mpmc
 
 import (
@@ -42,8 +46,8 @@ const (
 	HeaderSize = 512
 
 	// cacheLine is the padding granularity used to keep independently written
-	// header words apart. 128 bytes covers both 64-byte (x86, most ARM) and
-	// 128-byte (Apple silicon) cache lines.
+	// header words apart. 128 bytes covers both 64-byte and 128-byte cache
+	// lines (some arm64 CPUs use 128-byte lines).
 	cacheLine = 128
 
 	// slotAlign is the alignment of every slot. Aligning slots prevents a
@@ -127,8 +131,8 @@ const (
 	yieldIterations = 256                    // runtime.Gosched iterations before parking
 	maxPark         = 100 * time.Millisecond // upper bound for a single park
 	checkInterval   = 50 * time.Millisecond  // minimum spacing of Cancel.Check calls
-	minSleep        = 20 * time.Microsecond  // sleep backoff start (no parking support)
-	maxSleep        = 2 * time.Millisecond   // sleep backoff cap (no parking support)
+	minSleep        = 20 * time.Microsecond  // backoff start without cross-process parking
+	maxSleep        = 2 * time.Millisecond   // backoff cap without cross-process parking
 )
 
 // Cancel describes when a blocking operation must give up. A nil *Cancel
@@ -183,6 +187,10 @@ type MPMCRing[T any] struct {
 	size   uint64
 	stride uintptr
 	policy WaitPolicy
+
+	// parker, when set, replaces the in-memory wait words as the blocking
+	// primitive (see Parker).
+	parker Parker
 }
 
 // stride returns the slot stride for T.
@@ -311,6 +319,14 @@ func Attach[T any](p unsafe.Pointer, timeout time.Duration) *MPMCRing[T] {
 	}
 }
 
+// SetParker makes blocking operations on this handle park through p instead
+// of the platform's wait-word primitive. It must not be called concurrently
+// with operations on the handle, and p must stay usable until the last
+// operation on the handle returned.
+func (m *MPMCRing[T]) SetParker(p Parker) {
+	m.parker = p
+}
+
 // SetWaitPolicy selects the wait strategy used by blocking operations on this
 // handle. It must not be called concurrently with operations on the handle.
 func (m *MPMCRing[T]) SetWaitPolicy(p WaitPolicy) {
@@ -326,13 +342,67 @@ func (m *MPMCRing[T]) Size() uint64 {
 // re-check their condition and cancellation state and park again if needed.
 // Call it after closing a Cancel.Closed channel.
 func (m *MPMCRing[T]) WakeAll() {
-	wakeWord(&m.head.notEmpty)
-	wakeWord(&m.head.notFull)
+	m.site(NotEmpty).wake()
+	m.site(NotFull).wake()
 }
 
-func wakeWord(word *uint32) {
-	atomic.AddUint32(word, 1)
-	futexWake(word)
+// Side names one of the two conditions a blocked operation waits for.
+type Side uint8
+
+const (
+	// NotEmpty is awaited by consumers and signaled by producers.
+	NotEmpty Side = iota
+	// NotFull is awaited by producers and signaled by consumers.
+	NotFull
+)
+
+// Parker is a cross-process blocking primitive that replaces the platform's
+// wait-word primitive for one ring, shared by every process that attaches the
+// ring (for example a pair of named kernel semaphores per side).
+//
+// A waiter registers in the ring header's waiter count, re-checks the ring
+// and then calls Park; a waker that observes a non-zero waiter count after
+// publishing calls Wake. Wake grants n wake-up tokens and Park consumes one,
+// so a Wake that runs between the waiter's re-check and its Park is not lost.
+// Tokens granted to waiters that already gave up are harmless: they only
+// cause one spurious return from Park, after which waiters re-check.
+//
+// Implementations must be safe for concurrent use and Wake must not block.
+type Parker interface {
+	// Park blocks until a wake-up token is available (consuming it) or timeout
+	// elapses. It may also return early.
+	Park(side Side, timeout time.Duration)
+	// Wake makes up to n tokens available for side.
+	Wake(side Side, n uint32)
+}
+
+// waitSite names the wait word of one side of a ring together with its
+// blocking primitive.
+type waitSite struct {
+	word    *uint32
+	waiters *uint32
+	parker  Parker
+	side    Side
+}
+
+// site returns the wait site of side.
+func (m *MPMCRing[T]) site(side Side) waitSite {
+	if side == NotEmpty {
+		return waitSite{&m.head.notEmpty, &m.head.emptyWaiters, m.parker, side}
+	}
+	return waitSite{&m.head.notFull, &m.head.fullWaiters, m.parker, side}
+}
+
+// wake wakes the waiters parked on s, in every process.
+func (s waitSite) wake() {
+	if s.parker != nil {
+		if n := atomic.LoadUint32(s.waiters); n != 0 {
+			s.parker.Wake(s.side, n)
+		}
+		return
+	}
+	atomic.AddUint32(s.word, 1)
+	futexWake(s.word)
 }
 
 //go:nocheckptr
@@ -341,16 +411,16 @@ func (m *MPMCRing[T]) elem(slot uint64) *_melem[T] {
 }
 
 // notifyConsumers wakes parked consumers after a slot was published.
-func notifyConsumers(h *_mring) {
-	if atomic.LoadUint32(&h.emptyWaiters) != 0 {
-		wakeWord(&h.notEmpty)
+func (m *MPMCRing[T]) notifyConsumers() {
+	if atomic.LoadUint32(&m.head.emptyWaiters) != 0 {
+		m.site(NotEmpty).wake()
 	}
 }
 
 // notifyProducers wakes parked producers after a slot was released.
-func notifyProducers(h *_mring) {
-	if atomic.LoadUint32(&h.fullWaiters) != 0 {
-		wakeWord(&h.notFull)
+func (m *MPMCRing[T]) notifyProducers() {
+	if atomic.LoadUint32(&m.head.fullWaiters) != 0 {
+		m.site(NotFull).wake()
 	}
 }
 
@@ -375,7 +445,7 @@ func (m *MPMCRing[T]) claimProducer(c *Cancel) (uint64, *_melem[T], error) {
 			pos = atomic.LoadUint64(&h.w)
 		default:
 			// The ring is full: the slot still holds an unreleased item.
-			if err := w.wait(m.policy, c, &h.notFull, &h.fullWaiters, &e._seq, pos); err != nil {
+			if err := w.wait(m.policy, c, m.site(NotFull), &e._seq, pos); err != nil {
 				return 0, nil, err
 			}
 		}
@@ -403,7 +473,7 @@ func (m *MPMCRing[T]) claimConsumer(c *Cancel) (uint64, *_melem[T], error) {
 			pos = atomic.LoadUint64(&h.r)
 		default:
 			// The ring is empty: the slot has not been published yet.
-			if err := w.wait(m.policy, c, &h.notEmpty, &h.emptyWaiters, &e._seq, pos+1); err != nil {
+			if err := w.wait(m.policy, c, m.site(NotEmpty), &e._seq, pos+1); err != nil {
 				return 0, nil, err
 			}
 		}
@@ -413,29 +483,38 @@ func (m *MPMCRing[T]) claimConsumer(c *Cancel) (uint64, *_melem[T], error) {
 // publish makes a claimed producer slot visible to consumers.
 func (m *MPMCRing[T]) publish(pos uint64, e *_melem[T]) {
 	atomic.StoreUint64(&e._seq, pos+1)
-	notifyConsumers(m.head)
+	m.notifyConsumers()
 }
 
 // release returns a claimed consumer slot to producers.
 func (m *MPMCRing[T]) release(pos uint64, e *_melem[T]) {
 	atomic.StoreUint64(&e._seq, pos+m.mask+1)
-	notifyProducers(m.head)
+	m.notifyProducers()
 }
 
 // waiter holds the per-call state of a blocking operation.
 type waiter struct {
 	iter      int
 	armed     bool
-	stop      func() bool
+	stop      func() bool   // stops the context wake-up callback
+	stopped   chan struct{} // closed when the callback returns
 	nextCheck time.Time
 	sleep     time.Duration
 }
 
+// finish ends the blocking operation. When it returns, the context wake-up
+// callback is neither running nor will it run: context.AfterFunc's stop
+// function does not wait for a callback that already started, and the
+// callback touches the ring's wait word (or the Parker), which the owner may
+// unmap or close as soon as the operation returned.
 func (w *waiter) finish() {
-	if w.stop != nil {
-		w.stop()
-		w.stop = nil
+	if w.stop == nil {
+		return
 	}
+	if !w.stop() {
+		<-w.stopped
+	}
+	w.stop = nil
 }
 
 // poll reports a cancellation that is observable without reading the clock.
@@ -486,7 +565,7 @@ func stillBlocked(seq *uint64, target uint64) bool {
 
 // wait performs one backoff step while the slot at seq has not reached
 // target. It returns a non-nil error if the operation must be abandoned.
-func (w *waiter) wait(policy WaitPolicy, c *Cancel, word, waiters *uint32, seq *uint64, target uint64) error {
+func (w *waiter) wait(policy WaitPolicy, c *Cancel, site waitSite, seq *uint64, target uint64) error {
 	if err := poll(c); err != nil {
 		return err
 	}
@@ -539,29 +618,44 @@ func (w *waiter) wait(policy WaitPolicy, c *Cancel, word, waiters *uint32, seq *
 		return nil
 	}
 
-	if !parkingSupported {
+	if site.parker == nil && !parkingSupported {
+		// No cross-process parking: poll with a bounded exponential backoff.
 		if w.sleep == 0 {
 			w.sleep = minSleep
 		} else if w.sleep *= 2; w.sleep > maxSleep {
 			w.sleep = maxSleep
 		}
-		time.Sleep(min(w.sleep, timeout))
-		return nil
+		if !processLocalParking {
+			time.Sleep(min(w.sleep, timeout))
+			return nil
+		}
+		// Waiters of this process wake immediately; a wake-up from another
+		// process is only noticed when the backoff step ends.
+		timeout = min(w.sleep, timeout)
 	}
 
 	if !w.armed {
 		w.armed = true
 		if c != nil && c.Ctx != nil && c.Ctx.Done() != nil {
-			w.stop = context.AfterFunc(c.Ctx, func() { wakeWord(word) })
+			stopped := make(chan struct{})
+			w.stopped = stopped
+			w.stop = context.AfterFunc(c.Ctx, func() {
+				defer close(stopped)
+				site.wake()
+			})
 		}
 	}
 
-	atomic.AddUint32(waiters, 1)
-	v := atomic.LoadUint32(word)
+	atomic.AddUint32(site.waiters, 1)
+	v := atomic.LoadUint32(site.word)
 	if stillBlocked(seq, target) && poll(c) == nil {
-		futexWait(word, v, timeout)
+		if site.parker != nil {
+			site.parker.Park(site.side, timeout)
+		} else {
+			futexWait(site.word, v, timeout)
+		}
 	}
-	atomic.AddUint32(waiters, ^uint32(0))
+	atomic.AddUint32(site.waiters, ^uint32(0))
 	return nil
 }
 
@@ -689,6 +783,13 @@ func (m *MPMCRing[T]) ReserveConsumerCancel(c *Cancel) (ConsumerSlot[T], error) 
 // EnqueueZeroCopyCancel claims one producer slot, passes the slot index and
 // in-place element pointer to fn, then publishes the slot when fn returns.
 //
+// If fn panics (or ends its goroutine with runtime.Goexit), the slot is still
+// published so that the ring keeps moving, but with a zeroed element instead
+// of whatever fn had written, and the panic continues. Consumers therefore
+// see one zero element in place of the abandoned write; callers that must
+// distinguish it should recover inside fn and write a marker element
+// themselves.
+//
 // WARNING: The callback runs while the ring slot is claimed. It must return
 // promptly; if it blocks or never returns, the whole ring can suffer
 // head-of-line (HOL) blocking. Do not retain elem after the callback returns.
@@ -698,13 +799,23 @@ func (m *MPMCRing[T]) EnqueueZeroCopyCancel(c *Cancel, fn func(slot uint64, elem
 	if err != nil {
 		return err
 	}
+	completed := false
+	defer func() {
+		if !completed {
+			var zero T
+			e._data = zero
+		}
+		m.publish(pos, e)
+	}()
 	fn(pos&m.mask, &e._data)
-	m.publish(pos, e)
+	completed = true
 	return nil
 }
 
 // DequeueZeroCopyCancel claims one consumer slot, passes the slot index and
-// in-place element pointer to fn, then releases the slot when fn returns.
+// in-place element pointer to fn, then releases the slot when fn returns. The
+// slot is also released if fn panics (or calls runtime.Goexit), so a failing
+// callback consumes its element but cannot wedge the ring.
 //
 // WARNING: The callback runs while the ring slot is claimed. It must return
 // promptly; if it blocks or never returns, the whole ring can suffer
@@ -715,8 +826,8 @@ func (m *MPMCRing[T]) DequeueZeroCopyCancel(c *Cancel, fn func(slot uint64, elem
 	if err != nil {
 		return err
 	}
+	defer m.release(pos, e)
 	fn(pos&m.mask, &e._data)
-	m.release(pos, e)
 	return nil
 }
 

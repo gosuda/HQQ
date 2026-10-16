@@ -47,8 +47,9 @@
 //	}
 //	defer client.Close()
 //
-// For in-process testing or custom memory mappings, use [OpenStandardLinkMemory]
-// or [AlignedBuffer] with [OpenStandardLink] / [NewAdvancedLink].
+// For in-process testing or custom memory mappings, pass page-aligned memory
+// (for example from [AlignedBuffer]) to [OpenStandardLinkMemory] or
+// [NewAdvancedLinkMemory].
 //
 // # Concurrency Contract
 //
@@ -68,23 +69,27 @@
 //     concurrent use across goroutines.
 //   - [StandardLink.Close] and [NamedStandardLink.Close] wake all blocked
 //     readers and writers and wait for in-flight ring operations to drain
-//     before returning (and before unmapping shared memory).
+//     before returning (and before unmapping shared memory). Close and
+//     Unlink on named links may be called concurrently.
 //
 // # Crash Detection and Lifecycle
 //
-// Each attached endpoint records a monotonic session token, OS process ID, and
-// periodic heartbeat timestamp in the shared superblock:
+// Each attached endpoint records a random session token and a periodic
+// heartbeat timestamp in the shared superblock:
 //
-//   - Graceful peer shutdown sets a detached marker and wakes parked waiters,
-//     causing blocked reads and writes to return [ErrPeerClosed] (which wraps
-//     [io.EOF] and [net.ErrClosed]).
-//   - An abrupt peer crash (`SIGKILL` or process exit without `Close`) is
-//     detected via OS PID liveness probes and heartbeat expiration, returning
-//     [ErrPeerGone] (which also wraps [io.EOF] and [net.ErrClosed]).
-//   - Calling `Create*Link` on a leftover shared-memory segment whose previous
-//     owners have exited automatically re-initializes the segment and bumps
-//     its superblock epoch; if a live owner is still attached, creation fails
-//     with [ErrLinkBusy].
+//   - Graceful peer shutdown sets a detached marker and wakes parked waiters.
+//     Messages published before the close are still delivered; after them
+//     [StandardLink.Read] returns [io.EOF] itself, and the other blocking
+//     operations return [ErrPeerClosed] (which matches [io.EOF]).
+//   - An abrupt peer crash or hang (`SIGKILL`, process exit without `Close`)
+//     is detected when the peer's heartbeat stalls for
+//     [LinkOptions.PeerTimeout], returning [ErrPeerGone] (which matches
+//     [ErrConnNotFound]). The recorded PID is diagnostic only.
+//   - `Create*Link` and [Listen] create the name exclusively and fail with an
+//     error matching [os.ErrExist] if it exists. `OpenNamed*Link` and [Dial]
+//     re-initialize a segment whose previous endpoints all closed or died
+//     (bumping its epoch); if a live endpoint is still attached with a peer,
+//     opening fails with [ErrLinkBusy].
 //   - Standalone [Unlink] removes a named shared-memory object without opening
 //     or mapping it.
 //
@@ -95,8 +100,9 @@
 // the same physical pages with read-write permissions, a malicious peer with
 // write access to the segment can corrupt ring sequence numbers or superblock
 // metadata. Restrict segment permissions via the `mode` argument (for example
-// `0600`) when creating named links, and set [AdvancedOptions.MaxMessageSize]
-// to bound reassembly allocations.
+// `0600`) when creating named links. [AdvancedOptions.MaxMessageSize] bounds
+// one reassembled message and [AdvancedOptions.MaxReassemblyBytes] bounds the
+// memory held by all incomplete messages together.
 //
 // # Platform Notes
 //
@@ -108,5 +114,10 @@
 //   - Windows: Named shared memory uses `Local\<name>` by default so standard
 //     unprivileged user accounts do not need `SeCreateGlobalPrivilege`
 //     (pass an explicit `Global\<name>` prefix for cross-session sharing).
-//     Cross-process waiting uses bounded exponential sleep backoff.
+//     `mode` becomes a DACL (SYSTEM, the creating user for the owner bits,
+//     Everyone for the other bits). Named segments park cross-process
+//     waiters on four named kernel semaphores (`<name>.hqq-sem0`…`3`);
+//     unnamed memory uses `WaitOnAddress`, which wakes only waiters of the
+//     same process immediately. [Unlink] is a no-op: the mapping disappears
+//     with its last handle.
 package hqq

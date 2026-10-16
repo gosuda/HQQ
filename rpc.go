@@ -23,8 +23,9 @@ func (f HandlerFunc) ServeHQQ(ctx context.Context, request AdvancedMessage) ([]b
 }
 
 // MessageHandler is optionally implemented by a Handler to receive messages
-// that are not requests (SendLarge data and abort notifications). Without it,
-// Serve discards such messages.
+// that are not requests (SendLarge data and responses that match no waiting
+// call). Messages the sender aborted mid-transfer are never delivered: see
+// AdvancedLink.Receive. Without it, Serve discards such messages.
 type MessageHandler interface {
 	HandleMessage(ctx context.Context, message AdvancedMessage)
 }
@@ -86,6 +87,9 @@ func (m *Mux) HandleMessage(ctx context.Context, message AdvancedMessage) {
 // Serve receives requests until ctx is done or the link fails, and answers
 // each one with h on its own goroutine (at most BufferCount handlers run
 // concurrently). Serve waits for running handlers before it returns.
+//
+// A request whose sender aborted it mid-transfer is dropped and never
+// reaches h, because Receive does not deliver aborted messages.
 //
 // It returns ctx.Err() when ctx ends, nil when the peer closed the link
 // gracefully, and the receive error otherwise. The link must be negotiated

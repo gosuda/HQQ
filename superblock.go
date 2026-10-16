@@ -264,7 +264,7 @@ func claimSuperblock(sb *standardSuperblock, bufferCount, bufferSize int, layout
 		}
 
 		if time.Now().After(deadline) {
-			return 0, false, ErrFailedInit
+			return 0, false, errInitContended
 		}
 		time.Sleep(200 * time.Microsecond)
 	}
@@ -291,7 +291,7 @@ func zeroWithProgress(sb *standardSuperblock, b []byte) {
 func publishSuperblock(sb *standardSuperblock, bufferCount, bufferSize int, layoutSize uintptr, token uint64, opts LinkOptions) (uint64, error) {
 	if atomic.LoadUint64(&sb.initToken) != token {
 		// Another endpoint took over initialization.
-		return 0, ErrFailedInit
+		return 0, errInitContended
 	}
 	epoch := atomic.AddUint64(&sb.epoch, 1)
 	atomic.StoreUint64(&sb.major, protocol.HQQProtocolMajorVersion)

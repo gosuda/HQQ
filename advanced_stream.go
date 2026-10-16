@@ -66,7 +66,10 @@ func (l *AdvancedLink) Accept(ctx context.Context) (uint64, error) {
 }
 
 // Dial creates a logical Advanced stream by sending OpConnCreate and waiting
-// for the peer's OpConnAccept. It returns the new connection ID.
+// for the peer's OpConnAccept. It returns the new connection ID: Primary
+// endpoints allocate even non-zero IDs (2, 4, ...) and Secondary endpoints
+// odd IDs (1, 3, ...), so both sides can Dial concurrently without
+// colliding. ID 0 is reserved for link-level traffic.
 func (l *AdvancedLink) Dial(ctx context.Context) (uint64, error) {
 	ctx = orBackground(ctx)
 	if err := l.requireNegotiated(); err != nil {
@@ -75,10 +78,7 @@ func (l *AdvancedLink) Dial(ctx context.Context) (uint64, error) {
 	if err := l.startDispatcher(); err != nil {
 		return 0, err
 	}
-	connID := l.connectionIDGenerator.Add(1)
-	if connID == 0 {
-		connID = l.connectionIDGenerator.Add(1)
-	}
+	connID := l.nextConnectionID()
 	conn := newConnection(connID, ConnectionStateOpening)
 	accepted := make(chan error, 1)
 	l.controlMu.Lock()
@@ -137,14 +137,45 @@ func (l *AdvancedLink) handleControlPacket(ctx context.Context, p *protocol.Pack
 	}
 }
 
+// nextConnectionID allocates a connection ID of this endpoint's parity.
+func (l *AdvancedLink) nextConnectionID() uint64 {
+	for {
+		n := l.connectionIDGenerator.Add(1)
+		if l.Mode() == LinkModePrimary {
+			if id := n << 1; id != 0 {
+				return id
+			}
+			continue
+		}
+		return n<<1 - 1
+	}
+}
+
+// peerOwnsConnectionID reports whether connID has the parity the peer
+// allocates from: odd IDs belong to the Secondary, even non-zero IDs to the
+// Primary.
+func (l *AdvancedLink) peerOwnsConnectionID(connID uint64) bool {
+	if connID == 0 {
+		return false
+	}
+	peerIsSecondary := l.Mode() == LinkModePrimary
+	return (connID&1 == 1) == peerIsSecondary
+}
+
 func (l *AdvancedLink) handleConnCreate(ctx context.Context, connID uint64) error {
-	refuse := func() error {
-		return l.sendPacket(ctx, protocol.NewPacket(protocol.OpError, connID, uint64(ErrCodeConnNotFound)))
+	refuse := func(code ErrorCode) error {
+		return l.sendPacket(ctx, protocol.NewPacket(protocol.OpError, connID, uint64(code)))
 	}
 	l.controlMu.Lock()
 	if !l.listening {
 		l.controlMu.Unlock()
-		return refuse()
+		return refuse(ErrCodeConnNotFound)
+	}
+	// Refuse an ID the peer may not allocate and never replace a live
+	// stream: either would be a protocol violation by the peer.
+	if _, exists := l.connections[connID]; exists || !l.peerOwnsConnectionID(connID) {
+		l.controlMu.Unlock()
+		return refuse(ErrCodeInvalidOp)
 	}
 	l.connections[connID] = newConnection(connID, ConnectionStateOpen)
 	l.controlMu.Unlock()

@@ -11,8 +11,9 @@ import (
 
 // FuzzConsumeAdvancedChunk feeds arbitrary frame sequences into the Advanced
 // message assembler. It must never panic, never allocate more than
-// MaxMessageSize for one message, and only return complete messages whose
-// payload length equals the announced total size.
+// MaxMessageSize for one message or MaxReassemblyBytes for all incomplete
+// messages, and only return complete messages whose payload length equals
+// the announced total size.
 func FuzzConsumeAdvancedChunk(f *testing.F) {
 	const bufferSize = 64
 	frame := func(conn, msg, total, off, size, flags, aux uint64, fill byte) []byte {
@@ -29,11 +30,15 @@ func FuzzConsumeAdvancedChunk(f *testing.F) {
 	f.Add(frame(0, 2, 0, 0, 0, AdvFlagBegin|AdvFlagEnd|AdvFlagResponse|AdvFlagError, 9, 0))
 	f.Add(frame(3, 4, 50, 0, 0, AdvFlagAbort, 0, 0))
 	f.Add(frame(0, 1, 1<<40, 0, 64, AdvFlagBegin, 0, 0))
+	f.Add(append(append(frame(0, 1, 4000, 0, 64, AdvFlagBegin, 0, 'a'),
+		frame(0, 2, 4000, 0, 64, AdvFlagBegin|AdvFlagResponse, 0, 'b')...),
+		frame(0, 2, 4000, 64, 64, AdvFlagAbort|AdvFlagResponse, 0, 0)...))
 
 	f.Fuzz(func(t *testing.T, data []byte) {
 		l := &AdvancedLink{
-			assemblies:     make(map[advancedMessageKey]*advancedAssembly),
-			maxMessageSize: 4096,
+			assemblies:         make(map[advancedMessageKey]*advancedAssembly),
+			maxMessageSize:     4096,
+			maxReassemblyBytes: 6000,
 		}
 		buffer := make([]byte, bufferSize)
 		const frameLen = 7*8 + 1
@@ -48,8 +53,11 @@ func FuzzConsumeAdvancedChunk(f *testing.F) {
 			}
 			data = data[frameLen:]
 
-			msg, complete, err := l.consumeAdvancedChunk(&p, buffer)
-			if err != nil || !complete || msg.IsAbort() {
+			msg, outcome, err := l.consumeAdvancedChunk(&p, buffer)
+			if err == nil && outcome == chunkComplete && msg.IsAbort() {
+				t.Fatalf("complete message carries the abort flag: %+v", msg)
+			}
+			if err != nil || outcome != chunkComplete {
 				continue
 			}
 			if uint64(len(msg.Payload)) != p.Operand(2) {
@@ -59,10 +67,18 @@ func FuzzConsumeAdvancedChunk(f *testing.F) {
 				t.Fatalf("payload length %d exceeds MaxMessageSize", len(msg.Payload))
 			}
 		}
+		var held uint64
 		for key, a := range l.assemblies {
 			if uint64(len(a.data)) > l.maxMessageSize {
 				t.Fatalf("assembly %+v holds %d bytes", key, len(a.data))
 			}
+			held += a.charge
+		}
+		if held != l.assemblyBytes || held > l.maxReassemblyBytes {
+			t.Fatalf("assemblies charge %d, tracked %d, limit %d", held, l.assemblyBytes, l.maxReassemblyBytes)
+		}
+		if len(l.rejected) != len(l.rejectedOrder) || len(l.rejected) > maxRejectedMessages {
+			t.Fatalf("rejected set %d, order %d", len(l.rejected), len(l.rejectedOrder))
 		}
 	})
 }

@@ -6,18 +6,22 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
 	"runtime"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
 	"unsafe"
 
 	"gosuda.org/hqq/internal/mmap"
+	"gosuda.org/hqq/internal/mpmc"
+	"gosuda.org/hqq/internal/protocol"
 	"gosuda.org/hqq/internal/shm"
 )
 
@@ -260,7 +264,7 @@ func TestMultiProcessPeerCrashIsDetected(t *testing.T) {
 }
 
 func TestMultiProcessPeerCloseIsDetected(t *testing.T) {
-	testMultiProcessLiveness(t, "graceful", ErrPeerClosed)
+	testMultiProcessLiveness(t, "graceful", io.EOF)
 }
 
 func multiProcessChildArgs(t *testing.T) []string {
@@ -2907,4 +2911,593 @@ func negotiateAdvancedPairForBenchmark(b *testing.B, ctx context.Context, primar
 	if secondaryErr != nil {
 		b.Fatalf("secondary negotiation failed: %v", secondaryErr)
 	}
+}
+
+// advancedTestLinks returns a negotiated Advanced pair (client is the
+// Primary, server the Secondary).
+func advancedTestLinks(t *testing.T, bufferCount, bufferSize int, clientOpts, serverOpts AdvancedOptions) (client, server *AdvancedLink) {
+	t.Helper()
+	backing, client, server := newAdvancedPairWithOptions(t, bufferCount, bufferSize, clientOpts, serverOpts)
+	t.Cleanup(func() {
+		client.Close()
+		server.Close()
+		runtime.KeepAlive(backing)
+	})
+	negotiateAdvancedPair(t, client, server)
+	return client, server
+}
+
+// injectAdvancedFrame publishes one raw OpConnCopy frame from l, bypassing
+// the chunking of the public API (to forge aborts and partial messages).
+func injectAdvancedFrame(t *testing.T, l *AdvancedLink, connectionID, messageID, totalSize, chunkOffset, flags, aux uint64, chunk []byte) {
+	t.Helper()
+	s := l.slink
+	if err := s.enterTx(true); err != nil {
+		t.Fatalf("enterTx: %v", err)
+	}
+	defer s.exitTx()
+	c := mpmc.Cancel{Closed: s.closeCh, Check: s.checkFn, Deadline: time.Now().Add(2 * time.Second)}
+	if err := l.sendAdvancedChunk(&c, connectionID, messageID, totalSize, chunkOffset, flags, aux, chunk); err != nil {
+		t.Fatalf("inject frame: %v", err)
+	}
+}
+
+func TestPendingCallReleaseRecyclesOnlyCleanChannels(t *testing.T) {
+	l := &AdvancedLink{
+		pendingCalls: make(map[advancedCallKey]chan advancedDispatchResult),
+		abandoned:    make(map[advancedCallKey]struct{}),
+	}
+
+	// An entry nobody touched is released by its owner, which may recycle
+	// the (empty) channel.
+	key := advancedCallKey{connectionID: 1, messageID: 1}
+	ch := l.registerPendingCall(key)
+	if !l.unregisterPendingCall(key, ch) {
+		t.Fatalf("unregisterPendingCall of an untouched call = false, want true")
+	}
+
+	// failPendingCalls and routeResponse remove the entry first and send a
+	// result on the channel: unregisterPendingCall must report that and the
+	// channel must never come back from the pool.
+	for name, remove := range map[string]func(key advancedCallKey){
+		"failPendingCalls": func(advancedCallKey) { l.failPendingCalls(ErrClosed) },
+		"routeResponse": func(key advancedCallKey) {
+			if !l.routeResponse(AdvancedMessage{ConnectionID: key.connectionID, MessageID: key.messageID, Flags: AdvFlagResponse}) {
+				t.Fatalf("routeResponse did not find the pending call")
+			}
+		},
+	} {
+		key := advancedCallKey{connectionID: 2, messageID: 2}
+		dirty := l.registerPendingCall(key)
+		remove(key)
+		if l.unregisterPendingCall(key, dirty) {
+			t.Fatalf("%s: unregisterPendingCall = true after the entry was removed", name)
+		}
+		if len(dirty) != 1 {
+			t.Fatalf("%s: dirty channel holds %d results, want 1", name, len(dirty))
+		}
+		for i := 0; i < 256; i++ {
+			k := advancedCallKey{connectionID: 3, messageID: uint64(i)}
+			got := l.registerPendingCall(k)
+			if got == dirty || len(got) != 0 {
+				t.Fatalf("%s: registerPendingCall returned a dirty channel (len %d)", name, len(got))
+			}
+			l.unregisterPendingCall(k, got)
+		}
+	}
+}
+
+// TestAdvancedLinkPendingPoolStress hammers the synchronous call path with
+// concurrent responders so that recycled channels are reused constantly.
+func TestAdvancedLinkPendingPoolStress(t *testing.T) {
+	client, server := advancedTestLinks(t, 64, 64, AdvancedOptions{}, AdvancedOptions{})
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	go server.Serve(ctx, HandlerFunc(func(_ context.Context, request AdvancedMessage) ([]byte, error) {
+		return request.Payload, nil
+	}))
+
+	var wg sync.WaitGroup
+	errCh := make(chan error, 8)
+	for g := 0; g < 8; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			for i := 0; i < 200; i++ {
+				want := fmt.Sprintf("g%d-i%d", g, i)
+				got, err := client.Call(ctx, 1, []byte(want))
+				if err != nil {
+					errCh <- fmt.Errorf("Call %s: %w", want, err)
+					return
+				}
+				if string(got) != want {
+					errCh <- fmt.Errorf("Call %s returned %q (stale pooled result)", want, got)
+					return
+				}
+			}
+		}(g)
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Fatal(err)
+	}
+}
+
+func TestAdvancedServeDropsAbortedRequest(t *testing.T) {
+	client, server := advancedTestLinks(t, 16, 32, AdvancedOptions{}, AdvancedOptions{})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Count every request and message, whatever its method.
+	var handled, messages atomic.Int32
+	h := countingHandler{
+		serve: func(_ context.Context, request AdvancedMessage) ([]byte, error) {
+			handled.Add(1)
+			return request.Payload, nil
+		},
+		message: func(context.Context, AdvancedMessage) { messages.Add(1) },
+	}
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- server.Serve(ctx, h) }()
+
+	// A request whose multi-chunk send failed mid-way: first chunk, then
+	// the abort frame the sender emits. A stray abort without any partial
+	// state follows.
+	injectAdvancedFrame(t, client, 0, 900, 64, 0, AdvFlagBegin|AdvFlagRequest, 7, make([]byte, 32))
+	injectAdvancedFrame(t, client, 0, 900, 0, 0, AdvFlagAbort|AdvFlagRequest, 0, nil)
+	injectAdvancedFrame(t, client, 0, 901, 0, 0, AdvFlagAbort|AdvFlagRequest, 0, nil)
+
+	got, err := client.Call(ctx, 7, []byte("real"))
+	if err != nil || string(got) != "real" {
+		t.Fatalf("Call after aborted request = %q, %v", got, err)
+	}
+	if n := handled.Load(); n != 1 {
+		t.Fatalf("handler ran %d times, want 1 (the aborted request must not be served)", n)
+	}
+	if n := messages.Load(); n != 0 {
+		t.Fatalf("MessageHandler saw %d messages, want 0 (aborts are dropped)", n)
+	}
+	cancel()
+	<-serveErr
+}
+
+func TestAdvancedReceiveDropsAbortedMessages(t *testing.T) {
+	client, server := advancedTestLinks(t, 16, 32, AdvancedOptions{}, AdvancedOptions{})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	injectAdvancedFrame(t, client, 0, 910, 64, 0, AdvFlagBegin, 0, make([]byte, 32))
+	injectAdvancedFrame(t, client, 0, 910, 0, 0, AdvFlagAbort, 0, nil)
+	injectAdvancedFrame(t, client, 0, 911, 0, 0, AdvFlagAbort, 0, nil)
+	if _, err := client.SendLarge(ctx, 0, []byte("complete")); err != nil {
+		t.Fatalf("SendLarge: %v", err)
+	}
+	message, err := server.Receive(ctx)
+	if err != nil {
+		t.Fatalf("Receive: %v", err)
+	}
+	if message.IsAbort() || !message.IsData() || string(message.Payload) != "complete" {
+		t.Fatalf("Receive returned flags=%#x payload=%q, want the complete data message", message.Flags, message.Payload)
+	}
+	if len(server.assemblies) != 0 || server.assemblyBytes != 0 {
+		t.Fatalf("aborted message left %d assemblies / %d bytes", len(server.assemblies), server.assemblyBytes)
+	}
+}
+
+func TestAdvancedAbortedResponseFailsCall(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		dispatcher bool
+		partial    bool
+	}{
+		{"sync/abort-only", false, false},
+		{"sync/partial", false, true},
+		{"dispatcher/abort-only", true, false},
+		{"dispatcher/partial", true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client, server := advancedTestLinks(t, 16, 32, AdvancedOptions{}, AdvancedOptions{})
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if tc.dispatcher {
+				if err := client.startDispatcher(); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			serverErr := make(chan error, 1)
+			go func() {
+				request, err := server.Receive(ctx)
+				if err != nil {
+					serverErr <- err
+					return
+				}
+				if tc.partial {
+					injectAdvancedFrame(t, server, request.ConnectionID, request.MessageID, 64, 0, AdvFlagBegin|AdvFlagResponse, 5, make([]byte, 32))
+				}
+				injectAdvancedFrame(t, server, request.ConnectionID, request.MessageID, 0, 0, AdvFlagAbort|AdvFlagResponse, 0, nil)
+
+				// The link stays usable: answer the next call normally.
+				request, err = server.Receive(ctx)
+				if err != nil {
+					serverErr <- err
+					return
+				}
+				serverErr <- server.Respond(ctx, request, 0, []byte("pong"))
+			}()
+
+			response, err := client.CallOn(ctx, 0, 1, []byte("ping"))
+			if !errors.Is(err, ErrMessageAborted) || !errors.Is(err, ErrProtocol) {
+				t.Fatalf("CallOn with aborted response = (%+v, %v), want ErrMessageAborted", response, err)
+			}
+			if response.Payload != nil || response.Flags != 0 {
+				t.Fatalf("aborted call returned a message: %+v", response)
+			}
+			got, err := client.Call(ctx, 1, []byte("ping"))
+			if err != nil || string(got) != "pong" {
+				t.Fatalf("Call after aborted response = %q, %v", got, err)
+			}
+			if err := <-serverErr; err != nil {
+				t.Fatalf("server: %v", err)
+			}
+		})
+	}
+}
+
+func TestAdvancedDialAllocatesDisjointIDsPerRole(t *testing.T) {
+	const dials = 6
+	primary, secondary := advancedTestLinks(t, 32, 32, AdvancedOptions{}, AdvancedOptions{})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	for _, l := range []*AdvancedLink{primary, secondary} {
+		if err := l.Listen(ctx); err != nil {
+			t.Fatalf("Listen: %v", err)
+		}
+	}
+
+	type dialed struct {
+		id  uint64
+		err error
+	}
+	results := make(chan dialed, 2*dials)
+	var wg sync.WaitGroup
+	for _, l := range []*AdvancedLink{primary, secondary} {
+		for i := 0; i < dials; i++ {
+			wg.Add(1)
+			go func(l *AdvancedLink) {
+				defer wg.Done()
+				id, err := l.Dial(ctx)
+				results <- dialed{id, err}
+			}(l)
+		}
+	}
+	wg.Wait()
+	close(results)
+
+	seen := make(map[uint64]bool)
+	var even, odd int
+	for r := range results {
+		if r.err != nil {
+			t.Fatalf("Dial: %v", r.err)
+		}
+		if r.id == 0 || seen[r.id] {
+			t.Fatalf("connection ID %d is zero or duplicated", r.id)
+		}
+		seen[r.id] = true
+		if r.id%2 == 0 {
+			even++
+		} else {
+			odd++
+		}
+	}
+	if even != dials || odd != dials {
+		t.Fatalf("got %d even and %d odd IDs, want %d each", even, odd, dials)
+	}
+
+	// Each side accepted exactly the other side's IDs.
+	for _, tc := range []struct {
+		name   string
+		l      *AdvancedLink
+		parity uint64
+	}{{"primary accepts secondary IDs", primary, 1}, {"secondary accepts primary IDs", secondary, 0}} {
+		for i := 0; i < dials; i++ {
+			id, err := tc.l.Accept(ctx)
+			if err != nil {
+				t.Fatalf("%s: Accept: %v", tc.name, err)
+			}
+			if id%2 != tc.parity || id == 0 {
+				t.Fatalf("%s: accepted ID %d with the wrong parity", tc.name, id)
+			}
+		}
+	}
+}
+
+func TestAdvancedConnCreateRefusesForgedIDs(t *testing.T) {
+	for _, tc := range []struct {
+		name               string
+		victimIsPrimary    bool
+		valid, wrongParity uint64
+	}{
+		{"primary victim", true, 3, 4},
+		{"secondary victim", false, 4, 3},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a, b := advancedTestLinks(t, 16, 32, AdvancedOptions{}, AdvancedOptions{})
+			victim, forger := a, b
+			if !tc.victimIsPrimary {
+				victim, forger = b, a
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := victim.Listen(ctx); err != nil {
+				t.Fatalf("Listen: %v", err)
+			}
+			create := func(id uint64) {
+				t.Helper()
+				if err := forger.sendPacket(ctx, protocol.NewPacket(protocol.OpConnCreate, id)); err != nil {
+					t.Fatalf("send create(%d): %v", id, err)
+				}
+			}
+			// The forger never started a dispatcher, so Receive surfaces the
+			// OpError refusals directly.
+			expectRefused := func(what string) {
+				t.Helper()
+				if _, err := forger.Receive(ctx); !errors.Is(err, ErrInvalidOp) {
+					t.Fatalf("%s: Receive = %v, want a refusal (ErrInvalidOp)", what, err)
+				}
+			}
+
+			create(0)
+			expectRefused("connection ID 0")
+			create(tc.wrongParity)
+			expectRefused("wrong parity")
+
+			create(tc.valid)
+			id, err := victim.Accept(ctx)
+			if err != nil || id != tc.valid {
+				t.Fatalf("Accept = %d, %v, want %d", id, err, tc.valid)
+			}
+			victim.controlMu.Lock()
+			original := victim.connections[tc.valid]
+			victim.controlMu.Unlock()
+			if original == nil {
+				t.Fatalf("accepted connection %d is not registered", tc.valid)
+			}
+
+			create(tc.valid)
+			expectRefused("duplicate")
+			victim.controlMu.Lock()
+			current := victim.connections[tc.valid]
+			victim.controlMu.Unlock()
+			if current != original {
+				t.Fatalf("duplicate create replaced the live connection")
+			}
+			shortCtx, shortCancel := context.WithTimeout(ctx, 50*time.Millisecond)
+			defer shortCancel()
+			if id, err := victim.Accept(shortCtx); err == nil {
+				t.Fatalf("refused create was queued for Accept as %d", id)
+			}
+		})
+	}
+}
+
+func TestAdvancedReassemblyLimitBoundsIncompleteMessages(t *testing.T) {
+	const (
+		bufferSize = 64
+		overhead   = advancedAssemblyOverhead
+	)
+	l := &AdvancedLink{
+		assemblies:         make(map[advancedMessageKey]*advancedAssembly),
+		maxMessageSize:     1000,
+		maxReassemblyBytes: (300 + overhead) + (100 + overhead),
+		stats:              advancedCounters{},
+	}
+	buffer := make([]byte, bufferSize)
+	consume := func(conn, msg, total, off, size, flags, aux uint64) (AdvancedMessage, chunkOutcome) {
+		t.Helper()
+		p := protocol.NewConnCopyPacket(conn, msg, total, off, size, flags, aux)
+		m, outcome, err := l.consumeAdvancedChunk(&p, buffer)
+		if err != nil {
+			t.Fatalf("consume(msg %d off %d): %v", msg, off, err)
+		}
+		return m, outcome
+	}
+	// send feeds a whole message in bufferSize chunks and returns the
+	// outcome of its first and last chunk.
+	send := func(msg, total, kind uint64) (first, last chunkOutcome, firstMsg AdvancedMessage) {
+		for off := uint64(0); off < total; off += bufferSize {
+			size := min(uint64(bufferSize), total-off)
+			flags := kind
+			if off == 0 {
+				flags |= AdvFlagBegin
+			}
+			if off+size == total {
+				flags |= AdvFlagEnd
+			}
+			m, o := consume(0, msg, total, off, size, flags, 0)
+			if off == 0 {
+				first, firstMsg = o, m
+			}
+			last = o
+		}
+		return first, last, firstMsg
+	}
+	// begin feeds only the first chunk.
+	begin := func(msg, total, kind uint64) (AdvancedMessage, chunkOutcome) {
+		return consume(0, msg, total, 0, bufferSize, AdvFlagBegin|kind, 0)
+	}
+	rest := func(msg, total, kind uint64) (last chunkOutcome) {
+		for off := uint64(bufferSize); off < total; off += bufferSize {
+			size := min(uint64(bufferSize), total-off)
+			flags := kind
+			if off+size == total {
+				flags |= AdvFlagEnd
+			}
+			_, last = consume(0, msg, total, off, size, flags, 0)
+		}
+		return last
+	}
+
+	if _, o := begin(1, 300, 0); o != chunkPartial || l.assemblyBytes != 300+overhead {
+		t.Fatalf("first message: outcome %v, charged %d", o, l.assemblyBytes)
+	}
+	// Does not fit next to message 1: refused without allocating.
+	refused, o := begin(2, 300, AdvFlagRequest)
+	if o != chunkRefused || !refused.IsAbort() || !refused.IsRequest() || refused.MessageID != 2 {
+		t.Fatalf("over-limit request: outcome %v, message %+v", o, refused)
+	}
+	refusedResponse, o := begin(3, 300, AdvFlagResponse)
+	if o != chunkRefused || !errors.Is(refusedResponse.abortErr, ErrReassemblyLimit) {
+		t.Fatalf("over-limit response: outcome %v, abortErr %v", o, refusedResponse.abortErr)
+	}
+	if len(l.assemblies) != 1 || l.assemblyBytes != 300+overhead || len(l.rejected) != 2 {
+		t.Fatalf("refusal allocated: %d assemblies, %d bytes, %d rejected", len(l.assemblies), l.assemblyBytes, len(l.rejected))
+	}
+	// A message that still fits is accepted, a single-chunk message always is.
+	if _, o := begin(4, 100, 0); o != chunkPartial || l.assemblyBytes != 300+overhead+100+overhead {
+		t.Fatalf("fitting message: outcome %v, charged %d", o, l.assemblyBytes)
+	}
+	before := len(l.assemblies)
+	if m, o := consume(0, 5, 50, 0, 50, AdvFlagBegin|AdvFlagEnd, 0); o != chunkComplete || len(m.Payload) != 50 || len(l.assemblies) != before {
+		t.Fatalf("single-chunk message: outcome %v, %d assemblies", o, len(l.assemblies))
+	}
+
+	// The remaining chunks of refused messages are drained, and an abort
+	// for one is consumed silently.
+	if o := rest(2, 300, AdvFlagRequest); o != chunkPartial {
+		t.Fatalf("draining refused request: outcome %v", o)
+	}
+	if _, o := consume(0, 3, 0, 0, 0, AdvFlagAbort|AdvFlagResponse, 0); o != chunkPartial {
+		t.Fatalf("abort of a refused message: outcome %v", o)
+	}
+	if len(l.rejected) != 0 || len(l.rejectedOrder) != 0 {
+		t.Fatalf("rejected markers left behind: %d/%d", len(l.rejected), len(l.rejectedOrder))
+	}
+
+	// Completing and aborting messages releases their charge.
+	if o := rest(1, 300, 0); o != chunkComplete {
+		t.Fatalf("completing message 1: outcome %v", o)
+	}
+	if _, o := consume(0, 4, 0, 0, 0, AdvFlagAbort, 0); o != chunkAborted {
+		t.Fatalf("aborting message 4: outcome %v", o)
+	}
+	if len(l.assemblies) != 0 || l.assemblyBytes != 0 {
+		t.Fatalf("assemblies not released: %d assemblies, %d bytes", len(l.assemblies), l.assemblyBytes)
+	}
+	if first, last, _ := send(6, 300, 0); first != chunkPartial || last != chunkComplete {
+		t.Fatalf("message after release: first %v, last %v", first, last)
+	}
+}
+
+func TestAdvancedReassemblyLimitDefaultAndRejectedBound(t *testing.T) {
+	l := newAdvancedLink(&StandardLink{bufferCount: 4}, AdvancedOptions{MaxMessageSize: 1 << 20})
+	if l.maxReassemblyBytes != 4<<20 {
+		t.Fatalf("default MaxReassemblyBytes = %d, want 4 * MaxMessageSize", l.maxReassemblyBytes)
+	}
+	if l := newAdvancedLink(&StandardLink{bufferCount: 4}, AdvancedOptions{MaxMessageSize: ^uint64(0)}); l.maxReassemblyBytes != ^uint64(0) {
+		t.Fatalf("default MaxReassemblyBytes overflowed to %d", l.maxReassemblyBytes)
+	}
+	if l := newAdvancedLink(&StandardLink{bufferCount: 4}, AdvancedOptions{MaxReassemblyBytes: 77}); l.maxReassemblyBytes != 77 {
+		t.Fatalf("explicit MaxReassemblyBytes = %d, want 77", l.maxReassemblyBytes)
+	}
+
+	// The set of refused messages being drained is bounded (oldest first).
+	l.maxReassemblyBytes = 0
+	buffer := make([]byte, 16)
+	for i := 0; i < maxRejectedMessages+10; i++ {
+		p := protocol.NewConnCopyPacket(0, uint64(i+1), 100, 0, 16, AdvFlagBegin, 0)
+		if _, o, err := l.consumeAdvancedChunk(&p, buffer); err != nil || o != chunkRefused {
+			t.Fatalf("message %d: outcome %v, err %v", i, o, err)
+		}
+	}
+	if len(l.rejected) != maxRejectedMessages || len(l.rejectedOrder) != maxRejectedMessages {
+		t.Fatalf("rejected set holds %d/%d keys, want %d", len(l.rejected), len(l.rejectedOrder), maxRejectedMessages)
+	}
+}
+
+func TestAdvancedReassemblyLimitRefusesRequest(t *testing.T) {
+	client, server := advancedTestLinks(t, 16, 32, AdvancedOptions{}, AdvancedOptions{MaxReassemblyBytes: 1000})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	var messages atomic.Int32
+	mux := NewMux()
+	mux.HandleFunc(1, func(_ context.Context, request AdvancedMessage) ([]byte, error) { return request.Payload, nil })
+	mux.OnMessage = func(_ context.Context, m AdvancedMessage) {
+		if len(m.Payload) == 600 {
+			messages.Add(1)
+		}
+	}
+	go server.Serve(ctx, mux)
+
+	// A hog eats most of the server's budget: 600 + overhead of 1000.
+	hog := make([]byte, 600)
+	injectAdvancedFrame(t, client, 0, 950, 600, 0, AdvFlagBegin, 0, hog[:32])
+
+	request := bytes.Repeat([]byte("r"), 300)
+	_, err := client.Call(ctx, 1, request)
+	var re AdvancedResponseError
+	if !errors.As(err, &re) || re.Status != uint64(ErrCodeBufferOverflow) {
+		t.Fatalf("Call over the reassembly limit = %v, want AdvancedResponseError(ErrCodeBufferOverflow)", err)
+	}
+	if got := server.GetAdvancedStats().DroppedMessages; got != 1 {
+		t.Fatalf("server DroppedMessages = %d, want 1", got)
+	}
+
+	// Finish the hog (32-byte chunks); the budget is released.
+	for off := uint64(32); off < 600; off += 32 {
+		size := min(uint64(32), 600-off)
+		flags := uint64(0)
+		if off+size == 600 {
+			flags = AdvFlagEnd
+		}
+		injectAdvancedFrame(t, client, 0, 950, 600, off, flags, 0, hog[off:off+size])
+	}
+	got, err := client.Call(ctx, 1, request)
+	if err != nil || !bytes.Equal(got, request) {
+		t.Fatalf("Call after the budget was released = %d bytes, %v", len(got), err)
+	}
+	if messages.Load() != 1 {
+		t.Fatalf("completed hog delivered %d times, want 1", messages.Load())
+	}
+}
+
+func TestAdvancedReassemblyLimitRefusesResponse(t *testing.T) {
+	client, server := advancedTestLinks(t, 16, 32, AdvancedOptions{MaxReassemblyBytes: 1000}, AdvancedOptions{})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	response := bytes.Repeat([]byte("p"), 300)
+	go server.Serve(ctx, HandlerFunc(func(context.Context, AdvancedMessage) ([]byte, error) { return response, nil }))
+
+	hog := make([]byte, 600)
+	injectAdvancedFrame(t, server, 0, 960, 600, 0, AdvFlagBegin, 0, hog[:32])
+
+	_, err := client.Call(ctx, 1, []byte("x"))
+	if !errors.Is(err, ErrReassemblyLimit) || !errors.Is(err, ErrBufferOverflow) {
+		t.Fatalf("Call with a refused response = %v, want ErrReassemblyLimit", err)
+	}
+	if got := client.GetAdvancedStats().DroppedMessages; got != 1 {
+		t.Fatalf("client DroppedMessages = %d, want 1", got)
+	}
+	// Release the budget by aborting the hog; the link keeps working.
+	injectAdvancedFrame(t, server, 0, 960, 0, 0, AdvFlagAbort, 0, nil)
+	got, err := client.Call(ctx, 1, []byte("x"))
+	if err != nil || !bytes.Equal(got, response) {
+		t.Fatalf("Call after the budget was released = %d bytes, %v", len(got), err)
+	}
+}
+
+// countingHandler is a Handler and MessageHandler built from functions.
+type countingHandler struct {
+	serve   func(ctx context.Context, request AdvancedMessage) ([]byte, error)
+	message func(ctx context.Context, message AdvancedMessage)
+}
+
+func (h countingHandler) ServeHQQ(ctx context.Context, request AdvancedMessage) ([]byte, error) {
+	return h.serve(ctx, request)
+}
+
+func (h countingHandler) HandleMessage(ctx context.Context, message AdvancedMessage) {
+	h.message(ctx, message)
 }

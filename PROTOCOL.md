@@ -17,7 +17,7 @@ The Advanced Protocol preserves Standard Protocol ownership rules: every payload
 4. **No unread-buffer overwrite**: a payload buffer is recycled only after the receiver releases the owning ring slot.
 5. **Bounded memory**: all rings and payload buffers are allocated up front.
 6. **Composable dispatch**: automatic copy (`Read`/`Write`), zero-copy callbacks (`ReadZeroCopy`/`WriteZeroCopy`), and explicit reservations (`ReserveRead`/`ReserveWrite`) all operate on the same packet stream.
-7. **Deterministic lifecycle & crash detection**: endpoints advertise PID and heartbeat metadata in the superblock so peers distinguish graceful shutdown (`ErrPeerClosed`) from abrupt process termination (`ErrPeerGone`).
+7. **Deterministic lifecycle & crash detection**: endpoints advertise a session token and heartbeat in the superblock so peers distinguish graceful shutdown (`ErrPeerClosed`, `io.EOF` from `StandardLink.Read`) from abrupt process termination (`ErrPeerGone`).
 
 ## Shared Memory Layout
 
@@ -41,60 +41,75 @@ All regions are page-aligned. `bufferCount` must be a power of two and at least 
 
 ### Superblock (`HQQ_STL2`)
 
-The first page is a shared initialization, configuration, and endpoint-liveness superblock (`superblockMagic = 0x4851515F53544C32`, `"HQQ_STL2"`):
+The first page is a shared initialization, configuration, and endpoint-liveness superblock (`superblockMagic = 0x4851515F53544C32`, `"HQQ_STL2"`). Every field is a little-endian `uint64` accessed atomically; field order is part of the ABI:
 
-| Offset | Field | Type | Meaning |
-| ---: | --- | --- | --- |
-| `0` | `Magic` | `uint64` | `0x4851515F53544C32` (`"HQQ_STL2"`) |
-| `8` | `State` | `uint32` | `0` (`Empty`), `1` (`Initializing`), or `2` (`Ready`) |
-| `12` | `Major` | `uint16` | Standard protocol major version (`1`) |
-| `14` | `Minor` | `uint16` | Standard protocol minor version (`0`) |
-| `16` | `PageSize` | `uint64` | OS page size used to compute region boundaries |
-| `24` | `BufferCount` | `uint64` | Configured ring-slot/buffer count per direction |
-| `32` | `BufferSize` | `uint64` | Configured bytes per slot-owned payload buffer |
-| `40` | `LayoutSize` | `uint64` | Total bytes returned by `SizeStandardLink` |
-| `48` | `Epoch` | `uint64` | Monotonic generation counter incremented on re-initialization |
-| `56` | `InitPID` | `uint64` | OS PID of the endpoint currently initializing the segment |
-| `64` | `InitHeartbeat` | `uint64` | Monotonic wall-clock timestamp (`UnixNano`) refreshed during initialization |
-| `128` | `Primary` | `64B` | Primary endpoint liveness record (`Token`, `PID`, `Heartbeat`, `Interval`) |
-| `192` | `Secondary` | `64B` | Secondary endpoint liveness record (`Token`, `PID`, `Heartbeat`, `Interval`) |
+| Offset | Field | Meaning |
+| ---: | --- | --- |
+| `0` | `Magic` | `0x4851515F53544C32` (`"HQQ_STL2"`), written when the segment becomes `Ready` |
+| `8` | `State` | `0` (`Empty`), `1` (`Initializing`), or `2` (`Ready`); any other value is rejected with `ErrIncompatibleLayout` |
+| `16` | `Major` | Standard protocol major version (`1`), informational |
+| `24` | `Minor` | Standard protocol minor version (`0`), informational |
+| `32` | `PageSize` | OS page size used to compute region boundaries |
+| `40` | `BufferCount` | Configured ring-slot/buffer count per direction |
+| `48` | `BufferSize` | Configured bytes per slot-owned payload buffer |
+| `56` | `LayoutSize` | Total bytes returned by `SizeStandardLink` |
+| `64` | `Epoch` | Generation counter incremented on every (re)initialization |
+| `72` | `InitToken` | Session token of the endpoint currently initializing the segment (`0` when none) |
+| `80` | `InitHeartbeat` | Wall-clock `UnixNano` timestamp refreshed while initializing |
+| `88` | reserved | 5 words, zero |
+| `128` | `Primary` | Primary endpoint record (128 bytes) |
+| `256` | `Secondary` | Secondary endpoint record (128 bytes) |
 
-#### Endpoint Liveness Record (64 bytes, cache-line aligned)
+Region offsets are always computed from the caller's `bufferCount`/`bufferSize`; the stored geometry is only compared, never used for addressing. An opener whose geometry differs from a `Ready` segment fails with `ErrInvalidSize`.
 
-| Offset | Field | Type | Meaning |
-| ---: | --- | --- | --- |
-| `+0` | `Token` | `uint64` | `0` = never attached, `1` = gracefully detached (`detachedToken`), `>= 2` = active session token |
-| `+8` | `PID` | `uint64` | OS process ID of the attached endpoint |
-| `+16` | `Heartbeat` | `uint64` | Last heartbeat timestamp (`UnixNano`) |
-| `+24` | `Interval` | `uint64` | Configured heartbeat interval in nanoseconds |
+#### Endpoint Record (128 bytes)
 
-#### Initialization, Takeover, and Stale Segment Reuse
+| Offset | Field | Meaning |
+| ---: | --- | --- |
+| `+0` | `Token` | `0` = unused since initialization, `1` = owner closed gracefully (`detachedToken`), any other value = random session token of the attached owner |
+| `+8` | `PID` | OS process ID of the owner; diagnostic only (PIDs are not comparable across PID namespaces) |
+| `+16` | `Heartbeat` | Last heartbeat, wall-clock `UnixNano` |
+| `+24` | `Interval` | Owner's heartbeat interval in nanoseconds; `0` = heartbeats disabled (the endpoint is then always considered alive) |
+| `+32` | reserved | 12 words, zero |
 
-1. **Primary initialization**: The primary endpoint claims `State` via CAS (`Empty -> Initializing`), records `InitPID` and `InitHeartbeat`, formats both MPMC rings, zeros both payload pools while periodically refreshing `InitHeartbeat`, writes the layout fields, claims the `Primary` endpoint slot, and publishes `State = Ready`.
-2. **Initializer crash takeover**: If the initializing process crashes before publishing `State = Ready`, a subsequent opener detects that `InitPID` is no longer alive (or that `InitHeartbeat` has expired past `AttachTimeout`) and safely takes over initialization.
-3. **Third-endpoint rejection**: At most one Primary and one Secondary endpoint may be active simultaneously. If both endpoint slots hold live tokens, a third opener fails immediately with `ErrLinkBusy`.
-4. **Stale segment re-initialization**: When `CreateStandardLink` or `CreateAdvancedLink` opens an existing named segment whose previous endpoints are both dead or detached, it automatically increments `Epoch`, re-formats the rings, and re-initializes the superblock.
+#### Initialization, Takeover, and Segment Reuse
+
+1. **Initialization**: An opener that finds `State = Empty` claims it via CAS (`Empty -> Initializing`), stores its token in `InitToken` and refreshes `InitHeartbeat`, formats both MPMC rings, and zeros both payload pools (refreshing `InitHeartbeat` every 8 MiB). It then checks that it still owns `InitToken` (otherwise another endpoint took over and it fails), increments `Epoch`, writes the version and layout fields, clears the `Secondary` record and claims the `Primary` record, writes `Magic`, clears `InitToken`, and publishes `State = Ready`.
+2. **Initializer crash takeover**: If `State` stays `Initializing` and `InitHeartbeat` is older than `max(PeerTimeout, 2s)`, an opener takes over by CAS on `InitToken` and restarts initialization. An opener that waits longer than `AttachTimeout` for initialization to finish fails with an error matching `ErrFailedInit`; `Dial` retries on it.
+3. **Attaching**: On a `Ready` segment with a live Primary whose `Secondary.Token` is `0`, the opener claims the Secondary record via CAS.
+4. **Liveness at open**: an endpoint record is alive if its token is an owner token and its heartbeat is younger than `max(PeerTimeout, 4 × Interval)`. A heartbeat that looks stale is confirmed by watching it for `min(3 × Interval, 2s)`, so wall-clock jumps do not declare a live endpoint dead.
+5. **Third-endpoint rejection**: If both records are alive, or the live endpoint's earlier peer already closed or died (a dead endpoint may still own ring slots), the opener fails with `ErrLinkBusy`.
+6. **Segment reuse**: If neither record is alive, the opener re-initializes the `Ready` segment (`Ready -> Initializing`, step 1) and becomes Primary with a new `Epoch`. `CreateStandardLink`, `CreateAdvancedLink`, and `Listen` never reach this step for an existing name: they create the name exclusively and fail with `os.ErrExist`. `OpenNamed*` and `Dial` do reuse such segments.
 
 ### MPMC Ring Layout (v2)
 
-Each directional packet ring uses a 512-byte header (`mpmc.HeaderSize = 512`) split into four 128-byte cache-line-isolated regions to prevent false sharing between producers, consumers, and cross-process park/wake words:
+Each directional packet ring uses a 512-byte header (`mpmc.HeaderSize = 512`) split into four 128-byte lines so that independently written words never share a cache line (128 bytes covers both 64-byte and 128-byte cache lines):
 
 ```text
-Offset   0..127 : w            (uint64 write cursor)
-Offset 128..255 : notEmpty     (uint32 sequence) + emptyWaiters (uint32 count)
-Offset 256..383 : r            (uint64 read cursor)
-Offset 384..511 : notFull      (uint32 sequence) + fullWaiters  (uint32 count)
-Offset 512..end : slots[0..N-1], each rounded up to a 64-byte multiple
+Offset   0..127 : magic, size, init flag, slot stride, layout version (uint64 each; immutable after init)
+Offset 128..255 : r             (uint64 consumer cursor)
+Offset 256..383 : w             (uint64 producer cursor)
+Offset 384..399 : notEmpty      (uint32 wake word, bumped by producers)
+                  emptyWaiters  (uint32 number of parked consumers)
+                  notFull       (uint32 wake word, bumped by consumers)
+                  fullWaiters   (uint32 number of parked producers)
+Offset 512..end : slots[0..N-1]
 ```
 
-Each slot consists of an 8-byte sequence number (`seq uint64`) followed by the 64-byte `protocol.Packet` and 56 bytes of padding (`slotStride = 128` bytes), guaranteeing that no two slots share a 64-byte cache line.
+Each slot is an 8-byte sequence number (`seq uint64`) followed by the 64-byte `protocol.Packet`, rounded up to a 64-byte multiple (stride 128 bytes). An attacher rejects a ring whose magic, layout version, stride, or power-of-two size does not match.
 
-When `WaitAdaptive` (the default `WaitPolicy`) is active:
-- Contended producers/consumers spin briefly with CPU pause hints (` PAUSE` on amd64, `YIELD` on arm64), then increment the corresponding waiter count (`emptyWaiters` or `fullWaiters`) and park in the OS kernel:
-  - **Linux**: `futex` (`FUTEX_WAIT = 0`, `FUTEX_WAKE = 1`, shared across processes without `FUTEX_PRIVATE_FLAG`)
-  - **macOS**: `__ulock_wait` / `__ulock_wake` (`UL_COMPARE_AND_WAIT_SHARED = 3`)
-  - **Other platforms / Windows**: bounded exponential sleep backoff (`20µs` to `2ms`)
-- Publishing a slot or releasing a slot bumps `notEmpty` or `notFull` and issues a kernel wake only when `emptyWaiters > 0` or `fullWaiters > 0`, keeping the uncontended fast path completely syscall-free.
+When `WaitAdaptive` (the default `WaitPolicy`) is active, a blocked producer or consumer:
+
+1. re-checks the slot sequence in a tight loop (64 iterations), then
+2. yields with `runtime.Gosched` (256 iterations), then
+3. increments `emptyWaiters`/`fullWaiters`, loads the wake word, re-checks the sequence, and parks for at most 100 ms (or until its deadline or next liveness check):
+   - **Linux**: `futex` on the wake word (`FUTEX_WAIT = 0`, `FUTEX_WAKE = 1`, shared across processes without `FUTEX_PRIVATE_FLAG`)
+   - **macOS**: `__ulock_wait` / `__ulock_wake` on the wake word (`UL_COMPARE_AND_WAIT_SHARED = 3`)
+   - **Windows, named segments**: there is no cross-process compare-and-wait primitive, so each segment has four named kernel semaphores (`<mapping object name>.hqq-sem0` … `.hqq-sem3`: ring 0 notEmpty/notFull, ring 1 notEmpty/notFull). The waiter calls `WaitForSingleObject` on the semaphore; the waker, after publishing, reads the waiter count `n` and calls `ReleaseSemaphore(n)`. Because a released token persists, a wake that runs between the waiter's re-check and its wait is not lost; tokens left for waiters that already gave up only cause one spurious wake-up.
+   - **Windows, unnamed memory**: `WaitOnAddress` / `WakeByAddressAll`, which wake waiters of the same process only; waiters woken from another process notice within a 1–2 ms backoff.
+   - **Other platforms**: bounded exponential sleep backoff (`20µs` to `2ms`).
+
+Publishing or releasing a slot issues a kernel wake only when `emptyWaiters > 0` or `fullWaiters > 0`, keeping the uncontended fast path syscall-free.
 
 The core Vyukov MPMC state machine is formally specified in [`internal/mpmc/MPMC.tla`](internal/mpmc/MPMC.tla) and model-checked with TLC via [`scripts/tlc.sh`](scripts/tlc.sh) for writer/reader exclusivity (`NoRace`), payload integrity (`DataIntegrity`), FIFO claim order (`FIFOClaimOrder`), and lock-free system progress (`SystemProgress`).
 
@@ -182,7 +197,7 @@ The Advanced Protocol is an overlay over Standard Protocol 1.0. It publishes Adv
 | --- | ---: | --- |
 | `AdvFlagBegin` | `1 << 0` | First chunk of a logical message. |
 | `AdvFlagEnd` | `1 << 1` | Final chunk of a logical message. |
-| `AdvFlagAbort` | `1 << 2` | Sender abandoned this logical message; receiver discards partial state. |
+| `AdvFlagAbort` | `1 << 2` | Sender abandoned this logical message; receiver discards partial state. Aborted requests and data messages are never delivered to `Receive`, `Serve`, or a `MessageHandler`; an aborted response fails the waiting call with `ErrMessageAborted`. |
 | `AdvFlagRequest` | `1 << 3` | Chunk belongs to a request message. |
 | `AdvFlagResponse` | `1 << 4` | Chunk belongs to a response message. |
 | `AdvFlagError` | `1 << 5` | Response represents an application/protocol error. |
@@ -191,7 +206,7 @@ For single-chunk messages, both `AdvFlagBegin` and `AdvFlagEnd` are set.
 
 ### `OpConnCreate` (`0x01`), `OpConnAccept` (`0x02`), `OpConnClose` (`0x03`)
 
-- `OpConnCreate`: `Operand0 = ConnectionID`, `Operand1 = flags (0)`. Peer replies with `OpConnAccept` (`Operand0 = ConnectionID`) if listening, or `OpError` (`Operand0 = ConnectionID`, `Operand1 = ErrCodeConnNotFound`) if not listening.
+- `OpConnCreate`: `Operand0 = ConnectionID`, `Operand1 = flags (0)`. Peer replies with `OpConnAccept` (`Operand0 = ConnectionID`) if listening, or `OpError` (`Operand0 = ConnectionID`, `Operand1 = ErrCodeConnNotFound`) if not listening. A create whose ID is `0`, has the wrong parity for the sender's role, or is already in use is refused with `OpError` (`Operand1 = ErrCodeInvalidOp`); the existing connection is left untouched.
 - `OpConnClose`: `Operand0 = ConnectionID`, `Operand1 = reason`.
 
 ### `OpConnCopy` (`0x04`)
@@ -211,35 +226,42 @@ Transfers one Advanced chunk for large-data copy or request-response IPC:
 ### Protocol Negotiation (`OpProtoNegotiate` `0x05`, `OpProtoAck` `0x06`)
 
 Negotiation is mandatory before using Advanced APIs.
-- **Role-agnostic negotiation**: `AdvancedLink.Negotiate(ctx, features)` automatically initiates negotiation on the Primary endpoint and waits for negotiation on the Secondary endpoint.
-- **Simultaneous initiation resolution**: If both endpoints call `NegotiateProtocol` concurrently, each endpoint in state `Negotiating` that receives a peer's `OpProtoNegotiate` packet computes the intersection of features/capabilities, replies with `OpProtoAck`, and transitions to `Negotiated` without deadlocking.
+- **Role-agnostic negotiation**: `AdvancedLink.Negotiate(ctx, features)` initiates negotiation on the Primary endpoint and waits for negotiation on the Secondary endpoint.
+- **Simultaneous initiation resolution**: If both endpoints call `NegotiateProtocol` concurrently, the Primary's request wins: the Secondary answers the Primary's `OpProtoNegotiate` with `OpProtoAck` (intersection of features), and the Primary ignores the Secondary's request.
+- A failed negotiation leaves the link in `ProtocolStateFailed`; it cannot be renegotiated.
 
 ### Dispatcher, Late-Response Handling, and Overflow Policy
 
 - **Single-chunk fast path**: Single-frame messages (`AdvFlagBegin | AdvFlagEnd`) allocate and copy directly without inserting into the multi-chunk reassembly map.
+- **Reassembly bounds**: `AdvancedOptions.MaxMessageSize` (default 64 MiB) bounds one message's `TotalSize`. The first chunk of a multi-chunk message allocates `TotalSize` bytes and is charged `TotalSize + 256` against `AdvancedOptions.MaxReassemblyBytes` (default `4 × MaxMessageSize`). A first chunk that would exceed the budget is refused without allocating; its remaining chunks are drained. A refused request is answered with an error response (status `ErrCodeBufferOverflow`), a refused response fails the waiting call with `ErrReassemblyLimit`, and a refused data message is dropped; all are counted in `AdvancedStats.DroppedMessages`. At most 1024 refused messages are tracked for draining.
 - **Late responses to canceled calls**: When `Call` or `CallOn` times out or its `context.Context` is canceled while waiting for a response, the `(ConnectionID, MessageID)` key is recorded in a bounded ring of canceled calls. Subsequent response chunks for that call are silently drained and discarded rather than aborting the dispatcher.
 - **Incoming queue backpressure (`OverflowPolicy`)**:
-  - `OverflowBlock` (default): the dispatcher blocks until the application consumes from `Receive` or `Accept`, naturally propagating backpressure into the shared-memory ring.
-  - `OverflowDrop`: drops the newest incoming non-response message when the queue (`MaxIncomingMessages`) is full.
+  - `OverflowBlock` (default): the dispatcher blocks until the application consumes from `Receive` or `Accept`, propagating backpressure into the shared-memory ring. While it blocks, responses are not routed either.
+  - `OverflowDrop`: drops the newest incoming non-response message when the queue (`AdvancedOptions.IncomingQueueSize`, default `bufferCount`) is full.
   - `OverflowFail`: fails the dispatcher with `ErrIncomingOverflow`.
 
 ## Error Hierarchy
 
-All public errors support `errors.Is` both against specific HQQ sentinels and against standard library sentinels (`io.EOF`, `net.ErrClosed`, `os.ErrDeadlineExceeded`):
+All public errors support `errors.Is` against the sentinel itself and against the base it wraps:
 
-| Sentinel | Unwraps To | Meaning |
+| Sentinel | Wraps | Meaning |
 | --- | --- | --- |
+| `io.EOF` (returned as is) | — | `StandardLink.Read` after the peer closed gracefully and every buffered message was consumed |
 | `ErrClosed` | `net.ErrClosed` | Local link was closed |
-| `ErrPeerClosed` | `io.EOF`, `net.ErrClosed` | Remote peer closed its link gracefully |
-| `ErrPeerGone` | `io.EOF`, `net.ErrClosed` | Remote peer process exited or crashed without closing |
-| `ErrTimeout` | `os.ErrDeadlineExceeded` | Operation timed out (implements `net.Error` with `Timeout() == true`) |
-| `ErrLinkBusy` | `ErrFailedInit` | Both endpoint slots are already occupied by live processes |
-| `ErrIncompatibleLayout` | `ErrInvalidSize` | Existing shared memory layout parameters do not match caller arguments |
-| `ErrInvalidName` | — | Shared memory name is empty, contains slashes/NUL, or exceeds OS length limits |
+| `ErrPeerClosed` | `io.EOF` | Remote peer closed its link gracefully (all APIs except `StandardLink.Read`) |
+| `ErrPeerGone` | `ErrConnNotFound` | Remote peer stopped heartbeating (crashed or hung), or the segment was re-initialized under this endpoint |
+| `ErrTimeout` | `os.ErrDeadlineExceeded` | Deadline passed (implements `net.Error` with `Timeout() == true`) |
+| `ErrLinkBusy` | `ErrFailedInit` | Two live endpoints are attached, or the live endpoint's earlier peer already left |
+| `ErrIncompatibleLayout` | `ErrFailedInit` | Foreign magic, unknown superblock state, or ring header that does not match this HQQ version |
+| `ErrInvalidSize` | — | Invalid geometry, or geometry that differs from an existing segment |
+| `ErrInvalidName` | — | Shared memory name is empty, contains separators/NUL, or exceeds the platform limit |
 | `ErrNotNegotiated` | `ErrInvalidOp` | Advanced API called before protocol negotiation succeeded |
 | `ErrAlreadyNegotiated` | `ErrInvalidOp` | Protocol negotiation attempted more than once |
-| `ErrNegotiationRejected` | `ErrFailedInit` | Peer rejected protocol negotiation |
-| `ErrUnexpectedPacket` | `ErrInvalidOp` | Unexpected opcode observed on the active link mode |
+| `ErrNegotiationRejected` | `ErrInvalidOp` | Peer rejected negotiation or acknowledged an incompatible version/feature set |
+| `ErrUnexpectedPacket` | `ErrInvalidOp` | Packet that the calling API cannot consume (for example an Advanced frame on `StandardLink.Read`) |
 | `ErrProtocol` | `ErrInvalidOp` | Malformed frame bounds or protocol state violation |
+| `ErrMessageAborted` | `ErrProtocol` | `Call`/`CallOn`: the peer abandoned the response mid-transfer |
 | `ErrAdvancedActive` | `ErrInvalidOp` | Standard `Read`/`Write` called on a negotiated `AdvancedLink` |
-| `ErrIncomingOverflow` | `ErrBufferOverflow` | Incoming queue exceeded `MaxIncomingMessages` under `OverflowFail` |
+| `ErrNotListening` / `ErrAlreadyListening` | `ErrInvalidOp` | `Accept` before `Listen` / second `Listen` |
+| `ErrIncomingOverflow` | `ErrBufferOverflow` | Incoming queue exceeded `IncomingQueueSize` under `OverflowFail` |
+| `ErrReassemblyLimit` | `ErrBufferOverflow` | `Call`/`CallOn`: the response was refused under `MaxReassemblyBytes` |

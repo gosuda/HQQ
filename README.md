@@ -2,7 +2,7 @@
 
 **HQQ** (`gosuda.org/hqq`) is a Go inter-process communication (IPC) library built on shared memory, lock-free Vyukov-style MPMC rings, and slot-owned payload buffers.
 
-It delivers **sub-microsecond round-trip latency (~258 ns)** and **multi-GB/s throughput (27–64 GB/s)** while keeping idle CPU near **0%** via cross-process kernel parking (`futex` on Linux, `__ulock_wait` on macOS).
+It delivers **sub-microsecond round-trip latency (~258 ns)** and **multi-GB/s throughput (27–64 GB/s)** while keeping idle CPU near **0%** via cross-process kernel parking (`futex` on Linux, `__ulock_wait` on macOS, named kernel semaphores on Windows).
 
 ---
 
@@ -11,8 +11,8 @@ It delivers **sub-microsecond round-trip latency (~258 ns)** and **multi-GB/s th
 - **Two composable protocol layers over one shared-memory layout**:
   - **Standard Protocol (`StandardLink`)**: fixed-capacity messages (`Read`, `Write`, `ReadZeroCopy`, `WriteZeroCopy`, `ReserveRead`, `ReserveWrite`, and `net.PacketConn` deadlines) with zero heap allocations on the hot path.
   - **Advanced Protocol (`AdvancedLink`)**: negotiated overlay adding multi-chunk large-message transfer (`SendLarge`, `Receive`), concurrent out-of-order RPC (`Call`, `CallOn`, `Respond`, `Serve`, `Mux`), and logical stream multiplexing (`Listen`, `Accept`, `Dial`).
-- **Adaptive Cross-Process Parking (`WaitAdaptive`)**: spins briefly with CPU pause/yield hints and then parks in the OS kernel (`FUTEX_WAIT` on Linux, `UL_COMPARE_AND_WAIT_SHARED` on macOS), reducing idle blocked reader CPU from ~165% to **~0.1%** without sacrificing active throughput.
-- **Deterministic Crash & Lifecycle Detection (`HQQ_STL2` Superblock)**: tracks endpoint session tokens, OS PIDs, and heartbeats to distinguish graceful peer shutdown (`ErrPeerClosed`) from abrupt process termination (`ErrPeerGone`), automatically re-initialize stale segments from dead processes, and reject 3rd-party attachment collisions (`ErrLinkBusy`).
+- **Adaptive Cross-Process Parking (`WaitAdaptive`)**: re-checks the ring in a short tight loop, yields with `runtime.Gosched`, and then parks in the OS kernel (`FUTEX_WAIT` on Linux, `UL_COMPARE_AND_WAIT_SHARED` on macOS, named semaphores on Windows), reducing idle blocked reader CPU from ~165% to **~0.1%** without sacrificing active throughput.
+- **Deterministic Crash & Lifecycle Detection (`HQQ_STL2` Superblock)**: tracks per-endpoint session tokens and heartbeats to distinguish graceful peer shutdown (`io.EOF` from `Read`, `ErrPeerClosed` elsewhere) from abrupt process termination (`ErrPeerGone`), re-initializes segments whose endpoints have all closed or died, and rejects a third endpoint (`ErrLinkBusy`).
 - **Formal Verification & Safety**: MPMC ring invariants (`NoRace`, `DataIntegrity`, `FIFOClaimOrder`, `SystemProgress`) are model-checked with TLC ([`internal/mpmc/MPMC.tla`](internal/mpmc/MPMC.tla)), and the entire codebase passes default `go vet ./...` (including `unsafeptr`) and `go test -race ./...`.
 
 ---
@@ -20,7 +20,7 @@ It delivers **sub-microsecond round-trip latency (~258 ns)** and **multi-GB/s th
 ## Requirements
 
 - Go 1.24 or newer
-- `bufferCount`: power of two, `>= 2` (defaults to `128` in `hqq.Config`)
+- `bufferCount`: power of two, `>= 2` (defaults to `256` in `hqq.Config`)
 - `bufferSize`: multiple of 8 bytes, `>= 8` (defaults to `4096` in `hqq.Config`)
 
 ---
@@ -49,8 +49,9 @@ func main() {
 	defer cancel()
 
 	const name = "hqq_quickstart"
+	// Listen fails with os.ErrExist if the name already exists. Remove a name
+	// left behind by a crashed listener; a clean Close removes it itself.
 	_ = hqq.Unlink(name)
-	defer hqq.Unlink(name)
 
 	mux := hqq.NewMux()
 	mux.HandleFunc(MethodEcho, func(ctx context.Context, req hqq.AdvancedMessage) ([]byte, error) {
@@ -89,11 +90,11 @@ func main() {
 When your messages fit within `bufferSize` and you want raw `io.ReadWriter` / zero-copy ring performance without protocol negotiation:
 
 ```go
-primary, err := hqq.CreateStandardLink("my_std_link", 256, 4096, 0600)
+// The creator removes the name when it closes.
+primary, err := hqq.CreateStandardLink("my_std_link", 256, 4096, 0o600)
 if err != nil {
 	panic(err)
 }
-defer primary.Delete()
 defer primary.Close()
 
 secondary, err := hqq.OpenNamedStandardLink("my_std_link", 256, 4096)
@@ -116,17 +117,15 @@ _, _ = secondary.ReadZeroCopy(func(payload []byte) error {
 No `unsafe.Pointer` arithmetic is required in user code. Pass a page-aligned `[]byte` from `hqq.AlignedBuffer` (or your own `mmap` slice) to `hqq.OpenStandardLinkMemory`:
 
 ```go
-size := hqq.SizeStandardLink(128, 4096)
-backing, mem := hqq.AlignedBuffer(size)
-_ = backing // keep backing alive while links are open
+mem := hqq.AlignedBuffer(hqq.SizeStandardLink(128, 4096))
 
-primary, err := hqq.OpenStandardLinkMemory(mem, 128, 4096)
+primary, err := hqq.OpenStandardLinkMemory(mem, 128, 4096, hqq.LinkOptions{})
 if err != nil {
 	panic(err)
 }
 defer primary.Close()
 
-secondary, err := hqq.OpenStandardLinkMemory(mem, 128, 4096)
+secondary, err := hqq.OpenStandardLinkMemory(mem, 128, 4096, hqq.LinkOptions{})
 if err != nil {
 	panic(err)
 }
@@ -155,7 +154,7 @@ See [PROTOCOL.md](PROTOCOL.md) for the full wire and memory layout specification
 
 ## Benchmarks
 
-Measured on Apple M1 (`darwin/arm64`, Go 1.24, `go test . -bench 'Benchmark(StandardLink|AdvancedLink|Compare)' -benchmem`):
+Measured on `darwin/arm64` (Go 1.24, `go test . -bench 'Benchmark(StandardLink|AdvancedLink|Compare)' -benchmem`):
 
 ### HQQ vs Unix Domain Socket (`SOCK_STREAM`) vs OS Pipe
 
@@ -191,34 +190,43 @@ func Unlink(name string) error
 
 // Layout sizing & helpers
 func SizeStandardLink(bufferCount int, bufferSize int) uintptr
-func AlignedBuffer(size uintptr) (backing []byte, aligned []byte)
+func AlignedBuffer(size uintptr) []byte // page-aligned, heap-backed
 func LargeMessageThreshold(bufferSize int) int
 func IsLargeMessage(bufferSize int, payloadSize int) bool
 
 // StandardLink constructors
-func OpenStandardLinkMemory(mem []byte, bufferCount int, bufferSize int) (*StandardLink, error)
-func OpenStandardLinkMemoryWithOptions(mem []byte, bufferCount int, bufferSize int, opts LinkOptions) (*StandardLink, error)
+func OpenStandardLinkMemory(mem []byte, bufferCount int, bufferSize int, opts LinkOptions) (*StandardLink, error)
 func OpenStandardLink(offset uintptr, bufferCount int, bufferSize int) (*StandardLink, error)
 func OpenStandardLinkWithOptions(offset uintptr, bufferCount int, bufferSize int, opts LinkOptions) (*StandardLink, error)
 func CreateStandardLink(name string, bufferCount int, bufferSize int, mode os.FileMode) (*NamedStandardLink, error)
+func CreateStandardLinkWithOptions(name string, bufferCount int, bufferSize int, mode os.FileMode, opts LinkOptions) (*NamedStandardLink, error)
 func OpenNamedStandardLink(name string, bufferCount int, bufferSize int) (*NamedStandardLink, error)
+func OpenNamedStandardLinkWithOptions(name string, bufferCount int, bufferSize int, opts LinkOptions) (*NamedStandardLink, error)
 
 // AdvancedLink constructors
+func NewAdvancedLinkMemory(mem []byte, bufferCount int, bufferSize int, opts AdvancedOptions) (*AdvancedLink, error)
 func NewAdvancedLink(offset uintptr, bufferCount int, bufferSize int) (*AdvancedLink, error)
 func NewAdvancedLinkWithOptions(offset uintptr, bufferCount int, bufferSize int, opts AdvancedOptions) (*AdvancedLink, error)
 func CreateAdvancedLink(name string, bufferCount int, bufferSize int, mode os.FileMode) (*NamedAdvancedLink, error)
+func CreateAdvancedLinkWithOptions(name string, bufferCount int, bufferSize int, mode os.FileMode, opts AdvancedOptions) (*NamedAdvancedLink, error)
 func OpenNamedAdvancedLink(name string, bufferCount int, bufferSize int) (*NamedAdvancedLink, error)
+func OpenNamedAdvancedLinkWithOptions(name string, bufferCount int, bufferSize int, opts AdvancedOptions) (*NamedAdvancedLink, error)
+
+// Named links (both types)
+func (l *NamedStandardLink) Unlink() error // remove the name now; mappings stay valid
+func (l *NamedStandardLink) Close() error  // close, unmap, and remove the name if this endpoint created it
 ```
 
 ### `StandardLink` Methods
 
 ```go
-func (l *StandardLink) Read(b []byte) (int, error)
+func (l *StandardLink) Read(b []byte) (int, error) // io.EOF after a graceful peer Close
 func (l *StandardLink) Write(b []byte) (int, error)
-func (l *StandardLink) ReadZeroCopy(fn func([]byte) error) (int, error)
-func (l *StandardLink) WriteZeroCopy(fn func([]byte) (int, error)) (int, error)
+func (l *StandardLink) ReadZeroCopy(fn func(buffer []byte) error) (int, error)
+func (l *StandardLink) WriteZeroCopy(fn func(buffer []byte) (int, error)) (int, error)
 func (l *StandardLink) ReserveRead() (StandardReadReservation, error)
 func (l *StandardLink) ReserveWrite() (StandardWriteReservation, error)
+func (l *StandardLink) SetDeadline(t time.Time) error // also SetReadDeadline / SetWriteDeadline
 func (l *StandardLink) PeerState() PeerState
 func (l *StandardLink) Mode() LinkMode
 func (l *StandardLink) Type() LinkType
@@ -226,19 +234,19 @@ func (l *StandardLink) Close() error
 ```
 
 > [!WARNING]
-> `ReadZeroCopy`, `WriteZeroCopy`, `ReserveRead`, and `ReserveWrite` hold the underlying ring slot while active. Callbacks must return promptly, and reservations must always be completed (`Commit`/`Abort` for writes, `Release` for reads) to avoid head-of-line (HOL) blocking. Never retain the shared `[]byte` slice after the callback returns or after calling `Release`.
+> `ReadZeroCopy`, `WriteZeroCopy`, `ReserveRead`, and `ReserveWrite` hold the underlying ring slot while active. Callbacks must return promptly, and reservations must always be completed (`Commit`/`Abort` for writes, `Release` for reads) to avoid head-of-line (HOL) blocking. Never retain the shared `[]byte` slice after the callback returns or after calling `Release`. A callback that panics does not wedge the ring: `WriteZeroCopy` publishes a tombstone and `ReadZeroCopy` releases the slot before the panic propagates.
 
 ### `AdvancedLink` & RPC Methods
 
 ```go
 // Role-aware one-call negotiation (Primary initiates, Secondary waits)
-func (l *AdvancedLink) Negotiate(ctx context.Context, features uint64) (bool, error)
+func (l *AdvancedLink) Negotiate(ctx context.Context, features uint64) error
 func (l *AdvancedLink) NegotiateProtocol(ctx context.Context, version ProtocolVersion, features uint64) (bool, error)
 func (l *AdvancedLink) WaitForNegotiation(ctx context.Context) (bool, error)
 
 // Large-data transfer & message reception
 func (l *AdvancedLink) SendLarge(ctx context.Context, connectionID uint64, payload []byte) (messageID uint64, err error)
-func (l *AdvancedLink) Receive(ctx context.Context) (AdvancedMessage, error)
+func (l *AdvancedLink) Receive(ctx context.Context) (AdvancedMessage, error) // aborted messages are never returned
 
 // Request-Response RPC
 func (l *AdvancedLink) Call(ctx context.Context, methodID uint64, request []byte) ([]byte, error)
@@ -247,7 +255,7 @@ func (l *AdvancedLink) Respond(ctx context.Context, request AdvancedMessage, sta
 func (l *AdvancedLink) RespondError(ctx context.Context, request AdvancedMessage, status uint64, response []byte) error
 func (l *AdvancedLink) Serve(ctx context.Context, handler Handler) error
 
-// Logical streams
+// Logical streams (Primary allocates even IDs 2, 4, ...; Secondary odd IDs 1, 3, ...)
 func (l *AdvancedLink) Listen(ctx context.Context) error
 func (l *AdvancedLink) Accept(ctx context.Context) (uint64, error)
 func (l *AdvancedLink) Dial(ctx context.Context) (uint64, error)
@@ -261,20 +269,21 @@ func (l *AdvancedLink) Dial(ctx context.Context) (uint64, error)
 
 - **Goroutine-safe by default**: `Read`, `Write`, `ReadZeroCopy`, `WriteZeroCopy`, `ReserveRead`, `ReserveWrite`, `Call`, `CallOn`, `SendLarge`, `Respond`, and `Receive` are safe for concurrent use by multiple goroutines.
 - **Protocol exclusivity**: Once `AdvancedLink` negotiation succeeds, the Advanced dispatcher owns the underlying Standard ring. Calling `StandardLink.Read` or `StandardLink.Write` directly on a negotiated `AdvancedLink` returns `ErrAdvancedActive`.
-- **Safe `Close()`**: Closing a `StandardLink`, `AdvancedLink`, `NamedStandardLink`, or `NamedAdvancedLink` wakes all parked readers/writers and waits for in-flight ring callbacks to finish before returning or unmapping shared memory.
+- **Safe `Close()`**: Closing a `StandardLink`, `AdvancedLink`, `NamedStandardLink`, or `NamedAdvancedLink` wakes all parked readers/writers and waits for in-flight ring callbacks to finish before returning or unmapping shared memory. `Close` and `Unlink` on named links may be called concurrently and repeatedly; only the first `Close` unmaps.
 
 ### Crash Recovery & Liveness Semantics
 
-- **Graceful Shutdown (`ErrPeerClosed`)**: When a peer calls `Close()`, it writes a detached marker into the superblock and wakes parked waiters. Blocked `Read`, `Write`, `Receive`, or `Call` operations return `ErrPeerClosed` (which satisfies `errors.Is(err, io.EOF)` and `errors.Is(err, net.ErrClosed)`).
-- **Abrupt Process Crash (`ErrPeerGone`)**: Each endpoint updates its superblock heartbeat (default `100ms`) and records its OS PID. If the peer process is killed (`SIGKILL`) or crashes, the surviving endpoint detects the dead PID or expired heartbeat (default `500ms`) and unblocks all waiters with `ErrPeerGone` (which also wraps `io.EOF` and `net.ErrClosed`).
-- **Stale Segment Re-initialization**: If both previous endpoints have exited without unlinking the shared-memory file, calling `CreateStandardLink`, `CreateAdvancedLink`, or `Listen` on the same name automatically increments the superblock epoch and re-formats the segment. If a live process still holds the segment, creation fails with `ErrLinkBusy`.
-- **Standalone Cleanup**: Call `hqq.Unlink(name)` to remove a leftover shared-memory segment without mapping it.
+- **Graceful Shutdown**: When a peer calls `Close()`, it writes a detached marker into the superblock and wakes parked waiters. Messages it published before closing are still delivered. After that, `StandardLink.Read` returns `io.EOF` itself (so `io.Copy`, `io.ReadAll`, and `bufio.Scanner` see a normal end of stream); `Write`, `ReadZeroCopy`, `ReserveRead`, `Receive`, and `Call` return `ErrPeerClosed`, which matches `errors.Is(err, io.EOF)`.
+- **Abrupt Process Crash (`ErrPeerGone`)**: Each endpoint refreshes its superblock heartbeat (default every `250ms`, `LinkOptions.HeartbeatInterval`). If the peer is killed (`SIGKILL`) or hangs, the surviving endpoint unblocks all waiters with `ErrPeerGone` once the heartbeat stalls for `LinkOptions.PeerTimeout` (default `5s`, raised to at least four peer heartbeat intervals). `ErrPeerGone` matches `ErrConnNotFound`. The recorded PID is diagnostic only; liveness is decided by heartbeats alone.
+- **Segment reuse**: `CreateStandardLink`, `CreateAdvancedLink`, and `Listen` create the name exclusively and fail with an error matching `os.ErrExist` if it already exists. `OpenNamed*` and `Dial` attach to an existing segment; if both of its previous endpoints closed or died, the opener re-initializes it (new epoch) and becomes Primary. If two live endpoints are attached, or the live endpoint's earlier peer already left, opening fails with `ErrLinkBusy`.
+- **`Dial` retries** only while the name does not exist yet or the listener is still sizing/initializing the segment. Permanent errors (`ErrLinkBusy`, `ErrIncompatibleLayout`, `ErrInvalidSize`, `ErrInvalidName`) are returned immediately.
+- **Standalone Cleanup**: Call `hqq.Unlink(name)` to remove a name left behind by a crashed process without mapping it (no-op on Windows, where the segment disappears with its last handle).
 
 ### Security Model (Trusted Peer Assumption)
 
 Shared-memory IPC requires both endpoints to map the same physical memory pages as read-write (`PROT_READ | PROT_WRITE`). Consequently:
 - **Trusted Peers**: HQQ is designed for mutually trusted processes (e.g., sidecars, worker processes, plugin hosts) or sandboxed child processes where the parent restricts segment permissions (`mode = 0600`).
-- **Bounds Validation**: HQQ validates packet opcodes, slot indices, and chunk offsets on every read and bounds multi-chunk allocations via `AdvancedOptions.MaxMessageSize` (default `16 MiB`). However, a malicious process with write access to the raw shared-memory pages can always overwrite ring sequence numbers or superblock state. Do not expose shared-memory segments with world-writable permissions (`0666`) on multi-tenant systems.
+- **Bounds Validation**: HQQ validates packet opcodes, slot indices, and chunk offsets on every read. `AdvancedOptions.MaxMessageSize` (default `64 MiB`) bounds one reassembled message, and `AdvancedOptions.MaxReassemblyBytes` (default `4 × MaxMessageSize`) bounds the memory held by all incomplete multi-chunk messages together; a message that would exceed it is refused without allocating (`ErrReassemblyLimit` for a refused response). However, a malicious process with write access to the raw shared-memory pages can always overwrite ring sequence numbers or superblock state. Do not expose shared-memory segments with world-writable permissions (`0666`) on multi-tenant systems.
 
 ### Platform Notes
 
@@ -282,7 +291,9 @@ Shared-memory IPC requires both endpoints to map the same physical memory pages 
 | --- | --- | --- | --- |
 | **Linux** | `/dev/shm/<name>` (`O_CLOEXEC`) | 255 bytes | `futex` (`FUTEX_WAIT` / `FUTEX_WAKE`) |
 | **macOS** | POSIX `shm_open` (`O_CLOEXEC`) | **31 bytes** (`PSHMNAMLEN`, including `/`) | `__ulock_wait` / `__ulock_wake` (`UL_COMPARE_AND_WAIT_SHARED`) |
-| **Windows** | `CreateFileMappingW` / `OpenFileMappingW` | 255 bytes (`Local\<name>` default, or explicit `Global\<name>`) | Bounded exponential sleep backoff (`20µs–2ms`) |
+| **Windows** | `CreateFileMappingW` / `OpenFileMappingW` (`Local\<name>` default, or explicit `Global\<name>`) | kernel object name + 9-character semaphore suffix ≤ 259 UTF-16 units | Named segments: four named kernel semaphores per segment (`<object name>.hqq-sem0`…`3`, `CreateSemaphoreW` / `WaitForSingleObject`). Unnamed memory (`AlignedBuffer`, `OpenStandardLink`): `WaitOnAddress`, which wakes same-process waiters immediately; cross-process waiters fall back to a `1–2ms` backoff |
+
+On Windows, `mode` is translated to a DACL applied to the mapping and its semaphores: SYSTEM always gets full access, the owner bits apply to the creating user's SID, and the "other" bits apply to Everyone; group bits are ignored. With the default `0o600`, a `Global\` segment created by a service running as SYSTEM is not accessible to a desktop user; grant "other" access (for example `0o606`) for that case. `Unlink` is a no-op on Windows: a pagefile-backed section cannot be unnamed while handles are open.
 
 > [!NOTE]
 > In Docker/Kubernetes on Linux, `/dev/shm` defaults to `64 MiB`. For large `bufferCount * bufferSize` configurations, mount an emptyDir with `medium: Memory` or pass `--shm-size` to the container runtime.
@@ -292,7 +303,7 @@ Shared-memory IPC requires both endpoints to map the same physical memory pages 
 - **`BufferSize`**: Match your 95th-percentile message size so most messages travel as a single slot without chunking (e.g., `4096` for control/RPC messages, `65536` for media/tensor frames). Must be a multiple of 8.
 - **`BufferCount`**: Controls how many messages or chunks can be in flight per direction before backpressure stalls the writer. Must be a power of two (`>= 2`). `128` to `1024` works well for most workloads.
 - **`WaitPolicy`**:
-  - `WaitAdaptive` (default): spins for a few hundred iterations with CPU pause hints and then parks in the OS kernel. Best for almost all production deployments.
+  - `WaitAdaptive` (default): re-checks the ring in a short tight loop, then yields with `runtime.Gosched`, then parks in the OS kernel. Best for almost all production deployments.
   - `WaitSpin`: pure user-space busy-spin with zero kernel transitions. Use only when pinning dedicated cores for ultra-low tail latency.
 
 ---
@@ -308,8 +319,8 @@ go test -race ./...
 
 # Fuzz testing
 go test ./internal/protocol -run '^$' -fuzz=FuzzPacketRoundTrip -fuzztime=10s
-go test . -run '^$' -fuzz=FuzzStandardLinkReadCorruptedPacket -fuzztime=10s
-go test . -run '^$' -fuzz=FuzzAdvancedDispatcherCorruptedFrames -fuzztime=10s
+go test . -run '^$' -fuzz='^FuzzConsumeAdvancedChunk$' -fuzztime=10s
+go test . -run '^$' -fuzz='^FuzzOpenOverCorruptSuperblock$' -fuzztime=10s
 
 # TLA+ model checking of the MPMC ring (requires Java 11+)
 sh scripts/tlc.sh

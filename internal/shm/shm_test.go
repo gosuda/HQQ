@@ -3,6 +3,7 @@ package shm_test
 import (
 	"errors"
 	"os"
+	"runtime"
 	"strings"
 	"syscall"
 	"testing"
@@ -100,5 +101,27 @@ func TestSharedMemoryExclusiveCreate(t *testing.T) {
 
 	if _, err := shm.OpenSharedMemory(name, pagesize, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0600); err == nil {
 		t.Fatal("expected second exclusive create to fail")
+	}
+}
+
+func TestSharedMemorySemaphores(t *testing.T) {
+	const name = "/hsqtest_sem"
+	_ = shm.Unlink(name)
+	sm, err := shm.OpenSharedMemory(name, pagesize, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sm.Delete()
+	defer sm.Close()
+
+	if sm.Semaphore(-1) != nil || sm.Semaphore(shm.SemaphoreCount) != nil {
+		t.Fatal("out-of-range Semaphore index must return nil")
+	}
+	for i := 0; i < shm.SemaphoreCount; i++ {
+		// Windows parks waiters on semaphores; the other platforms use
+		// futex-style words inside the memory and have none.
+		if has := sm.Semaphore(i) != nil; has != (runtime.GOOS == "windows") {
+			t.Fatalf("Semaphore(%d) present = %v on %s", i, has, runtime.GOOS)
+		}
 	}
 }

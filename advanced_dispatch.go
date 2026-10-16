@@ -103,7 +103,10 @@ func (l *AdvancedLink) deliverIncoming(ctx context.Context, message AdvancedMess
 // routeResponse hands a response to its pending call. It returns false if no
 // call is waiting for it (the response is then delivered to Receive), and
 // true if it was routed or recognized as a late response to a canceled call
-// and discarded.
+// and discarded. An aborted response (a response whose sender abandoned it,
+// or that was refused by the reassembly limit) fails its pending call with
+// the abort error and is always consumed: without a waiting call there is
+// nothing to fail and nothing to deliver.
 func (l *AdvancedLink) routeResponse(message AdvancedMessage) bool {
 	key := advancedCallKey{connectionID: message.ConnectionID, messageID: message.MessageID}
 	l.pendingMu.Lock()
@@ -118,11 +121,15 @@ func (l *AdvancedLink) routeResponse(message AdvancedMessage) bool {
 	}
 	l.pendingMu.Unlock()
 	if pending == nil {
-		return false
+		return message.IsAbort()
+	}
+	result := advancedDispatchResult{message: message}
+	if message.IsAbort() {
+		result = advancedDispatchResult{err: message.abortError()}
 	}
 	// The channel has capacity 1 and only the goroutine that removed the
 	// entry sends on it, so this never blocks.
-	pending <- advancedDispatchResult{message: message}
+	pending <- result
 	return true
 }
 
@@ -134,12 +141,23 @@ func (l *AdvancedLink) registerPendingCall(key advancedCallKey) chan advancedDis
 	return ch
 }
 
-func (l *AdvancedLink) unregisterPendingCall(key advancedCallKey, ch chan advancedDispatchResult) {
+// unregisterPendingCall removes the entry of a call that finished without
+// consuming a result from ch, and reports whether it was still registered.
+// If so, the caller was the only goroutine that could have sent on ch, which
+// is therefore empty and unreachable, and ch is returned to pendingPool. If
+// not, routeResponse or failPendingCalls removed the entry first and has
+// sent (or is about to send) a result on ch: ch must not be recycled.
+func (l *AdvancedLink) unregisterPendingCall(key advancedCallKey, ch chan advancedDispatchResult) bool {
 	l.pendingMu.Lock()
-	if l.pendingCalls[key] == ch {
+	removed := l.pendingCalls[key] == ch
+	if removed {
 		delete(l.pendingCalls, key)
 	}
 	l.pendingMu.Unlock()
+	if removed {
+		pendingPool.Put(ch)
+	}
+	return removed
 }
 
 // abandonCall removes a call that gives up before its response arrived and

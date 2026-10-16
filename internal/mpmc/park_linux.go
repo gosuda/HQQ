@@ -13,6 +13,10 @@ import (
 // processes on this platform.
 const parkingSupported = true
 
+// processLocalParking reports whether futexWait/futexWake block and wake at
+// least between threads of one process. It is implied by parkingSupported.
+const processLocalParking = true
+
 const (
 	// Shared (non-private) futex operations: the wait word lives in a
 	// MAP_SHARED mapping and waiters may belong to different processes.
