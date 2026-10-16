@@ -17,9 +17,18 @@ const parkingSupported = true
 // least between threads of one process. It is implied by parkingSupported.
 const processLocalParking = true
 
-// Darwin ulock interface (xnu bsd/sys/ulock.h). These system calls back
-// os_sync_wait_on_address and libdispatch; the syscall numbers are stable
-// since macOS 10.12.
+// Darwin ulock interface (xnu bsd/sys/ulock.h).
+//
+// PLATFORM RISK: __ulock_wait and __ulock_wake are private Darwin interfaces
+// used by libdispatch and the system libraries. Apple documents neither the
+// system call numbers nor the operation codes; they have been stable since
+// macOS 10.12 but may change or be restricted in any release. They are invoked
+// as raw system calls because a cgo-free Go build cannot call libSystem
+// wrappers. The public, supported alternative is os_sync_wait_on_address /
+// os_sync_wake_by_address_all (<os/os_sync_wait_on_address.h>), available
+// since macOS 14.4. futexWait ignores errors, so if the system calls ever
+// stop working, parking degrades to busy re-checking (no hang, no lost data)
+// rather than failing loudly.
 const (
 	sysUlockWait = 515
 	sysUlockWake = 516

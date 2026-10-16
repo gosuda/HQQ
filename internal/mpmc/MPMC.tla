@@ -7,7 +7,7 @@
 (*     pos := load(w)                                                      *)
 (*     loop: diff := int64(seq[pos&mask] - pos)                            *)
 (*           diff == 0 : if CAS(w, pos, pos+1) { write data;               *)
-(*                                               store seq = pos+1 }       *)
+(*                                  CAS seq: pos -> pos+1 }                *)
 (*           diff <  0 : queue full, retry with the same pos               *)
 (*           diff >  0 : another producer got pos, pos := load(w)          *)
 (*                                                                         *)
@@ -15,7 +15,7 @@
 (*     pos := load(r)                                                      *)
 (*     loop: diff := int64(seq[pos&mask] - (pos+1))                        *)
 (*           diff == 0 : if CAS(r, pos, pos+1) { read data;                *)
-(*                                     store seq = pos+mask+1 }            *)
+(*                         CAS seq: pos+1 -> pos+mask+1 }                  *)
 (*           diff <  0 : queue empty, retry with the same pos              *)
 (*           diff >  0 : another consumer got pos, pos := load(r)          *)
 (*                                                                         *)
@@ -32,10 +32,17 @@
 (*    since it was loaded (only the owner of pos, or the consumer of       *)
 (*    pos-BufferSize when diff < 0, writes it). If the CAS fails, or diff  *)
 (*    /= 0, the thread only retries, which the model also allows.          *)
-(*  - Retrying "with the same pos" (diff < 0, or a failed CAS, which in    *)
-(*    the Go code also keeps pos) leaves every variable unchanged, i.e. it *)
-(*    is a stuttering step. A failed CAS is additionally allowed to reload *)
-(*    pos, so implementations that reload on CAS failure are covered too.  *)
+(*  - Retrying "with the same pos" after diff < 0 leaves every variable    *)
+(*    unchanged, i.e. it is a stuttering step. After a failed cursor CAS   *)
+(*    the Go code reloads pos (pos = load(w) / load(r)); the model allows  *)
+(*    that (P_Check/C_Check, "reload pos") and, as stuttering, also keeping *)
+(*    the old pos, so implementations of either kind are covered.          *)
+(*  - The publish and release CASes (seq: pos -> pos+1 and pos+1 ->        *)
+(*    pos+mask+1) are modelled as a plain step that is enabled when the    *)
+(*    CAS expected value matches. A slot's owner is unique (NoRace) and    *)
+(*    nobody else writes the slot's seq while it is owned, so the CAS      *)
+(*    cannot fail for the owner; the invariant CompletionCAS checks that   *)
+(*    the expected value always matches in the Publish and Read states.    *)
 (*  - Blocking/parking (futex wait words, Windows wait objects), context   *)
 (*    cancellation before a claim and Try* variants that give up are not   *)
 (*    modelled: before a claim they have no effect on shared ring state    *)
@@ -56,19 +63,36 @@
 (*                     Consumers = {c1,c2}  (MaxVal = 8)                   *)
 (*     Manual run:     BufferSize = 4, Producers = {p1,p2},                *)
 (*                     Consumers = {c1,c2}  (MaxVal = 16)                  *)
-(*   Invariants: TypeOK, QueueSafety, NoRace, DataIntegrity, FIFOBound.    *)
+(*   Invariants: TypeOK, QueueSafety, NoRace, DataIntegrity, FIFOBound,    *)
+(*               CompletionCAS.                                            *)
 (*   Properties: FIFOClaimOrder, ProducerProgress, ConsumerProgress,       *)
 (*               SystemProgress.                                           *)
 (*   Deadlock checking is ON (no -deadlock flag): the processes loop       *)
 (*   forever, so a state without successors would be a bug.                *)
+(*                                                                         *)
+(*   NOT modelled (outside the scope of this specification):               *)
+(*     - parking, wake-ups and the waiter counters in the ring header      *)
+(*       (futex/ulock/Parker), including the process-local waiter          *)
+(*       aggregation layer (one leader per wait word parks, the others     *)
+(*       wait on a Go channel), which only affects when a blocked thread   *)
+(*       re-runs the loop above;                                           *)
+(*     - Format (re-initialization while the ring is quiescent);           *)
+(*     - process crashes: a thread that dies between claim and publish     *)
+(*       (or release) holds its slot forever, which blocks the ring and is *)
+(*       what the fairness assumption below excludes;                      *)
+(*     - stale copies of a reservation: their publish/release CAS fails,   *)
+(*       and a failed CAS is a no-op for the ring, i.e. a stuttering step. *)
 (***************************************************************************)
 EXTENDS Integers, Sequences, FiniteSets, TLC
 
-CONSTANTS BufferSize,  \* Number of slots (power of 2, >= 1; e.g. 2)
+CONSTANTS BufferSize,  \* Number of slots (power of 2, >= 2; e.g. 2)
           Producers,   \* Set of producer processes (e.g. {p1, p2})
           Consumers    \* Set of consumer processes (e.g. {c1, c2})
 
-ASSUME /\ BufferSize \in Nat \ {0}
+\* A single slot is not a valid ring: pos+1 (published) and pos+mask+1
+\* (free for the next lap) coincide when mask = 0, so a second producer would
+\* overwrite an unconsumed element. mpmc.Format rejects size 1.
+ASSUME /\ BufferSize \in Nat \ {0, 1}
        /\ \E k \in 0..BufferSize : 2^k = BufferSize   \* power of two
        /\ Producers \cap Consumers = {}
        /\ Producers /= {} /\ Consumers /= {}
@@ -181,12 +205,14 @@ P_Write(p) ==
     /\ pc' = [pc EXCEPT ![p] = "Publish"]
     /\ UNCHANGED <<seq, w, r, p_pos, c_pos, writers, readers, q>>
 
-\* atomic.StoreUint64(&slot._seq, pos+1)  (ProducerSlot.Commit)
+\* CompareAndSwapUint64(&slot._seq, pos, pos+1)  (ProducerSlot.Commit), which
+\* always succeeds for the owner (see CompletionCAS).
 P_Publish(p) ==
     /\ pc[p] = "Publish"
     /\ LET pos == p_pos[p]
            idx == pos % BufferSize
-       IN /\ seq' = [seq EXCEPT ![idx] = Inc(pos)]
+       IN /\ seq[idx] = pos                             \* CAS expected value
+          /\ seq' = [seq EXCEPT ![idx] = Inc(pos)]
           /\ writers' = [writers EXCEPT ![idx] = @ \ {p}]
     /\ pc' = [pc EXCEPT ![p] = "Loop"]
     /\ UNCHANGED <<w, r, p_pos, c_pos, data, readers, q>>
@@ -225,13 +251,15 @@ C_Check(c) ==
           \* diff < 0 (queue empty): retry with the same pos (stuttering).
 
 \* The payload is read while in "Read" (DataIntegrity is checked in every
-\* state of that interval); then
-\* atomic.StoreUint64(&slot._seq, pos+mask+1)  (ConsumerSlot.Release)
+\* state of that interval); then the release CAS
+\* CompareAndSwapUint64(&slot._seq, pos+1, pos+mask+1)  (ConsumerSlot.Release)
+\* which always succeeds for the owner (see CompletionCAS).
 C_Release(c) ==
     /\ pc[c] = "Read"
     /\ LET pos == c_pos[c]
            idx == pos % BufferSize
-       IN /\ seq' = [seq EXCEPT ![idx] = IncBy(pos, BufferSize)]
+       IN /\ seq[idx] = Inc(pos)                        \* CAS expected value
+          /\ seq' = [seq EXCEPT ![idx] = IncBy(pos, BufferSize)]
           /\ readers' = [readers EXCEPT ![idx] = @ \ {c}]
     /\ pc' = [pc EXCEPT ![c] = "Loop"]
     /\ UNCHANGED <<w, r, p_pos, c_pos, data, writers, q>>
@@ -289,6 +317,16 @@ FIFOBound ==
     /\ Len(q) <= BufferSize
     /\ Len(q) = UnsignedSub(w, r)
 
+\* The completing CAS of every slot owner finds its expected value: a producer
+\* between claim and publish sees seq = pos, a consumer between claim and
+\* release sees seq = pos+1. Stale copies of a reservation are not modelled:
+\* their CAS fails and changes nothing.
+CompletionCAS ==
+    /\ \A p \in Producers :
+           pc[p] \in {"Write", "Publish"} => seq[p_pos[p] % BufferSize] = p_pos[p]
+    /\ \A c \in Consumers :
+           pc[c] = "Read" => seq[c_pos[c] % BufferSize] = Inc(c_pos[c])
+
 \* Linearizability w.r.t. a FIFO queue (history-based check): enqueues
 \* linearize at the successful w CAS (appending pos to q), dequeues at the
 \* successful r CAS. Every dequeue must take the oldest enqueued, not yet
@@ -322,9 +360,6 @@ ConsumerProgress ==
 SystemProgress ==
     /\ []<><<w' /= w>>_w
     /\ []<><<r' /= r>>_r
-
-\* Kept for backwards compatibility with older configs.
-Liveness == ProducerProgress
 
 \* NOT a theorem -- do NOT add to MPMC.cfg. Per-thread progress (starvation
 \* freedom) does not hold: the algorithm is lock-free, not wait-free. Under

@@ -47,6 +47,16 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-hqq-benchmark-
 
+      - name: Run CPU-ratio performance tests
+        env:
+          HQQ_PERF_TESTS: '1'
+        run: |
+          go test ./... \
+            -count=1 \
+            -timeout 3m \
+            -run '^(TestIdleLinkDoesNotBurnCPU|TestMPMCIdleWaitDoesNotBurnCPU|TestMPMCWaitSpinBurnsCPU)$' \
+            -v
+
       - name: Run HQQ benchmarks
         run: |
           mkdir -p benchmark-artifacts/pprof
@@ -75,8 +85,8 @@ jobs:
           output-file-path: benchmark.txt
           external-data-json-path: benchmark-data.json
           summary-always: true
-          fail-on-alert: false
-          alert-threshold: '200%'
+          fail-on-alert: true
+          alert-threshold: '115%'
           auto-push: false
           github-token: ${{ secrets.GITHUB_TOKEN }}
 

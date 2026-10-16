@@ -29,10 +29,10 @@ func (l *AdvancedLink) dispatchLoop(ctx context.Context) {
 	defer close(l.dispatchDone)
 	for {
 		l.receiveMu.Lock()
-		message, err := l.receiveNextLocked(ctx)
+		message, abortErr, err := l.receiveNextLocked(ctx)
 		l.receiveMu.Unlock()
 		if err == nil {
-			if message.IsResponse() && l.routeResponse(message) {
+			if message.IsResponse() && l.routeResponse(message, abortErr) {
 				continue
 			}
 			err = l.deliverIncoming(ctx, message)
@@ -103,11 +103,11 @@ func (l *AdvancedLink) deliverIncoming(ctx context.Context, message AdvancedMess
 // routeResponse hands a response to its pending call. It returns false if no
 // call is waiting for it (the response is then delivered to Receive), and
 // true if it was routed or recognized as a late response to a canceled call
-// and discarded. An aborted response (a response whose sender abandoned it,
-// or that was refused by the reassembly limit) fails its pending call with
-// the abort error and is always consumed: without a waiting call there is
-// nothing to fail and nothing to deliver.
-func (l *AdvancedLink) routeResponse(message AdvancedMessage) bool {
+// and discarded. abortErr is non-nil for an aborted response (one whose
+// sender abandoned it, or that was refused by the reassembly limit): it fails
+// the pending call with abortErr and is always consumed, because without a
+// waiting call there is nothing to fail and nothing to deliver.
+func (l *AdvancedLink) routeResponse(message AdvancedMessage, abortErr error) bool {
 	key := advancedCallKey{connectionID: message.ConnectionID, messageID: message.MessageID}
 	l.pendingMu.Lock()
 	pending := l.pendingCalls[key]
@@ -121,11 +121,11 @@ func (l *AdvancedLink) routeResponse(message AdvancedMessage) bool {
 	}
 	l.pendingMu.Unlock()
 	if pending == nil {
-		return message.IsAbort()
+		return abortErr != nil
 	}
 	result := advancedDispatchResult{message: message}
-	if message.IsAbort() {
-		result = advancedDispatchResult{err: message.abortError()}
+	if abortErr != nil {
+		result = advancedDispatchResult{err: abortErr}
 	}
 	// The channel has capacity 1 and only the goroutine that removed the
 	// entry sends on it, so this never blocks.

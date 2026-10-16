@@ -6,8 +6,12 @@
 // sequence number that encodes whether it is free for the producer that owns
 // position p (seq == p) or published for the consumer that owns position p
 // (seq == p+1). Producers and consumers claim positions with a CAS on the
-// write/read cursor and publish with a single atomic store, which also
-// provides the release/acquire ordering for the slot payload.
+// write/read cursor and complete a slot with a CAS on its sequence number
+// (p to p+1 when publishing, p+1 to p+mask+1 when releasing), which also
+// provides the release/acquire ordering for the slot payload. The completing
+// CAS cannot fail for the slot's owner; it only fails for a stale copy of a
+// reservation that was already completed, which then neither touches the
+// ring nor wakes anyone.
 //
 // Blocking operations use an adaptive wait strategy (see WaitPolicy): a short
 // busy spin, then cooperative yielding, then parking on a 32-bit wait word in
@@ -18,6 +22,11 @@
 // parking, and otherwise parks on WaitOnAddress, which only wakes waiters of
 // the same process and therefore bounds every park by a short backoff. Other
 // platforms fall back to bounded exponential sleeps.
+//
+// Within one process, all goroutines blocked on the same wait word share a
+// single kernel park: one leader parks, the others wait on a process-local
+// channel and re-check when the leader returns, so N blocked goroutines pin
+// one OS thread rather than N.
 package mpmc
 
 import (
@@ -92,10 +101,20 @@ type _mring struct {
 
 	// Line 3: wait words. They are only written when a waiter parks or a
 	// parked waiter has to be woken, so the hot path only reads them.
+	//
+	// emptyWaiters and fullWaiters count the registered waiters of each
+	// side: with waiter aggregation (see waitgroup.go) at most one per
+	// process, the one parked in the kernel. A waker bumps the matching word
+	// and issues a wake only while the count is non-zero. A process that is
+	// killed while parked never decrements its count, so the count stays
+	// raised until Format resets it. The cost is one superfluous wake
+	// syscall per publish (or release) for the surviving endpoint, which
+	// must close the link after ErrPeerGone anyway; correctness is not
+	// affected, because waiters only ever use the count as a hint to wake.
 	notEmpty     uint32 // bumped by producers to wake parked consumers
-	emptyWaiters uint32 // number of consumers parked on notEmpty
+	emptyWaiters uint32 // number of consumers registered as parked on notEmpty
 	notFull      uint32 // bumped by consumers to wake parked producers
-	fullWaiters  uint32 // number of producers parked on notFull
+	fullWaiters  uint32 // number of producers registered as parked on notFull
 	_            [cacheLine/8 - 2]uint64
 }
 
@@ -180,6 +199,12 @@ func (c *Cancel) deadline() time.Time {
 
 // MPMCRing is a handle to a ring stored in caller-provided memory. Handles are
 // cheap; every process (or goroutine) may attach its own handle.
+//
+// The ring memory is typically shared between processes and is not scanned by
+// the Go garbage collector, so T must not contain Go pointers (pointers,
+// slices, strings, maps, channels, interfaces, funcs) and must be valid for
+// any bit pattern another process may have written. Use plain integers,
+// fixed-size arrays and structs of them.
 type MPMCRing[T any] struct {
 	head   *_mring
 	data   unsafe.Pointer
@@ -200,9 +225,18 @@ func stride[T any]() uintptr {
 }
 
 // SizeMPMCRing returns the number of bytes required for a ring with n slots
-// of T, including the header.
+// of T, including the header. It returns 0 if n is not a power of two of at
+// least 2, or if the size would overflow uintptr; Format rejects the same
+// sizes.
 func SizeMPMCRing[T any](n uintptr) uintptr {
-	return HeaderSize + stride[T]()*n
+	if !validRingSize(uint64(n)) {
+		return 0
+	}
+	st := stride[T]()
+	if n > (^uintptr(0)-HeaderSize)/st {
+		return 0
+	}
+	return HeaderSize + st*n
 }
 
 // PointerFromAddress converts the address of memory that is either outside
@@ -216,48 +250,31 @@ func PointerFromAddress(addr uintptr) unsafe.Pointer {
 	return *(*unsafe.Pointer)(unsafe.Pointer(&addr))
 }
 
-// _RoundUpPowerOf2 rounds up a number to the next power of 2.
-//
-// Algorithm from: https://graphics.stanford.edu/~seander/bithacks.html#RoundUpPowerOf2
-func _RoundUpPowerOf2(v uint64) uint64 {
-	v--
-	v |= v >> 1
-	v |= v >> 2
-	v |= v >> 4
-	v |= v >> 8
-	v |= v >> 16
-	v |= v >> 32
-	v++
-	return v
+// validRingSize reports whether n is a supported slot count: a power of two
+// of at least 2. A single slot cannot work because the "published" and "free
+// for the next lap" sequence values coincide (pos+1 == pos+mask+1), so a
+// second producer could overwrite an unconsumed element.
+func validRingSize(n uint64) bool {
+	return n >= 2 && n&(n-1) == 0
 }
 
-// MPMCInit initializes a ring at address h unless an initialized ring is
-// already there, in which case it returns false. size is rounded up to a
-// power of two; the memory must hold SizeMPMCRing[T](size) bytes.
+// Format unconditionally initializes a ring at p with exactly size slots. The
+// caller must guarantee that no other party is using the memory while Format
+// runs, and that it spans at least SizeMPMCRing[T](size) bytes.
 //
-// Use Format to unconditionally (re)initialize memory the caller owns
-// exclusively.
-func MPMCInit[T any](h uintptr, size uint64) bool {
-	p := PointerFromAddress(h)
-	hdr := (*_mring)(p)
-	magic := atomic.LoadUint64(&hdr._magic)
-	if magic == _mpmc_magic && atomic.LoadUint64(&hdr._flag)&uint64(_mpmc_init) != 0 {
-		return false
-	}
-	if !atomic.CompareAndSwapUint64(&hdr._magic, magic, 0) {
-		return false
-	}
-	Format[T](p, size)
-	return true
-}
-
-// Format unconditionally initializes a ring at p with size slots (rounded up
-// to a power of two). The caller must guarantee that no other party is using
-// the memory while Format runs.
+// Format panics if size is not a power of two of at least 2: that is a
+// programmer error, SizeMPMCRing returns 0 for such sizes, and silently
+// rounding up would make the ring larger than the memory the caller sized for
+// it.
+//
+// Format zeroes every slot and both wait-word pairs, which also clears waiter
+// counts left behind by processes that died while parked (see _mring).
 //
 //go:nocheckptr
 func Format[T any](p unsafe.Pointer, size uint64) {
-	size = _RoundUpPowerOf2(size)
+	if !validRingSize(size) {
+		panic("mpmc: ring size must be a power of two of at least 2")
+	}
 	hdr := (*_mring)(p)
 	atomic.StoreUint64(&hdr._flag, 0)
 	atomic.StoreUint64(&hdr._magic, 0)
@@ -301,7 +318,7 @@ func Attach[T any](p unsafe.Pointer, timeout time.Duration) *MPMCRing[T] {
 			st := stride[T]()
 			if atomic.LoadUint64(&hdr._stride) != uint64(st) ||
 				atomic.LoadUint64(&hdr._version) != layoutVersion ||
-				size == 0 || size&(size-1) != 0 {
+				!validRingSize(size) {
 				return nil
 			}
 			return &MPMCRing[T]{
@@ -367,6 +384,12 @@ const (
 // Tokens granted to waiters that already gave up are harmless: they only
 // cause one spurious return from Park, after which waiters re-check.
 //
+// Within one process only one goroutine per side (the leader of the
+// goroutines blocked on that side) registers and calls Park at a time, so n
+// counts parked processes, not goroutines. A process killed while parked
+// leaves its count raised until the ring is re-formatted (see Format), which
+// only costs surplus tokens.
+//
 // Implementations must be safe for concurrent use and Wake must not block.
 type Parker interface {
 	// Park blocks until a wake-up token is available (consuming it) or timeout
@@ -429,8 +452,6 @@ func (m *MPMCRing[T]) notifyProducers() {
 func (m *MPMCRing[T]) claimProducer(c *Cancel) (uint64, *_melem[T], error) {
 	h := m.head
 	pos := atomic.LoadUint64(&h.w)
-	var w waiter
-	defer w.finish()
 	for {
 		e := m.elem(pos & m.mask)
 		diff := int64(atomic.LoadUint64(&e._seq) - pos)
@@ -444,7 +465,31 @@ func (m *MPMCRing[T]) claimProducer(c *Cancel) (uint64, *_melem[T], error) {
 			// Another producer claimed this position; catch up.
 			pos = atomic.LoadUint64(&h.w)
 		default:
-			// The ring is full: the slot still holds an unreleased item.
+			// The ring is full. Waiting needs per-call state, kept out of
+			// this fast path.
+			return m.claimProducerSlow(c, pos)
+		}
+	}
+}
+
+// claimProducerSlow is claimProducer once the ring was found full at pos.
+func (m *MPMCRing[T]) claimProducerSlow(c *Cancel, pos uint64) (uint64, *_melem[T], error) {
+	h := m.head
+	var w waiter
+	defer w.finish()
+	for {
+		e := m.elem(pos & m.mask)
+		diff := int64(atomic.LoadUint64(&e._seq) - pos)
+		switch {
+		case diff == 0:
+			if atomic.CompareAndSwapUint64(&h.w, pos, pos+1) {
+				return pos, e, nil
+			}
+			pos = atomic.LoadUint64(&h.w)
+		case diff > 0:
+			pos = atomic.LoadUint64(&h.w)
+		default:
+			// The slot still holds an unreleased item.
 			if err := w.wait(m.policy, c, m.site(NotFull), &e._seq, pos); err != nil {
 				return 0, nil, err
 			}
@@ -457,8 +502,6 @@ func (m *MPMCRing[T]) claimProducer(c *Cancel) (uint64, *_melem[T], error) {
 func (m *MPMCRing[T]) claimConsumer(c *Cancel) (uint64, *_melem[T], error) {
 	h := m.head
 	pos := atomic.LoadUint64(&h.r)
-	var w waiter
-	defer w.finish()
 	for {
 		e := m.elem(pos & m.mask)
 		diff := int64(atomic.LoadUint64(&e._seq) - (pos + 1))
@@ -472,7 +515,30 @@ func (m *MPMCRing[T]) claimConsumer(c *Cancel) (uint64, *_melem[T], error) {
 			// Another consumer claimed this position; catch up.
 			pos = atomic.LoadUint64(&h.r)
 		default:
-			// The ring is empty: the slot has not been published yet.
+			// The ring is empty; see claimProducer.
+			return m.claimConsumerSlow(c, pos)
+		}
+	}
+}
+
+// claimConsumerSlow is claimConsumer once the ring was found empty at pos.
+func (m *MPMCRing[T]) claimConsumerSlow(c *Cancel, pos uint64) (uint64, *_melem[T], error) {
+	h := m.head
+	var w waiter
+	defer w.finish()
+	for {
+		e := m.elem(pos & m.mask)
+		diff := int64(atomic.LoadUint64(&e._seq) - (pos + 1))
+		switch {
+		case diff == 0:
+			if atomic.CompareAndSwapUint64(&h.r, pos, pos+1) {
+				return pos, e, nil
+			}
+			pos = atomic.LoadUint64(&h.r)
+		case diff > 0:
+			pos = atomic.LoadUint64(&h.r)
+		default:
+			// The slot has not been published yet.
 			if err := w.wait(m.policy, c, m.site(NotEmpty), &e._seq, pos+1); err != nil {
 				return 0, nil, err
 			}
@@ -480,16 +546,41 @@ func (m *MPMCRing[T]) claimConsumer(c *Cancel) (uint64, *_melem[T], error) {
 	}
 }
 
-// publish makes a claimed producer slot visible to consumers.
+// publish makes a claimed producer slot visible to consumers. The caller is
+// the only owner of the claim (it holds pos on its stack), so a plain store
+// suffices.
 func (m *MPMCRing[T]) publish(pos uint64, e *_melem[T]) {
 	atomic.StoreUint64(&e._seq, pos+1)
 	m.notifyConsumers()
 }
 
-// release returns a claimed consumer slot to producers.
+// release returns a claimed consumer slot to producers; see publish.
 func (m *MPMCRing[T]) release(pos uint64, e *_melem[T]) {
 	atomic.StoreUint64(&e._seq, pos+m.mask+1)
 	m.notifyProducers()
+}
+
+// publishSlot is publish for a claim held by a ProducerSlot, which callers
+// may copy. It completes the slot with a compare-and-swap from the claimed
+// state (seq == pos), so a stale copy of an already committed slot fails the
+// swap and neither modifies the ring nor wakes anyone; it then returns false.
+func (m *MPMCRing[T]) publishSlot(pos uint64, e *_melem[T]) bool {
+	if !atomic.CompareAndSwapUint64(&e._seq, pos, pos+1) {
+		return false
+	}
+	m.notifyConsumers()
+	return true
+}
+
+// releaseSlot is release for a claim held by a ConsumerSlot; like
+// publishSlot it swaps from the claimed state (seq == pos+1) and reports
+// false, without side effects, when the slot was already released.
+func (m *MPMCRing[T]) releaseSlot(pos uint64, e *_melem[T]) bool {
+	if !atomic.CompareAndSwapUint64(&e._seq, pos+1, pos+m.mask+1) {
+		return false
+	}
+	m.notifyProducers()
+	return true
 }
 
 // waiter holds the per-call state of a blocking operation.
@@ -500,6 +591,10 @@ type waiter struct {
 	stopped   chan struct{} // closed when the callback returns
 	nextCheck time.Time
 	sleep     time.Duration
+
+	group *parkGroup  // waiter aggregation state of word, nil until the first park
+	word  *uint32     // wait word group belongs to
+	timer *time.Timer // follower wake-up timer, reused across parks
 }
 
 // finish ends the blocking operation. When it returns, the context wake-up
@@ -508,13 +603,20 @@ type waiter struct {
 // callback touches the ring's wait word (or the Parker), which the owner may
 // unmap or close as soon as the operation returned.
 func (w *waiter) finish() {
-	if w.stop == nil {
-		return
+	if w.stop != nil {
+		if !w.stop() {
+			<-w.stopped
+		}
+		w.stop = nil
 	}
-	if !w.stop() {
-		<-w.stopped
+	if w.group != nil {
+		releaseParkGroup(w.word, w.group)
+		w.group = nil
 	}
-	w.stop = nil
+	if w.timer != nil {
+		w.timer.Stop()
+		w.timer = nil
+	}
 }
 
 // poll reports a cancellation that is observable without reading the clock.
@@ -634,28 +736,7 @@ func (w *waiter) wait(policy WaitPolicy, c *Cancel, site waitSite, seq *uint64, 
 		timeout = min(w.sleep, timeout)
 	}
 
-	if !w.armed {
-		w.armed = true
-		if c != nil && c.Ctx != nil && c.Ctx.Done() != nil {
-			stopped := make(chan struct{})
-			w.stopped = stopped
-			w.stop = context.AfterFunc(c.Ctx, func() {
-				defer close(stopped)
-				site.wake()
-			})
-		}
-	}
-
-	atomic.AddUint32(site.waiters, 1)
-	v := atomic.LoadUint32(site.word)
-	if stillBlocked(seq, target) && poll(c) == nil {
-		if site.parker != nil {
-			site.parker.Park(site.side, timeout)
-		} else {
-			futexWait(site.word, v, timeout)
-		}
-	}
-	atomic.AddUint32(site.waiters, ^uint32(0))
+	w.park(c, site, seq, target, timeout)
 	return nil
 }
 
@@ -672,9 +753,19 @@ type ProducerSlot[T any] struct {
 	done bool
 }
 
-// Valid reports whether the slot was successfully reserved and not committed.
+// Valid reports whether the slot was successfully reserved and not committed
+// through this value. It does not observe a Commit made through a copy; see
+// Owned.
 func (s *ProducerSlot[T]) Valid() bool {
 	return s != nil && s.elem != nil && !s.done
+}
+
+// Owned reports whether the ring still treats the slot as claimed by this
+// reservation: the slot is Valid and has not been published (or otherwise
+// completed) through a copy of this value. The answer is a snapshot; the
+// compare-and-swap inside Commit is the authority.
+func (s *ProducerSlot[T]) Owned() bool {
+	return s.Valid() && atomic.LoadUint64(&s.elem._seq) == s.pos
 }
 
 // Slot returns the ring slot index.
@@ -693,15 +784,15 @@ func (s *ProducerSlot[T]) Value() *T {
 	return &s.elem._data
 }
 
-// Commit publishes the reserved producer slot. It returns false if the slot was
-// already committed or is invalid.
+// Commit publishes the reserved producer slot. It returns false, and leaves
+// the ring and its waiters untouched, if the slot was already committed or is
+// invalid, including when another copy of this value committed it first.
 func (s *ProducerSlot[T]) Commit() bool {
 	if !s.Valid() {
 		return false
 	}
-	s.ring.publish(s.pos, s.elem)
 	s.done = true
-	return true
+	return s.ring.publishSlot(s.pos, s.elem)
 }
 
 // ConsumerSlot is a claimed consumer-side ring slot.
@@ -717,9 +808,19 @@ type ConsumerSlot[T any] struct {
 	done bool
 }
 
-// Valid reports whether the slot was successfully reserved and not released.
+// Valid reports whether the slot was successfully reserved and not released
+// through this value. It does not observe a Release made through a copy; see
+// Owned.
 func (s *ConsumerSlot[T]) Valid() bool {
 	return s != nil && s.elem != nil && !s.done
+}
+
+// Owned reports whether the ring still treats the slot as claimed by this
+// reservation: the slot is Valid and has not been released through a copy of
+// this value. The answer is a snapshot; the compare-and-swap inside Release is
+// the authority.
+func (s *ConsumerSlot[T]) Owned() bool {
+	return s.Valid() && atomic.LoadUint64(&s.elem._seq) == s.pos+1
 }
 
 // Slot returns the ring slot index.
@@ -738,15 +839,16 @@ func (s *ConsumerSlot[T]) Value() *T {
 	return &s.elem._data
 }
 
-// Release returns the reserved consumer slot to producers. It returns false if
-// the slot was already released or is invalid.
+// Release returns the reserved consumer slot to producers. It returns false,
+// and leaves the ring and its waiters untouched, if the slot was already
+// released or is invalid, including when another copy of this value released
+// it first.
 func (s *ConsumerSlot[T]) Release() bool {
 	if !s.Valid() {
 		return false
 	}
-	s.ring.release(s.pos, s.elem)
 	s.done = true
-	return true
+	return s.ring.releaseSlot(s.pos, s.elem)
 }
 
 func ctxCancel(ctx context.Context) *Cancel {

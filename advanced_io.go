@@ -8,7 +8,6 @@ import (
 
 	"gosuda.org/hqq/internal/mpmc"
 	"gosuda.org/hqq/internal/protocol"
-	"gosuda.org/hqq/internal/race"
 )
 
 // AdvancedMessage is one complete Advanced Protocol message.
@@ -19,11 +18,6 @@ type AdvancedMessage struct {
 	Status       uint64 // status of a response (error code if IsError)
 	Flags        uint64 // AdvFlag* bits
 	Payload      []byte // owned by the receiver
-
-	// abortErr is why an aborted response fails its waiting call
-	// (ErrMessageAborted or ErrReassemblyLimit). It is never set on messages
-	// handed to applications.
-	abortErr error
 }
 
 // IsData reports whether m is a plain large-copy message (SendLarge).
@@ -75,7 +69,13 @@ type advancedAssembly struct {
 	message AdvancedMessage
 	data    []byte
 	next    uint64
-	charge  uint64 // bytes charged against AdvancedLink.maxReassemblyBytes
+}
+
+// charge is the number of bytes the assembly holds against
+// AdvancedLink.maxReassemblyBytes: the announced message size plus the
+// fixed bookkeeping overhead.
+func (a *advancedAssembly) charge() uint64 {
+	return uint64(len(a.data)) + advancedAssemblyOverhead
 }
 
 // pendingPool recycles the one-shot channels used by Call. A channel may be
@@ -91,9 +91,14 @@ var pendingPool = sync.Pool{
 
 // SendLarge publishes payload as one Advanced large-copy message, split into
 // OpConnCopy chunks of at most BufferSize bytes. The peer receives it as one
-// AdvancedMessage from Receive.
+// AdvancedMessage from Receive. connectionID is 0 for link-level traffic or
+// an open stream (OpenStream, AcceptStream); any other ID, including a stream
+// closed with CloseStream or by the peer, returns ErrConnNotFound.
 func (l *AdvancedLink) SendLarge(ctx context.Context, connectionID uint64, payload []byte) (uint64, error) {
 	if err := l.requireFeature(FeatureLargeCopy); err != nil {
+		return 0, err
+	}
+	if err := l.requireStream(connectionID); err != nil {
 		return 0, err
 	}
 	messageID := l.nextMessageID()
@@ -139,12 +144,12 @@ func (l *AdvancedLink) Receive(ctx context.Context) (AdvancedMessage, error) {
 			l.receiveMu.Unlock()
 			continue
 		}
-		message, err := l.receiveNextLocked(ctx)
+		message, abortErr, err := l.receiveNextLocked(ctx)
 		l.receiveMu.Unlock()
 		if err != nil {
 			return AdvancedMessage{}, err
 		}
-		if message.IsResponse() && l.routeResponse(message) {
+		if message.IsResponse() && l.routeResponse(message, abortErr) {
 			continue
 		}
 		return message, nil
@@ -185,12 +190,17 @@ func (l *AdvancedLink) Call(ctx context.Context, methodID uint64, request []byte
 }
 
 // CallOn sends a request on connectionID and waits for the matching response.
-// Many calls may be outstanding at once; responses may arrive in any order.
+// connectionID is 0 for link-level traffic or an open stream; any other ID,
+// including a closed stream, returns ErrConnNotFound. Many calls may be
+// outstanding at once; responses may arrive in any order.
 // If ctx ends first, the call returns ctx.Err() and a late response is
 // discarded. CallOn returns ErrMessageAborted or ErrReassemblyLimit under
 // the same conditions as Call.
 func (l *AdvancedLink) CallOn(ctx context.Context, connectionID uint64, methodID uint64, request []byte) (AdvancedMessage, error) {
 	if err := l.requireFeature(FeatureRequestResponse); err != nil {
+		return AdvancedMessage{}, err
+	}
+	if err := l.requireStream(connectionID); err != nil {
 		return AdvancedMessage{}, err
 	}
 	ctx = orBackground(ctx)
@@ -251,7 +261,7 @@ func (l *AdvancedLink) awaitResponse(ctx context.Context, key advancedCallKey, p
 			return result.message, result.err
 		default:
 		}
-		message, err := l.receiveNextLocked(ctx)
+		message, abortErr, err := l.receiveNextLocked(ctx)
 		l.receiveMu.Unlock()
 		if err != nil {
 			l.abandonCall(key, pending)
@@ -260,12 +270,12 @@ func (l *AdvancedLink) awaitResponse(ctx context.Context, key advancedCallKey, p
 		if message.IsResponse() {
 			if message.ConnectionID == key.connectionID && message.MessageID == key.messageID {
 				l.unregisterPendingCall(key, pending)
-				if message.IsAbort() {
-					return AdvancedMessage{}, message.abortError()
+				if abortErr != nil {
+					return AdvancedMessage{}, abortErr
 				}
 				return message, nil
 			}
-			if l.routeResponse(message) {
+			if l.routeResponse(message, abortErr) {
 				continue
 			}
 		}
@@ -365,7 +375,7 @@ func (l *AdvancedLink) sendAdvancedChunk(c *mpmc.Cancel, connectionID, messageID
 	s := l.slink
 	return s.txRing.EnqueueZeroCopyCancel(c, func(slot uint64, p *protocol.Packet) {
 		if len(chunk) > 0 {
-			race.Copy(s.txBufs[slot], chunk)
+			copy(s.txBufs[slot], chunk)
 		}
 		*p = protocol.NewConnCopyPacket(connectionID, messageID, totalSize, chunkOffset, uint64(len(chunk)), flags, aux)
 	})
@@ -374,15 +384,18 @@ func (l *AdvancedLink) sendAdvancedChunk(c *mpmc.Cancel, connectionID, messageID
 // receiveNextLocked returns the next message that needs routing, handling
 // control packets inline. The caller holds receiveMu.
 //
-// It returns complete messages and aborted responses (abortErr set), which
-// the caller routes to the waiting call. Aborted messages that are not
-// responses and the remaining chunks of refused messages are dropped here;
-// a refused request is answered with an error response.
-func (l *AdvancedLink) receiveNextLocked(ctx context.Context) (AdvancedMessage, error) {
+// It returns complete messages and aborted responses, which the caller
+// routes to the waiting call; for an aborted response abortErr is why the
+// call fails (ErrMessageAborted or ErrReassemblyLimit) and is nil for every
+// other message. Aborted messages that are not responses and the remaining
+// chunks of refused messages are dropped here; a refused request is
+// answered with an error response queued on the control sender, so
+// receiveNextLocked never waits for the tx ring.
+func (l *AdvancedLink) receiveNextLocked(ctx context.Context) (message AdvancedMessage, abortErr error, err error) {
 	rxBufs := l.slink.rxBufs
 	for {
 		var (
-			message  AdvancedMessage
+			msg      AdvancedMessage
 			outcome  chunkOutcome
 			frameErr error
 			control  protocol.Packet
@@ -392,7 +405,7 @@ func (l *AdvancedLink) receiveNextLocked(ctx context.Context) (AdvancedMessage, 
 			switch p.Op() {
 			case protocol.OpStandardLinkTombstone:
 			case protocol.OpConnCopy:
-				message, outcome, frameErr = l.consumeAdvancedChunk(p, rxBufs[slot])
+				msg, outcome, frameErr = l.consumeAdvancedChunk(p, rxBufs[slot])
 			case protocol.OpConnCreate, protocol.OpConnAccept, protocol.OpConnClose:
 				control, kind = *p, 1
 			case protocol.OpError:
@@ -403,33 +416,33 @@ func (l *AdvancedLink) receiveNextLocked(ctx context.Context) (AdvancedMessage, 
 		})
 		switch {
 		case err != nil:
-			return AdvancedMessage{}, err
+			return AdvancedMessage{}, nil, err
 		case frameErr != nil:
-			return AdvancedMessage{}, frameErr
+			return AdvancedMessage{}, nil, frameErr
 		case kind == 1:
 			if err := l.handleControlPacket(ctx, &control); err != nil {
-				return AdvancedMessage{}, err
+				return AdvancedMessage{}, nil, err
 			}
 		case kind == 2:
 			if !l.routeControlError(&control) {
-				return AdvancedMessage{}, errorFromCode(ErrorCode(control.Operand(1)))
+				return AdvancedMessage{}, nil, errorFromCode(ErrorCode(control.Operand(1)))
 			}
 		case outcome == chunkComplete:
-			return message, nil
+			return msg, nil, nil
 		case outcome == chunkAborted:
-			if message.IsResponse() {
-				return message, nil
+			if msg.IsResponse() {
+				return msg, ErrMessageAborted, nil
 			}
 			// An aborted request or data message was never complete.
 		case outcome == chunkRefused:
 			l.stats.droppedMessages.Add(1)
 			switch {
-			case message.IsResponse():
-				return message, nil
-			case message.IsRequest():
+			case msg.IsResponse():
+				return msg, ErrReassemblyLimit, nil
+			case msg.IsRequest():
 				// Best effort: the peer's Call otherwise waits for a
 				// response that will never come.
-				_ = l.RespondError(ctx, message, uint64(ErrCodeBufferOverflow), nil)
+				l.refuseRequest(msg)
 			}
 		}
 	}
@@ -445,11 +458,11 @@ const (
 	// chunkComplete: the final chunk arrived; the message is assembled.
 	chunkComplete
 	// chunkAborted: the sender abandoned the message. The returned message
-	// carries AdvFlagAbort; for a response its abortErr is ErrMessageAborted.
+	// carries AdvFlagAbort; a response fails its call with ErrMessageAborted.
 	chunkAborted
 	// chunkRefused: the first chunk would exceed maxReassemblyBytes and the
 	// message was refused without allocating. The returned message carries
-	// AdvFlagAbort; for a response its abortErr is ErrReassemblyLimit.
+	// AdvFlagAbort; a response fails its call with ErrReassemblyLimit.
 	chunkRefused
 )
 
@@ -471,13 +484,6 @@ func (l *AdvancedLink) consumeAdvancedChunk(p *protocol.Packet, buffer []byte) (
 	}
 	kind := flags & (AdvFlagRequest | AdvFlagResponse)
 	key := advancedMessageKey{connectionID: connectionID, messageID: messageID, kind: kind}
-	header := AdvancedMessage{
-		ConnectionID: connectionID,
-		MessageID:    messageID,
-		MethodID:     methodIDFromFlags(flags, aux),
-		Status:       statusFromFlags(flags, aux),
-		Flags:        flags,
-	}
 
 	if flags&AdvFlagAbort != 0 {
 		l.dropAssembly(key)
@@ -485,10 +491,7 @@ func (l *AdvancedLink) consumeAdvancedChunk(p *protocol.Packet, buffer []byte) (
 			// Already surfaced when the message was refused.
 			return AdvancedMessage{}, chunkPartial, nil
 		}
-		if flags&AdvFlagResponse != 0 {
-			header.abortErr = ErrMessageAborted
-		}
-		return header, chunkAborted, nil
+		return newAdvancedHeader(connectionID, messageID, flags, aux), chunkAborted, nil
 	}
 
 	fail := func(err error) (AdvancedMessage, chunkOutcome, error) {
@@ -521,21 +524,19 @@ func (l *AdvancedLink) consumeAdvancedChunk(p *protocol.Packet, buffer []byte) (
 			if chunkSize != totalSize {
 				return fail(ErrInvalidSize)
 			}
-			header.Payload = make([]byte, int(totalSize))
-			race.Copy(header.Payload, buffer[:chunkSize])
-			return header, chunkComplete, nil
+			message := newAdvancedHeader(connectionID, messageID, flags, aux)
+			message.Payload = make([]byte, int(totalSize))
+			copy(message.Payload, buffer[:chunkSize])
+			return message, chunkComplete, nil
 		}
-		header.Flags &^= AdvFlagBegin | AdvFlagEnd
+		header := newAdvancedHeader(connectionID, messageID, flags&^(AdvFlagBegin|AdvFlagEnd), aux)
 		charge := totalSize + advancedAssemblyOverhead
 		if charge > l.maxReassemblyBytes || l.assemblyBytes > l.maxReassemblyBytes-charge {
 			l.rejectMessage(key)
 			header.Flags |= AdvFlagAbort
-			if flags&AdvFlagResponse != 0 {
-				header.abortErr = ErrReassemblyLimit
-			}
 			return header, chunkRefused, nil
 		}
-		assembly = &advancedAssembly{message: header, data: make([]byte, int(totalSize)), charge: charge}
+		assembly = &advancedAssembly{message: header, data: make([]byte, int(totalSize))}
 		l.assemblies[key] = assembly
 		l.assemblyBytes += charge
 	}
@@ -552,7 +553,7 @@ func (l *AdvancedLink) consumeAdvancedChunk(p *protocol.Packet, buffer []byte) (
 	if chunkOffset != assembly.next || uint64(len(assembly.data)) != totalSize {
 		return fail(ErrInvalidSize)
 	}
-	race.Copy(assembly.data[chunkOffset:chunkOffset+chunkSize], buffer[:chunkSize])
+	copy(assembly.data[chunkOffset:chunkOffset+chunkSize], buffer[:chunkSize])
 	assembly.next += chunkSize
 
 	if flags&AdvFlagEnd == 0 {
@@ -570,7 +571,7 @@ func (l *AdvancedLink) consumeAdvancedChunk(p *protocol.Packet, buffer []byte) (
 // dropAssembly discards the incomplete message key and releases its charge.
 func (l *AdvancedLink) dropAssembly(key advancedMessageKey) {
 	if assembly := l.assemblies[key]; assembly != nil {
-		l.assemblyBytes -= assembly.charge
+		l.assemblyBytes -= assembly.charge()
 		delete(l.assemblies, key)
 	}
 }
@@ -607,12 +608,16 @@ func (l *AdvancedLink) forgetRejected(key advancedMessageKey) bool {
 	return true
 }
 
-// abortError returns why an aborted response fails its call.
-func (m AdvancedMessage) abortError() error {
-	if m.abortErr != nil {
-		return m.abortErr
+// newAdvancedHeader returns the message header (everything but the
+// payload) announced by an OpConnCopy frame.
+func newAdvancedHeader(connectionID, messageID, flags, aux uint64) AdvancedMessage {
+	return AdvancedMessage{
+		ConnectionID: connectionID,
+		MessageID:    messageID,
+		MethodID:     methodIDFromFlags(flags, aux),
+		Status:       statusFromFlags(flags, aux),
+		Flags:        flags,
 	}
-	return ErrMessageAborted
 }
 
 func methodIDFromFlags(flags, aux uint64) uint64 {

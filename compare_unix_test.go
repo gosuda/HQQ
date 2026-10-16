@@ -27,11 +27,11 @@ func hqqPair(b *testing.B, policy WaitPolicy, size int) duplexPair {
 	const bufferCount = 256
 	mem := AlignedBuffer(SizeStandardLink(bufferCount, size))
 	opts := LinkOptions{WaitPolicy: policy}
-	x, err := OpenStandardLinkMemory(mem, bufferCount, size, opts)
+	x, err := NewStandardLink(mem, bufferCount, size, opts)
 	if err != nil {
 		b.Fatal(err)
 	}
-	y, err := OpenStandardLinkMemory(mem, bufferCount, size, opts)
+	y, err := NewStandardLink(mem, bufferCount, size, opts)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -201,10 +201,11 @@ func processCPUTime(t testing.TB) time.Duration {
 
 // TestIdleLinkDoesNotBurnCPU guards the end-to-end idle behavior: a link with
 // a blocked reader and a blocked writer (heartbeats running) must stay far
-// below one busy core.
+// below one busy core. It compares CPU time with wall time, which is only
+// meaningful on a quiet machine, so it runs only with HQQ_PERF_TESTS=1.
 func TestIdleLinkDoesNotBurnCPU(t *testing.T) {
-	if testing.Short() {
-		t.Skip("timing-based test")
+	if os.Getenv("HQQ_PERF_TESTS") != "1" {
+		t.Skip("CPU-ratio measurement; set HQQ_PERF_TESTS=1 to run it on a quiet machine")
 	}
 	_, primary, secondary := newMemoryPair(t, 4, 64, LinkOptions{})
 	for i := 0; i < 4; i++ {

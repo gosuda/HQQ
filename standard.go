@@ -1,8 +1,8 @@
 package hqq
 
 import (
+	"context"
 	"io"
-	"net"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -10,7 +10,6 @@ import (
 
 	"gosuda.org/hqq/internal/mpmc"
 	"gosuda.org/hqq/internal/protocol"
-	"gosuda.org/hqq/internal/race"
 )
 
 // cacheLinePad separates independently written fields.
@@ -21,15 +20,19 @@ type cacheLinePad struct{ _ [128]byte }
 // Concurrency: all methods are safe for concurrent use. Write, WriteZeroCopy
 // and ReserveWrite may be called from many goroutines (each call publishes
 // exactly one message). Read, ReadZeroCopy and ReserveRead may also be
-// called concurrently; each call consumes whole messages, and the unread tail
-// of a message that did not fit into a Read buffer is returned by the next
-// read call on this endpoint. Deadlines may be changed while calls are
-// blocked.
+// called concurrently. One read call returns bytes of at most one message: a
+// message that did not fit into a Read buffer leaves its unread tail queued
+// (first in, first out) and the following read calls on this endpoint return
+// the queued tails, each in a call of its own, before they consume newer
+// messages. With concurrent readers, messages and tails may be received in
+// any order, but never mixed within one call. Deadlines may be changed while
+// calls are blocked.
 //
 // Lifetime: Close wakes every blocked call (they return ErrClosed), waits for
-// in-flight calls to finish, stops the heartbeat and detaches the endpoint.
-// Buffers obtained from zero-copy callbacks or reservations must not be used
-// after Close.
+// in-flight calls (including running zero-copy callbacks), stops the
+// heartbeat and detaches the endpoint. Buffers obtained from zero-copy
+// callbacks or reservations must not be used after Close. Close must not be
+// called from inside a zero-copy callback, see Close.
 type StandardLink struct {
 	// Configuration
 	linkMode    LinkMode // Primary or Secondary mode
@@ -52,11 +55,8 @@ type StandardLink struct {
 
 	// State management
 	idGenerator atomic.Uint64 // Generates copy IDs
-	recv        recvRemainder // Unread tail of a partially read message
+	recv        recvRemainder // FIFO of unread tails of partially read messages
 
-	// PacketConn interface support
-	localAddr     net.Addr
-	remoteAddr    atomic.Pointer[addrHolder]
 	readDeadline  atomic.Pointer[time.Time]
 	writeDeadline atomic.Pointer[time.Time]
 
@@ -80,38 +80,22 @@ type StandardLink struct {
 	writeDeadlineFn func() time.Time
 }
 
-type addrHolder struct{ addr net.Addr }
-
-// OpenStandardLink creates or attaches to a standard link in caller-owned,
-// page-aligned memory at offset with default options. See
-// OpenStandardLinkWithOptions.
-func OpenStandardLink(offset uintptr, bufferCount int, bufferSize int) (*StandardLink, error) {
-	return OpenStandardLinkWithOptions(offset, bufferCount, bufferSize, LinkOptions{})
-}
-
-// OpenStandardLinkWithOptions creates or attaches to a standard link at
-// offset, the address of at least SizeStandardLink(bufferCount, bufferSize)
-// bytes of page-aligned memory that the caller keeps mapped for the lifetime
-// of the link (typically a MAP_SHARED mapping).
+// NewStandardLink creates or attaches to a standard link in caller-owned
+// memory. mem must be page-aligned and at least SizeStandardLink(bufferCount,
+// bufferSize) bytes long, and the caller keeps it mapped for the lifetime of
+// the link; it is typically a MAP_SHARED mapping, or AlignedBuffer for links
+// between goroutines of one process. For links between processes prefer the
+// named constructors CreateStandardLink and OpenStandardLink.
 //
 // The first endpoint becomes the Primary and initializes the segment; the
 // second becomes the Secondary. A segment whose endpoints both closed or died
-// is re-initialized. A third endpoint gets ErrLinkBusy.
-//
-// Prefer OpenStandardLinkMemory, which can validate the memory size, or the
-// named-memory constructors CreateStandardLink / OpenNamedStandardLink.
-func OpenStandardLinkWithOptions(offset uintptr, bufferCount int, bufferSize int, opts LinkOptions) (*StandardLink, error) {
-	if offset == 0 || offset%pagesize != 0 {
-		return nil, ErrMemoryAlign
-	}
-	return openStandardLink(mpmc.PointerFromAddress(offset), bufferCount, bufferSize, opts)
-}
-
-// OpenStandardLinkMemory is OpenStandardLinkWithOptions for a memory slice.
-// mem must be page-aligned and at least SizeStandardLink(bufferCount,
-// bufferSize) bytes long; it is typically a shared mapping, or AlignedBuffer
-// for links between goroutines of one process.
-func OpenStandardLinkMemory(mem []byte, bufferCount int, bufferSize int, opts LinkOptions) (*StandardLink, error) {
+// is re-initialized. A third endpoint gets ErrLinkBusy. A segment whose first
+// page is not entirely zero and that is not a valid HQQ segment is not
+// touched: the call fails with ErrIncompatibleLayout, as it does for a
+// segment of another layout version. A geometry that differs from the one
+// the segment was initialized with fails with a *GeometryError, which
+// matches ErrInvalidSize.
+func NewStandardLink(mem []byte, bufferCount int, bufferSize int, opts LinkOptions) (*StandardLink, error) {
 	if len(mem) == 0 {
 		return nil, ErrMemorySmall
 	}
@@ -143,43 +127,74 @@ func AlignedBuffer(size uintptr) []byte {
 	return backing[start : start+size : start+size]
 }
 
-// layoutOffsets returns the offsets of the four regions after the superblock.
-func layoutOffsets(bufferCount, bufferSize int) (ring0, buf0, ring1, buf1 uintptr) {
-	dataRingSize := mpmc.SizeMPMCRing[protocol.Packet](uintptr(bufferCount))
-	buffersSize := uintptr(bufferCount) * uintptr(bufferSize)
-	ring0 = alignPage(unsafe.Sizeof(standardSuperblock{}))
-	buf0 = alignPage(ring0 + dataRingSize)
-	ring1 = alignPage(buf0 + buffersSize)
-	buf1 = alignPage(ring1 + dataRingSize)
-	return
+// ringAttachSlice is how long one mpmc.Attach call may wait; between calls
+// attachRing looks at the context.
+const ringAttachSlice = 10 * time.Millisecond
+
+// attachRing attaches to the ring at p, waiting up to timeout for it to be
+// initialized and giving up with ctx.Err() as soon as ctx is done. A nil ring
+// with a nil error means the ring is missing or has an incompatible layout.
+func attachRing(ctx context.Context, p unsafe.Pointer, timeout time.Duration) (*mpmc.MPMCRing[protocol.Packet], error) {
+	deadline := time.Now().Add(timeout)
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		start := time.Now()
+		if r := mpmc.Attach[protocol.Packet](p, ringAttachSlice); r != nil {
+			return r, nil
+		}
+		// Attach returns early only for an incompatible layout; it returns
+		// after the full slice when the ring is not initialized yet.
+		if time.Since(start) < ringAttachSlice || !time.Now().Before(deadline) {
+			return nil, nil
+		}
+	}
 }
 
 //go:nocheckptr
 func openStandardLink(base unsafe.Pointer, bufferCount int, bufferSize int, opts LinkOptions) (*StandardLink, error) {
-	if bufferSize%BufferSizeAlignment != 0 || !validConfig(bufferCount, bufferSize) {
+	layout, ok := computeLayout(bufferCount, bufferSize)
+	if !ok {
 		return nil, ErrInvalidSize
 	}
 	opts = opts.normalized()
-	requiredSize := SizeStandardLink(bufferCount, bufferSize)
+	ctx := orBackground(opts.ctx)
+	opts.ctx = nil // the link does not keep the caller's context
+	requiredSize := layout.total
 	token := newToken()
 	sb := (*standardSuperblock)(base)
 
-	linkMode, mustInit, err := claimSuperblock(sb, bufferCount, bufferSize, requiredSize, token, opts)
+	claimOpts := opts
+	claimOpts.ctx = ctx
+	linkMode, mustInit, err := claimSuperblock(sb, bufferCount, bufferSize, requiredSize, token, claimOpts)
 	if err != nil {
 		return nil, err
 	}
 
-	ring0Off, buf0Off, ring1Off, buf1Off := layoutOffsets(bufferCount, bufferSize)
-	buffersSize := bufferCount * bufferSize
-	buffers0 := unsafe.Slice((*byte)(unsafe.Add(base, buf0Off)), buffersSize)
-	buffers1 := unsafe.Slice((*byte)(unsafe.Add(base, buf1Off)), buffersSize)
+	buffersSize := bufferCount * bufferSize // cannot overflow: bounded by layout.total
+	buffers0 := unsafe.Slice((*byte)(unsafe.Add(base, layout.buf0)), buffersSize)
+	buffers1 := unsafe.Slice((*byte)(unsafe.Add(base, layout.buf1)), buffersSize)
 
 	var epoch uint64
 	if mustInit {
-		mpmc.Format[protocol.Packet](unsafe.Add(base, ring0Off), uint64(bufferCount))
-		mpmc.Format[protocol.Packet](unsafe.Add(base, ring1Off), uint64(bufferCount))
-		zeroWithProgress(sb, buffers0)
-		zeroWithProgress(sb, buffers1)
+		// Every step first checks that this endpoint still owns the
+		// initialization: an endpoint that lost it must not touch the
+		// segment any more.
+		session := &initSession{sb: sb, token: token, ctx: ctx}
+		for _, ringOff := range [2]uintptr{layout.ring0, layout.ring1} {
+			if err := session.check(); err != nil {
+				return nil, err
+			}
+			mpmc.Format[protocol.Packet](unsafe.Add(base, ringOff), uint64(bufferCount))
+			session.progress()
+		}
+		if err := session.zero(buffers0); err != nil {
+			return nil, err
+		}
+		if err := session.zero(buffers1); err != nil {
+			return nil, err
+		}
 		if epoch, err = publishSuperblock(sb, bufferCount, bufferSize, requiredSize, token, opts); err != nil {
 			return nil, err
 		}
@@ -195,8 +210,16 @@ func openStandardLink(base unsafe.Pointer, bufferCount int, bufferSize int, opts
 		atomic.CompareAndSwapUint64(&sb.endpoints[self].token, token, detachedToken)
 	}
 
-	ring0 := mpmc.Attach[protocol.Packet](unsafe.Add(base, ring0Off), opts.AttachTimeout)
-	ring1 := mpmc.Attach[protocol.Packet](unsafe.Add(base, ring1Off), opts.AttachTimeout)
+	ring0, err := attachRing(ctx, unsafe.Add(base, layout.ring0), opts.AttachTimeout)
+	if err != nil {
+		detach()
+		return nil, err
+	}
+	ring1, err := attachRing(ctx, unsafe.Add(base, layout.ring1), opts.AttachTimeout)
+	if err != nil {
+		detach()
+		return nil, err
+	}
 	if ring0 == nil || ring1 == nil ||
 		ring0.Size() != uint64(bufferCount) || ring1.Size() != uint64(bufferCount) {
 		detach()
@@ -225,10 +248,8 @@ func openStandardLink(base unsafe.Pointer, bufferCount int, bufferSize int, opts
 		ring1:       ring1,
 		buffers0:    splitBuffers(buffers0, bufferCount, bufferSize),
 		buffers1:    splitBuffers(buffers1, bufferCount, bufferSize),
-		localAddr:   &HQQAddr{LinkID: "hqq-local"},
 		closeCh:     make(chan struct{}),
 	}
-	link.remoteAddr.Store(&addrHolder{addr: &HQQAddr{LinkID: "hqq-remote"}})
 	if linkMode == LinkModeSecondary {
 		link.txRing, link.txBufs = ring1, link.buffers1
 		link.rxRing, link.rxBufs = ring0, link.buffers0
@@ -321,21 +342,37 @@ func mapWaitErr(err error) error {
 	}
 }
 
+// dequeueDrained dequeues one packet from ring. If that fails because the
+// peer closed or died, it makes one more attempt without waiting: the peer
+// may have published its last messages right before it went away, and they
+// are delivered before the failure is reported. The returned error is the raw
+// ring or peer error; callers map it with mapWaitErr.
+func dequeueDrained(ring *mpmc.MPMCRing[protocol.Packet], c *mpmc.Cancel, fn func(slot uint64, p *protocol.Packet)) error {
+	err := ring.DequeueZeroCopyCancel(c, fn)
+	if err != nil && peerLost(err) && ring.DequeueZeroCopyCancel(&mpmc.Cancel{NoWait: true}, fn) == nil {
+		return nil
+	}
+	return err
+}
+
+// reserveDrained is dequeueDrained for a consumer reservation.
+func reserveDrained(ring *mpmc.MPMCRing[protocol.Packet], c *mpmc.Cancel) (mpmc.ConsumerSlot[protocol.Packet], error) {
+	slot, err := ring.ReserveConsumerCancel(c)
+	if err != nil && peerLost(err) {
+		if s, retryErr := ring.ReserveConsumerCancel(&mpmc.Cancel{NoWait: true}); retryErr == nil {
+			return s, nil
+		}
+	}
+	return slot, err
+}
+
+// peerLost reports whether err says that the peer closed or died.
+func peerLost(err error) bool { return err == ErrPeerClosed || err == ErrPeerGone }
+
 // dequeue consumes one packet. fn runs while the slot is claimed.
 func (l *StandardLink) dequeue(fn func(slot uint64, p *protocol.Packet)) error {
 	c := mpmc.Cancel{Closed: l.closeCh, DeadlineFunc: l.readDeadlineFn, Check: l.checkFn}
-	err := l.rxRing.DequeueZeroCopyCancel(&c, fn)
-	if err == nil {
-		return nil
-	}
-	if err == ErrPeerClosed || err == ErrPeerGone {
-		// The peer may have published its last messages right before it
-		// went away; deliver them before reporting the failure.
-		if l.rxRing.DequeueZeroCopyCancel(&mpmc.Cancel{NoWait: true}, fn) == nil {
-			return nil
-		}
-	}
-	return mapWaitErr(err)
+	return mapWaitErr(dequeueDrained(l.rxRing, &c, fn))
 }
 
 // enqueue publishes one packet. fn runs while the slot is claimed.
@@ -344,12 +381,64 @@ func (l *StandardLink) enqueue(fn func(slot uint64, p *protocol.Packet)) error {
 	return mapWaitErr(l.txRing.EnqueueZeroCopyCancel(&c, fn))
 }
 
-// Read implements io.Reader. It returns one message (or the unread tail of a
-// previous message); a message larger than b is split across Read calls.
-// After the peer closed the link gracefully and every buffered message was
-// consumed, Read returns io.EOF itself (not ErrPeerClosed), as the io.Reader
-// contract requires, so io.Copy, io.ReadAll and bufio.Scanner treat it as a
-// normal end of stream.
+// reserveRx reserves the next readable packet slot.
+func (l *StandardLink) reserveRx() (mpmc.ConsumerSlot[protocol.Packet], error) {
+	c := mpmc.Cancel{Closed: l.closeCh, DeadlineFunc: l.readDeadlineFn, Check: l.checkFn}
+	slot, err := reserveDrained(l.rxRing, &c)
+	return slot, mapWaitErr(err)
+}
+
+// classify interprets a packet taken from the receive ring. It returns the
+// payload size of a copy packet; size 0 and a nil error mean a tombstone that
+// the caller skips. Error packets yield the peer's error, anything else
+// ErrUnexpectedPacket.
+func (l *StandardLink) classify(p *protocol.Packet) (size int, err error) {
+	switch p.Op() {
+	case protocol.OpStandardLinkTombstone:
+		return 0, nil
+	case protocol.OpStandardLinkCopy:
+		size = int(p.Operand(2))
+		if size <= 0 || size > l.bufferSize {
+			return 0, ErrInvalidSize
+		}
+		return size, nil
+	case protocol.OpError:
+		return 0, errorFromCode(ErrorCode(p.Operand(1)))
+	default:
+		return 0, ErrUnexpectedPacket
+	}
+}
+
+// consume dequeues one packet and hands the payload of a copy packet to
+// deliver while the ring slot is claimed. skip reports a tombstone: nothing
+// was delivered and the caller should try the next packet. The slot is
+// released even if deliver panics.
+func (l *StandardLink) consume(deliver func(payload []byte) (int, error)) (n int, skip bool, err error) {
+	var pktErr error
+	err = l.dequeue(func(slot uint64, p *protocol.Packet) {
+		size, cerr := l.classify(p)
+		switch {
+		case cerr != nil:
+			pktErr = cerr
+		case size == 0:
+			skip = true
+		default:
+			n, pktErr = deliver(l.rxBufs[slot][:size:size])
+		}
+	})
+	if err != nil {
+		return 0, false, err
+	}
+	return n, skip, pktErr
+}
+
+// Read implements io.Reader. One call returns bytes of at most one message
+// (or of one queued tail of a previous message): a message larger than b is
+// split across Read calls, and the unread tail is returned by the following
+// read calls before newer messages are consumed. After the peer closed the
+// link gracefully and every buffered message was consumed, Read returns
+// io.EOF itself (not ErrPeerClosed), as the io.Reader contract requires, so
+// io.Copy, io.ReadAll and bufio.Scanner treat it as a normal end of stream.
 //
 // Read is the automatic-release hot path for the same packet stream consumed
 // by ReadZeroCopy and ReserveRead. It releases the claimed ring slot before
@@ -359,26 +448,43 @@ func (l *StandardLink) Read(b []byte) (int, error) {
 	if len(b) == 0 {
 		return 0, nil
 	}
-	if n, ok := l.recv.read(b); ok {
-		return n, nil
-	}
+	return l.recvMessage(b, false)
+}
+
+// recvMessage implements Read (datagram false) and ReadFrom (datagram true):
+// it serves the oldest queued tail if there is one, otherwise the next
+// message. In datagram mode the part of the message that does not fit into b
+// is discarded instead of queued, and an empty b still consumes one message.
+func (l *StandardLink) recvMessage(b []byte, datagram bool) (int, error) {
 	if err := l.enterRx(); err != nil {
 		return 0, err
 	}
 	defer l.exitRx()
 
+	if n, ok := l.recv.read(b, datagram); ok {
+		return n, nil
+	}
+	// One callback per packet (no nested deliver closure): this is the
+	// hottest receive path.
 	for {
-		var n int
-		var readErr error
+		var (
+			n      int
+			skip   bool
+			pktErr error
+		)
 		err := l.dequeue(func(slot uint64, p *protocol.Packet) {
-			switch p.Op() {
-			case protocol.OpStandardLinkTombstone:
-			case protocol.OpStandardLinkCopy:
-				n, readErr = l.copyOut(p, l.rxBufs[slot], b)
-			case protocol.OpError:
-				readErr = errorFromCode(ErrorCode(p.Operand(1)))
+			size, cerr := l.classify(p)
+			switch {
+			case cerr != nil:
+				pktErr = cerr
+			case size == 0:
+				skip = true
 			default:
-				readErr = ErrUnexpectedPacket
+				payload := l.rxBufs[slot][:size:size]
+				n = copy(b, payload)
+				if n < size && !datagram {
+					l.recv.store(payload[n:])
+				}
 			}
 		})
 		if err == ErrPeerClosed {
@@ -387,27 +493,13 @@ func (l *StandardLink) Read(b []byte) (int, error) {
 		if err != nil {
 			return 0, err
 		}
-		if readErr != nil {
-			return n, readErr
+		if pktErr != nil {
+			return 0, pktErr
 		}
-		if n > 0 {
+		if !skip {
 			return n, nil
 		}
 	}
-}
-
-// copyOut copies a Standard copy packet's payload into dst and keeps the
-// unread tail in the remainder buffer.
-func (l *StandardLink) copyOut(p *protocol.Packet, buffer []byte, dst []byte) (int, error) {
-	size := int(p.Operand(2))
-	if size <= 0 || size > len(buffer) {
-		return 0, ErrInvalidSize
-	}
-	n := race.Copy(dst, buffer[:size])
-	if n < size {
-		l.recv.store(buffer[n:size])
-	}
-	return n, nil
 }
 
 // Write implements io.Writer. It publishes b as one message and rejects
@@ -432,7 +524,7 @@ func (l *StandardLink) Write(b []byte) (int, error) {
 
 	copyID := l.idGenerator.Add(1)
 	err := l.enqueue(func(slot uint64, p *protocol.Packet) {
-		race.Copy(l.txBufs[slot], b)
+		copy(l.txBufs[slot], b)
 		*p = protocol.NewStandardLinkCopyPacket(copyID, slot, uint64(bN))
 	})
 	if err != nil {
@@ -453,6 +545,10 @@ func (l *StandardLink) Write(b []byte) (int, error) {
 // ring moving and the error is returned. If it panics, a tombstone is
 // published as well and the panic continues in the caller after the slot
 // is released, so a failing callback cannot wedge the link.
+//
+// The callback must not call Close on this link: Close waits for the
+// callback to return, so the call would deadlock (like locking a sync.Mutex
+// twice).
 func (l *StandardLink) WriteZeroCopy(fn func(buffer []byte) (int, error)) (int, error) {
 	if fn == nil {
 		return 0, ErrInvalidOp
@@ -499,7 +595,10 @@ func (l *StandardLink) fillSlot(slot mpmc.ProducerSlot[protocol.Packet], copyID 
 }
 
 // ReadZeroCopy reads one message by passing the ring-slot-owned shared payload
-// buffer directly to fn.
+// buffer directly to fn. If a previous Read left the tail of a message
+// queued, fn receives the oldest queued tail (all of it) instead of a new
+// message; the buffer then lives in the endpoint's own memory, not in the
+// ring. fn never sees bytes of two messages.
 //
 // WARNING: The callback runs while the underlying ring slot is claimed. It must
 // return promptly; if it blocks or never returns, the whole ring can suffer
@@ -508,10 +607,21 @@ func (l *StandardLink) fillSlot(slot mpmc.ProducerSlot[protocol.Packet], copyID 
 // The buffer is only valid for the duration of fn. Returning from fn releases
 // the ring slot and allows a future writer to overwrite the same memory. The
 // slot is released, and the message consumed, if fn panics as well.
+//
+// The callback must not call Close on this link: Close waits for the
+// callback to return, so the call would deadlock (like locking a sync.Mutex
+// twice).
 func (l *StandardLink) ReadZeroCopy(fn func(buffer []byte) error) (int, error) {
 	if fn == nil {
 		return 0, ErrInvalidOp
 	}
+	// Register before touching the remainder so that Close waits for fn in
+	// every case.
+	if err := l.enterRx(); err != nil {
+		return 0, err
+	}
+	defer l.exitRx()
+
 	if view, backing, ok := l.recv.take(); ok {
 		// Give the backing store back even if fn panics.
 		defer l.recv.giveBack(backing)
@@ -520,38 +630,18 @@ func (l *StandardLink) ReadZeroCopy(fn func(buffer []byte) error) (int, error) {
 		}
 		return len(view), nil
 	}
-	if err := l.enterRx(); err != nil {
-		return 0, err
+	deliver := func(payload []byte) (int, error) {
+		if err := fn(payload); err != nil {
+			return 0, err
+		}
+		return len(payload), nil
 	}
-	defer l.exitRx()
-
 	for {
-		var n int
-		var readErr error
-		err := l.dequeue(func(slot uint64, p *protocol.Packet) {
-			switch p.Op() {
-			case protocol.OpStandardLinkTombstone:
-			case protocol.OpStandardLinkCopy:
-				size := int(p.Operand(2))
-				if size <= 0 || size > l.bufferSize {
-					readErr = ErrInvalidSize
-					return
-				}
-				n = size
-				readErr = fn(l.rxBufs[slot][:size:size])
-			case protocol.OpError:
-				readErr = errorFromCode(ErrorCode(p.Operand(1)))
-			default:
-				readErr = ErrUnexpectedPacket
-			}
-		})
+		n, skip, err := l.consume(deliver)
 		if err != nil {
 			return 0, err
 		}
-		if readErr != nil {
-			return 0, readErr
-		}
-		if n > 0 {
+		if !skip {
 			return n, nil
 		}
 	}
@@ -565,20 +655,6 @@ func (l *StandardLink) Mode() LinkMode {
 // Type returns LinkTypeStandard.
 func (l *StandardLink) Type() LinkType {
 	return l.linkType
-}
-
-// GetMode returns the endpoint role.
-//
-// Deprecated: Use Mode.
-func (l *StandardLink) GetMode() LinkMode {
-	return l.Mode()
-}
-
-// GetType returns the link type.
-//
-// Deprecated: Use Type.
-func (l *StandardLink) GetType() LinkType {
-	return l.Type()
 }
 
 // BufferSize returns the configured payload-buffer size in bytes.
@@ -597,24 +673,6 @@ func (l *StandardLink) BufferCount() int {
 	return l.bufferCount
 }
 
-// LargeMessageThreshold returns the largest payload size that this StandardLink
-// can publish in one Standard Protocol packet.
-func (l *StandardLink) LargeMessageThreshold() int {
-	if l == nil {
-		return 0
-	}
-	return LargeMessageThreshold(l.bufferSize)
-}
-
-// IsLargeMessage reports whether payloadSize should be sent through the
-// Advanced Protocol large-message path for this link configuration.
-func (l *StandardLink) IsLargeMessage(payloadSize int) bool {
-	if l == nil {
-		return false
-	}
-	return IsLargeMessage(l.bufferSize, payloadSize)
-}
-
 // PeerState reports what this endpoint currently knows about its peer.
 func (l *StandardLink) PeerState() PeerState {
 	if l.enterRx() == nil {
@@ -629,7 +687,11 @@ func (l *StandardLink) PeerState() PeerState {
 // segment so that the peer observes ErrPeerClosed. Close is idempotent.
 //
 // Close waits for zero-copy callbacks that are running; a callback that never
-// returns makes Close block forever.
+// returns makes Close block forever. Consequently Close must not be called
+// from inside a ReadZeroCopy or WriteZeroCopy callback (it would wait for
+// itself, like locking a sync.Mutex twice), and an active reservation must be
+// finished with Commit, Abort or Release before Close is called: its buffer
+// is invalid once Close has run.
 func (l *StandardLink) Close() error {
 	l.closeOnce.Do(func() {
 		l.closed.Store(true)
@@ -651,75 +713,117 @@ func (l *StandardLink) Close() error {
 	return nil
 }
 
-// recvRemainder holds the unread tail of a partially read message. Its
-// backing buffer is reused across partial reads; zero-copy consumers borrow
-// it and give it back.
+// recvRemainder is a FIFO of the unread tails of partially read messages.
+// Each tail keeps its own backing buffer, so two tails are never merged and
+// no read returns bytes of two messages. Backing buffers are recycled
+// through a small free list; zero-copy consumers borrow a tail's buffer and
+// give it back.
 type recvRemainder struct {
-	pending  atomic.Bool
-	mu       sync.Mutex
-	buf      []byte // backing store, nil while lent out
-	off, end int
-	size     int // preferred capacity (BufferSize)
+	pending atomic.Bool // the queue holds at least one tail
+	mu      sync.Mutex
+	queue   []tail   // queue[head:] are the tails, oldest first
+	head    int      //
+	free    [][]byte // spare backing buffers, at most maxSpareTails
+	size    int      // preferred buffer capacity (BufferSize)
 }
 
+// tail is the unread part buf[off:end] of one message.
+type tail struct {
+	buf      []byte
+	off, end int
+}
+
+// maxSpareTails bounds the recycled buffers kept per endpoint; there is one
+// queued tail per reader that was mid-message at the same time, so a handful
+// covers every realistic workload.
+const maxSpareTails = 4
+
+// store queues a copy of src as the newest tail.
 func (r *recvRemainder) store(src []byte) {
 	r.mu.Lock()
-	if r.off < r.end {
-		// Concurrent readers produced two tails; keep both, in order.
-		r.buf = append(r.buf[:r.end], src...)
-		r.end += len(src)
-	} else {
-		if cap(r.buf) < len(src) {
-			r.buf = make([]byte, max(len(src), r.size))
-		}
-		r.buf = r.buf[:cap(r.buf)]
-		race.Copy(r.buf, src)
-		r.off, r.end = 0, len(src)
+	buf := r.getBuf(len(src))
+	n := copy(buf, src)
+	if r.head > 0 && len(r.queue) == cap(r.queue) {
+		// Reclaim the consumed prefix instead of growing the queue.
+		live := copy(r.queue, r.queue[r.head:])
+		clear(r.queue[live:])
+		r.queue = r.queue[:live]
+		r.head = 0
 	}
+	r.queue = append(r.queue, tail{buf: buf, end: n})
 	r.pending.Store(true)
 	r.mu.Unlock()
 }
 
-func (r *recvRemainder) read(dst []byte) (int, bool) {
+// read copies from the oldest tail into dst. With discard the tail is dropped
+// even if dst was too short for it. ok is false if no tail is queued.
+func (r *recvRemainder) read(dst []byte, discard bool) (n int, ok bool) {
 	if !r.pending.Load() {
 		return 0, false
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.off == r.end {
+	if r.head == len(r.queue) {
 		return 0, false
 	}
-	n := copy(dst, r.buf[r.off:r.end])
-	r.off += n
-	if r.off == r.end {
-		r.off, r.end = 0, 0
-		r.pending.Store(false)
+	t := &r.queue[r.head]
+	n = copy(dst, t.buf[t.off:t.end])
+	t.off += n
+	if discard || t.off == t.end {
+		r.putBuf(t.buf)
+		r.popLocked()
 	}
 	return n, true
 }
 
-// take lends out the whole remainder. giveBack must be called with backing.
+// take lends out all of the oldest tail. giveBack must be called with
+// backing once the caller is done with view.
 func (r *recvRemainder) take() (view, backing []byte, ok bool) {
 	if !r.pending.Load() {
 		return nil, nil, false
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.off == r.end {
+	if r.head == len(r.queue) {
 		return nil, nil, false
 	}
-	view = r.buf[r.off:r.end:r.end]
-	backing = r.buf
-	r.buf = nil
-	r.off, r.end = 0, 0
-	r.pending.Store(false)
-	return view, backing, true
+	t := r.queue[r.head]
+	r.popLocked()
+	return t.buf[t.off:t.end:t.end], t.buf, true
 }
 
 func (r *recvRemainder) giveBack(backing []byte) {
 	r.mu.Lock()
-	if r.buf == nil {
-		r.buf = backing[:cap(backing)]
-	}
+	r.putBuf(backing)
 	r.mu.Unlock()
+}
+
+// popLocked drops the oldest tail from the queue. r.mu must be held.
+func (r *recvRemainder) popLocked() {
+	r.queue[r.head] = tail{}
+	r.head++
+	if r.head == len(r.queue) {
+		r.queue = r.queue[:0]
+		r.head = 0
+		r.pending.Store(false)
+	}
+}
+
+// getBuf returns a buffer of length (= capacity) at least n. r.mu must be held.
+func (r *recvRemainder) getBuf(n int) []byte {
+	if k := len(r.free); k > 0 {
+		b := r.free[k-1]
+		r.free = r.free[:k-1]
+		if cap(b) >= n {
+			return b
+		}
+	}
+	return make([]byte, max(n, r.size))
+}
+
+// putBuf recycles a backing buffer. r.mu must be held.
+func (r *recvRemainder) putBuf(b []byte) {
+	if len(r.free) < maxSpareTails {
+		r.free = append(r.free, b[:cap(b)])
+	}
 }

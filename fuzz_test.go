@@ -72,7 +72,7 @@ func FuzzConsumeAdvancedChunk(f *testing.F) {
 			if uint64(len(a.data)) > l.maxMessageSize {
 				t.Fatalf("assembly %+v holds %d bytes", key, len(a.data))
 			}
-			held += a.charge
+			held += a.charge()
 		}
 		if held != l.assemblyBytes || held > l.maxReassemblyBytes {
 			t.Fatalf("assemblies charge %d, tracked %d, limit %d", held, l.assemblyBytes, l.maxReassemblyBytes)
@@ -87,39 +87,62 @@ func FuzzConsumeAdvancedChunk(f *testing.F) {
 // contents. Open must either fail cleanly or produce a working link; it must
 // never panic or hang.
 func FuzzOpenOverCorruptSuperblock(f *testing.F) {
+	// The superblock fields by offset: magic 0, state 8, major 16, minor 24,
+	// initToken 72, requiredFeatures 88, creatorToken 96.
+	word := func(b []byte, off int, v uint64) []byte {
+		binary.LittleEndian.PutUint64(b[off:], v)
+		return b
+	}
+	v3 := func(state uint64) []byte {
+		b := make([]byte, 128)
+		word(b, 0, superblockMagic)
+		word(b, 8, state)
+		word(b, 16, superblockMajor)
+		word(b, 24, superblockMinor)
+		return b
+	}
 	f.Add(make([]byte, 128), uint64(0), uint64(0))
-	ready := make([]byte, 128)
-	binary.LittleEndian.PutUint64(ready[0:], superblockMagic)
-	binary.LittleEndian.PutUint64(ready[8:], superblockStateReady)
-	f.Add(ready, uint64(1), uint64(5_000_000))
-	initializing := make([]byte, 128)
-	binary.LittleEndian.PutUint64(initializing[8:], superblockStateInitializing)
-	f.Add(initializing, uint64(0), uint64(0))
+	f.Add(v3(superblockStateReady), uint64(1), uint64(5_000_000))
+	f.Add(v3(superblockStateReady), uint64(0), uint64(0))
+	// A v2 ("HQQ_STL2") segment and a segment that requires an unknown
+	// layout feature.
+	f.Add(word(v3(superblockStateReady), 0, 0x4851515f53544c32), uint64(1), uint64(5_000_000))
+	f.Add(word(v3(superblockStateReady), 88, 1<<5), uint64(1), uint64(5_000_000))
+	// Initializing segments: nothing recorded yet, a live-looking layout and
+	// token, and one of another layout version.
+	f.Add(word(make([]byte, 128), 8, superblockStateInitializing), uint64(0), uint64(0))
+	f.Add(word(v3(superblockStateInitializing), 72, 0x1234), uint64(0), uint64(0))
+	f.Add(word(v3(superblockStateInitializing), 16, 2), uint64(0), uint64(0))
+	// Empty segments with leftover data in the first page.
+	f.Add(word(make([]byte, 128), 96, 5), uint64(0), uint64(0))
 
 	opts := LinkOptions{
 		HeartbeatInterval: 5 * time.Millisecond,
 		PeerTimeout:       20 * time.Millisecond,
 		AttachTimeout:     20 * time.Millisecond,
+		initStale:         5 * time.Millisecond, // bound takeover waits
 	}
 	f.Fuzz(func(t *testing.T, header []byte, token uint64, interval uint64) {
 		const bufferCount, bufferSize = 4, 64
 		mem := AlignedBuffer(SizeStandardLink(bufferCount, bufferSize))
 		copy(mem[:128], header)
 		sb := (*standardSuperblock)(unsafe.Pointer(&mem[0]))
-		sb.initHeartbeat = uint64(time.Now().UnixNano()) // bound takeover waits
 		for i := range sb.endpoints {
+			if sb.state == superblockStateEmpty {
+				break // an empty segment must stay all zero to be claimable
+			}
 			sb.endpoints[i].token = token
 			sb.endpoints[i].interval = interval % uint64(5*time.Millisecond)
 			sb.endpoints[i].heartbeat = 1
 		}
 
-		link, err := OpenStandardLinkMemory(mem, bufferCount, bufferSize, opts)
+		link, err := NewStandardLink(mem, bufferCount, bufferSize, opts)
 		if err != nil {
 			return
 		}
 		defer link.Close()
 		if link.Mode() == LinkModePrimary {
-			peer, err := OpenStandardLinkMemory(mem, bufferCount, bufferSize, opts)
+			peer, err := NewStandardLink(mem, bufferCount, bufferSize, opts)
 			if err != nil {
 				t.Fatalf("attach to freshly initialized segment: %v", err)
 			}

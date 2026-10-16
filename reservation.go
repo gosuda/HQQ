@@ -11,7 +11,7 @@ import (
 // called promptly; if the reservation is dropped, copied, or retained without
 // finishing, the whole direction can suffer head-of-line (HOL) blocking. The
 // buffer returned by Buffer is invalid after Commit or Abort returns, and
-// after the link is closed.
+// after the link is closed. Finish the reservation before calling Close.
 type StandardWriteReservation struct {
 	link   *StandardLink
 	slot   mpmc.ProducerSlot[protocol.Packet]
@@ -28,9 +28,11 @@ func (r *StandardWriteReservation) Slot() uint64 {
 	return r.slot.Slot()
 }
 
-// Buffer returns the slot-owned payload buffer while the reservation is active.
+// Buffer returns the slot-owned payload buffer while the reservation is
+// active. It returns nil once the reservation was committed or aborted,
+// including through a copy of this value.
 func (r *StandardWriteReservation) Buffer() []byte {
-	if r == nil || r.done {
+	if r == nil || r.done || !r.slot.Owned() {
 		return nil
 	}
 	return r.buffer
@@ -38,9 +40,10 @@ func (r *StandardWriteReservation) Buffer() []byte {
 
 // Commit publishes n bytes from the reserved payload buffer. An invalid n
 // publishes a tombstone instead (so the ring keeps moving) and returns
-// ErrInvalidSize or ErrBufferOverflow.
+// ErrInvalidSize or ErrBufferOverflow. It returns ErrInvalidOp if the
+// reservation was already completed, including through a copy of this value.
 func (r *StandardWriteReservation) Commit(n int) error {
-	if r == nil || r.done || !r.slot.Valid() {
+	if r == nil || r.done || !r.slot.Owned() {
 		return ErrInvalidOp
 	}
 	switch {
@@ -60,16 +63,19 @@ func (r *StandardWriteReservation) Commit(n int) error {
 	}
 	defer r.link.exitTx()
 	*r.slot.Value() = protocol.NewStandardLinkCopyPacket(r.copyID, r.slot.Slot(), uint64(n))
-	r.slot.Commit()
 	r.done = true
+	if !r.slot.Commit() {
+		return ErrInvalidOp
+	}
 	return nil
 }
 
 // Abort publishes a tombstone for the reserved slot. Readers skip tombstones.
 // Use Abort when a reserved write cannot be completed but ring progress must be
-// preserved.
+// preserved. It returns ErrInvalidOp if the reservation was already completed,
+// including through a copy of this value.
 func (r *StandardWriteReservation) Abort(reason ErrorCode) error {
-	if r == nil || r.done || !r.slot.Valid() {
+	if r == nil || r.done || !r.slot.Owned() {
 		return ErrInvalidOp
 	}
 	if reason == 0 {
@@ -84,8 +90,10 @@ func (r *StandardWriteReservation) publishTombstone(reason ErrorCode) error {
 	}
 	defer r.link.exitTx()
 	*r.slot.Value() = protocol.NewStandardLinkTombstonePacket(r.copyID, r.slot.Slot(), uint64(reason))
-	r.slot.Commit()
 	r.done = true
+	if !r.slot.Commit() {
+		return ErrInvalidOp
+	}
 	return nil
 }
 
@@ -95,7 +103,7 @@ func (r *StandardWriteReservation) publishTombstone(reason ErrorCode) error {
 // promptly; if the reservation is dropped, copied, or retained without
 // releasing, the whole direction can suffer head-of-line (HOL) blocking. The
 // buffer returned by Buffer is invalid after Release returns, and after the
-// link is closed.
+// link is closed. Release the reservation before calling Close.
 type StandardReadReservation struct {
 	slot    mpmc.ConsumerSlot[protocol.Packet]
 	link    *StandardLink
@@ -115,14 +123,18 @@ func (r *StandardReadReservation) Slot() uint64 {
 }
 
 // Buffer returns the reserved payload buffer while the reservation is active.
+// It returns nil once the reservation was released, including through a copy
+// of this value.
 func (r *StandardReadReservation) Buffer() []byte {
-	if r == nil || r.done {
+	if r == nil || r.done || (!r.local && !r.slot.Owned()) {
 		return nil
 	}
 	return r.buffer
 }
 
-// Release releases the reserved read slot.
+// Release releases the reserved read slot. It returns ErrInvalidOp if the
+// reservation was already released, including through a copy of this value;
+// a stale copy neither frees the slot a second time nor wakes producers.
 func (r *StandardReadReservation) Release() error {
 	if r == nil || r.done {
 		return ErrInvalidOp
@@ -132,14 +144,17 @@ func (r *StandardReadReservation) Release() error {
 		r.done = true
 		return nil
 	}
+	if !r.slot.Owned() {
+		return ErrInvalidOp
+	}
 	if err := r.link.enterRx(); err != nil {
 		return err
 	}
 	defer r.link.exitRx()
+	r.done = true
 	if !r.slot.Release() {
 		return ErrInvalidOp
 	}
-	r.done = true
 	return nil
 }
 
@@ -147,6 +162,9 @@ func (r *StandardReadReservation) Release() error {
 //
 // WARNING: Commit or Abort must be called promptly on the returned reservation;
 // otherwise the whole direction can suffer head-of-line (HOL) blocking.
+//
+// Close must not be called while a reservation is active: finish it with
+// Commit or Abort first. Its buffer is invalid once Close has run.
 func (l *StandardLink) ReserveWrite() (StandardWriteReservation, error) {
 	if err := l.enterTx(true); err != nil {
 		return StandardWriteReservation{}, err
@@ -166,55 +184,43 @@ func (l *StandardLink) ReserveWrite() (StandardWriteReservation, error) {
 	}, nil
 }
 
-// ReserveRead reserves one readable payload buffer. Tombstones are skipped;
-// Advanced Protocol frames are discarded with ErrUnexpectedPacket.
+// ReserveRead reserves one readable payload buffer. If a previous Read left
+// the tail of a message queued, the reservation serves the oldest queued tail
+// (all of it) instead of a new message. Tombstones are skipped; Advanced
+// Protocol frames are discarded with ErrUnexpectedPacket.
 //
 // WARNING: Release must be called promptly on the returned reservation;
 // otherwise the whole direction can suffer head-of-line (HOL) blocking.
+//
+// Close must not be called while a reservation is active: Release it first.
+// Its buffer is invalid once Close has run.
 func (l *StandardLink) ReserveRead() (StandardReadReservation, error) {
-	if view, backing, ok := l.recv.take(); ok {
-		return StandardReadReservation{link: l, buffer: view, backing: backing, local: true}, nil
-	}
 	if err := l.enterRx(); err != nil {
 		return StandardReadReservation{}, err
 	}
 	defer l.exitRx()
 
+	if view, backing, ok := l.recv.take(); ok {
+		return StandardReadReservation{link: l, buffer: view, backing: backing, local: true}, nil
+	}
 	for {
-		c := mpmc.Cancel{Closed: l.closeCh, DeadlineFunc: l.readDeadlineFn, Check: l.checkFn}
-		slot, err := l.rxRing.ReserveConsumerCancel(&c)
-		if err == ErrPeerClosed || err == ErrPeerGone {
-			if s, retryErr := l.rxRing.ReserveConsumerCancel(&mpmc.Cancel{NoWait: true}); retryErr == nil {
-				slot, err = s, nil
-			}
-		}
+		slot, err := l.reserveRx()
 		if err != nil {
-			return StandardReadReservation{}, mapWaitErr(err)
+			return StandardReadReservation{}, err
 		}
-
-		p := slot.Value()
-		switch p.Op() {
-		case protocol.OpStandardLinkTombstone:
-			slot.Release()
-			continue
-		case protocol.OpStandardLinkCopy:
-			size := int(p.Operand(2))
-			if size <= 0 || size > l.bufferSize {
-				slot.Release()
-				return StandardReadReservation{}, ErrInvalidSize
-			}
-			return StandardReadReservation{
-				slot:   slot,
-				link:   l,
-				buffer: l.rxBufs[slot.Slot()][:size:size],
-			}, nil
-		case protocol.OpError:
-			err := errorFromCode(ErrorCode(p.Operand(1)))
+		size, err := l.classify(slot.Value())
+		if err != nil {
 			slot.Release()
 			return StandardReadReservation{}, err
-		default:
-			slot.Release()
-			return StandardReadReservation{}, ErrUnexpectedPacket
 		}
+		if size == 0 {
+			slot.Release()
+			continue
+		}
+		return StandardReadReservation{
+			slot:   slot,
+			link:   l,
+			buffer: l.rxBufs[slot.Slot()][:size:size],
+		}, nil
 	}
 }

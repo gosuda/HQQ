@@ -1,6 +1,7 @@
 package hqq
 
 import (
+	"context"
 	"time"
 
 	"gosuda.org/hqq/internal/mpmc"
@@ -82,11 +83,19 @@ type LinkOptions struct {
 
 	// PeerTimeout is how long the peer's heartbeat may stall before blocking
 	// calls fail with ErrPeerGone. It is raised to at least four peer
-	// heartbeat intervals. Zero selects DefaultPeerTimeout.
+	// heartbeat intervals. It also sets how long an endpoint that is
+	// initializing a segment may show no progress before a creator or a
+	// caller-owned-memory endpoint takes the initialization over (at least
+	// 2 seconds; openers of a named segment never take over). Zero selects
+	// DefaultPeerTimeout.
 	PeerTimeout time.Duration
 
-	// AttachTimeout bounds how long Open waits for another endpoint that is
-	// initializing the segment. Zero selects DefaultAttachTimeout.
+	// AttachTimeout bounds how long opening waits for another endpoint that
+	// is initializing the segment, and how long an opener of a named segment
+	// waits for its creator to claim a segment the creator has not
+	// initialized yet. An opener never initializes a segment itself: after
+	// AttachTimeout it fails with an error matching ErrFailedInit (Dial
+	// retries it). Zero selects DefaultAttachTimeout.
 	AttachTimeout time.Duration
 
 	// parkers, set by the named-segment constructors on platforms whose
@@ -94,6 +103,27 @@ type LinkOptions struct {
 	// the cross-process wake objects of ring 0 and ring 1. Nil entries keep
 	// the in-memory wait words.
 	parkers [2]mpmc.Parker
+
+	// role, set by the named-segment constructors, tells how this endpoint
+	// reached the segment (see attachRole). The zero value is for
+	// caller-owned memory.
+	role attachRole
+
+	// creatorToken, set by the named-segment constructors for a creating
+	// endpoint, is stored in the superblock when this endpoint initializes
+	// the segment. It identifies the instance that owns the name (see
+	// namedMapping).
+	creatorToken uint64
+
+	// ctx, set by Dial and Listen, bounds the wait for the segment to
+	// become usable (claiming it and attaching its rings). The link does
+	// not keep it.
+	ctx context.Context
+
+	// initStale overrides how long an initializer may show no progress
+	// before it is taken over (see initStaleWindow). Zero selects the
+	// default; tests shorten it.
+	initStale time.Duration
 }
 
 func (o LinkOptions) normalized() LinkOptions {

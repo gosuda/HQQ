@@ -155,12 +155,12 @@ type semaphore struct {
 }
 
 // createSemaphore creates the semaphore name with sa, or opens it if it
-// already exists. The semaphore starts without tokens and holds up to
-// math.MaxInt32.
-func createSemaphore(sa *syscall.SecurityAttributes, name string) (*semaphore, error) {
+// already exists, in which case alreadyExists is true. The semaphore starts
+// without tokens and holds up to math.MaxInt32.
+func createSemaphore(sa *syscall.SecurityAttributes, name string) (sem *semaphore, alreadyExists bool, err error) {
 	p, err := syscall.UTF16PtrFromString(name)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	ret, _, err := _CreateSemaphoreW.Call(
 		uintptr(unsafe.Pointer(sa)),
@@ -174,9 +174,11 @@ func createSemaphore(sa *syscall.SecurityAttributes, name string) (*semaphore, e
 		if err == syscall.Errno(0) {
 			err = syscall.EINVAL
 		}
-		return nil, err
+		return nil, false, err
 	}
-	return &semaphore{handle: syscall.Handle(ret)}, nil
+	// CreateSemaphoreW succeeds with ERROR_ALREADY_EXISTS when it opened an
+	// existing semaphore instead of creating one.
+	return &semaphore{handle: syscall.Handle(ret)}, err == ERROR_ALREADY_EXISTS, nil
 }
 
 // openSemaphore opens the existing semaphore name for waiting and releasing.
@@ -253,6 +255,10 @@ func closeSemaphores(sems *[SemaphoreCount]Semaphore) error {
 // ErrInvalidName. A creator makes the semaphores before the mapping, so that
 // every endpoint that can open the mapping finds them.
 //
+// With os.O_EXCL, creation fails with an error matching os.ErrExist when the
+// mapping name or any of its semaphore names already exists, which always
+// means that some process holds a live handle to it.
+//
 // When creating, mode is translated to a DACL (Windows has no Unix modes):
 //
 //   - SYSTEM always gets full access.
@@ -316,11 +322,16 @@ func (s *SharedMemory) create(objectName string, size, flags int, mode os.FileMo
 		}
 	}()
 	for i, suffix := range semaphoreSuffixes {
-		sem, err := createSemaphore(&semaphoreSD.attrs, objectName+suffix)
-		if err != nil {
-			return &os.PathError{Op: "CreateSemaphore", Path: s.name, Err: err}
+		sem, existed, serr := createSemaphore(&semaphoreSD.attrs, objectName+suffix)
+		if serr != nil {
+			return &os.PathError{Op: "CreateSemaphore", Path: s.name, Err: serr}
 		}
 		s.sems[i] = sem
+		if existed && flags&os.O_EXCL != 0 {
+			// A live handle to the name's semaphore exists: the name is in
+			// use. The deferred cleanup closes the handles opened so far.
+			return &os.PathError{Op: "CreateSemaphore", Path: s.name, Err: os.ErrExist}
+		}
 	}
 
 	fd, alreadyExists, err := nsCreateFileMapping(
@@ -364,9 +375,9 @@ func (s *SharedMemory) open(objectName string, flags int) (err error) {
 		}
 	}()
 	for i, suffix := range semaphoreSuffixes {
-		sem, err := openSemaphore(objectName + suffix)
-		if err != nil {
-			return &os.PathError{Op: "OpenSemaphore", Path: s.name, Err: err}
+		sem, serr := openSemaphore(objectName + suffix)
+		if serr != nil {
+			return &os.PathError{Op: "OpenSemaphore", Path: s.name, Err: serr}
 		}
 		s.sems[i] = sem
 	}
@@ -400,6 +411,18 @@ func Unlink(name string) error {
 // Delete is a no-op on Windows; see Unlink.
 func (s *SharedMemory) Delete() error {
 	return nil
+}
+
+// NamesPersist is false on Windows: a name exists exactly as long as a handle
+// to its mapping or semaphores is open, so a name never outlives its users.
+// An existing name therefore always means a live handle somewhere, and
+// creating over it with os.O_EXCL fails with os.ErrExist.
+const NamesPersist = false
+
+// NameRefersToSelf is not needed on Windows (Delete is a no-op): known is
+// always false.
+func (s *SharedMemory) NameRefersToSelf() (known, same bool, err error) {
+	return false, false, nil
 }
 
 // sectionBasicInformation is SECTION_BASIC_INFORMATION from winternl.h.

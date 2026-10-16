@@ -9,6 +9,10 @@ import (
 	"unsafe"
 )
 
+// NamesPersist reports whether names outlive their handles on this platform,
+// so that a name left behind needs Unlink (everywhere except Windows).
+const NamesPersist = true
+
 // maxNameLen is the platform limit for shm_open names. macOS rejects names
 // longer than PSHMNAMLEN (31) bytes; FreeBSD allows up to PATH_MAX.
 var maxNameLen = func() int {
@@ -73,6 +77,11 @@ func shmUnlink(name string) error {
 
 // OpenSharedMemory opens or creates the shared memory object name. flags are
 // os.O_* flags; when os.O_CREATE is set the object is sized to size bytes.
+//
+// A created object is sized with ftruncate, which does not reserve storage
+// (unlike the Linux fallocate path), and the name is opened without
+// O_NOFOLLOW or a file-type check: shm_open names are not file system paths
+// and cannot be symbolic links.
 // The descriptor is close-on-exec.
 func OpenSharedMemory(name string, size int, flags int, mode os.FileMode) (*SharedMemory, error) {
 	full, err := posixName(name)
@@ -107,6 +116,19 @@ func Unlink(name string) error {
 		return &os.PathError{Op: "shm_unlink", Path: name, Err: err}
 	}
 	return nil
+}
+
+// NameRefersToSelf reports that macOS and FreeBSD offer no way to compare the
+// object behind a shm name with an open descriptor (shm_open names have no
+// inode identity visible to user space): known is always false. Callers
+// must identify their object some other way, for example by a token stored
+// in the object itself.
+//
+// Allocation is unchanged from POSIX: a created object is sized with
+// ftruncate, which does not reserve storage (macOS does not support
+// fallocate or posix_fallocate on shm objects).
+func (s *SharedMemory) NameRefersToSelf() (known, same bool, err error) {
+	return false, false, nil
 }
 
 // Delete removes the shared memory object's name.

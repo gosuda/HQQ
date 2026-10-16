@@ -14,6 +14,8 @@ import (
 	"testing"
 	"time"
 	"unsafe"
+
+	"gosuda.org/hqq/internal/protocol"
 )
 
 // fastLiveness makes peer failures observable within a fraction of a second.
@@ -26,11 +28,11 @@ var fastLiveness = LinkOptions{
 func newMemoryPair(t testing.TB, bufferCount, bufferSize int, opts LinkOptions) ([]byte, *StandardLink, *StandardLink) {
 	t.Helper()
 	mem := AlignedBuffer(SizeStandardLink(bufferCount, bufferSize))
-	primary, err := OpenStandardLinkMemory(mem, bufferCount, bufferSize, opts)
+	primary, err := NewStandardLink(mem, bufferCount, bufferSize, opts)
 	if err != nil {
 		t.Fatalf("open primary: %v", err)
 	}
-	secondary, err := OpenStandardLinkMemory(mem, bufferCount, bufferSize, opts)
+	secondary, err := NewStandardLink(mem, bufferCount, bufferSize, opts)
 	if err != nil {
 		primary.Close()
 		t.Fatalf("open secondary: %v", err)
@@ -40,6 +42,58 @@ func newMemoryPair(t testing.TB, bufferCount, bufferSize int, opts LinkOptions) 
 		primary.Close()
 	})
 	return mem, primary, secondary
+}
+
+// newTestStandardLink opens a single StandardLink endpoint on fresh in-process
+// memory; it is closed when the test ends.
+func newTestStandardLink(t testing.TB, bufferCount, bufferSize int, opts LinkOptions) *StandardLink {
+	t.Helper()
+	link, err := NewStandardLink(AlignedBuffer(SizeStandardLink(bufferCount, bufferSize)), bufferCount, bufferSize, opts)
+	if err != nil {
+		t.Fatalf("NewStandardLink: %v", err)
+	}
+	t.Cleanup(func() { link.Close() })
+	return link
+}
+
+// newTestAdvancedLink opens a single, not yet negotiated AdvancedLink
+// endpoint on fresh in-process memory; it is closed when the test ends.
+func newTestAdvancedLink(t testing.TB, bufferCount, bufferSize int, opts AdvancedOptions) *AdvancedLink {
+	t.Helper()
+	link, err := NewAdvancedLink(AlignedBuffer(SizeStandardLink(bufferCount, bufferSize)), bufferCount, bufferSize, opts)
+	if err != nil {
+		t.Fatalf("NewAdvancedLink: %v", err)
+	}
+	t.Cleanup(func() { link.Close() })
+	return link
+}
+
+// newAdvancedPair opens a Primary and a Secondary AdvancedLink on shared
+// in-process memory with default options. The links are not negotiated and
+// are closed when the test ends.
+func newAdvancedPair(t testing.TB, bufferCount, bufferSize int) (primary, secondary *AdvancedLink) {
+	t.Helper()
+	return newAdvancedPairWithOptions(t, bufferCount, bufferSize, AdvancedOptions{}, AdvancedOptions{})
+}
+
+// newAdvancedPairWithOptions is newAdvancedPair with per-endpoint options.
+func newAdvancedPairWithOptions(t testing.TB, bufferCount, bufferSize int, primaryOpts, secondaryOpts AdvancedOptions) (primary, secondary *AdvancedLink) {
+	t.Helper()
+	mem := AlignedBuffer(SizeStandardLink(bufferCount, bufferSize))
+	primary, err := NewAdvancedLink(mem, bufferCount, bufferSize, primaryOpts)
+	if err != nil {
+		t.Fatalf("open primary: %v", err)
+	}
+	secondary, err = NewAdvancedLink(mem, bufferCount, bufferSize, secondaryOpts)
+	if err != nil {
+		primary.Close()
+		t.Fatalf("open secondary: %v", err)
+	}
+	t.Cleanup(func() {
+		secondary.Close()
+		primary.Close()
+	})
+	return primary, secondary
 }
 
 // simulateCrash stops an endpoint's heartbeat without detaching it, which is
@@ -115,14 +169,14 @@ func TestStandardLinkCloseWakesBlockedWrite(t *testing.T) {
 // the shared memory while another goroutine is still inside the ring.
 func TestNamedLinkCloseWithBlockedReadIsSafe(t *testing.T) {
 	name := newPortableSharedMemoryName()
-	primary, err := CreateStandardLink(name, 4, 64, 0o600)
+	primary, err := CreateStandardLink(name, 4, 64, 0o600, LinkOptions{})
 	if err != nil {
 		t.Fatalf("CreateStandardLink: %v", err)
 	}
 	defer primary.Close()
-	secondary, err := OpenNamedStandardLink(name, 4, 64)
+	secondary, err := OpenStandardLink(name, 4, 64, LinkOptions{})
 	if err != nil {
-		t.Fatalf("OpenNamedStandardLink: %v", err)
+		t.Fatalf("OpenStandardLink: %v", err)
 	}
 
 	errCh := make(chan error, 4)
@@ -189,7 +243,7 @@ func TestPeerGoneAfterCrash(t *testing.T) {
 
 func TestPeerNotConnectedDoesNotFailReads(t *testing.T) {
 	mem := AlignedBuffer(SizeStandardLink(4, 64))
-	primary, err := OpenStandardLinkMemory(mem, 4, 64, fastLiveness)
+	primary, err := NewStandardLink(mem, 4, 64, fastLiveness)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -213,7 +267,7 @@ func TestStaleSegmentIsReinitialized(t *testing.T) {
 	simulateCrash(secondary)
 	time.Sleep(200 * time.Millisecond)
 
-	fresh, err := OpenStandardLinkMemory(mem, 4, 64, fastLiveness)
+	fresh, err := NewStandardLink(mem, 4, 64, fastLiveness)
 	if err != nil {
 		t.Fatalf("open over stale segment: %v", err)
 	}
@@ -224,7 +278,7 @@ func TestStaleSegmentIsReinitialized(t *testing.T) {
 	if fresh.epoch != oldEpoch+1 {
 		t.Fatalf("epoch = %d, want %d", fresh.epoch, oldEpoch+1)
 	}
-	peer, err := OpenStandardLinkMemory(mem, 4, 64, fastLiveness)
+	peer, err := NewStandardLink(mem, 4, 64, fastLiveness)
 	if err != nil {
 		t.Fatalf("attach to re-initialized segment: %v", err)
 	}
@@ -252,11 +306,11 @@ func TestStaleSegmentIsReinitialized(t *testing.T) {
 func TestGracefullyClosedSegmentIsReusable(t *testing.T) {
 	mem := AlignedBuffer(SizeStandardLink(4, 64))
 	for round := 0; round < 3; round++ {
-		a, err := OpenStandardLinkMemory(mem, 4, 64, LinkOptions{})
+		a, err := NewStandardLink(mem, 4, 64, LinkOptions{})
 		if err != nil {
 			t.Fatalf("round %d open a: %v", round, err)
 		}
-		b, err := OpenStandardLinkMemory(mem, 4, 64, LinkOptions{})
+		b, err := NewStandardLink(mem, 4, 64, LinkOptions{})
 		if err != nil {
 			t.Fatalf("round %d open b: %v", round, err)
 		}
@@ -278,31 +332,35 @@ func TestGracefullyClosedSegmentIsReusable(t *testing.T) {
 
 func TestThirdEndpointGetsLinkBusy(t *testing.T) {
 	mem, _, _ := newMemoryPair(t, 4, 64, LinkOptions{})
-	_, err := OpenStandardLinkMemory(mem, 4, 64, LinkOptions{})
+	_, err := NewStandardLink(mem, 4, 64, LinkOptions{})
 	if !errors.Is(err, ErrLinkBusy) || !errors.Is(err, ErrFailedInit) {
 		t.Fatalf("third endpoint = %v, want ErrLinkBusy", err)
 	}
 }
 
-func TestOpenStandardLinkMemoryValidation(t *testing.T) {
+func TestNewStandardLinkValidation(t *testing.T) {
 	size := SizeStandardLink(4, 64)
 	mem := AlignedBuffer(size + pagesize)
-	if _, err := OpenStandardLinkMemory(mem[:size-1], 4, 64, LinkOptions{}); err != ErrMemorySmall {
+	if _, err := NewStandardLink(mem[:size-1], 4, 64, LinkOptions{}); err != ErrMemorySmall {
 		t.Fatalf("short memory = %v, want ErrMemorySmall", err)
 	}
-	if _, err := OpenStandardLinkMemory(mem[1:], 4, 64, LinkOptions{}); err != ErrMemoryAlign {
+	if _, err := NewStandardLink(mem[1:], 4, 64, LinkOptions{}); err != ErrMemoryAlign {
 		t.Fatalf("misaligned memory = %v, want ErrMemoryAlign", err)
 	}
-	if _, err := OpenStandardLinkMemory(mem, 4, 12, LinkOptions{}); err != ErrInvalidSize {
+	if _, err := NewStandardLink(mem, 4, 12, LinkOptions{}); err != ErrInvalidSize {
 		t.Fatalf("unaligned bufferSize = %v, want ErrInvalidSize", err)
 	}
-	if _, err := OpenStandardLinkMemory(nil, 4, 64, LinkOptions{}); err != ErrMemorySmall {
+	if _, err := NewStandardLink(nil, 4, 64, LinkOptions{}); err != ErrMemorySmall {
 		t.Fatalf("nil memory = %v, want ErrMemorySmall", err)
 	}
-	backing, offset := createAlignedBuffer(t, size)
-	defer func() { _ = backing }()
-	if _, err := OpenStandardLink(offset, 4, 12); err != ErrInvalidSize {
-		t.Fatalf("OpenStandardLink unaligned bufferSize = %v, want ErrInvalidSize", err)
+	if _, err := NewAdvancedLink(mem[:size-1], 4, 64, AdvancedOptions{}); err != ErrMemorySmall {
+		t.Fatalf("advanced short memory = %v, want ErrMemorySmall", err)
+	}
+	if _, err := NewAdvancedLink(mem[1:], 4, 64, AdvancedOptions{}); err != ErrMemoryAlign {
+		t.Fatalf("advanced misaligned memory = %v, want ErrMemoryAlign", err)
+	}
+	if _, err := NewAdvancedLink(mem, 4, 12, AdvancedOptions{}); err != ErrInvalidSize {
+		t.Fatalf("advanced unaligned bufferSize = %v, want ErrInvalidSize", err)
 	}
 }
 
@@ -453,17 +511,17 @@ func TestPartialReadRemainderReusesBuffer(t *testing.T) {
 
 func TestStandardReadsRejectAdvancedFrames(t *testing.T) {
 	mem := AlignedBuffer(SizeStandardLink(8, 16))
-	adv, err := NewAdvancedLinkMemory(mem, 8, 16, AdvancedOptions{})
+	adv, err := NewAdvancedLink(mem, 8, 16, AdvancedOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer adv.Close()
-	std, err := OpenStandardLinkMemory(mem, 8, 16, LinkOptions{})
+	std, err := NewStandardLink(mem, 8, 16, LinkOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer std.Close()
-	adv.setNegotiated(CurrentProtocolVersion, supportedFeatures, 0)
+	adv.setNegotiated(CurrentProtocolVersion(), supportedFeatures)
 
 	ctx := context.Background()
 	for _, read := range []func() error{
@@ -490,20 +548,7 @@ func TestStandardReadsRejectAdvancedFrames(t *testing.T) {
 
 func newNegotiatedPair(t testing.TB, bufferCount, bufferSize int, primaryOpts, secondaryOpts AdvancedOptions) (*AdvancedLink, *AdvancedLink) {
 	t.Helper()
-	mem := AlignedBuffer(SizeStandardLink(bufferCount, bufferSize))
-	primary, err := NewAdvancedLinkMemory(mem, bufferCount, bufferSize, primaryOpts)
-	if err != nil {
-		t.Fatal(err)
-	}
-	secondary, err := NewAdvancedLinkMemory(mem, bufferCount, bufferSize, secondaryOpts)
-	if err != nil {
-		primary.Close()
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		secondary.Close()
-		primary.Close()
-	})
+	primary, secondary := newAdvancedPairWithOptions(t, bufferCount, bufferSize, primaryOpts, secondaryOpts)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	errCh := make(chan error, 2)
@@ -520,8 +565,8 @@ func newNegotiatedPair(t testing.TB, bufferCount, bufferSize int, primaryOpts, s
 func TestNegotiateChoosesRolesAutomatically(t *testing.T) {
 	primary, secondary := newNegotiatedPair(t, 8, 32, AdvancedOptions{}, AdvancedOptions{})
 	for _, l := range []*AdvancedLink{primary, secondary} {
-		if l.GetProtocolState() != ProtocolStateNegotiated || !l.IsLargeCopyEnabled() || !l.IsRequestResponseEnabled() {
-			t.Fatalf("%v: state=%v features=%#x", l.Mode(), l.GetProtocolState(), l.GetNegotiatedFeatures())
+		if l.ProtocolState() != ProtocolStateNegotiated || l.NegotiatedFeatures()&FeatureLargeCopy == 0 || l.NegotiatedFeatures()&FeatureRequestResponse == 0 {
+			t.Fatalf("%v: state=%v features=%#x", l.Mode(), l.ProtocolState(), l.NegotiatedFeatures())
 		}
 	}
 	if err := primary.Negotiate(context.Background(), 0); !errors.Is(err, ErrAlreadyNegotiated) {
@@ -536,11 +581,7 @@ func TestNegotiateChoosesRolesAutomatically(t *testing.T) {
 }
 
 func TestNegotiateFeatureIntersection(t *testing.T) {
-	mem := AlignedBuffer(SizeStandardLink(8, 32))
-	primary, _ := NewAdvancedLinkMemory(mem, 8, 32, AdvancedOptions{})
-	secondary, _ := NewAdvancedLinkMemory(mem, 8, 32, AdvancedOptions{})
-	defer primary.Close()
-	defer secondary.Close()
+	primary, secondary := newAdvancedPair(t, 8, 32)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	errCh := make(chan error, 1)
@@ -551,26 +592,86 @@ func TestNegotiateFeatureIntersection(t *testing.T) {
 	if err := <-errCh; err != nil {
 		t.Fatal(err)
 	}
-	if primary.IsRequestResponseEnabled() || !primary.IsLargeCopyEnabled() {
-		t.Fatalf("negotiated features = %#x, want only FeatureLargeCopy", primary.GetNegotiatedFeatures())
+	if primary.NegotiatedFeatures()&FeatureRequestResponse != 0 || primary.NegotiatedFeatures()&FeatureLargeCopy == 0 {
+		t.Fatalf("negotiated features = %#x, want only FeatureLargeCopy", primary.NegotiatedFeatures())
 	}
 	if _, err := primary.Call(ctx, 1, nil); !errors.Is(err, ErrNotNegotiated) {
 		t.Fatalf("Call without FeatureRequestResponse = %v, want ErrNotNegotiated", err)
 	}
 }
 
+// The negotiation packets still carry a capability word (operand 2) for wire
+// compatibility: it is always sent as zero and ignored when received.
+func TestNegotiationCapabilityWordIsZeroAndIgnored(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	const forged = ^uint64(0)
+
+	t.Run("request and ack send zero", func(t *testing.T) {
+		primary, secondary := newAdvancedPair(t, 8, 32)
+		errCh := make(chan error, 1)
+		go func() { errCh <- primary.Negotiate(ctx, 0) }()
+		request, err := secondary.recvPacket(ctx)
+		if err != nil || request.Op() != protocol.OpProtoNegotiate {
+			t.Fatalf("recv request = %v, %v", request.Op(), err)
+		}
+		if got := request.Operand(2); got != 0 {
+			t.Fatalf("request capability word = %#x, want 0", got)
+		}
+		if ok, err := secondary.answerNegotiation(ctx, request, supportedFeatures); err != nil || !ok {
+			t.Fatalf("answerNegotiation = %v, %v", ok, err)
+		}
+		if err := <-errCh; err != nil {
+			t.Fatalf("Negotiate: %v", err)
+		}
+	})
+
+	t.Run("nonzero request capabilities are ignored", func(t *testing.T) {
+		primary, secondary := newAdvancedPair(t, 8, 32)
+		request := protocol.NewPacket(protocol.OpProtoNegotiate, CurrentProtocolVersion().encode(), supportedFeatures, forged)
+		if err := primary.sendPacket(ctx, request); err != nil {
+			t.Fatal(err)
+		}
+		if ok, err := secondary.WaitForNegotiation(ctx); err != nil || !ok {
+			t.Fatalf("WaitForNegotiation = %v, %v", ok, err)
+		}
+		ack, err := primary.recvPacket(ctx)
+		if err != nil || ack.Op() != protocol.OpProtoAck {
+			t.Fatalf("recv ack = %v, %v", ack.Op(), err)
+		}
+		if got := ack.Operand(2); got != 0 {
+			t.Fatalf("ack capability word = %#x, want 0", got)
+		}
+	})
+
+	t.Run("nonzero ack capabilities are ignored", func(t *testing.T) {
+		primary, secondary := newAdvancedPair(t, 8, 32)
+		errCh := make(chan error, 1)
+		go func() { errCh <- primary.Negotiate(ctx, 0) }()
+		if _, err := secondary.recvPacket(ctx); err != nil {
+			t.Fatal(err)
+		}
+		ack := protocol.NewPacket(protocol.OpProtoAck, CurrentProtocolVersion().encode(), supportedFeatures, forged)
+		if err := secondary.sendPacket(ctx, ack); err != nil {
+			t.Fatal(err)
+		}
+		if err := <-errCh; err != nil {
+			t.Fatalf("Negotiate with a nonzero ack capability word: %v", err)
+		}
+		if got := primary.NegotiatedFeatures(); got != supportedFeatures {
+			t.Fatalf("NegotiatedFeatures = %#x, want %#x", got, supportedFeatures)
+		}
+	})
+}
+
 func TestSimultaneousNegotiateProtocolDoesNotDeadlock(t *testing.T) {
-	mem := AlignedBuffer(SizeStandardLink(8, 32))
-	primary, _ := NewAdvancedLinkMemory(mem, 8, 32, AdvancedOptions{})
-	secondary, _ := NewAdvancedLinkMemory(mem, 8, 32, AdvancedOptions{})
-	defer primary.Close()
-	defer secondary.Close()
+	primary, secondary := newAdvancedPair(t, 8, 32)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	errCh := make(chan error, 2)
 	for _, l := range []*AdvancedLink{primary, secondary} {
 		go func(l *AdvancedLink) {
-			ok, err := l.NegotiateProtocol(ctx, CurrentProtocolVersion, supportedFeatures)
+			ok, err := l.NegotiateProtocol(ctx, CurrentProtocolVersion(), supportedFeatures)
 			if err == nil && !ok {
 				err = errors.New("negotiation not ok")
 			}
@@ -622,7 +723,7 @@ func TestCanceledCallLateResponseIsDiscarded(t *testing.T) {
 	if msg, err := client.Receive(recvCtx); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("Receive got %+v, %v; the late response must be discarded", msg, err)
 	}
-	if got := client.GetAdvancedStats().AbandonedResponses; got != 1 {
+	if got := client.Stats().AbandonedResponses; got != 1 {
 		t.Fatalf("AbandonedResponses = %d, want 1", got)
 	}
 }
@@ -647,7 +748,7 @@ func TestOverflowDropKeepsResponsesFlowing(t *testing.T) {
 	if err != nil || string(resp) != "answer" {
 		t.Fatalf("Call = %q, %v", resp, err)
 	}
-	if got := client.GetAdvancedStats().DroppedMessages; got != 2 {
+	if got := client.Stats().DroppedMessages; got != 2 {
 		t.Fatalf("DroppedMessages = %d, want 2", got)
 	}
 	msg, err := client.Receive(ctx)
@@ -677,7 +778,7 @@ func TestMuxServe(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
-	var messages atomic.Int32
+	messages := make(chan []byte, 4)
 	mux := NewMux()
 	mux.HandleFunc(1, func(_ context.Context, req AdvancedMessage) ([]byte, error) {
 		return append([]byte("echo:"), req.Payload...), nil
@@ -688,7 +789,7 @@ func TestMuxServe(t *testing.T) {
 	mux.HandleFunc(3, func(context.Context, AdvancedMessage) ([]byte, error) {
 		return nil, errors.New("boom")
 	})
-	mux.OnMessage = func(context.Context, AdvancedMessage) { messages.Add(1) }
+	mux.OnMessage = func(_ context.Context, m AdvancedMessage) { messages <- m.Payload }
 
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- server.Serve(ctx, mux) }()
@@ -728,14 +829,22 @@ func TestMuxServe(t *testing.T) {
 	if _, err := client.SendLarge(ctx, 0, []byte("note")); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(50 * time.Millisecond)
-	if messages.Load() != 1 {
-		t.Fatalf("OnMessage called %d times, want 1", messages.Load())
+	select {
+	case payload := <-messages:
+		if string(payload) != "note" {
+			t.Fatalf("OnMessage payload = %q, want %q", payload, "note")
+		}
+	case <-ctx.Done():
+		t.Fatal("OnMessage was not called")
 	}
 
 	client.Close()
 	if err := waitErr(t, serveErr, 2*time.Second); err != nil {
 		t.Fatalf("Serve after peer Close = %v, want nil", err)
+	}
+	// Serve calls OnMessage inline and has returned: the count is final.
+	if len(messages) != 0 {
+		t.Fatalf("OnMessage called %d more times, want exactly once", len(messages))
 	}
 }
 
@@ -775,13 +884,13 @@ func TestListenDial(t *testing.T) {
 	if err != nil || !bytes.Equal(resp, bytes.ToUpper(payload)) {
 		t.Fatalf("Call = %d bytes, %v", len(resp), err)
 	}
-	if _, err := Listen(ctx, name, cfg); !errors.Is(err, os.ErrExist) {
-		t.Fatalf("second Listen = %v, want os.ErrExist", err)
+	if _, err := Listen(ctx, name, cfg); !errors.Is(err, ErrLinkBusy) {
+		t.Fatalf("second Listen while the first is alive = %v, want ErrLinkBusy", err)
 	}
 
 	client.Close()
 	server.Close()
-	if _, err := OpenNamedAdvancedLink(name, 16, 64); err == nil {
+	if _, err := OpenAdvancedLink(name, 16, 64, AdvancedOptions{}); err == nil {
 		t.Fatal("segment name still exists after the listener closed")
 	}
 }
@@ -797,7 +906,7 @@ func TestDialTimesOutWithoutListener(t *testing.T) {
 func TestDialFailsFastOnIncompatibleLayout(t *testing.T) {
 	name := newPortableSharedMemoryName()
 	cfg := Config{BufferCount: 16, BufferSize: 64}
-	link, err := CreateAdvancedLink(name, cfg.BufferCount, cfg.BufferSize, 0o600)
+	link, err := CreateAdvancedLink(name, cfg.BufferCount, cfg.BufferSize, 0o600, AdvancedOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -818,7 +927,7 @@ func TestDialFailsFastOnIncompatibleLayout(t *testing.T) {
 
 func TestConcurrentNamedCloseAndUnlink(t *testing.T) {
 	name := newPortableSharedMemoryName()
-	link, err := CreateStandardLink(name, 4, 64, 0o600)
+	link, err := CreateStandardLink(name, 4, 64, 0o600, LinkOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -836,14 +945,14 @@ func TestConcurrentNamedCloseAndUnlink(t *testing.T) {
 		}()
 	}
 	wg.Wait()
-	if _, err := OpenNamedStandardLink(name, 4, 64); err == nil {
+	if _, err := OpenStandardLink(name, 4, 64, LinkOptions{}); err == nil {
 		t.Fatal("segment name still exists after Close")
 	}
 }
 
 func TestUnlinkRemovesStaleName(t *testing.T) {
 	name := newPortableSharedMemoryName()
-	link, err := CreateStandardLink(name, 4, 64, 0o600)
+	link, err := CreateStandardLink(name, 4, 64, 0o600, LinkOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -851,18 +960,32 @@ func TestUnlinkRemovesStaleName(t *testing.T) {
 	link.unlinkOnClose = false
 	link.Close()
 
-	// On Windows the mapping died with its last handle, so this create
-	// succeeds; close it, or the leaked handle keeps the name alive.
-	if dup, err := CreateStandardLink(name, 4, 64, 0o600); err == nil {
-		dup.Close()
-		if !isWindows() {
-			t.Fatal("CreateStandardLink succeeded over an existing name")
-		}
+	// Both endpoints of the left-behind segment are gone, so creating over
+	// the name reuses it (on Windows the name died with its last handle and
+	// this is a plain create).
+	reused, err := CreateStandardLink(name, 4, 64, 0o600, LinkOptions{})
+	if err != nil {
+		t.Fatalf("CreateStandardLink over a dead segment: %v", err)
 	}
+	if reused.Mode() != LinkModePrimary {
+		t.Fatalf("mode after reuse = %v, want primary", reused.Mode())
+	}
+	reused.Close()
+	if _, err := OpenStandardLink(name, 4, 64, LinkOptions{}); err == nil {
+		t.Fatal("name still exists after the reusing creator closed")
+	}
+
+	// Left behind once more: standalone Unlink removes it.
+	link, err = CreateStandardLink(name, 4, 64, 0o600, LinkOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	link.unlinkOnClose = false
+	link.Close()
 	if err := Unlink(name); err != nil && !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("Unlink: %v", err)
 	}
-	again, err := CreateStandardLink(name, 4, 64, 0o600)
+	again, err := CreateStandardLink(name, 4, 64, 0o600, LinkOptions{})
 	if err != nil {
 		t.Fatalf("CreateStandardLink after Unlink: %v", err)
 	}
@@ -871,7 +994,7 @@ func TestUnlinkRemovesStaleName(t *testing.T) {
 
 func TestInvalidSharedMemoryNames(t *testing.T) {
 	for _, name := range []string{"", "/", "..", "/../etc/passwd", "a/b", "a\\b", "x\x00y"} {
-		if _, err := CreateStandardLink(name, 4, 64, 0o600); !errors.Is(err, ErrInvalidName) {
+		if _, err := CreateStandardLink(name, 4, 64, 0o600, LinkOptions{}); !errors.Is(err, ErrInvalidName) {
 			t.Errorf("CreateStandardLink(%q) = %v, want ErrInvalidName", name, err)
 		}
 	}
@@ -898,8 +1021,8 @@ func TestErrorCompatibility(t *testing.T) {
 			t.Errorf("errors.Is(%v, %v) = false", c.err, c.base)
 		}
 	}
-	if err := errorFromCode(0x99); err == nil || !strings.Contains(err.Error(), "0x99") {
-		t.Errorf("unknown error code = %v", err)
+	if err := errorFromCode(0x99); !errors.Is(err, ErrProtocol) || !strings.Contains(err.Error(), "0x99") {
+		t.Errorf("unknown error code = %v, want ErrProtocol naming 0x99", err)
 	}
 }
 

@@ -53,7 +53,7 @@ jobs:
         run: go test ./... -count=1 -timeout=90s
 
       - name: Run multi-process and lifecycle tests
-        run: go test . -run 'TestMultiProcess|TestPeer|TestCreateLink|TestThirdEndpoint|TestLargeMessageThresholdAPI' -count=2 -v -timeout=120s
+        run: go test . -run 'TestMultiProcess|TestPeer|TestThirdEndpoint|TestListenDial|TestOpener|TestCloseDoesNotRemove|TestUnlinkRemovesStaleName|TestLargeMessageThresholdAPI' -count=2 -v -timeout=120s
 
       - name: Run race tests
         if: runner.os != 'Windows'

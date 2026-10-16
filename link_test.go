@@ -17,29 +17,12 @@ import (
 	"syscall"
 	"testing"
 	"time"
-	"unsafe"
 
 	"gosuda.org/hqq/internal/mmap"
 	"gosuda.org/hqq/internal/mpmc"
 	"gosuda.org/hqq/internal/protocol"
 	"gosuda.org/hqq/internal/shm"
 )
-
-// createAlignedBuffer creates a page-aligned buffer for testing
-// This helper function ensures the shared memory buffer is properly aligned
-func createAlignedBuffer(t *testing.T, size uintptr) ([]byte, uintptr) {
-	// Create shared memory buffer with extra space for alignment
-	alignment := syscall.Getpagesize()
-	buffer := make([]byte, int(size)+alignment)
-
-	// Find page-aligned offset
-	offset := uintptr(unsafe.Pointer(&buffer[0]))
-	if offset%uintptr(alignment) != 0 {
-		offset = ((offset / uintptr(alignment)) + 1) * uintptr(alignment)
-	}
-
-	return buffer, offset
-}
 
 func TestLargeMessageThresholdAPI(t *testing.T) {
 	if got := LargeMessageThreshold(64); got != 64 {
@@ -55,34 +38,24 @@ func TestLargeMessageThresholdAPI(t *testing.T) {
 		t.Fatal("65-byte payload should be large for a 64-byte Standard payload buffer")
 	}
 
+	// Sizing helpers work before any link exists and agree with the
+	// configuration of a link built on SizeStandardLink-sized memory.
 	bufferCount := 8
 	bufferSize := 64
-	size := SizeStandardLink(bufferCount, bufferSize)
-	backing, offset := createAlignedBuffer(t, size)
-	defer runtime.KeepAlive(backing)
-
-	standard, err := OpenStandardLink(offset, bufferCount, bufferSize)
-	if err != nil {
-		t.Fatalf("OpenStandardLink failed: %v", err)
-	}
-	defer standard.Close()
+	_, standard, _ := newMemoryPair(t, bufferCount, bufferSize, LinkOptions{})
 	if standard.BufferSize() != bufferSize || standard.BufferCount() != bufferCount {
 		t.Fatalf("standard sizing = %d/%d", standard.BufferCount(), standard.BufferSize())
 	}
-	if standard.LargeMessageThreshold() != bufferSize {
-		t.Fatalf("standard threshold = %d, want %d", standard.LargeMessageThreshold(), bufferSize)
+	if got := LargeMessageThreshold(standard.BufferSize()); got != bufferSize {
+		t.Fatalf("threshold = %d, want %d", got, bufferSize)
 	}
-	if !standard.IsLargeMessage(bufferSize + 1) {
-		t.Fatalf("standard IsLargeMessage(%d) = false", bufferSize+1)
+	if !IsLargeMessage(standard.BufferSize(), bufferSize+1) {
+		t.Fatalf("IsLargeMessage(%d, %d) = false", bufferSize, bufferSize+1)
 	}
 
-	advanced, err := NewAdvancedLink(offset, bufferCount, bufferSize)
-	if err != nil {
-		t.Fatalf("NewAdvancedLink failed: %v", err)
-	}
-	defer advanced.Close()
-	if advanced.LargeMessageThreshold() != bufferSize {
-		t.Fatalf("advanced threshold = %d, want %d", advanced.LargeMessageThreshold(), bufferSize)
+	primary, _ := newAdvancedPair(t, bufferCount, bufferSize)
+	if got := LargeMessageThreshold(primary.BufferSize()); got != bufferSize {
+		t.Fatalf("advanced threshold = %d, want %d", got, bufferSize)
 	}
 }
 
@@ -92,15 +65,6 @@ func TestAdvancedProtocolBitValuesMatchSpec(t *testing.T) {
 	}
 	if FeatureRequestResponse != 1<<1 {
 		t.Fatalf("FeatureRequestResponse = %d, want %d", FeatureRequestResponse, 1<<1)
-	}
-	if CapabilityLargeBuffers != 1<<0 {
-		t.Fatalf("CapabilityLargeBuffers = %d, want %d", CapabilityLargeBuffers, 1<<0)
-	}
-	if CapabilityHighThroughput != 1<<1 {
-		t.Fatalf("CapabilityHighThroughput = %d, want %d", CapabilityHighThroughput, 1<<1)
-	}
-	if CapabilityLowLatency != 1<<2 {
-		t.Fatalf("CapabilityLowLatency = %d, want %d", CapabilityLowLatency, 1<<2)
 	}
 }
 
@@ -204,7 +168,7 @@ func TestMultiProcessAdvancedLink(t *testing.T) {
 const multiProcessCrashExitCode = 3
 
 func runLivenessChildProcess(t *testing.T, role, name string, bufferCount, bufferSize int) {
-	link, err := OpenNamedStandardLinkWithOptions(name, bufferCount, bufferSize, LinkOptions{HeartbeatInterval: 20 * time.Millisecond})
+	link, err := OpenStandardLink(name, bufferCount, bufferSize, LinkOptions{HeartbeatInterval: 20 * time.Millisecond})
 	if err != nil {
 		t.Fatalf("child open: %v", err)
 	}
@@ -225,13 +189,13 @@ func runLivenessChildProcess(t *testing.T, role, name string, bufferCount, buffe
 func testMultiProcessLiveness(t *testing.T, role string, want error) {
 	const bufferCount, bufferSize = 16, 128
 	name := newPortableSharedMemoryName()
-	parent, err := CreateStandardLinkWithOptions(name, bufferCount, bufferSize, 0o600,
+	parent, err := CreateStandardLink(name, bufferCount, bufferSize, 0o600,
 		LinkOptions{HeartbeatInterval: 20 * time.Millisecond, PeerTimeout: 300 * time.Millisecond})
 	if err != nil {
 		if errors.Is(err, syscall.ENOSYS) {
 			t.Skipf("shared memory is not supported on this platform: %v", err)
 		}
-		t.Fatalf("CreateStandardLinkWithOptions: %v", err)
+		t.Fatalf("CreateStandardLink: %v", err)
 	}
 	defer parent.Close()
 
@@ -321,8 +285,8 @@ func createNamedStandardLink(t *testing.T, bufferCount, bufferSize int) (string,
 	t.Helper()
 	name := newPortableSharedMemoryName()
 	size := int(SizeStandardLink(bufferCount, bufferSize))
-	smem, mapped, offset := mapNamedSharedMemory(t, name, size, os.O_RDWR|os.O_CREATE|os.O_EXCL)
-	link, err := OpenStandardLink(offset, bufferCount, bufferSize)
+	smem, mapped := mapNamedSharedMemory(t, name, size, os.O_RDWR|os.O_CREATE|os.O_EXCL)
+	link, err := NewStandardLink(mapped, bufferCount, bufferSize, LinkOptions{})
 	if err != nil {
 		_ = mmap.UnMap(mapped)
 		_ = smem.Close()
@@ -336,8 +300,8 @@ func createNamedAdvancedLink(t *testing.T, bufferCount, bufferSize int) (string,
 	t.Helper()
 	name := newPortableSharedMemoryName()
 	size := int(SizeStandardLink(bufferCount, bufferSize))
-	smem, mapped, offset := mapNamedSharedMemory(t, name, size, os.O_RDWR|os.O_CREATE|os.O_EXCL)
-	link, err := NewAdvancedLink(offset, bufferCount, bufferSize)
+	smem, mapped := mapNamedSharedMemory(t, name, size, os.O_RDWR|os.O_CREATE|os.O_EXCL)
+	link, err := NewAdvancedLink(mapped, bufferCount, bufferSize, AdvancedOptions{})
 	if err != nil {
 		_ = mmap.UnMap(mapped)
 		_ = smem.Close()
@@ -357,8 +321,8 @@ func newPortableSharedMemoryName() string {
 
 func openNamedStandardLink(t *testing.T, name string, size, bufferCount, bufferSize int) (*shm.SharedMemory, []byte, *StandardLink) {
 	t.Helper()
-	smem, mapped, offset := mapNamedSharedMemory(t, name, size, os.O_RDWR)
-	link, err := OpenStandardLink(offset, bufferCount, bufferSize)
+	smem, mapped := mapNamedSharedMemory(t, name, size, os.O_RDWR)
+	link, err := NewStandardLink(mapped, bufferCount, bufferSize, LinkOptions{})
 	if err != nil {
 		_ = mmap.UnMap(mapped)
 		_ = smem.Close()
@@ -369,8 +333,8 @@ func openNamedStandardLink(t *testing.T, name string, size, bufferCount, bufferS
 
 func openNamedAdvancedLink(t *testing.T, name string, size, bufferCount, bufferSize int) (*shm.SharedMemory, []byte, *AdvancedLink) {
 	t.Helper()
-	smem, mapped, offset := mapNamedSharedMemory(t, name, size, os.O_RDWR)
-	link, err := NewAdvancedLink(offset, bufferCount, bufferSize)
+	smem, mapped := mapNamedSharedMemory(t, name, size, os.O_RDWR)
+	link, err := NewAdvancedLink(mapped, bufferCount, bufferSize, AdvancedOptions{})
 	if err != nil {
 		_ = mmap.UnMap(mapped)
 		_ = smem.Close()
@@ -379,7 +343,7 @@ func openNamedAdvancedLink(t *testing.T, name string, size, bufferCount, bufferS
 	return smem, mapped, link
 }
 
-func mapNamedSharedMemory(t *testing.T, name string, size int, flags int) (*shm.SharedMemory, []byte, uintptr) {
+func mapNamedSharedMemory(t *testing.T, name string, size int, flags int) (*shm.SharedMemory, []byte) {
 	t.Helper()
 	smem, err := shm.OpenSharedMemory(name, size, flags, 0600)
 	if err != nil {
@@ -396,7 +360,7 @@ func mapNamedSharedMemory(t *testing.T, name string, size int, flags int) (*shm.
 		}
 		t.Fatalf("mmap.Map(%q) failed: %v", name, err)
 	}
-	return smem, mapped, uintptr(unsafe.Pointer(&mapped[0]))
+	return smem, mapped
 }
 
 func cleanupNamedLink(t *testing.T, smem *shm.SharedMemory, mapped []byte, link *StandardLink, remove bool) {
@@ -519,38 +483,35 @@ func TestStandardLinkCreation(t *testing.T) {
 	bufferSize := 4096
 
 	// Calculate required memory size
-	size := SizeStandardLink(bufferCount, bufferSize)
-	if size == 0 {
+	if SizeStandardLink(bufferCount, bufferSize) == 0 {
 		t.Fatal("SizeStandardLink returned 0")
 	}
 
-	// Create aligned buffer
-	backing, offset := createAlignedBuffer(t, size)
-	defer runtime.KeepAlive(backing)
+	mem := AlignedBuffer(SizeStandardLink(bufferCount, bufferSize))
 
 	// Create primary link
-	primary, err := OpenStandardLink(offset, bufferCount, bufferSize)
+	primary, err := NewStandardLink(mem, bufferCount, bufferSize, LinkOptions{})
 	if err != nil {
 		t.Fatalf("Failed to create primary link: %v", err)
 	}
 	defer primary.Close()
 
-	if primary.GetMode() != LinkModePrimary {
+	if primary.Mode() != LinkModePrimary {
 		t.Error("Primary link should be in primary mode")
 	}
 
-	if primary.GetType() != LinkTypeStandard {
+	if primary.Type() != LinkTypeStandard {
 		t.Error("Link should be of type Standard")
 	}
 
 	// Create secondary link
-	secondary, err := OpenStandardLink(offset, bufferCount, bufferSize)
+	secondary, err := NewStandardLink(mem, bufferCount, bufferSize, LinkOptions{})
 	if err != nil {
 		t.Fatalf("Failed to create secondary link: %v", err)
 	}
 	defer secondary.Close()
 
-	if secondary.GetMode() != LinkModeSecondary {
+	if secondary.Mode() != LinkModeSecondary {
 		t.Error("Secondary link should be in secondary mode")
 	}
 }
@@ -561,25 +522,7 @@ func TestStandardLinkReadWrite(t *testing.T) {
 	bufferCount := 1024
 	bufferSize := 4096
 
-	// Calculate required memory size
-	size := SizeStandardLink(bufferCount, bufferSize)
-
-	// Create aligned buffer
-	backing, offset := createAlignedBuffer(t, size)
-	defer runtime.KeepAlive(backing)
-
-	// Create links
-	primary, err := OpenStandardLink(offset, bufferCount, bufferSize)
-	if err != nil {
-		t.Fatalf("Failed to create primary link: %v", err)
-	}
-	defer primary.Close()
-
-	secondary, err := OpenStandardLink(offset, bufferCount, bufferSize)
-	if err != nil {
-		t.Fatalf("Failed to create secondary link: %v", err)
-	}
-	defer secondary.Close()
+	_, primary, secondary := newMemoryPair(t, bufferCount, bufferSize, LinkOptions{})
 
 	// Test data
 	testData := []byte("Hello, HQQ!")
@@ -611,21 +554,7 @@ func TestStandardLinkReadWrite(t *testing.T) {
 func TestStandardLinkBidirectionalReadWrite(t *testing.T) {
 	bufferCount := 16
 	bufferSize := 128
-	size := SizeStandardLink(bufferCount, bufferSize)
-	backing, offset := createAlignedBuffer(t, size)
-	defer runtime.KeepAlive(backing)
-
-	primary, err := OpenStandardLink(offset, bufferCount, bufferSize)
-	if err != nil {
-		t.Fatalf("Failed to create primary link: %v", err)
-	}
-	defer primary.Close()
-
-	secondary, err := OpenStandardLink(offset, bufferCount, bufferSize)
-	if err != nil {
-		t.Fatalf("Failed to create secondary link: %v", err)
-	}
-	defer secondary.Close()
+	_, primary, secondary := newMemoryPair(t, bufferCount, bufferSize, LinkOptions{})
 
 	fromPrimary := []byte("primary to secondary")
 	fromSecondary := []byte("secondary to primary")
@@ -658,21 +587,7 @@ func TestStandardLinkBidirectionalReadWrite(t *testing.T) {
 func TestStandardLinkDoesNotOverwriteUnreadBuffers(t *testing.T) {
 	bufferCount := 4
 	bufferSize := 16
-	size := SizeStandardLink(bufferCount, bufferSize)
-	backing, offset := createAlignedBuffer(t, size)
-	defer runtime.KeepAlive(backing)
-
-	primary, err := OpenStandardLink(offset, bufferCount, bufferSize)
-	if err != nil {
-		t.Fatalf("Failed to create primary link: %v", err)
-	}
-	defer primary.Close()
-
-	secondary, err := OpenStandardLink(offset, bufferCount, bufferSize)
-	if err != nil {
-		t.Fatalf("Failed to create secondary link: %v", err)
-	}
-	defer secondary.Close()
+	_, primary, secondary := newMemoryPair(t, bufferCount, bufferSize, LinkOptions{})
 
 	messages := [][]byte{
 		[]byte("AAAA0001"),
@@ -706,21 +621,7 @@ func TestStandardLinkDoesNotOverwriteUnreadBuffers(t *testing.T) {
 func TestStandardLinkPartialReadPreservesRemainderAndReleasesBuffer(t *testing.T) {
 	bufferCount := 2
 	bufferSize := 16
-	size := SizeStandardLink(bufferCount, bufferSize)
-	backing, offset := createAlignedBuffer(t, size)
-	defer runtime.KeepAlive(backing)
-
-	primary, err := OpenStandardLink(offset, bufferCount, bufferSize)
-	if err != nil {
-		t.Fatalf("Failed to create primary link: %v", err)
-	}
-	defer primary.Close()
-
-	secondary, err := OpenStandardLink(offset, bufferCount, bufferSize)
-	if err != nil {
-		t.Fatalf("Failed to create secondary link: %v", err)
-	}
-	defer secondary.Close()
+	_, primary, secondary := newMemoryPair(t, bufferCount, bufferSize, LinkOptions{})
 
 	first := []byte("0123456789ABCDEF")
 	second := []byte("fedcba9876543210")
@@ -766,21 +667,7 @@ func TestStandardLinkPartialReadPreservesRemainderAndReleasesBuffer(t *testing.T
 func TestStandardLinkZeroCopyReadWrite(t *testing.T) {
 	bufferCount := 8
 	bufferSize := 64
-	size := SizeStandardLink(bufferCount, bufferSize)
-	backing, offset := createAlignedBuffer(t, size)
-	defer runtime.KeepAlive(backing)
-
-	primary, err := OpenStandardLink(offset, bufferCount, bufferSize)
-	if err != nil {
-		t.Fatalf("Failed to create primary link: %v", err)
-	}
-	defer primary.Close()
-
-	secondary, err := OpenStandardLink(offset, bufferCount, bufferSize)
-	if err != nil {
-		t.Fatalf("Failed to create secondary link: %v", err)
-	}
-	defer secondary.Close()
+	_, primary, secondary := newMemoryPair(t, bufferCount, bufferSize, LinkOptions{})
 
 	payload := []byte("zero-copy payload")
 	n, err := primary.WriteZeroCopy(func(buffer []byte) (int, error) {
@@ -842,21 +729,7 @@ func TestStandardLinkZeroCopyReadWrite(t *testing.T) {
 func TestStandardLinkReserveCommitReadRelease(t *testing.T) {
 	bufferCount := 8
 	bufferSize := 64
-	size := SizeStandardLink(bufferCount, bufferSize)
-	backing, offset := createAlignedBuffer(t, size)
-	defer runtime.KeepAlive(backing)
-
-	primary, err := OpenStandardLink(offset, bufferCount, bufferSize)
-	if err != nil {
-		t.Fatalf("Failed to create primary link: %v", err)
-	}
-	defer primary.Close()
-
-	secondary, err := OpenStandardLink(offset, bufferCount, bufferSize)
-	if err != nil {
-		t.Fatalf("Failed to create secondary link: %v", err)
-	}
-	defer secondary.Close()
+	_, primary, secondary := newMemoryPair(t, bufferCount, bufferSize, LinkOptions{})
 
 	payload := []byte("reserve-commit")
 	writeReservation, err := primary.ReserveWrite()
@@ -895,21 +768,7 @@ func TestStandardLinkReserveCommitReadRelease(t *testing.T) {
 func TestStandardLinkDispatchModesCanMix(t *testing.T) {
 	bufferCount := 16
 	bufferSize := 64
-	size := SizeStandardLink(bufferCount, bufferSize)
-	backing, offset := createAlignedBuffer(t, size)
-	defer runtime.KeepAlive(backing)
-
-	primary, err := OpenStandardLink(offset, bufferCount, bufferSize)
-	if err != nil {
-		t.Fatalf("Failed to create primary link: %v", err)
-	}
-	defer primary.Close()
-
-	secondary, err := OpenStandardLink(offset, bufferCount, bufferSize)
-	if err != nil {
-		t.Fatalf("Failed to create secondary link: %v", err)
-	}
-	defer secondary.Close()
+	_, primary, secondary := newMemoryPair(t, bufferCount, bufferSize, LinkOptions{})
 
 	send := func(mode string, payload []byte) {
 		t.Helper()
@@ -1006,21 +865,7 @@ func TestStandardLinkDispatchModesCanMix(t *testing.T) {
 func TestStandardLinkReserveAbortTombstoneIsSkipped(t *testing.T) {
 	bufferCount := 2
 	bufferSize := 32
-	size := SizeStandardLink(bufferCount, bufferSize)
-	backing, offset := createAlignedBuffer(t, size)
-	defer runtime.KeepAlive(backing)
-
-	primary, err := OpenStandardLink(offset, bufferCount, bufferSize)
-	if err != nil {
-		t.Fatalf("Failed to create primary link: %v", err)
-	}
-	defer primary.Close()
-
-	secondary, err := OpenStandardLink(offset, bufferCount, bufferSize)
-	if err != nil {
-		t.Fatalf("Failed to create secondary link: %v", err)
-	}
-	defer secondary.Close()
+	_, primary, secondary := newMemoryPair(t, bufferCount, bufferSize, LinkOptions{})
 
 	for i := 0; i < bufferCount; i++ {
 		reservation, err := primary.ReserveWrite()
@@ -1059,21 +904,7 @@ func TestStandardLinkReserveAbortTombstoneIsSkipped(t *testing.T) {
 func TestStandardLinkReserveInvalidCommitPublishesTombstone(t *testing.T) {
 	bufferCount := 2
 	bufferSize := 32
-	size := SizeStandardLink(bufferCount, bufferSize)
-	backing, offset := createAlignedBuffer(t, size)
-	defer runtime.KeepAlive(backing)
-
-	primary, err := OpenStandardLink(offset, bufferCount, bufferSize)
-	if err != nil {
-		t.Fatalf("Failed to create primary link: %v", err)
-	}
-	defer primary.Close()
-
-	secondary, err := OpenStandardLink(offset, bufferCount, bufferSize)
-	if err != nil {
-		t.Fatalf("Failed to create secondary link: %v", err)
-	}
-	defer secondary.Close()
+	_, primary, secondary := newMemoryPair(t, bufferCount, bufferSize, LinkOptions{})
 
 	reservation, err := primary.ReserveWrite()
 	if err != nil {
@@ -1101,21 +932,7 @@ func TestStandardLinkReserveInvalidCommitPublishesTombstone(t *testing.T) {
 func TestStandardLinkWriteReservationHoldsSlotUntilAbort(t *testing.T) {
 	bufferCount := 2
 	bufferSize := 32
-	size := SizeStandardLink(bufferCount, bufferSize)
-	backing, offset := createAlignedBuffer(t, size)
-	defer runtime.KeepAlive(backing)
-
-	primary, err := OpenStandardLink(offset, bufferCount, bufferSize)
-	if err != nil {
-		t.Fatalf("Failed to create primary link: %v", err)
-	}
-	defer primary.Close()
-
-	secondary, err := OpenStandardLink(offset, bufferCount, bufferSize)
-	if err != nil {
-		t.Fatalf("Failed to create secondary link: %v", err)
-	}
-	defer secondary.Close()
+	_, primary, secondary := newMemoryPair(t, bufferCount, bufferSize, LinkOptions{})
 
 	first, err := primary.ReserveWrite()
 	if err != nil {
@@ -1170,21 +987,7 @@ func TestStandardLinkWriteReservationHoldsSlotUntilAbort(t *testing.T) {
 func TestStandardLinkReadReservationHoldsSlotUntilRelease(t *testing.T) {
 	bufferCount := 2
 	bufferSize := 32
-	size := SizeStandardLink(bufferCount, bufferSize)
-	backing, offset := createAlignedBuffer(t, size)
-	defer runtime.KeepAlive(backing)
-
-	primary, err := OpenStandardLink(offset, bufferCount, bufferSize)
-	if err != nil {
-		t.Fatalf("Failed to create primary link: %v", err)
-	}
-	defer primary.Close()
-
-	secondary, err := OpenStandardLink(offset, bufferCount, bufferSize)
-	if err != nil {
-		t.Fatalf("Failed to create secondary link: %v", err)
-	}
-	defer secondary.Close()
+	_, primary, secondary := newMemoryPair(t, bufferCount, bufferSize, LinkOptions{})
 
 	for i := 0; i < bufferCount; i++ {
 		payload := []byte{byte('A' + i)}
@@ -1239,23 +1042,13 @@ func TestAdvancedLinkCreation(t *testing.T) {
 	bufferCount := 1024
 	bufferSize := 4096
 
-	// Calculate required memory size
-	size := SizeStandardLink(bufferCount, bufferSize)
-	backing, offset := createAlignedBuffer(t, size)
-	defer runtime.KeepAlive(backing)
+	advLink := newTestAdvancedLink(t, bufferCount, bufferSize, AdvancedOptions{})
 
-	// Create advanced link
-	advLink, err := NewAdvancedLink(offset, bufferCount, bufferSize)
-	if err != nil {
-		t.Fatalf("Failed to create advanced link: %v", err)
-	}
-	defer advLink.Close()
-
-	if advLink.GetType() != LinkTypeAdvanced {
+	if advLink.Type() != LinkTypeAdvanced {
 		t.Error("Link should be of type Advanced")
 	}
 
-	if advLink.GetProtocolState() != ProtocolStateNone {
+	if advLink.ProtocolState() != ProtocolStateNone {
 		t.Error("Protocol state should be None initially")
 	}
 
@@ -1271,26 +1064,11 @@ func TestAdvancedLinkProtocolNegotiation(t *testing.T) {
 	bufferCount := 1024
 	bufferSize := 4096
 
-	// Calculate required memory size
-	size := SizeStandardLink(bufferCount, bufferSize)
-	backing, offset := createAlignedBuffer(t, size)
-	defer runtime.KeepAlive(backing)
-
-	// Create advanced links
-	primary, err := NewAdvancedLink(offset, bufferCount, bufferSize)
-	if err != nil {
-		t.Fatalf("Failed to create primary advanced link: %v", err)
-	}
-	defer primary.Close()
-
-	secondary, err := NewAdvancedLink(offset, bufferCount, bufferSize)
-	if err != nil {
-		t.Fatalf("Failed to create secondary advanced link: %v", err)
-	}
-	defer secondary.Close()
+	primary, secondary := newAdvancedPair(t, bufferCount, bufferSize)
 
 	// Test negotiation
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 	version := ProtocolVersion{Major: 1, Minor: 0}
 	features := FeatureLargeCopy | FeatureRequestResponse
 
@@ -1332,21 +1110,21 @@ func TestAdvancedLinkProtocolNegotiation(t *testing.T) {
 	}
 
 	// Check protocol states
-	if primary.GetProtocolState() != ProtocolStateNegotiated {
-		t.Errorf("Primary protocol state should be Negotiated, got %v", primary.GetProtocolState())
+	if primary.ProtocolState() != ProtocolStateNegotiated {
+		t.Errorf("Primary protocol state should be Negotiated, got %v", primary.ProtocolState())
 	}
-	if secondary.GetProtocolState() != ProtocolStateNegotiated {
-		t.Errorf("Secondary protocol state should be Negotiated, got %v", secondary.GetProtocolState())
+	if secondary.ProtocolState() != ProtocolStateNegotiated {
+		t.Errorf("Secondary protocol state should be Negotiated, got %v", secondary.ProtocolState())
 	}
 
 	// Check negotiated version
-	negotiatedVersion := primary.GetNegotiatedVersion()
+	negotiatedVersion := primary.NegotiatedVersion()
 	if negotiatedVersion.Major != 1 || negotiatedVersion.Minor != 0 {
 		t.Errorf("Expected version 1.0, got %d.%d", negotiatedVersion.Major, negotiatedVersion.Minor)
 	}
 
 	// Check negotiated features
-	negotiatedFeatures := primary.GetNegotiatedFeatures()
+	negotiatedFeatures := primary.NegotiatedFeatures()
 	if (negotiatedFeatures & FeatureLargeCopy) == 0 {
 		t.Error("large-copy feature should be negotiated")
 	}
@@ -1355,106 +1133,10 @@ func TestAdvancedLinkProtocolNegotiation(t *testing.T) {
 	}
 
 	// Check feature flags
-	if !primary.IsLargeCopyEnabled() {
+	if primary.NegotiatedFeatures()&FeatureLargeCopy == 0 {
 		t.Error("large-copy should be enabled")
 	}
-	if !primary.IsRequestResponseEnabled() {
-		t.Error("request-response should be enabled")
-	}
-}
-
-// TestAdvancedLinkReadWrite tests read/write functionality with advanced links
-// It verifies that data transfer works after protocol negotiation
-func TestAdvancedLinkReadWrite(t *testing.T) {
-	bufferCount := 1024
-	bufferSize := 4096
-
-	// Calculate required memory size
-	size := SizeStandardLink(bufferCount, bufferSize)
-	backing, offset := createAlignedBuffer(t, size)
-	defer runtime.KeepAlive(backing)
-
-	// Create advanced links
-	primary, err := NewAdvancedLink(offset, bufferCount, bufferSize)
-	if err != nil {
-		t.Fatalf("Failed to create primary advanced link: %v", err)
-	}
-	defer primary.Close()
-
-	secondary, err := NewAdvancedLink(offset, bufferCount, bufferSize)
-	if err != nil {
-		t.Fatalf("Failed to create secondary advanced link: %v", err)
-	}
-	defer secondary.Close()
-
-	// Perform protocol negotiation with timeout
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	version := ProtocolVersion{Major: 1, Minor: 0}
-	features := FeatureLargeCopy | FeatureRequestResponse
-
-	var wg sync.WaitGroup
-	wg.Add(2)
-
-	var primaryErr, secondaryErr error
-	var primarySuccess, secondarySuccess bool
-
-	// Primary initiates negotiation
-	go func() {
-		defer wg.Done()
-		primarySuccess, primaryErr = primary.NegotiateProtocol(ctx, version, features)
-	}()
-
-	// Secondary waits for negotiation
-	go func() {
-		defer wg.Done()
-		secondarySuccess, secondaryErr = secondary.WaitForNegotiation(ctx)
-	}()
-
-	// Wait for both to complete
-	wg.Wait()
-
-	// Check negotiation results
-	if primaryErr != nil {
-		t.Fatalf("Primary negotiation failed: %v", primaryErr)
-	}
-	if secondaryErr != nil {
-		t.Fatalf("Secondary negotiation failed: %v", secondaryErr)
-	}
-
-	if !primarySuccess || !secondarySuccess {
-		t.Fatal("Protocol negotiation should have succeeded")
-	}
-
-	// Verify negotiation was successful
-	if primary.GetProtocolState() != ProtocolStateNegotiated {
-		t.Errorf("Primary protocol state should be Negotiated, got %v", primary.GetProtocolState())
-	}
-	if secondary.GetProtocolState() != ProtocolStateNegotiated {
-		t.Errorf("Secondary protocol state should be Negotiated, got %v", secondary.GetProtocolState())
-	}
-
-	// Check negotiated version
-	negotiatedVersion := primary.GetNegotiatedVersion()
-	if negotiatedVersion.Major != 1 || negotiatedVersion.Minor != 0 {
-		t.Errorf("Expected version 1.0, got %d.%d", negotiatedVersion.Major, negotiatedVersion.Minor)
-	}
-
-	// Check negotiated features
-	negotiatedFeatures := primary.GetNegotiatedFeatures()
-	if (negotiatedFeatures & FeatureLargeCopy) == 0 {
-		t.Error("large-copy feature should be negotiated")
-	}
-	if (negotiatedFeatures & FeatureRequestResponse) == 0 {
-		t.Error("request-response feature should be negotiated")
-	}
-
-	// Check feature flags
-	if !primary.IsLargeCopyEnabled() {
-		t.Error("large-copy should be enabled")
-	}
-	if !primary.IsRequestResponseEnabled() {
+	if primary.NegotiatedFeatures()&FeatureRequestResponse == 0 {
 		t.Error("request-response should be enabled")
 	}
 }
@@ -1493,45 +1175,8 @@ func negotiateAdvancedPair(t *testing.T, primary, secondary *AdvancedLink) {
 	}
 }
 
-func newAdvancedPair(t *testing.T, bufferCount, bufferSize int) ([]byte, *AdvancedLink, *AdvancedLink) {
-	t.Helper()
-	size := SizeStandardLink(bufferCount, bufferSize)
-	backing, offset := createAlignedBuffer(t, size)
-
-	primary, err := NewAdvancedLink(offset, bufferCount, bufferSize)
-	if err != nil {
-		t.Fatalf("Failed to create primary advanced link: %v", err)
-	}
-	secondary, err := NewAdvancedLink(offset, bufferCount, bufferSize)
-	if err != nil {
-		primary.Close()
-		t.Fatalf("Failed to create secondary advanced link: %v", err)
-	}
-	return backing, primary, secondary
-}
-
-func newAdvancedPairWithOptions(t *testing.T, bufferCount, bufferSize int, primaryOptions, secondaryOptions AdvancedOptions) ([]byte, *AdvancedLink, *AdvancedLink) {
-	t.Helper()
-	size := SizeStandardLink(bufferCount, bufferSize)
-	backing, offset := createAlignedBuffer(t, size)
-
-	primary, err := NewAdvancedLinkWithOptions(offset, bufferCount, bufferSize, primaryOptions)
-	if err != nil {
-		t.Fatalf("Failed to create primary advanced link: %v", err)
-	}
-	secondary, err := NewAdvancedLinkWithOptions(offset, bufferCount, bufferSize, secondaryOptions)
-	if err != nil {
-		primary.Close()
-		t.Fatalf("Failed to create secondary advanced link: %v", err)
-	}
-	return backing, primary, secondary
-}
-
 func TestAdvancedLinkRequiresNegotiation(t *testing.T) {
-	backing, link, peer := newAdvancedPair(t, 8, 32)
-	defer runtime.KeepAlive(backing)
-	defer link.Close()
-	defer peer.Close()
+	link, _ := newAdvancedPair(t, 8, 32)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
@@ -1544,10 +1189,10 @@ func TestAdvancedLinkRequiresNegotiation(t *testing.T) {
 	if _, err := link.Receive(ctx); !isNotNegotiated(err) {
 		t.Fatalf("Receive before negotiation = %v, want ErrNotNegotiated", err)
 	}
-	if err := link.Listen(ctx); !isNotNegotiated(err) {
+	if err := link.ListenStreams(ctx); !isNotNegotiated(err) {
 		t.Fatalf("Listen before negotiation = %v, want ErrNotNegotiated", err)
 	}
-	if _, err := link.Dial(ctx); !isNotNegotiated(err) {
+	if _, err := link.OpenStream(ctx); !isNotNegotiated(err) {
 		t.Fatalf("Dial before negotiation = %v, want ErrNotNegotiated", err)
 	}
 }
@@ -1559,10 +1204,7 @@ func isNotNegotiated(err error) bool {
 }
 
 func TestAdvancedLinkLargeCopy(t *testing.T) {
-	backing, primary, secondary := newAdvancedPair(t, 8, 16)
-	defer runtime.KeepAlive(backing)
-	defer primary.Close()
-	defer secondary.Close()
+	primary, secondary := newAdvancedPair(t, 8, 16)
 	negotiateAdvancedPair(t, primary, secondary)
 
 	payload := make([]byte, 97)
@@ -1592,10 +1234,7 @@ func TestAdvancedLinkLargeCopy(t *testing.T) {
 }
 
 func TestAdvancedLinkRequestResponse(t *testing.T) {
-	backing, primary, secondary := newAdvancedPair(t, 16, 16)
-	defer runtime.KeepAlive(backing)
-	defer primary.Close()
-	defer secondary.Close()
+	primary, secondary := newAdvancedPair(t, 16, 16)
 	negotiateAdvancedPair(t, primary, secondary)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -1638,10 +1277,7 @@ func TestAdvancedLinkRequestResponse(t *testing.T) {
 }
 
 func TestAdvancedLinkErrorResponse(t *testing.T) {
-	backing, primary, secondary := newAdvancedPair(t, 8, 32)
-	defer runtime.KeepAlive(backing)
-	defer primary.Close()
-	defer secondary.Close()
+	primary, secondary := newAdvancedPair(t, 8, 32)
 	negotiateAdvancedPair(t, primary, secondary)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -1674,10 +1310,7 @@ func TestAdvancedLinkErrorResponse(t *testing.T) {
 }
 
 func TestAdvancedLinkEmptyRequestResponse(t *testing.T) {
-	backing, primary, secondary := newAdvancedPair(t, 8, 32)
-	defer runtime.KeepAlive(backing)
-	defer primary.Close()
-	defer secondary.Close()
+	primary, secondary := newAdvancedPair(t, 8, 32)
 	negotiateAdvancedPair(t, primary, secondary)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -1711,10 +1344,7 @@ func TestAdvancedLinkEmptyRequestResponse(t *testing.T) {
 
 func TestAdvancedLinkConcurrentCallsUsePendingTable(t *testing.T) {
 	const requestCount = 16
-	backing, client, server := newAdvancedPair(t, 64, 32)
-	defer runtime.KeepAlive(backing)
-	defer client.Close()
-	defer server.Close()
+	client, server := newAdvancedPair(t, 64, 32)
 	negotiateAdvancedPair(t, client, server)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -1778,21 +1408,18 @@ func TestAdvancedLinkConcurrentCallsUsePendingTable(t *testing.T) {
 }
 
 func TestAdvancedLinkLogicalStreamDialAcceptAndCallOn(t *testing.T) {
-	backing, client, server := newAdvancedPair(t, 16, 32)
-	defer runtime.KeepAlive(backing)
-	defer client.Close()
-	defer server.Close()
+	client, server := newAdvancedPair(t, 16, 32)
 	negotiateAdvancedPair(t, client, server)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	if err := server.Listen(ctx); err != nil {
-		t.Fatalf("Listen failed: %v", err)
+	if err := server.ListenStreams(ctx); err != nil {
+		t.Fatalf("ListenStreams failed: %v", err)
 	}
 	accepted := make(chan uint64, 1)
 	acceptErr := make(chan error, 1)
 	go func() {
-		connID, err := server.Accept(ctx)
+		connID, err := server.AcceptStream(ctx)
 		if err != nil {
 			acceptErr <- err
 			return
@@ -1800,9 +1427,9 @@ func TestAdvancedLinkLogicalStreamDialAcceptAndCallOn(t *testing.T) {
 		accepted <- connID
 	}()
 
-	connID, err := client.Dial(ctx)
+	connID, err := client.OpenStream(ctx)
 	if err != nil {
-		t.Fatalf("Dial failed: %v", err)
+		t.Fatalf("OpenStream failed: %v", err)
 	}
 	select {
 	case got := <-accepted:
@@ -1842,10 +1469,7 @@ func TestAdvancedLinkLogicalStreamDialAcceptAndCallOn(t *testing.T) {
 
 func TestAdvancedLinkMaxMessageSizeGuardsSendAndReceive(t *testing.T) {
 	t.Run("send", func(t *testing.T) {
-		backing, primary, secondary := newAdvancedPairWithOptions(t, 8, 16, AdvancedOptions{MaxMessageSize: 32}, AdvancedOptions{})
-		defer runtime.KeepAlive(backing)
-		defer primary.Close()
-		defer secondary.Close()
+		primary, secondary := newAdvancedPairWithOptions(t, 8, 16, AdvancedOptions{MaxMessageSize: 32}, AdvancedOptions{})
 		negotiateAdvancedPair(t, primary, secondary)
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 		defer cancel()
@@ -1855,10 +1479,7 @@ func TestAdvancedLinkMaxMessageSizeGuardsSendAndReceive(t *testing.T) {
 	})
 
 	t.Run("receive", func(t *testing.T) {
-		backing, primary, secondary := newAdvancedPairWithOptions(t, 16, 16, AdvancedOptions{}, AdvancedOptions{MaxMessageSize: 32})
-		defer runtime.KeepAlive(backing)
-		defer primary.Close()
-		defer secondary.Close()
+		primary, secondary := newAdvancedPairWithOptions(t, 16, 16, AdvancedOptions{}, AdvancedOptions{MaxMessageSize: 32})
 		negotiateAdvancedPair(t, primary, secondary)
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 		defer cancel()
@@ -1877,18 +1498,11 @@ func TestAdvancedLinkStatistics(t *testing.T) {
 	bufferCount := 1024
 	bufferSize := 4096
 
-	// Calculate required memory size
-	size := SizeStandardLink(bufferCount, bufferSize)
-	backing, offset := createAlignedBuffer(t, size)
-	defer runtime.KeepAlive(backing)
+	advLink := newTestAdvancedLink(t, bufferCount, bufferSize, AdvancedOptions{})
 
-	// Create advanced link
-	advLink, err := NewAdvancedLink(offset, bufferCount, bufferSize)
-	if err != nil {
-		t.Fatalf("Failed to create advanced link: %v", err)
+	if got := advLink.Stats(); got != (AdvancedStats{}) {
+		t.Errorf("initial Stats = %+v, want zero value", got)
 	}
-	defer advLink.Close()
-
 }
 
 // TestStandardLinkErrors tests error handling in standard links
@@ -1907,12 +1521,9 @@ func TestStandardLinkErrors(t *testing.T) {
 	}
 
 	// Test memory alignment error
-	backing, offset := createAlignedBuffer(t, 4096)
-	defer runtime.KeepAlive(backing)
-	// Create misalignment by adding 1
-	offset++
-
-	_, err := OpenStandardLink(offset, 1024, 4096)
+	mem := AlignedBuffer(4096)
+	// Create misalignment by skipping 1 byte
+	_, err := NewStandardLink(mem[1:], 1024, 4096, LinkOptions{})
 	if err != ErrMemoryAlign {
 		t.Errorf("Expected ErrMemoryAlign, got %v", err)
 	}
@@ -1926,27 +1537,26 @@ func TestStandardLinkErrors(t *testing.T) {
 }
 
 func TestStandardLinkSuperblockRejectsMismatchedConfig(t *testing.T) {
-	size := SizeStandardLink(8, 64)
-	backing, offset := createAlignedBuffer(t, size)
-	defer runtime.KeepAlive(backing)
+	mem := AlignedBuffer(SizeStandardLink(8, 64))
 
-	primary, err := OpenStandardLink(offset, 8, 64)
+	primary, err := NewStandardLink(mem, 8, 64, LinkOptions{})
 	if err != nil {
-		t.Fatalf("OpenStandardLink primary failed: %v", err)
+		t.Fatalf("NewStandardLink primary failed: %v", err)
 	}
 	defer primary.Close()
 
-	if _, err := OpenStandardLink(offset, 16, 64); err != ErrInvalidSize {
-		t.Fatalf("OpenStandardLink with mismatched bufferCount = %v, want ErrInvalidSize", err)
+	var geometryErr *GeometryError
+	if _, err := NewStandardLink(mem, 16, 64, LinkOptions{}); !errors.Is(err, ErrInvalidSize) || !errors.As(err, &geometryErr) {
+		t.Fatalf("NewStandardLink with mismatched bufferCount = %v, want *GeometryError wrapping ErrInvalidSize", err)
 	}
-	if _, err := OpenStandardLink(offset, 8, 128); err != ErrInvalidSize {
-		t.Fatalf("OpenStandardLink with mismatched bufferSize = %v, want ErrInvalidSize", err)
+	if _, err := NewStandardLink(mem, 8, 128, LinkOptions{}); !errors.Is(err, ErrInvalidSize) || !errors.As(err, &geometryErr) {
+		t.Fatalf("NewStandardLink with mismatched bufferSize = %v, want *GeometryError wrapping ErrInvalidSize", err)
 	}
 }
 
 func TestNamedStandardLinkAPI(t *testing.T) {
 	name := newPortableSharedMemoryName()
-	primary, err := CreateStandardLink(name, 8, 64, 0600)
+	primary, err := CreateStandardLink(name, 8, 64, 0600, LinkOptions{})
 	if err != nil {
 		if errors.Is(err, syscall.ENOSYS) {
 			t.Skipf("shared memory is not supported on this platform: %v", err)
@@ -1955,9 +1565,9 @@ func TestNamedStandardLinkAPI(t *testing.T) {
 	}
 	defer primary.Close()
 
-	secondary, err := OpenNamedStandardLink(name, 8, 64)
+	secondary, err := OpenStandardLink(name, 8, 64, LinkOptions{})
 	if err != nil {
-		t.Fatalf("OpenNamedStandardLink failed: %v", err)
+		t.Fatalf("OpenStandardLink failed: %v", err)
 	}
 	defer secondary.Close()
 
@@ -1978,21 +1588,7 @@ func TestNamedStandardLinkAPI(t *testing.T) {
 func TestStandardLinkDeadlines(t *testing.T) {
 	bufferCount := 2
 	bufferSize := 64
-	size := SizeStandardLink(bufferCount, bufferSize)
-	backing, offset := createAlignedBuffer(t, size)
-	defer runtime.KeepAlive(backing)
-
-	primary, err := OpenStandardLink(offset, bufferCount, bufferSize)
-	if err != nil {
-		t.Fatalf("Failed to create primary link: %v", err)
-	}
-	defer primary.Close()
-
-	secondary, err := OpenStandardLink(offset, bufferCount, bufferSize)
-	if err != nil {
-		t.Fatalf("Failed to create secondary link: %v", err)
-	}
-	defer secondary.Close()
+	_, primary, secondary := newMemoryPair(t, bufferCount, bufferSize, LinkOptions{})
 
 	if err := secondary.SetReadDeadline(time.Now().Add(20 * time.Millisecond)); err != nil {
 		t.Fatalf("SetReadDeadline failed: %v", err)
@@ -2022,21 +1618,7 @@ func TestStandardLinkHighVolumeOrderedDelivery(t *testing.T) {
 	bufferCount := 64
 	bufferSize := 64
 	messageCount := 4096
-	size := SizeStandardLink(bufferCount, bufferSize)
-	backing, offset := createAlignedBuffer(t, size)
-	defer runtime.KeepAlive(backing)
-
-	primary, err := OpenStandardLink(offset, bufferCount, bufferSize)
-	if err != nil {
-		t.Fatalf("Failed to create primary link: %v", err)
-	}
-	defer primary.Close()
-
-	secondary, err := OpenStandardLink(offset, bufferCount, bufferSize)
-	if err != nil {
-		t.Fatalf("Failed to create secondary link: %v", err)
-	}
-	defer secondary.Close()
+	_, primary, secondary := newMemoryPair(t, bufferCount, bufferSize, LinkOptions{})
 
 	errCh := make(chan error, 2)
 	var wg sync.WaitGroup
@@ -2091,21 +1673,7 @@ func TestStandardLinkMultiPProgress(t *testing.T) {
 	bufferCount := 64
 	bufferSize := 128
 	messageCount := 8192
-	size := SizeStandardLink(bufferCount, bufferSize)
-	backing, offset := createAlignedBuffer(t, size)
-	defer runtime.KeepAlive(backing)
-
-	primary, err := OpenStandardLink(offset, bufferCount, bufferSize)
-	if err != nil {
-		t.Fatalf("Failed to create primary link: %v", err)
-	}
-	defer primary.Close()
-
-	secondary, err := OpenStandardLink(offset, bufferCount, bufferSize)
-	if err != nil {
-		t.Fatalf("Failed to create secondary link: %v", err)
-	}
-	defer secondary.Close()
+	_, primary, secondary := newMemoryPair(t, bufferCount, bufferSize, LinkOptions{})
 
 	done := make(chan error, 2)
 	go func() {
@@ -2159,17 +1727,7 @@ func TestAdvancedLinkNegotiationTimeout(t *testing.T) {
 	bufferCount := 1024
 	bufferSize := 4096
 
-	// Calculate required memory size
-	size := SizeStandardLink(bufferCount, bufferSize)
-	backing, offset := createAlignedBuffer(t, size)
-	defer runtime.KeepAlive(backing)
-
-	// Create advanced link
-	advLink, err := NewAdvancedLink(offset, bufferCount, bufferSize)
-	if err != nil {
-		t.Fatalf("Failed to create advanced link: %v", err)
-	}
-	defer advLink.Close()
+	advLink := newTestAdvancedLink(t, bufferCount, bufferSize, AdvancedOptions{})
 
 	// Test negotiation with timeout
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
@@ -2186,126 +1744,78 @@ func TestAdvancedLinkNegotiationTimeout(t *testing.T) {
 		t.Error("Negotiation should not succeed without peer")
 	}
 
-	if advLink.GetProtocolState() != ProtocolStateFailed {
-		t.Errorf("Protocol state should be Failed, got %v", advLink.GetProtocolState())
+	if advLink.ProtocolState() != ProtocolStateFailed {
+		t.Errorf("Protocol state should be Failed, got %v", advLink.ProtocolState())
 	}
 }
 
 // TestConcurrentReadWrite tests concurrent read/write operations
 // It verifies that multiple goroutines can safely use the link simultaneously
+// and that a failure of either side ends the test promptly: both links carry
+// a deadline, and every goroutine reports exactly one result.
 func TestConcurrentReadWrite(t *testing.T) {
 	bufferCount := 1024
 	bufferSize := 4096
 
-	// Calculate required memory size
-	size := SizeStandardLink(bufferCount, bufferSize)
-	backing, offset := createAlignedBuffer(t, size)
-	defer runtime.KeepAlive(backing)
+	_, primary, secondary := newMemoryPair(t, bufferCount, bufferSize, LinkOptions{})
 
-	// Create links
-	primary, err := OpenStandardLink(offset, bufferCount, bufferSize)
-	if err != nil {
-		t.Fatalf("Failed to create primary link: %v", err)
-	}
-	defer primary.Close()
-
-	secondary, err := OpenStandardLink(offset, bufferCount, bufferSize)
-	if err != nil {
-		t.Fatalf("Failed to create secondary link: %v", err)
-	}
-	defer secondary.Close()
-
-	// Test concurrent read/write
 	const numMessages = 100
-	messageSize := 100
+	const messageSize = 100
 
-	// Use channels to synchronize and verify data
-	writeChan := make(chan int, numMessages)
-	readChan := make(chan int, numMessages)
-	errorChan := make(chan error, 2)
+	deadline := time.Now().Add(10 * time.Second)
+	if err := primary.SetWriteDeadline(deadline); err != nil {
+		t.Fatal(err)
+	}
+	if err := secondary.SetReadDeadline(deadline); err != nil {
+		t.Fatal(err)
+	}
 
-	var wg sync.WaitGroup
-	wg.Add(2)
+	results := make(chan error, 2)
 
-	// Writer goroutine
 	go func() {
-		defer wg.Done()
-		for i := 0; i < numMessages; i++ {
-			data := make([]byte, messageSize)
-			for j := 0; j < messageSize; j++ {
-				data[j] = byte(i % 256)
-			}
-
+		for i := range numMessages {
+			data := bytes.Repeat([]byte{byte(i % 256)}, messageSize)
 			n, err := primary.Write(data)
 			if err != nil {
-				errorChan <- fmt.Errorf("write failed at message %d: %v", i, err)
+				results <- fmt.Errorf("write failed at message %d: %v", i, err)
 				return
 			}
 			if n != messageSize {
-				errorChan <- fmt.Errorf("expected to write %d bytes, wrote %d at message %d", messageSize, n, i)
+				results <- fmt.Errorf("expected to write %d bytes, wrote %d at message %d", messageSize, n, i)
 				return
 			}
-
-			writeChan <- i
 		}
-		close(writeChan)
+		results <- nil
 	}()
 
-	// Reader goroutine
 	go func() {
-		defer wg.Done()
 		readBuffer := make([]byte, messageSize)
-		for i := 0; i < numMessages; i++ {
+		for i := range numMessages {
 			n, err := secondary.Read(readBuffer)
 			if err != nil {
-				errorChan <- fmt.Errorf("read failed at message %d: %v", i, err)
+				results <- fmt.Errorf("read failed at message %d: %v", i, err)
 				return
 			}
 			if n != messageSize {
-				errorChan <- fmt.Errorf("expected to read %d bytes, got %d at message %d", messageSize, n, i)
+				results <- fmt.Errorf("expected to read %d bytes, got %d at message %d", messageSize, n, i)
 				return
 			}
-
-			// Verify the data content
 			expectedByte := byte(i % 256)
 			for j, b := range readBuffer {
 				if b != expectedByte {
-					errorChan <- fmt.Errorf("data mismatch at message %d, byte %d: expected %d, got %d", i, j, expectedByte, b)
+					results <- fmt.Errorf("data mismatch at message %d, byte %d: expected %d, got %d", i, j, expectedByte, b)
 					return
 				}
 			}
-
-			readChan <- i
 		}
-		close(readChan)
+		results <- nil
 	}()
 
-	// Wait for completion
-	wg.Wait()
-	close(errorChan)
-
-	// Check for errors
-	for err := range errorChan {
-		t.Error(err)
+	for range 2 {
+		if err := <-results; err != nil {
+			t.Error(err)
+		}
 	}
-
-	// Verify all messages were written and read
-	writeCount := 0
-	for range writeChan {
-		writeCount++
-	}
-	if writeCount != numMessages {
-		t.Errorf("Expected %d messages to be written, got %d", numMessages, writeCount)
-	}
-
-	readCount := 0
-	for range readChan {
-		readCount++
-	}
-	if readCount != numMessages {
-		t.Errorf("Expected %d messages to be read, got %d", numMessages, readCount)
-	}
-
 }
 
 // BenchmarkStandardLinkReadWrite benchmarks the standard link read/write performance
@@ -2314,23 +1824,7 @@ func BenchmarkStandardLinkReadWrite(b *testing.B) {
 	bufferCount := 1024
 	bufferSize := 1 << 12
 
-	// Calculate required memory size
-	size := SizeStandardLink(bufferCount, bufferSize)
-	backing, offset := createAlignedBuffer(nil, size)
-	defer runtime.KeepAlive(backing)
-
-	// Create links
-	primary, err := OpenStandardLink(offset, bufferCount, bufferSize)
-	if err != nil {
-		b.Fatalf("Failed to create primary link: %v", err)
-	}
-	defer primary.Close()
-
-	secondary, err := OpenStandardLink(offset, bufferCount, bufferSize)
-	if err != nil {
-		b.Fatalf("Failed to create secondary link: %v", err)
-	}
-	defer secondary.Close()
+	_, primary, secondary := newMemoryPair(b, bufferCount, bufferSize, LinkOptions{})
 
 	// Test data
 	testData := make([]byte, 1<<12)
@@ -2369,21 +1863,7 @@ func benchmarkStandardLinkReadWrite(b *testing.B, payloadSize int) {
 		bufferSize = 8
 	}
 
-	size := SizeStandardLink(bufferCount, bufferSize)
-	backing, offset := createAlignedBuffer(nil, size)
-	defer runtime.KeepAlive(backing)
-
-	primary, err := OpenStandardLink(offset, bufferCount, bufferSize)
-	if err != nil {
-		b.Fatalf("Failed to create primary link: %v", err)
-	}
-	defer primary.Close()
-
-	secondary, err := OpenStandardLink(offset, bufferCount, bufferSize)
-	if err != nil {
-		b.Fatalf("Failed to create secondary link: %v", err)
-	}
-	defer secondary.Close()
+	_, primary, secondary := newMemoryPair(b, bufferCount, bufferSize, LinkOptions{})
 
 	testData := make([]byte, payloadSize)
 	readBuffer := make([]byte, payloadSize)
@@ -2428,21 +1908,7 @@ func benchmarkStandardLinkZeroCopy(b *testing.B, payloadSize int) {
 		bufferSize = 8
 	}
 
-	size := SizeStandardLink(bufferCount, bufferSize)
-	backing, offset := createAlignedBuffer(nil, size)
-	defer runtime.KeepAlive(backing)
-
-	primary, err := OpenStandardLink(offset, bufferCount, bufferSize)
-	if err != nil {
-		b.Fatalf("Failed to create primary link: %v", err)
-	}
-	defer primary.Close()
-
-	secondary, err := OpenStandardLink(offset, bufferCount, bufferSize)
-	if err != nil {
-		b.Fatalf("Failed to create secondary link: %v", err)
-	}
-	defer secondary.Close()
+	_, primary, secondary := newMemoryPair(b, bufferCount, bufferSize, LinkOptions{})
 
 	b.SetBytes(int64(payloadSize))
 	b.ReportAllocs()
@@ -2489,21 +1955,7 @@ func benchmarkStandardLinkReserveCommit(b *testing.B, payloadSize int) {
 		bufferSize = 8
 	}
 
-	size := SizeStandardLink(bufferCount, bufferSize)
-	backing, offset := createAlignedBuffer(nil, size)
-	defer runtime.KeepAlive(backing)
-
-	primary, err := OpenStandardLink(offset, bufferCount, bufferSize)
-	if err != nil {
-		b.Fatalf("Failed to create primary link: %v", err)
-	}
-	defer primary.Close()
-
-	secondary, err := OpenStandardLink(offset, bufferCount, bufferSize)
-	if err != nil {
-		b.Fatalf("Failed to create secondary link: %v", err)
-	}
-	defer secondary.Close()
+	_, primary, secondary := newMemoryPair(b, bufferCount, bufferSize, LinkOptions{})
 
 	b.SetBytes(int64(payloadSize))
 	b.ReportAllocs()
@@ -2536,21 +1988,7 @@ func benchmarkStandardLinkReserveCommit(b *testing.B, payloadSize int) {
 func BenchmarkStandardLinkPipeline(b *testing.B) {
 	bufferCount := 1024
 	bufferSize := 1 << 12
-	size := SizeStandardLink(bufferCount, bufferSize)
-	backing, offset := createAlignedBuffer(nil, size)
-	defer runtime.KeepAlive(backing)
-
-	primary, err := OpenStandardLink(offset, bufferCount, bufferSize)
-	if err != nil {
-		b.Fatalf("Failed to create primary link: %v", err)
-	}
-	defer primary.Close()
-
-	secondary, err := OpenStandardLink(offset, bufferCount, bufferSize)
-	if err != nil {
-		b.Fatalf("Failed to create secondary link: %v", err)
-	}
-	defer secondary.Close()
+	_, primary, secondary := newMemoryPair(b, bufferCount, bufferSize, LinkOptions{})
 
 	testData := make([]byte, bufferSize)
 	readBuffer := make([]byte, bufferSize)
@@ -2608,21 +2046,7 @@ func benchmarkStandardLinkPipeline(b *testing.B, payloadSize int) {
 		bufferSize = 8
 	}
 
-	size := SizeStandardLink(bufferCount, bufferSize)
-	backing, offset := createAlignedBuffer(nil, size)
-	defer runtime.KeepAlive(backing)
-
-	primary, err := OpenStandardLink(offset, bufferCount, bufferSize)
-	if err != nil {
-		b.Fatalf("Failed to create primary link: %v", err)
-	}
-	defer primary.Close()
-
-	secondary, err := OpenStandardLink(offset, bufferCount, bufferSize)
-	if err != nil {
-		b.Fatalf("Failed to create secondary link: %v", err)
-	}
-	defer secondary.Close()
+	_, primary, secondary := newMemoryPair(b, bufferCount, bufferSize, LinkOptions{})
 
 	testData := make([]byte, payloadSize)
 	readBuffer := make([]byte, payloadSize)
@@ -2673,25 +2097,13 @@ func TestStandardLinkBufferOverflow(t *testing.T) {
 	bufferCount := 1024
 	bufferSize := 4096
 
-	// Calculate required memory size
-	size := SizeStandardLink(bufferCount, bufferSize)
-
-	// Create aligned buffer
-	backing, offset := createAlignedBuffer(t, size)
-	defer runtime.KeepAlive(backing)
-
-	// Create links
-	primary, err := OpenStandardLink(offset, bufferCount, bufferSize)
-	if err != nil {
-		t.Fatalf("Failed to create primary link: %v", err)
-	}
-	defer primary.Close()
+	primary := newTestStandardLink(t, bufferCount, bufferSize, LinkOptions{})
 
 	// Test data larger than buffer size
 	testData := make([]byte, bufferSize+100) // 100 bytes larger than buffer
 
 	// Write from primary - should fail with buffer overflow error
-	_, err = primary.Write(testData)
+	_, err := primary.Write(testData)
 	if err != ErrBufferOverflow {
 		t.Errorf("Expected ErrBufferOverflow, got %v", err)
 	}
@@ -2703,25 +2115,7 @@ func TestStandardLinkPacketConn(t *testing.T) {
 	bufferCount := 1024
 	bufferSize := 4096
 
-	// Calculate required memory size
-	size := SizeStandardLink(bufferCount, bufferSize)
-
-	// Create aligned buffer
-	backing, offset := createAlignedBuffer(t, size)
-	defer runtime.KeepAlive(backing)
-
-	// Create links
-	primary, err := OpenStandardLink(offset, bufferCount, bufferSize)
-	if err != nil {
-		t.Fatalf("Failed to create primary link: %v", err)
-	}
-	defer primary.Close()
-
-	secondary, err := OpenStandardLink(offset, bufferCount, bufferSize)
-	if err != nil {
-		t.Fatalf("Failed to create secondary link: %v", err)
-	}
-	defer secondary.Close()
+	_, primary, secondary := newMemoryPair(t, bufferCount, bufferSize, LinkOptions{})
 
 	// Test that StandardLink implements PacketConn interface
 	var _ net.PacketConn = primary
@@ -2736,7 +2130,7 @@ func TestStandardLinkPacketConn(t *testing.T) {
 	}
 
 	// Test SetDeadline/SetReadDeadline/SetWriteDeadline
-	err = primary.SetDeadline(time.Now().Add(time.Second))
+	err := primary.SetDeadline(time.Now().Add(time.Second))
 	if err != nil {
 		t.Errorf("SetDeadline failed: %v", err)
 	}
@@ -2793,20 +2187,7 @@ func BenchmarkAdvancedLinkLargeCopy(b *testing.B) {
 		bufferSize  = 256
 		payloadSize = 4096
 	)
-	size := SizeStandardLink(bufferCount, bufferSize)
-	backing, offset := createAlignedBuffer(nil, size)
-	defer runtime.KeepAlive(backing)
-
-	primary, err := NewAdvancedLink(offset, bufferCount, bufferSize)
-	if err != nil {
-		b.Fatalf("Failed to create primary advanced link: %v", err)
-	}
-	defer primary.Close()
-	secondary, err := NewAdvancedLink(offset, bufferCount, bufferSize)
-	if err != nil {
-		b.Fatalf("Failed to create secondary advanced link: %v", err)
-	}
-	defer secondary.Close()
+	primary, secondary := newAdvancedPair(b, bufferCount, bufferSize)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	negotiateAdvancedPairForBenchmark(b, ctx, primary, secondary)
@@ -2837,20 +2218,7 @@ func BenchmarkAdvancedLinkRequestResponse(b *testing.B) {
 		bufferSize  = 256
 		payloadSize = 1024
 	)
-	size := SizeStandardLink(bufferCount, bufferSize)
-	backing, offset := createAlignedBuffer(nil, size)
-	defer runtime.KeepAlive(backing)
-
-	primary, err := NewAdvancedLink(offset, bufferCount, bufferSize)
-	if err != nil {
-		b.Fatalf("Failed to create primary advanced link: %v", err)
-	}
-	defer primary.Close()
-	secondary, err := NewAdvancedLink(offset, bufferCount, bufferSize)
-	if err != nil {
-		b.Fatalf("Failed to create secondary advanced link: %v", err)
-	}
-	defer secondary.Close()
+	primary, secondary := newAdvancedPair(b, bufferCount, bufferSize)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	negotiateAdvancedPairForBenchmark(b, ctx, primary, secondary)
@@ -2917,12 +2285,7 @@ func negotiateAdvancedPairForBenchmark(b *testing.B, ctx context.Context, primar
 // Primary, server the Secondary).
 func advancedTestLinks(t *testing.T, bufferCount, bufferSize int, clientOpts, serverOpts AdvancedOptions) (client, server *AdvancedLink) {
 	t.Helper()
-	backing, client, server := newAdvancedPairWithOptions(t, bufferCount, bufferSize, clientOpts, serverOpts)
-	t.Cleanup(func() {
-		client.Close()
-		server.Close()
-		runtime.KeepAlive(backing)
-	})
+	client, server = newAdvancedPairWithOptions(t, bufferCount, bufferSize, clientOpts, serverOpts)
 	negotiateAdvancedPair(t, client, server)
 	return client, server
 }
@@ -2962,7 +2325,7 @@ func TestPendingCallReleaseRecyclesOnlyCleanChannels(t *testing.T) {
 	for name, remove := range map[string]func(key advancedCallKey){
 		"failPendingCalls": func(advancedCallKey) { l.failPendingCalls(ErrClosed) },
 		"routeResponse": func(key advancedCallKey) {
-			if !l.routeResponse(AdvancedMessage{ConnectionID: key.connectionID, MessageID: key.messageID, Flags: AdvFlagResponse}) {
+			if !l.routeResponse(AdvancedMessage{ConnectionID: key.connectionID, MessageID: key.messageID, Flags: AdvFlagResponse}, nil) {
 				t.Fatalf("routeResponse did not find the pending call")
 			}
 		},
@@ -3145,14 +2508,14 @@ func TestAdvancedAbortedResponseFailsCall(t *testing.T) {
 	}
 }
 
-func TestAdvancedDialAllocatesDisjointIDsPerRole(t *testing.T) {
-	const dials = 6
+func TestAdvancedOpenStreamAllocatesDisjointIDsPerRole(t *testing.T) {
+	const streams = 6
 	primary, secondary := advancedTestLinks(t, 32, 32, AdvancedOptions{}, AdvancedOptions{})
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	for _, l := range []*AdvancedLink{primary, secondary} {
-		if err := l.Listen(ctx); err != nil {
-			t.Fatalf("Listen: %v", err)
+		if err := l.ListenStreams(ctx); err != nil {
+			t.Fatalf("ListenStreams: %v", err)
 		}
 	}
 
@@ -3160,14 +2523,14 @@ func TestAdvancedDialAllocatesDisjointIDsPerRole(t *testing.T) {
 		id  uint64
 		err error
 	}
-	results := make(chan dialed, 2*dials)
+	results := make(chan dialed, 2*streams)
 	var wg sync.WaitGroup
 	for _, l := range []*AdvancedLink{primary, secondary} {
-		for i := 0; i < dials; i++ {
+		for i := 0; i < streams; i++ {
 			wg.Add(1)
 			go func(l *AdvancedLink) {
 				defer wg.Done()
-				id, err := l.Dial(ctx)
+				id, err := l.OpenStream(ctx)
 				results <- dialed{id, err}
 			}(l)
 		}
@@ -3179,7 +2542,7 @@ func TestAdvancedDialAllocatesDisjointIDsPerRole(t *testing.T) {
 	var even, odd int
 	for r := range results {
 		if r.err != nil {
-			t.Fatalf("Dial: %v", r.err)
+			t.Fatalf("OpenStream: %v", r.err)
 		}
 		if r.id == 0 || seen[r.id] {
 			t.Fatalf("connection ID %d is zero or duplicated", r.id)
@@ -3191,8 +2554,8 @@ func TestAdvancedDialAllocatesDisjointIDsPerRole(t *testing.T) {
 			odd++
 		}
 	}
-	if even != dials || odd != dials {
-		t.Fatalf("got %d even and %d odd IDs, want %d each", even, odd, dials)
+	if even != streams || odd != streams {
+		t.Fatalf("got %d even and %d odd IDs, want %d each", even, odd, streams)
 	}
 
 	// Each side accepted exactly the other side's IDs.
@@ -3201,10 +2564,10 @@ func TestAdvancedDialAllocatesDisjointIDsPerRole(t *testing.T) {
 		l      *AdvancedLink
 		parity uint64
 	}{{"primary accepts secondary IDs", primary, 1}, {"secondary accepts primary IDs", secondary, 0}} {
-		for i := 0; i < dials; i++ {
-			id, err := tc.l.Accept(ctx)
+		for i := 0; i < streams; i++ {
+			id, err := tc.l.AcceptStream(ctx)
 			if err != nil {
-				t.Fatalf("%s: Accept: %v", tc.name, err)
+				t.Fatalf("%s: AcceptStream: %v", tc.name, err)
 			}
 			if id%2 != tc.parity || id == 0 {
 				t.Fatalf("%s: accepted ID %d with the wrong parity", tc.name, id)
@@ -3230,8 +2593,8 @@ func TestAdvancedConnCreateRefusesForgedIDs(t *testing.T) {
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
-			if err := victim.Listen(ctx); err != nil {
-				t.Fatalf("Listen: %v", err)
+			if err := victim.ListenStreams(ctx); err != nil {
+				t.Fatalf("ListenStreams: %v", err)
 			}
 			create := func(id uint64) {
 				t.Helper()
@@ -3254,29 +2617,29 @@ func TestAdvancedConnCreateRefusesForgedIDs(t *testing.T) {
 			expectRefused("wrong parity")
 
 			create(tc.valid)
-			id, err := victim.Accept(ctx)
+			id, err := victim.AcceptStream(ctx)
 			if err != nil || id != tc.valid {
-				t.Fatalf("Accept = %d, %v, want %d", id, err, tc.valid)
+				t.Fatalf("AcceptStream = %d, %v, want %d", id, err, tc.valid)
 			}
 			victim.controlMu.Lock()
-			original := victim.connections[tc.valid]
+			_, registered := victim.connections[tc.valid]
 			victim.controlMu.Unlock()
-			if original == nil {
+			if !registered {
 				t.Fatalf("accepted connection %d is not registered", tc.valid)
 			}
 
 			create(tc.valid)
 			expectRefused("duplicate")
 			victim.controlMu.Lock()
-			current := victim.connections[tc.valid]
+			_, stillRegistered := victim.connections[tc.valid]
 			victim.controlMu.Unlock()
-			if current != original {
-				t.Fatalf("duplicate create replaced the live connection")
+			if !stillRegistered {
+				t.Fatalf("duplicate create dropped the live connection")
 			}
 			shortCtx, shortCancel := context.WithTimeout(ctx, 50*time.Millisecond)
 			defer shortCancel()
-			if id, err := victim.Accept(shortCtx); err == nil {
-				t.Fatalf("refused create was queued for Accept as %d", id)
+			if id, err := victim.AcceptStream(shortCtx); err == nil {
+				t.Fatalf("refused create was queued for AcceptStream as %d", id)
 			}
 		})
 	}
@@ -3348,8 +2711,8 @@ func TestAdvancedReassemblyLimitBoundsIncompleteMessages(t *testing.T) {
 		t.Fatalf("over-limit request: outcome %v, message %+v", o, refused)
 	}
 	refusedResponse, o := begin(3, 300, AdvFlagResponse)
-	if o != chunkRefused || !errors.Is(refusedResponse.abortErr, ErrReassemblyLimit) {
-		t.Fatalf("over-limit response: outcome %v, abortErr %v", o, refusedResponse.abortErr)
+	if o != chunkRefused || !refusedResponse.IsAbort() || !refusedResponse.IsResponse() {
+		t.Fatalf("over-limit response: outcome %v, message %+v", o, refusedResponse)
 	}
 	if len(l.assemblies) != 1 || l.assemblyBytes != 300+overhead || len(l.rejected) != 2 {
 		t.Fatalf("refusal allocated: %d assemblies, %d bytes, %d rejected", len(l.assemblies), l.assemblyBytes, len(l.rejected))
@@ -3441,7 +2804,7 @@ func TestAdvancedReassemblyLimitRefusesRequest(t *testing.T) {
 	if !errors.As(err, &re) || re.Status != uint64(ErrCodeBufferOverflow) {
 		t.Fatalf("Call over the reassembly limit = %v, want AdvancedResponseError(ErrCodeBufferOverflow)", err)
 	}
-	if got := server.GetAdvancedStats().DroppedMessages; got != 1 {
+	if got := server.Stats().DroppedMessages; got != 1 {
 		t.Fatalf("server DroppedMessages = %d, want 1", got)
 	}
 
@@ -3477,7 +2840,7 @@ func TestAdvancedReassemblyLimitRefusesResponse(t *testing.T) {
 	if !errors.Is(err, ErrReassemblyLimit) || !errors.Is(err, ErrBufferOverflow) {
 		t.Fatalf("Call with a refused response = %v, want ErrReassemblyLimit", err)
 	}
-	if got := client.GetAdvancedStats().DroppedMessages; got != 1 {
+	if got := client.Stats().DroppedMessages; got != 1 {
 		t.Fatalf("client DroppedMessages = %d, want 1", got)
 	}
 	// Release the budget by aborting the hog; the link keeps working.

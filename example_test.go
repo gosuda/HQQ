@@ -58,19 +58,19 @@ func ExampleListen() {
 	// server: <nil>
 }
 
-// OpenStandardLinkMemory runs a link in any page-aligned memory. AlignedBuffer
-// is enough between goroutines of one process; between processes use a
-// shared mapping (CreateStandardLink / OpenNamedStandardLink).
-func ExampleOpenStandardLinkMemory() {
+// NewStandardLink runs a link in any page-aligned memory. AlignedBuffer is
+// enough between goroutines of one process; between processes use a shared
+// mapping (CreateStandardLink / OpenStandardLink).
+func ExampleNewStandardLink() {
 	const bufferCount, bufferSize = 16, 256
 	mem := hqq.AlignedBuffer(hqq.SizeStandardLink(bufferCount, bufferSize))
 
-	a, err := hqq.OpenStandardLinkMemory(mem, bufferCount, bufferSize, hqq.LinkOptions{})
+	a, err := hqq.NewStandardLink(mem, bufferCount, bufferSize, hqq.LinkOptions{})
 	if err != nil {
 		panic(err)
 	}
 	defer a.Close()
-	b, err := hqq.OpenStandardLinkMemory(mem, bufferCount, bufferSize, hqq.LinkOptions{})
+	b, err := hqq.NewStandardLink(mem, bufferCount, bufferSize, hqq.LinkOptions{})
 	if err != nil {
 		panic(err)
 	}
@@ -83,17 +83,17 @@ func ExampleOpenStandardLinkMemory() {
 	// Output: ping primary secondary
 }
 
-// CreateStandardLink and OpenNamedStandardLink map a named segment; the
+// CreateStandardLink and OpenStandardLink map a named segment; the
 // creator removes the name when it closes.
 func ExampleCreateStandardLink() {
 	name := shortName("std")
-	server, err := hqq.CreateStandardLink(name, 64, 1024, 0o600)
+	server, err := hqq.CreateStandardLink(name, 64, 1024, 0o600, hqq.LinkOptions{})
 	if err != nil {
 		panic(err)
 	}
 	defer server.Close()
 
-	client, err := hqq.OpenNamedStandardLink(name, 64, 1024)
+	client, err := hqq.OpenStandardLink(name, 64, 1024, hqq.LinkOptions{})
 	if err != nil {
 		panic(err)
 	}
@@ -114,8 +114,8 @@ func ExampleCreateStandardLink() {
 // filling. Every reservation must be committed (or aborted) promptly.
 func ExampleStandardLink_ReserveWrite() {
 	mem := hqq.AlignedBuffer(hqq.SizeStandardLink(8, 64))
-	w, _ := hqq.OpenStandardLinkMemory(mem, 8, 64, hqq.LinkOptions{})
-	r, _ := hqq.OpenStandardLinkMemory(mem, 8, 64, hqq.LinkOptions{})
+	w, _ := hqq.NewStandardLink(mem, 8, 64, hqq.LinkOptions{})
+	r, _ := hqq.NewStandardLink(mem, 8, 64, hqq.LinkOptions{})
 	defer w.Close()
 	defer r.Close()
 

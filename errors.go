@@ -69,8 +69,15 @@ var (
 	// protocol negotiation, or when the required feature was not negotiated.
 	ErrNotNegotiated = &hqqError{msg: "hqq: advanced protocol not negotiated", base: ErrInvalidOp}
 
-	// ErrAlreadyNegotiated is returned when negotiation is attempted twice.
+	// ErrAlreadyNegotiated is returned when negotiation is attempted after it
+	// succeeded or while it is in progress.
 	ErrAlreadyNegotiated = &hqqError{msg: "hqq: protocol already negotiated or in progress", base: ErrInvalidOp}
+
+	// ErrNegotiationFailed is returned when negotiation is attempted again
+	// after an earlier attempt failed. Failure is terminal: negotiation frames
+	// of the failed attempt may still be in flight, so the link must be closed
+	// and a new one opened.
+	ErrNegotiationFailed = &hqqError{msg: "hqq: protocol negotiation failed earlier; reopen the link", base: ErrInvalidOp}
 
 	// ErrNegotiationRejected is returned when the peer rejects negotiation or
 	// acknowledges an incompatible version or feature set.
@@ -120,7 +127,7 @@ var (
 	ErrInvalidName = shm.ErrInvalidName
 )
 
-// Transient attach errors. Both wrap ErrFailedInit; Dial retries only on
+// Transient attach errors. All wrap ErrFailedInit; Dial retries only on
 // these (and on a missing name), never on a permanent ErrFailedInit variant
 // such as ErrIncompatibleLayout.
 var (
@@ -132,6 +139,12 @@ var (
 	// the segment past AttachTimeout, or took over this endpoint's
 	// initialization.
 	errInitContended = &hqqError{msg: "hqq: shared memory segment initialization did not complete", base: ErrFailedInit}
+
+	// errNoLiveEndpoint is returned to an opener (OpenStandardLink,
+	// OpenAdvancedLink, Dial) when every endpoint of the segment closed or
+	// died. Openers never re-initialize a segment; a new creator (Create*,
+	// Listen) reuses it.
+	errNoLiveEndpoint = &hqqError{msg: "hqq: shared memory segment has no live endpoint", base: ErrFailedInit}
 )
 
 // hqqError is an error with a stable message that wraps a broader base error.
@@ -153,12 +166,40 @@ func (*timeoutError) Unwrap() error   { return os.ErrDeadlineExceeded }
 
 var _ net.Error = (*timeoutError)(nil)
 
-// unknownCodeError reports an OpError packet with an unknown code.
+// unknownCodeError reports an OpError packet with an unknown code. It
+// matches ErrProtocol: the peer sent something this version does not
+// understand.
 type unknownCodeError struct{ code ErrorCode }
 
 func (e unknownCodeError) Error() string {
 	return fmt.Sprintf("hqq: peer reported unknown error code %#x", uint64(e.code))
 }
+
+func (e unknownCodeError) Unwrap() error { return ErrProtocol }
+
+// GeometryError reports that an existing shared-memory segment was laid out
+// for a different configuration than the caller asked for. It matches
+// ErrInvalidSize.
+type GeometryError struct {
+	// Want is the configuration requested by the caller; Got is the one
+	// recorded in the segment.
+	Want, Got Geometry
+}
+
+// Geometry is the layout configuration of a segment.
+type Geometry struct {
+	BufferCount, BufferSize int
+	LayoutSize              uintptr
+	PageSize                uintptr
+}
+
+func (e *GeometryError) Error() string {
+	return fmt.Sprintf("hqq: segment geometry mismatch: want %d x %d bytes (layout %d, page %d), segment has %d x %d bytes (layout %d, page %d)",
+		e.Want.BufferCount, e.Want.BufferSize, e.Want.LayoutSize, e.Want.PageSize,
+		e.Got.BufferCount, e.Got.BufferSize, e.Got.LayoutSize, e.Got.PageSize)
+}
+
+func (e *GeometryError) Unwrap() error { return ErrInvalidSize }
 
 // errorFromCode converts a protocol error code to an error.
 func errorFromCode(code ErrorCode) error {

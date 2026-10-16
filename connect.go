@@ -23,9 +23,9 @@ type Config struct {
 	// messages are chunked automatically. Default: DefaultBufferSize.
 	BufferSize int
 
-	// Mode is the permission of the created segment (Listen only).
+	// Perm is the permission of the created segment (Listen only).
 	// Default: 0600.
-	Mode os.FileMode
+	Perm os.FileMode
 
 	// Features to negotiate. Default: FeatureLargeCopy|FeatureRequestResponse.
 	Features uint64
@@ -41,8 +41,8 @@ func (c Config) normalized() Config {
 	if c.BufferSize == 0 {
 		c.BufferSize = DefaultBufferSize
 	}
-	if c.Mode == 0 {
-		c.Mode = 0o600
+	if c.Perm == 0 {
+		c.Perm = 0o600
 	}
 	if c.Features == FeatureNone {
 		c.Features = supportedFeatures
@@ -52,14 +52,20 @@ func (c Config) normalized() Config {
 
 // Listen creates the named segment, waits until a peer Dials it, and
 // negotiates the Advanced Protocol. The returned link is ready for Call,
-// Serve, SendLarge and Receive. Closing it removes the name.
+// Serve, SendLarge and Receive. Closing it removes the name, unless the name
+// was removed and created again by somebody else meanwhile.
 //
-// Listen fails with an error matching os.ErrExist if the name is in use; a
-// name left behind by a crashed process can be removed with Unlink.
+// If the name already exists, Listen reuses it when both endpoints of the
+// existing segment are closed or dead (for example after a crash of the
+// previous listener) and fails with ErrLinkBusy when an endpoint is still
+// alive; see CreateStandardLink. A name that is not an HQQ segment of this
+// layout version fails with ErrIncompatibleLayout and is left untouched.
+// ctx bounds the wait for a peer and the wait for a segment that another
+// endpoint is still initializing.
 func Listen(ctx context.Context, name string, cfg Config) (*NamedAdvancedLink, error) {
 	ctx = orBackground(ctx)
 	cfg = cfg.normalized()
-	link, err := CreateAdvancedLinkWithOptions(name, cfg.BufferCount, cfg.BufferSize, cfg.Mode, cfg.Advanced)
+	link, err := openNamedAdvanced(ctx, name, cfg.BufferCount, cfg.BufferSize, true, cfg.Perm, cfg.Advanced)
 	if err != nil {
 		return nil, err
 	}
@@ -70,15 +76,19 @@ func Listen(ctx context.Context, name string, cfg Config) (*NamedAdvancedLink, e
 	return link, nil
 }
 
-// Dial attaches to the named segment created by Listen, retrying until it
-// exists or ctx is done, and negotiates the Advanced Protocol. cfg must use
-// the same BufferCount and BufferSize as the listener.
+// Dial attaches to the named segment created by Listen as the Secondary and
+// negotiates the Advanced Protocol. It retries while the name does not exist
+// yet, while the listener has not finished initializing the segment, and
+// while the segment has no live endpoint (until a new Listen reuses the
+// name); every other error is returned at once. cfg must use the same
+// BufferCount and BufferSize as the listener. ctx also bounds every wait
+// inside a single attempt: Dial returns ctx.Err() as soon as ctx is done.
 func Dial(ctx context.Context, name string, cfg Config) (*NamedAdvancedLink, error) {
 	ctx = orBackground(ctx)
 	cfg = cfg.normalized()
 	backoff := time.Millisecond
 	for {
-		link, err := OpenNamedAdvancedLinkWithOptions(name, cfg.BufferCount, cfg.BufferSize, cfg.Advanced)
+		link, err := openNamedAdvanced(ctx, name, cfg.BufferCount, cfg.BufferSize, false, 0, cfg.Advanced)
 		if err == nil {
 			if err := link.Negotiate(ctx, cfg.Features); err != nil {
 				_ = link.Close()
@@ -99,11 +109,13 @@ func Dial(ctx context.Context, name string, cfg Config) (*NamedAdvancedLink, err
 }
 
 // dialRetryable reports whether a failed open may succeed later: the
-// listener has not created the name yet, has not sized the segment yet, or
-// is still initializing it. Every other error (a busy link, a geometry or
-// layout mismatch, an invalid name) is permanent.
+// listener has not created the name yet, has not claimed or finished
+// initializing the segment yet, or is gone and a new listener may reuse the
+// name. Every other error (a busy link, a geometry or layout mismatch, an
+// invalid name) is permanent.
 func dialRetryable(err error) bool {
 	return errors.Is(err, os.ErrNotExist) ||
 		errors.Is(err, errSegmentNotReady) ||
-		errors.Is(err, errInitContended)
+		errors.Is(err, errInitContended) ||
+		errors.Is(err, errNoLiveEndpoint)
 }

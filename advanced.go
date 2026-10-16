@@ -19,16 +19,6 @@ const (
 	supportedFeatures = FeatureLargeCopy | FeatureRequestResponse
 )
 
-// Capability flags for Advanced Protocol negotiation.
-const (
-	CapabilityNone           uint64 = 0
-	CapabilityLargeBuffers   uint64 = 1 << 0 // Endpoint supports large configured payload buffers.
-	CapabilityHighThroughput uint64 = 1 << 1 // Endpoint is optimized for high-throughput chunk streams.
-	CapabilityLowLatency     uint64 = 1 << 2 // Endpoint is optimized for low-latency request-response calls.
-
-	supportedCapabilities = CapabilityLargeBuffers | CapabilityHighThroughput | CapabilityLowLatency
-)
-
 // Advanced Protocol frame flags stored in OpConnCopy operand 5.
 const (
 	AdvFlagBegin uint64 = 1 << iota
@@ -73,11 +63,16 @@ type ProtocolVersion struct {
 	Minor uint8 // Minor version for backward-compatible additions
 }
 
-// CurrentProtocolVersion is the Advanced Protocol version implemented by this
-// package.
-var CurrentProtocolVersion = ProtocolVersion{
+// currentProtocolVersion backs CurrentProtocolVersion.
+var currentProtocolVersion = ProtocolVersion{
 	Major: protocol.HQQProtocolMajorVersion,
 	Minor: protocol.HQQProtocolMinorVersion,
+}
+
+// CurrentProtocolVersion returns the Advanced Protocol version implemented by
+// this package.
+func CurrentProtocolVersion() ProtocolVersion {
+	return currentProtocolVersion
 }
 
 func (v ProtocolVersion) encode() uint64 {
@@ -95,16 +90,23 @@ const (
 	ProtocolStateNone        ProtocolState = iota // No negotiation initiated
 	ProtocolStateNegotiating                      // Negotiation in progress
 	ProtocolStateNegotiated                       // Negotiation completed successfully
-	ProtocolStateFailed                           // Negotiation failed
+
+	// ProtocolStateFailed means a negotiation attempt failed: the peer
+	// rejected it, the packets were invalid, or the attempt ended with an
+	// error such as a canceled context or a closed link. Failed is terminal:
+	// every later Negotiate, NegotiateProtocol or WaitForNegotiation call
+	// returns ErrNegotiationFailed, and the link cannot be negotiated again.
+	// Close it and create a new one.
+	ProtocolStateFailed
 )
 
 // OverflowPolicy selects what the Advanced dispatcher does when the incoming
-// queue (messages for Receive, or streams for Accept) is full.
+// queue (messages for Receive, or streams for AcceptStream) is full.
 type OverflowPolicy uint8
 
 const (
 	// OverflowBlock (the default) applies backpressure: the dispatcher waits
-	// for Receive/Accept. While it waits, responses to Call are not routed
+	// for Receive/AcceptStream. While it waits, responses to Call are not routed
 	// either, so an application that only calls Call must not let the peer
 	// send it unsolicited messages under this policy.
 	OverflowBlock OverflowPolicy = iota
@@ -158,7 +160,7 @@ type AdvancedStats struct {
 	LargeBytes         uint64
 	Requests           uint64
 	Responses          uint64
-	DroppedMessages    uint64 // messages discarded by OverflowDrop or refused by MaxReassemblyBytes
+	DroppedMessages    uint64 // messages discarded by OverflowDrop, refused by MaxReassemblyBytes, or whose control reply was dropped because the control queue was full
 	AbandonedResponses uint64 // late responses to canceled calls that were discarded
 }
 
@@ -179,27 +181,34 @@ type advancedCounters struct {
 // Concurrency: all methods are safe for concurrent use. After negotiation a
 // single dispatcher path consumes the receive direction: Receive may drive it
 // synchronously, and a background dispatcher is started when concurrent calls
-// or streams need asynchronous routing.
+// or streams need asynchronous routing. The receive path never waits for the
+// tx ring: the replies it generates (stream accepts and refusals, error
+// responses to requests refused by MaxReassemblyBytes) are sent by a separate
+// control-sender goroutine through a bounded queue; a reply that does not fit
+// is dropped and counted in AdvancedStats.DroppedMessages.
 type AdvancedLink struct {
 	slink *StandardLink // Wrapped standard link
 
 	// Protocol negotiation state
-	state                  atomic.Int32  // ProtocolState
-	negotiated             atomic.Uint64 // negotiatedBit | features
-	protocolMu             sync.RWMutex  // guards the negotiated* fields below
-	negotiatedVersion      ProtocolVersion
-	negotiatedFeatures     uint64
-	negotiatedCapabilities uint64
+	state              atomic.Int32  // ProtocolState
+	negotiated         atomic.Uint64 // negotiatedBit | features
+	protocolMu         sync.RWMutex  // guards the negotiated* fields below
+	negotiatedVersion  ProtocolVersion
+	negotiatedFeatures uint64
 
 	messageIDGenerator atomic.Uint64
 
 	// Connection management (guarded by controlMu)
 	connectionIDGenerator atomic.Uint64
 	controlMu             sync.Mutex
-	listening             bool // Whether the link is listening for connections
-	connections           map[uint64]*Connection
+	listening             bool                // Whether the link is listening for connections
+	connections           map[uint64]struct{} // IDs of open and opening streams
 	pendingConnections    map[uint64]chan error
 	acceptCh              chan uint64
+	// acceptSlots reserves room in acceptCh for streams whose accept reply is
+	// queued on the control sender: a slot is taken when OpConnCreate is
+	// received and released by AcceptStream (or when the accept fails).
+	acceptSlots chan struct{}
 
 	// Receive path
 	receiveMu  sync.Mutex
@@ -226,6 +235,14 @@ type AdvancedLink struct {
 	dispatchErr     error
 	incoming        chan advancedDispatchResult
 
+	// Control sender: sends the replies generated by the receive path (see
+	// controlJob). ctrlQueue, ctrlCancel and ctrlStarted's transition are
+	// guarded by dispatchMu; ctrlQueue is read lock-free once ctrlStarted.
+	ctrlStarted atomic.Bool
+	ctrlQueue   chan controlJob
+	ctrlCancel  context.CancelFunc
+	ctrlDone    chan struct{}
+
 	// Pending calls (guarded by pendingMu)
 	pendingMu      sync.Mutex
 	pendingCalls   map[advancedCallKey]chan advancedDispatchResult
@@ -237,49 +254,12 @@ type AdvancedLink struct {
 	closeErr  error
 }
 
-// Connection represents a logical Advanced stream.
-type Connection struct {
-	id        uint64
-	state     atomic.Uint32 // ConnectionState
-	createdAt time.Time
-}
-
-// ConnectionState represents the state of a connection
-type ConnectionState uint32
-
-const (
-	ConnectionStateClosed  ConnectionState = iota // Connection is closed
-	ConnectionStateOpening                        // Connection is being established
-	ConnectionStateOpen                           // Connection is active
-	ConnectionStateClosing                        // Connection is being closed
-)
-
-func newConnection(id uint64, state ConnectionState) *Connection {
-	c := &Connection{id: id, createdAt: time.Now()}
-	c.state.Store(uint32(state))
-	return c
-}
-
-// NewAdvancedLink creates or attaches to an advanced link in caller-owned
-// memory at offset, with default options.
-func NewAdvancedLink(offset uintptr, bufferCount int, bufferSize int) (*AdvancedLink, error) {
-	return NewAdvancedLinkWithOptions(offset, bufferCount, bufferSize, AdvancedOptions{})
-}
-
-// NewAdvancedLinkWithOptions creates or attaches to an advanced link with
-// explicit options. See OpenStandardLinkWithOptions for the memory contract.
-func NewAdvancedLinkWithOptions(offset uintptr, bufferCount int, bufferSize int, opts AdvancedOptions) (*AdvancedLink, error) {
-	slink, err := OpenStandardLinkWithOptions(offset, bufferCount, bufferSize, opts.Link)
-	if err != nil {
-		return nil, err
-	}
-	return newAdvancedLink(slink, opts), nil
-}
-
-// NewAdvancedLinkMemory creates or attaches to an advanced link in mem; see
-// OpenStandardLinkMemory.
-func NewAdvancedLinkMemory(mem []byte, bufferCount int, bufferSize int, opts AdvancedOptions) (*AdvancedLink, error) {
-	slink, err := OpenStandardLinkMemory(mem, bufferCount, bufferSize, opts.Link)
+// NewAdvancedLink creates or attaches to an Advanced link in mem. mem must be
+// page-aligned and at least SizeStandardLink(bufferCount, bufferSize) bytes
+// long; it is typically a shared mapping, or AlignedBuffer for links between
+// goroutines of one process. See NewStandardLink for the endpoint roles.
+func NewAdvancedLink(mem []byte, bufferCount int, bufferSize int, opts AdvancedOptions) (*AdvancedLink, error) {
+	slink, err := NewStandardLink(mem, bufferCount, bufferSize, opts.Link)
 	if err != nil {
 		return nil, err
 	}
@@ -304,14 +284,16 @@ func newAdvancedLink(slink *StandardLink, opts AdvancedOptions) *AdvancedLink {
 	}
 	return &AdvancedLink{
 		slink:              slink,
-		connections:        make(map[uint64]*Connection),
+		connections:        make(map[uint64]struct{}),
 		pendingConnections: make(map[uint64]chan error),
 		acceptCh:           make(chan uint64, incomingQueueSize),
+		acceptSlots:        make(chan struct{}, incomingQueueSize),
 		assemblies:         make(map[advancedMessageKey]*advancedAssembly),
 		maxMessageSize:     maxMessageSize,
 		maxReassemblyBytes: maxReassemblyBytes,
 		overflow:           opts.IncomingOverflow,
 		dispatchDone:       make(chan struct{}),
+		ctrlDone:           make(chan struct{}),
 		incoming:           make(chan advancedDispatchResult, incomingQueueSize),
 		pendingCalls:       make(map[advancedCallKey]chan advancedDispatchResult),
 		abandoned:          make(map[advancedCallKey]struct{}),
@@ -337,41 +319,41 @@ func (l *AdvancedLink) Write(b []byte) (n int, err error) {
 	return l.slink.Write(b)
 }
 
-// Close stops the dispatcher, fails pending calls and dials with ErrClosed,
-// and closes the underlying StandardLink. Close is idempotent.
+// Close stops the dispatcher and the control sender, fails pending calls and
+// dials with ErrClosed, and closes the underlying StandardLink. Control
+// replies still queued are discarded. Close is idempotent.
 func (l *AdvancedLink) Close() error {
 	l.closeOnce.Do(func() {
 		l.dispatchMu.Lock()
 		l.closing = true
 		cancel := l.dispatchCancel
 		started := l.dispatchStarted.Load()
+		ctrlCancel := l.ctrlCancel
+		ctrlStarted := l.ctrlStarted.Load()
 		l.dispatchMu.Unlock()
 
 		if cancel != nil {
 			cancel()
 		}
+		if ctrlCancel != nil {
+			ctrlCancel()
+		}
 		l.closeErr = l.slink.Close()
 		if started {
 			<-l.dispatchDone
+		}
+		if ctrlStarted {
+			<-l.ctrlDone
 		}
 		l.failPendingCalls(ErrClosed)
 		l.failPendingConnections(ErrClosed)
 
 		l.controlMu.Lock()
 		l.listening = false
-		for id, conn := range l.connections {
-			conn.state.Store(uint32(ConnectionStateClosed))
-			delete(l.connections, id)
-		}
+		clear(l.connections)
 		l.controlMu.Unlock()
 	})
 	return l.closeErr
-}
-
-// Standard returns the underlying StandardLink (for PeerState, deadlines and
-// configuration). Do not read from it after negotiation.
-func (l *AdvancedLink) Standard() *StandardLink {
-	return l.slink
 }
 
 // Mode returns the endpoint role of the underlying link.
@@ -382,20 +364,6 @@ func (l *AdvancedLink) Mode() LinkMode {
 // Type returns LinkTypeAdvanced.
 func (l *AdvancedLink) Type() LinkType {
 	return LinkTypeAdvanced
-}
-
-// GetMode returns the endpoint role of the underlying link.
-//
-// Deprecated: Use Mode.
-func (l *AdvancedLink) GetMode() LinkMode {
-	return l.Mode()
-}
-
-// GetType returns LinkTypeAdvanced.
-//
-// Deprecated: Use Type.
-func (l *AdvancedLink) GetType() LinkType {
-	return l.Type()
 }
 
 // PeerState reports what this endpoint knows about its peer.
@@ -417,23 +385,6 @@ func (l *AdvancedLink) BufferCount() int {
 		return 0
 	}
 	return l.slink.BufferCount()
-}
-
-// LargeMessageThreshold returns the largest payload size that fits in one
-// Standard Protocol packet before Advanced chunking is required.
-func (l *AdvancedLink) LargeMessageThreshold() int {
-	if l == nil {
-		return 0
-	}
-	return l.slink.LargeMessageThreshold()
-}
-
-// IsLargeMessage reports whether payloadSize should use Advanced chunking.
-func (l *AdvancedLink) IsLargeMessage(payloadSize int) bool {
-	if l == nil {
-		return false
-	}
-	return l.slink.IsLargeMessage(payloadSize)
 }
 
 func orBackground(ctx context.Context) context.Context {
@@ -487,34 +438,33 @@ func (l *AdvancedLink) dequeue(ctx context.Context, fn func(slot uint64, p *prot
 	}
 	defer s.exitRx()
 	c := mpmc.Cancel{Ctx: ctx, Closed: s.closeCh, Check: s.checkFn}
-	err := s.rxRing.DequeueZeroCopyCancel(&c, fn)
-	if err == nil {
-		return nil
-	}
-	if err == ErrPeerClosed || err == ErrPeerGone {
-		if s.rxRing.DequeueZeroCopyCancel(&mpmc.Cancel{NoWait: true}, fn) == nil {
-			return nil
-		}
-	}
-	return mapCtxErr(ctx, err)
-}
-
-func (l *AdvancedLink) beginNegotiation() error {
-	if !l.state.CompareAndSwap(int32(ProtocolStateNone), int32(ProtocolStateNegotiating)) {
-		return ErrAlreadyNegotiated
+	if err := dequeueDrained(s.rxRing, &c, fn); err != nil {
+		return mapCtxErr(ctx, err)
 	}
 	return nil
+}
+
+// beginNegotiation moves None to Negotiating. Any other state is an error:
+// ErrNegotiationFailed after a failed attempt (terminal), ErrAlreadyNegotiated
+// while an attempt is in progress or after it succeeded.
+func (l *AdvancedLink) beginNegotiation() error {
+	if l.state.CompareAndSwap(int32(ProtocolStateNone), int32(ProtocolStateNegotiating)) {
+		return nil
+	}
+	if ProtocolState(l.state.Load()) == ProtocolStateFailed {
+		return ErrNegotiationFailed
+	}
+	return ErrAlreadyNegotiated
 }
 
 func (l *AdvancedLink) setProtocolFailed() {
 	l.state.Store(int32(ProtocolStateFailed))
 }
 
-func (l *AdvancedLink) setNegotiated(version ProtocolVersion, features uint64, capabilities uint64) {
+func (l *AdvancedLink) setNegotiated(version ProtocolVersion, features uint64) {
 	l.protocolMu.Lock()
 	l.negotiatedVersion = version
 	l.negotiatedFeatures = features
-	l.negotiatedCapabilities = capabilities
 	l.protocolMu.Unlock()
 	l.negotiated.Store(negotiatedBit | features)
 	l.state.Store(int32(ProtocolStateNegotiated))
@@ -525,6 +475,11 @@ func (l *AdvancedLink) setNegotiated(version ProtocolVersion, features uint64, c
 // Secondary answers it. Both endpoints simply call Negotiate. features selects
 // the requested features; zero requests all supported features. The result
 // is the intersection of both sides' features.
+//
+// A link is negotiated at most once: Negotiate returns ErrAlreadyNegotiated
+// while a negotiation is in progress or after it succeeded, and
+// ErrNegotiationFailed after a failed attempt (ProtocolStateFailed is
+// terminal).
 func (l *AdvancedLink) Negotiate(ctx context.Context, features uint64) error {
 	if features == FeatureNone {
 		features = supportedFeatures
@@ -532,7 +487,7 @@ func (l *AdvancedLink) Negotiate(ctx context.Context, features uint64) error {
 	var ok bool
 	var err error
 	if l.slink.linkMode == LinkModePrimary {
-		ok, err = l.NegotiateProtocol(ctx, CurrentProtocolVersion, features)
+		ok, err = l.NegotiateProtocol(ctx, currentProtocolVersion, features)
 	} else {
 		ok, err = l.waitForNegotiation(ctx, features)
 	}
@@ -546,6 +501,11 @@ func (l *AdvancedLink) Negotiate(ctx context.Context, features uint64) error {
 // acknowledgment. The peer must call WaitForNegotiation, Negotiate, or
 // NegotiateProtocol: if both endpoints call NegotiateProtocol at the same
 // time, the Primary's request wins and the Secondary answers it.
+//
+// It returns ErrAlreadyNegotiated if a negotiation is in progress or
+// succeeded, and ErrNegotiationFailed if an earlier attempt failed. Any
+// error from the attempt itself (including a canceled ctx) leaves the link
+// in the terminal ProtocolStateFailed.
 func (l *AdvancedLink) NegotiateProtocol(ctx context.Context, version ProtocolVersion, features uint64) (bool, error) {
 	ctx = orBackground(ctx)
 	if err := l.beginNegotiation(); err != nil {
@@ -554,7 +514,7 @@ func (l *AdvancedLink) NegotiateProtocol(ctx context.Context, version ProtocolVe
 	start := time.Now()
 	defer func() { l.stats.negotiationTime.Store(int64(time.Since(start))) }()
 
-	request := protocol.NewPacket(protocol.OpProtoNegotiate, version.encode(), features, supportedCapabilities)
+	request := protocol.NewPacket(protocol.OpProtoNegotiate, version.encode(), features, 0)
 	if err := l.sendPacket(ctx, request); err != nil {
 		l.setProtocolFailed()
 		return false, err
@@ -572,15 +532,13 @@ func (l *AdvancedLink) NegotiateProtocol(ctx context.Context, version ProtocolVe
 		case protocol.OpProtoAck:
 			ackVersion := decodeVersion(p.Operand(0))
 			ackFeatures := p.Operand(1)
-			ackCapabilities := p.Operand(2)
 			if ackVersion.Major != protocol.HQQProtocolMajorVersion ||
 				ackVersion.Minor > protocol.HQQProtocolMinorVersion ||
-				ackFeatures&^(features&supportedFeatures) != 0 ||
-				ackCapabilities&^supportedCapabilities != 0 {
+				ackFeatures&^(features&supportedFeatures) != 0 {
 				l.setProtocolFailed()
 				return false, ErrNegotiationRejected
 			}
-			l.setNegotiated(ackVersion, ackFeatures, ackCapabilities)
+			l.setNegotiated(ackVersion, ackFeatures)
 			return true, nil
 		case protocol.OpProtoNegotiate:
 			if l.slink.linkMode == LinkModeSecondary {
@@ -601,7 +559,8 @@ func (l *AdvancedLink) NegotiateProtocol(ctx context.Context, version ProtocolVe
 }
 
 // WaitForNegotiation waits for the peer's negotiation request and answers it
-// with the intersection of the requested and supported features.
+// with the intersection of the requested and supported features. Its
+// result codes and failure semantics are those of NegotiateProtocol.
 func (l *AdvancedLink) WaitForNegotiation(ctx context.Context) (bool, error) {
 	return l.waitForNegotiation(ctx, supportedFeatures)
 }
@@ -645,55 +604,37 @@ func (l *AdvancedLink) answerNegotiation(ctx context.Context, p protocol.Packet,
 	}
 	version := ProtocolVersion{Major: requested.Major, Minor: min(requested.Minor, uint8(protocol.HQQProtocolMinorVersion))}
 	features := p.Operand(1) & supportedFeatures & allowed
-	capabilities := p.Operand(2) & supportedCapabilities
 
-	ack := protocol.NewPacket(protocol.OpProtoAck, version.encode(), features, capabilities)
+	ack := protocol.NewPacket(protocol.OpProtoAck, version.encode(), features, 0)
 	if err := l.sendPacket(ctx, ack); err != nil {
 		l.setProtocolFailed()
 		return false, err
 	}
-	l.setNegotiated(version, features, capabilities)
+	l.setNegotiated(version, features)
 	return true, nil
 }
 
-// GetProtocolState returns the current protocol negotiation state.
-func (l *AdvancedLink) GetProtocolState() ProtocolState {
+// ProtocolState returns the current protocol negotiation state.
+func (l *AdvancedLink) ProtocolState() ProtocolState {
 	return ProtocolState(l.state.Load())
 }
 
-// GetNegotiatedVersion returns the negotiated protocol version.
-func (l *AdvancedLink) GetNegotiatedVersion() ProtocolVersion {
+// NegotiatedVersion returns the negotiated protocol version.
+func (l *AdvancedLink) NegotiatedVersion() ProtocolVersion {
 	l.protocolMu.RLock()
 	defer l.protocolMu.RUnlock()
 	return l.negotiatedVersion
 }
 
-// GetNegotiatedFeatures returns the negotiated feature flags.
-func (l *AdvancedLink) GetNegotiatedFeatures() uint64 {
+// NegotiatedFeatures returns the negotiated feature flags.
+func (l *AdvancedLink) NegotiatedFeatures() uint64 {
 	l.protocolMu.RLock()
 	defer l.protocolMu.RUnlock()
 	return l.negotiatedFeatures
 }
 
-// GetNegotiatedCapabilities returns the negotiated capability flags.
-func (l *AdvancedLink) GetNegotiatedCapabilities() uint64 {
-	l.protocolMu.RLock()
-	defer l.protocolMu.RUnlock()
-	return l.negotiatedCapabilities
-}
-
-// IsLargeCopyEnabled returns whether Advanced large-data copy is enabled.
-func (l *AdvancedLink) IsLargeCopyEnabled() bool {
-	return l.requireFeature(FeatureLargeCopy) == nil
-}
-
-// IsRequestResponseEnabled returns whether Advanced request-response IPC is enabled.
-func (l *AdvancedLink) IsRequestResponseEnabled() bool {
-	return l.requireFeature(FeatureRequestResponse) == nil
-}
-
-// GetAdvancedStats returns advanced statistics for the link.
-func (l *AdvancedLink) GetAdvancedStats() AdvancedStats {
+// Stats returns advanced statistics for the link.
+func (l *AdvancedLink) Stats() AdvancedStats {
 	return AdvancedStats{
 		NegotiationTime:    time.Duration(l.stats.negotiationTime.Load()),
 		LargeMessages:      l.stats.largeMessages.Load(),

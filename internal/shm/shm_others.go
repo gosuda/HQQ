@@ -7,6 +7,14 @@ import (
 	"syscall"
 )
 
+// NamesPersist is false: shared memory is not supported on this platform.
+const NamesPersist = false
+
+// NameRefersToSelf is not supported on this platform.
+func (s *SharedMemory) NameRefersToSelf() (known, same bool, err error) {
+	return false, false, syscall.ENOSYS
+}
+
 // OpenSharedMemory is not supported on this platform.
 func OpenSharedMemory(name string, size int, flags int, mode os.FileMode) (*SharedMemory, error) {
 	if _, err := baseName(name, 0); err != nil {

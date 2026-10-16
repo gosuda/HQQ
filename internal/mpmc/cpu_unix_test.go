@@ -3,6 +3,7 @@
 package mpmc_test
 
 import (
+	"os"
 	"syscall"
 	"testing"
 	"time"
@@ -19,12 +20,19 @@ func processCPUTime(t *testing.T) time.Duration {
 	return time.Duration(ru.Utime.Nano() + ru.Stime.Nano())
 }
 
+// requirePerfTests skips CPU-ratio tests unless HQQ_PERF_TESTS=1: they compare
+// process CPU time to wall time, which a loaded or noisy machine can skew.
+func requirePerfTests(t *testing.T) {
+	t.Helper()
+	if os.Getenv("HQQ_PERF_TESTS") != "1" {
+		t.Skip("CPU-ratio test; set HQQ_PERF_TESTS=1 to run")
+	}
+}
+
 // TestMPMCIdleWaitDoesNotBurnCPU guards against regressions to busy-wait
 // behavior: a consumer blocked on an empty ring must park instead of spinning.
 func TestMPMCIdleWaitDoesNotBurnCPU(t *testing.T) {
-	if testing.Short() {
-		t.Skip("timing-based test")
-	}
+	requirePerfTests(t)
 	buffer, r := newRing(t, 8)
 	defer func() { _ = buffer }()
 
@@ -47,9 +55,7 @@ func TestMPMCIdleWaitDoesNotBurnCPU(t *testing.T) {
 
 // TestMPMCWaitSpinBurnsCPU documents the trade-off of WaitSpin.
 func TestMPMCWaitSpinBurnsCPU(t *testing.T) {
-	if testing.Short() {
-		t.Skip("timing-based test")
-	}
+	requirePerfTests(t)
 	buffer, r := newRing(t, 8)
 	defer func() { _ = buffer }()
 	r.SetWaitPolicy(mpmc.WaitSpin)
