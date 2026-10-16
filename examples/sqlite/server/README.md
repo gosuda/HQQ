@@ -1,55 +1,163 @@
-# hqq-sqlite C server (not implemented yet)
+# hqq-sqlite-server: the C server
 
-This directory is reserved for the C server of the hqq-sqlite service. It is
-a stub: nothing here builds yet. The Go fake server in `../fakeserver` is the
-reference for the observable behavior, and `../PROTOCOL.md` is the contract.
+`hqq-sqlite-server` serves the hqq-sqlite protocol ([../PROTOCOL.md](../PROTOCOL.md),
+version 1.0) on one HQQ listener. It is written in C11 on libhqq's Advanced layer
+and the SQLite C API. The Go driver in `../driver` is its reference client, and
+the end-to-end tests in `../e2e` run that driver against it.
 
-## What it must implement
+POSIX only (Linux and macOS). Windows is not supported.
 
-1. **Listener.** Create an HQQ acceptor on the configured listener name. Each
-   accepted link gets `ListenStreams`, then an `AcceptStream` loop. Each
-   accepted stream is one session.
-2. **Sessions.** One SQLite connection per session, opened with
-   `sqlite3_open_v2` on Open (PROTOCOL.md section 6.1). The database name is
-   resolved through the alias table of the server configuration, and raw paths
-   are used only if the policy allows them. Apply the busy timeout with
-   `sqlite3_busy_timeout`, and apply the pragmas with validated names and
-   values only.
-3. **Methods.** Handle all fourteen methods of PROTOCOL.md section 6, with the
-   byte layouts of section 3 and the rules of sections 4 to 6. Build responses
-   and errors exactly as sections 5 and 7 describe.
-4. **Errors.** Send SQLite errors as `0x10000 + rc` with `sqlite3_errmsg()`,
-   and protocol errors as `0x20000 + code` (section 7).
-5. **Cancellation.** When a request's handler context ends (cancel or
-   deadline), call `sqlite3_interrupt()` on the session connection, check the
-   context between steps, and send no response (section 9).
-6. **Teardown.** When a stream closes, or the link is lost, roll back an open
-   transaction, finalize statements and cursors, and close the connection with
-   `sqlite3_close_v2` (section 8.3).
-7. **Limits and the trust model.** Set the `sqlite3_limit()` values, disable
-   ATTACH, DETACH, and loadable extensions, and enforce the limits of section
-   11 (section 12).
+## Build
 
-## Dependencies
+libhqq builds the server behind an option that is OFF by default:
 
-- **libhqq Advanced layer (draft, in progress).** The working tree has a draft
-  of `c/include/hqq/hqq_advanced.h` and `hqq_listener.h`. The calls this server
-  needs are:
-  - listener: `hqq_acceptor_create`, `hqq_acceptor_accept`, `hqq_acceptor_close`,
-    and `hqq_connect` on the client side;
-  - streams: `hqq_adv_listen_streams`, `hqq_adv_accept_stream`, `hqq_stream_recv`
-    (session watcher), `hqq_stream_close`;
-  - requests: `hqq_adv_serve` with `hqq_request_method`, `hqq_request_data`,
-    `hqq_request_stream_id`, and the response calls;
-  - cancellation and deadlines: `hqq_req_ctx_wait_done` (the hook that calls
-    `sqlite3_interrupt`), `hqq_req_ctx_err`, and `hqq_req_ctx_deadline`.
-  The names are draft and may change. The protocol does not depend on them.
-- **SQLite amalgamation.** `sqlite3.c` and `sqlite3.h`, vendored or fetched by
-  the build. No system SQLite is assumed.
+```sh
+cmake -S c -B build -DHQQ_BUILD_SQLITE_SERVER=ON -DHQQ_WERROR=ON
+cmake --build build --target hqq-sqlite-server hqqsqlite_server_unit_tests
+ctest --test-dir build -R hqqsqlite_server --output-on-failure
+```
 
-## Done means
+The binary is `build/sqlite-server/hqq-sqlite-server`.
 
-- The Go driver test suite (`../driver`) passes when pointed at this server.
-  That needs a small harness that starts the C server instead of
-  `fakeserver.Listen`, and it is not written yet.
-- The golden vectors of PROTOCOL.md section 16 decode identically in C.
+### SQLite
+
+- **System library (default).** `find_package(SQLite3 3.24)` finds it: libsqlite3-dev
+  on Ubuntu, and the SDK copy (`libsqlite3.tbd`) or Homebrew on macOS.
+- **Amalgamation.** `-DHQQ_SQLITE_AMALGAMATION_DIR=/path` builds against
+  `sqlite3.c` and `sqlite3.h` in that directory. Nothing is downloaded and nothing is
+  vendored in the repository.
+
+The server needs a thread-safe SQLite (`sqlite3_threadsafe() != 0`) and version
+3.24 or later. It refuses to start otherwise.
+
+Some SQLite builds omit loadable extensions (`OMIT_LOAD_EXTENSION`; the macOS SDK
+copy does). In such a build `SQLITE_DBCONFIG_ENABLE_LOAD_EXTENSION` is reported as
+unsupported. The server accepts that only when `sqlite3_compileoption_used`
+reports `OMIT_LOAD_EXTENSION`, because then there is no loader to disable.
+
+## Run
+
+```
+hqq-sqlite-server <listener-name> [options]
+
+  --allow-dir DIR          allow raw database paths inside DIR (default: aliases only)
+  --alias NAME=PATH        database alias (repeatable)
+  --max-sessions N         open sessions allowed at once (1..65536, default 256)
+  --perm OCTAL             listener permission (default 0600)
+  --heartbeat-ms N         link heartbeat interval (default: libhqq's)
+  --peer-timeout-ms N      peer timeout (default: libhqq's)
+  --shutdown-timeout-ms N  wait for running requests on shutdown (default 5000)
+  --version, --help
+```
+
+On start it prints `ready <listener-name>` on stdout. It exits with status 2 on a bad
+option and 1 when the listener cannot be created (for example, the name is in use by a
+live server).
+
+`SIGINT` and `SIGTERM` start a graceful shutdown: the acceptor closes, each link
+refuses new requests (status 8, PROTOCOL.md section 2 and libhqq section 6), running
+requests finish up to `--shutdown-timeout-ms`, then the streams close and every
+session rolls back its open transaction. `SIGKILL` runs no cleanup; SQLite recovers its
+files at the next open.
+
+## Database policy
+
+- **Aliases** (`--alias NAME=PATH`) are checked first. The path is canonicalized at
+  start-up and may lie anywhere.
+- **Raw paths** are used only with `--allow-dir DIR`. A relative path is taken relative
+  to `DIR`. The canonical result (symbolic links resolved) must lie strictly inside
+  `DIR`. A path with a `..` component is refused by name. A symbolic link that leads
+  outside is refused, and so is a dangling link.
+- Anything else is `FORBIDDEN` (9). A missing parent directory is SQLite `CANTOPEN`.
+- `ATTACH`, `DETACH` (authorizer) and loadable extensions are disabled in every
+  session.
+
+## Design
+
+| Piece | Where | What it does |
+|---|---|---|
+| Acceptor | `src/sqlsrv_link.c` | One thread: `hqq_acceptor_accept`. Each accepted link gets `hqq_adv_listen_streams` before anything else. |
+| Link | `sqlsrv_link.c` | Two threads: `hqq_adv_serve` (requests) and the stream loop (`hqq_adv_accept_stream`). The stream loop drains the link at the end. |
+| Watcher | `sqlsrv_link.c` | One detached thread per session: `hqq_stream_recv`. Its return ends the session: stop, teardown, stream close, then the link forgets the session. |
+| Session | `src/sqlsrv_session.c` | One worker thread per session, which owns the SQLite connection and runs all requests in arrival order. |
+| Handler | `sqlsrv_session.c` (`sqlsrv_sess_request`) | Runs on a Serve worker. It hands the job to the session worker, waits, and writes the response. On context end it calls `sqlite3_interrupt` and re-interrupts until the job stops. It sends nothing for a canceled request. |
+
+Each session is independent: its own connection, statements, cursors, and
+transaction. A long query blocks only its own session. The session worker checks the
+request context between steps, so an interrupt that arrives between two steps is not
+lost.
+
+Requests of one link run on libhqq's Serve worker pool, which grows to 64 workers per
+link (`ADV_MAX_WORKERS`). A request holds one worker until it is answered, so one link
+serves at most 64 concurrent requests. The Go driver shares one link per connector,
+which is enough for the 50-connection test.
+
+Rows are pulled, batches are bounded by row count, by the 1 MiB batch budget, and by
+the 16 MiB message limit. A row is measured before it is encoded. When a row fits a
+message of its own but not the current response (a Query header can take several MiB),
+it is kept in the cursor and returned by the next Fetch.
+
+### Limits
+
+PROTOCOL.md section 11 is enforced. The server also sets `sqlite3_limit` for SQL
+length (1 MiB), variables (32766), columns (2000), and attached databases (0).
+
+## Tests
+
+- `tests/test_units.c` (`hqqsqlite_server_units`): codec and golden encodings from
+  PROTOCOL.md section 16, status values, limits, pragma and flag validation, and the
+  path policy (traversal, symbolic links, dangling links, aliases, NUL).
+- `../e2e` (Go): starts the server (`HQQ_SQLITE_SERVER` names the binary; the tests
+  skip without it) and runs the driver against it: values, prepared and named
+  statements, batches, large blobs and the 16 MiB row limit, transactions and
+  read-only mode, cancellation of a 1e9-row recursive CTE, 50 concurrent connections,
+  a client crash inside a transaction (rollback observed by another session), SIGKILL
+  of the server with reconnect, the path policy, the session limit, error codes,
+  busy locks, graceful shutdown, and argument checks.
+
+Sanitized run: build with `-DHQQ_SANITIZE=address+undefined` and point
+`HQQ_SQLITE_SERVER` at that binary (see `.github/workflows/sqlite.yml`).
+
+## Protocol notes
+
+Points where PROTOCOL.md is silent or differs from the implementation. Each was
+decided as stated; the maintainers of PROTOCOL.md should confirm them.
+
+1. **Stream open before `ListenStreams`.** Section 2 says the request waits until
+   `ListenStreams` runs. The server receives a link only after the client's connect
+   returns, so a stream open can arrive first. libhqq holds such a request for
+   `stream_listen_grace_ns` (default 2 s, the server's setting) and admits it when
+   `ListenStreams` runs; after the grace it is refused with `ConnNotFound`. The Go
+   library does the same (`AdvancedOptions.StreamListenGrace`). Without the grace the
+   client's first open lost the race in every run (the table row "not listening" in
+   section 2 describes only the refusal after the grace).
+2. **Check order of Open.** `ALREADY_OPEN` is answered before the version check, as the
+   Go fake server does. Section 6.1 lists only the body, policy, and open checks. A
+   state check comes first because a session that is already open has no next step.
+3. **Open response minor.** The response always carries minor 0, the server's minor.
+   The effective minor is not echoed.
+4. **Ordinal range.** The `1..MaxParams` ordinal rule is applied to named parameters
+   too (their ordinals must be unique and in range, even though they are ignored for
+   binding).
+5. **Parameter count.** More than 32766 parameters is `LIMIT`, not `BAD_REQUEST`
+   (section 11 allows either).
+6. **`more` and the last batch.** A full batch reports `more = 1` without stepping, so
+   a statement that ended exactly at the batch boundary is confirmed by a final empty
+   batch with `more = 0` (section 5 allows this).
+7. **Row held for the next batch.** A row that fits a message but not the current
+   response is returned by the next Fetch (section 5 only says that a row which fits
+   no message is `TOOBIG`).
+8. **Column names.** A column name longer than 1024 bytes is `LIMIT`. Decltypes are not
+   limited (they come from the schema).
+9. **Teardown order.** Cursors are released before the rollback, not after. This avoids
+   a rollback with an active read statement. The observable result is the same.
+10. **Pragmas.** Open validates the name and value alphabets (section 6.1). Pragma
+    names are not checked against a list, so a client can set a pragma such as
+    `writable_schema`. Section 12 treats clients as trusted.
+11. **Concurrency bound.** At most 64 requests per link (libhqq's worker bound), which
+    section 13 does not mention.
+12. **Stream lookup.** A request on a stream that is not registered yet waits up to
+    5 seconds for its registration, then gets `NO_SESSION`. A request with no stream at
+    all (stream 0) is `NO_SESSION` at once.
+13. **Extended result codes.** Enabled on every connection, so the status is the
+    extended code (for example `0x10813`), as section 7 shows.

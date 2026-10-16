@@ -251,7 +251,7 @@ Condensed from the output of `hqq-interop list` (Go helper), which is authoritat
 | X-A02 | advanced | any | `sizes`: c,o (c:ok,o:ok)<br>`sender-abort-after-chunk-1`: c,o (c:ok,o:ok) | X-16 | message sizes 0 .. MaxMessageSize, local refusal, abort |
 | X-A03 | advanced | any | `reassembly-limit`: c,o (c:ok,o:ok) | X-17 | reassembly limit: refused request, refused response, refused data |
 | X-A04 | advanced | any | `default`: c,o (c:ok,o:ok) | X-18 | request/response: concurrent calls, error payload, cancelled call, unknown method |
-| X-A05 | advanced | any | `basic`, `bad-parity`, `duplicate`: c,o (c:ok,o:ok) each | X-19 | streams: refusal, parity, ids never reused, close semantics |
+| X-A05 | advanced | any | `basic`, `bad-parity`, `duplicate`, `held`: c,o (c:ok,o:ok) each | X-19 | streams: refusal, held requests before ListenStreams (SPEC 10.3), parity, ids never reused, close semantics |
 | X-A06 | advanced | any | `flood`: c,o (c:ok,o:ok)<br>`flood-chunked`: c,o (c:ok,o:ok) | X-20 | flood from both sides on a tiny ring with a slow consumer |
 | X-A07 | advanced | any | `cancel`: c,o (c:ok,o:ok)<br>`nocancel`: c,o (c:ok,o:ok) | 1.1 sections 2, 4.2 | cancel: OpCancel ends the handler, unknown key ignored; no FeatureCancel |
 | X-A08 | advanced | any | `metadata`: c,o (c:ok,o:ok)<br>`without-metadata`: c,o (c:ok,o:ok) | 1.1 sections 3, 5 | request metadata: caller, trace, time budget; expired deadline sends nothing |

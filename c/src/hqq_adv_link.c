@@ -101,6 +101,12 @@ hqq_status adv_wrap_base(hqq_link *base, const hqq_adv_options *opts, hqq_adv **
     a->queue_size = qs;
     a->overflow = opts != NULL ? opts->overflow : HQQ_OVERFLOW_BLOCK;
     a->control_cap = bc > ADV_CONTROL_MIN ? bc : ADV_CONTROL_MIN;
+    a->listen_grace_ns = ADV_LISTEN_GRACE_NS;
+    if (opts != NULL && opts->stream_listen_grace_ns < 0) {
+        a->listen_grace_ns = 0;
+    } else if (opts != NULL && opts->stream_listen_grace_ns > 0) {
+        a->listen_grace_ns = (uint64_t)opts->stream_listen_grace_ns;
+    }
     hqq_cancel_init(&a->stop);
     atomic_store_explicit(&a->closing, 0, memory_order_seq_cst);
     atomic_store_explicit(&a->users, 0, memory_order_seq_cst);
@@ -127,7 +133,8 @@ hqq_status adv_wrap_base(hqq_link *base, const hqq_adv_options *opts, hqq_adv **
     a->abandoned = (adv_key *)hqq_alloc(a->alloc_set ? &a->alloc : NULL, ADV_ABANDONED_CAP * sizeof(adv_key));
     a->refused = (adv_key *)hqq_alloc(a->alloc_set ? &a->alloc : NULL, ADV_REFUSED_CAP * sizeof(adv_key));
     a->ctl = (adv_ctl_job *)hqq_alloc(a->alloc_set ? &a->alloc : NULL, (size_t)a->control_cap * sizeof(adv_ctl_job));
-    if (st != HQQ_OK || a->abandoned == NULL || a->refused == NULL || a->ctl == NULL) {
+    a->held = (adv_held *)hqq_alloc(a->alloc_set ? &a->alloc : NULL, (size_t)a->queue_size * sizeof(adv_held));
+    if (st != HQQ_OK || a->abandoned == NULL || a->refused == NULL || a->ctl == NULL || a->held == NULL) {
         if (st == HQQ_OK) {
             st = HQQ_ERR_NO_MEMORY;
         }
@@ -240,6 +247,10 @@ static void free_link_state(hqq_adv *a) {
         hqq_free(ap, a->ctl, (size_t)a->control_cap * sizeof(adv_ctl_job));
         a->ctl = NULL;
     }
+    if (a->held != NULL) {
+        hqq_free(ap, a->held, (size_t)a->queue_size * sizeof(adv_held));
+        a->held = NULL;
+    }
 }
 
 hqq_status hqq_adv_create(const char *name, uint64_t buffer_count, uint64_t buffer_size, unsigned perm,
@@ -340,6 +351,7 @@ hqq_status hqq_adv_close(hqq_adv *a) {
         return HQQ_ERR_CLOSED;
     }
     atomic_store_explicit(&a->closing, 1, memory_order_seq_cst);
+    adv_held_release_locked(a, 0);
     /* Every request context ends: handlers see their context canceled. */
     {
         hqq_req_ctx *r;
@@ -712,6 +724,7 @@ void adv_dispatch_main(void *arg) {
             if (atomic_load_explicit(&a->closing, memory_order_seq_cst)) {
                 st = HQQ_ERR_CLOSED;
             }
+            adv_held_release_locked(a, st != HQQ_ERR_CLOSED);
             adv_fail_all_locked(a, st);
             hqq_spin_unlock(&a->lock);
             return;
@@ -731,8 +744,26 @@ void adv_control_main(void *arg) {
         hqq_status st;
 
         hqq_spin_lock(&a->lock);
-        while (a->ctl_count == 0 && !atomic_load_explicit(&a->closing, memory_order_seq_cst)) {
-            adv_park_locked(a, ADV_POLL_NS);
+        for (;;) {
+            uint64_t ns = ADV_POLL_NS;
+            uint64_t now;
+            if (atomic_load_explicit(&a->closing, memory_order_seq_cst)) {
+                break;
+            }
+            now = adv_mono();
+            adv_held_expire_locked(a, now);
+            if (a->ctl_count != 0) {
+                break;
+            }
+            if (a->held_count != 0) {
+                /* Wake for the earliest grace period when it comes sooner. */
+                uint64_t due = a->held[a->held_head].deadline;
+                uint64_t left = due > now ? due - now : 0;
+                if (left < ns) {
+                    ns = left;
+                }
+            }
+            adv_park_locked(a, ns);
         }
         if (atomic_load_explicit(&a->closing, memory_order_seq_cst)) {
             hqq_spin_unlock(&a->lock);

@@ -1,0 +1,108 @@
+name: SQLite service
+
+# The hqq-sqlite C server (examples/sqlite/server) built on libhqq, its C unit
+# tests, and the Go end-to-end tests that run the Go driver against it
+# (examples/sqlite/e2e). SQLite comes from the system: libsqlite3-dev on Ubuntu,
+# the SDK copy on macOS. Nothing is downloaded during the build.
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sqlite-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  server:
+    name: Server ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.2
+
+      - name: Set up Go
+        uses: actions/setup-go@v6.4.0
+        with:
+          go-version-file: go.mod
+
+      - name: Install SQLite (Ubuntu)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsqlite3-dev
+
+      - name: Configure libhqq and the server
+        run: |
+          cmake -S c -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DHQQ_WERROR=ON \
+            -DHQQ_BUILD_TESTS=ON \
+            -DHQQ_BUILD_STRESS=OFF \
+            -DHQQ_BUILD_SQLITE_SERVER=ON
+
+      - name: Build the server and its unit tests
+        run: cmake --build build --config Release --target hqq-sqlite-server hqqsqlite_server_unit_tests
+
+      - name: Unit tests (C)
+        run: ctest --test-dir build -R hqqsqlite_server --output-on-failure
+
+      - name: Go vet
+        run: go vet ./examples/sqlite/...
+
+      - name: End-to-end tests (Go driver against the C server)
+        env:
+          HQQ_SQLITE_SERVER: ${{ github.workspace }}/build/sqlite-server/hqq-sqlite-server
+        run: go test -count=1 -timeout 5m -v ./examples/sqlite/e2e/...
+
+  asan:
+    name: Server ASan+UBSan (ubuntu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.2
+
+      - name: Set up Go
+        uses: actions/setup-go@v6.4.0
+        with:
+          go-version-file: go.mod
+
+      - name: Install SQLite
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsqlite3-dev
+
+      - name: Configure and build the sanitized server
+        run: |
+          cmake -S c -B build-asan \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DHQQ_WERROR=ON \
+            -DHQQ_BUILD_TESTS=OFF \
+            -DHQQ_BUILD_STRESS=OFF \
+            -DHQQ_SANITIZE=address+undefined \
+            -DHQQ_BUILD_SQLITE_SERVER=ON
+          cmake --build build-asan --target hqq-sqlite-server
+
+      - name: End-to-end tests against the sanitized server
+        env:
+          HQQ_SQLITE_SERVER: ${{ github.workspace }}/build-asan/sqlite-server/hqq-sqlite-server
+          ASAN_OPTIONS: detect_leaks=1:abort_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: go test -count=1 -timeout 10m -v ./examples/sqlite/e2e/...

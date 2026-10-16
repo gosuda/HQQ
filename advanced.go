@@ -182,6 +182,16 @@ type AdvancedOptions struct {
 	// routed to is full.
 	IncomingOverflow OverflowPolicy
 
+	// StreamListenGrace is how long a stream request (OpenStream of the peer)
+	// that arrives before ListenStreams is held. A held request is accepted in
+	// arrival order when ListenStreams runs, as if it had just arrived. One
+	// still held when the grace period ends, when the link fails, or when
+	// Shutdown is called is refused with ErrConnNotFound. A request that finds
+	// the bound reached (the held requests and the accepted streams not yet
+	// returned by AcceptStream fill IncomingQueueSize) is refused at once, and
+	// so is every request when the grace is negative. Zero uses 2 seconds.
+	StreamListenGrace time.Duration
+
 	// Link configures the underlying StandardLink.
 	Link LinkOptions
 }
@@ -193,7 +203,7 @@ type AdvancedStats struct {
 	MessageBytes       uint64 // payload bytes of those messages
 	Requests           uint64
 	Responses          uint64
-	DroppedMessages    uint64 // messages discarded by OverflowDrop, for an unknown or closed stream, as a response without a waiting call, refused by MaxReassemblyBytes, or whose control reply (including an OpCancel) was dropped because the control queue was full
+	DroppedMessages    uint64 // messages discarded by OverflowDrop, for an unknown or closed stream, as a response without a waiting call, refused by MaxReassemblyBytes, or whose control reply (including an OpCancel) was dropped because the control queue was full, or a held stream request that Close discarded
 	AbandonedResponses uint64 // late responses to canceled calls that were discarded
 	CanceledRequests   uint64 // requests whose handler context was canceled by the peer's OpCancel
 	RefusedRequests    uint64 // requests answered with ErrCodeShuttingDown after Shutdown
@@ -263,10 +273,15 @@ type AdvancedLink struct {
 	connectionIDGenerator atomic.Uint64
 	controlMu             sync.Mutex
 	listening             bool // Whether the link is listening for connections
-	stream0               *Stream
-	streams               map[uint64]*Stream
-	pendingConnections    map[uint64]chan error
-	acceptCh              chan *Stream
+	// held are the stream requests held while the link is not listening, in
+	// arrival order (see holdCreateLocked). streamListenGrace is the grace of
+	// AdvancedOptions.StreamListenGrace with the default applied (immutable).
+	held               []*heldCreate
+	streamListenGrace  time.Duration
+	stream0            *Stream
+	streams            map[uint64]*Stream
+	pendingConnections map[uint64]chan error
+	acceptCh           chan *Stream
 	// acceptSlots reserves room in acceptCh for streams whose accept reply is
 	// queued on the control sender: a slot is taken when OpConnCreate is
 	// received and released by AcceptStream (or when the accept fails).
@@ -373,6 +388,12 @@ func newAdvancedLink(slink *StandardLink, opts AdvancedOptions) *AdvancedLink {
 	if incomingQueueSize <= 0 {
 		incomingQueueSize = slink.bufferCount
 	}
+	// A zero StreamListenGrace selects the default; a negative one refuses
+	// every held request at once.
+	grace := opts.StreamListenGrace
+	if grace == 0 {
+		grace = defaultStreamListenGrace
+	}
 	l := &AdvancedLink{
 		slink:              slink,
 		streams:            make(map[uint64]*Stream),
@@ -384,6 +405,7 @@ func newAdvancedLink(slink *StandardLink, opts AdvancedOptions) *AdvancedLink {
 		maxReassemblyBytes: maxReassemblyBytes,
 		overflow:           opts.IncomingOverflow,
 		queueSize:          incomingQueueSize,
+		streamListenGrace:  grace,
 		pool:               newMsgPool(maxMessageSize),
 		dispatchDone:       make(chan struct{}),
 		ctrlDone:           make(chan struct{}),
@@ -402,7 +424,8 @@ func newAdvancedLink(slink *StandardLink, opts AdvancedOptions) *AdvancedLink {
 
 // Close stops the dispatcher and the control sender, fails pending calls and
 // dials with ErrClosed, and closes the underlying StandardLink. Control
-// replies still queued are discarded. Receive operations blocked on the link
+// replies still queued are discarded, and so are the stream requests held for
+// ListenStreams (counted in DroppedMessages). Receive operations blocked on the link
 // or on one of its streams return ErrClosed. The contexts of the handlers that
 // are running are canceled at once and Serve returns ErrClosed; Close does not
 // wait for the handlers and does not drain: use Shutdown before Close for a
@@ -416,6 +439,7 @@ func (l *AdvancedLink) Close() error {
 		l.dispatchMu.Unlock()
 
 		l.lifeCancel()
+		l.releaseHeld(false)
 		l.cancelAllRequests()
 		l.closeErr = l.slink.Close()
 		if started {

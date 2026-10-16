@@ -1,0 +1,18 @@
+# Rust binding for libhqq: a workspace of three crates, no crates.io dependencies.
+#
+#   hqq-sys      raw FFI; build.rs compiles the in-tree C library (c/) and links it statically
+#   hqq          safe wrapper: Link, AdvLink, Stream, Message, Acceptor, errors
+#   hqq-interop  the hqq-interop helper (conformance/INTEROP_CLI.md)
+#
+#   cargo test --workspace
+#   cargo run -p hqq --example echo -- --selftest
+[workspace]
+resolver = "2"
+members = ["hqq-sys", "hqq", "hqq-interop"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT"
+publish = false

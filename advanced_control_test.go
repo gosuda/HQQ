@@ -267,8 +267,8 @@ func TestAcceptedStreamIsVisibleAfterAccept(t *testing.T) {
 // draining the flood regardless.
 func TestFullTxRingDoesNotStopReceiveDraining(t *testing.T) {
 	const bufferCount = 4
-	flooder, flooded := newNegotiatedPair(t, bufferCount, 32, AdvancedOptions{}, AdvancedOptions{})
-	// flooded is not listening: it refuses every OpConnCreate.
+	// flooded is not listening and holds no stream request (negative grace): it refuses every OpConnCreate at once.
+	flooder, flooded := newNegotiatedPair(t, bufferCount, 32, AdvancedOptions{}, AdvancedOptions{StreamListenGrace: -1})
 	if err := flooded.startDispatcher(); err != nil {
 		t.Fatal(err)
 	}

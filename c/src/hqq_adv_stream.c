@@ -99,26 +99,126 @@ static hqq_status status_from_code(uint64_t code) {
 
 /* ---- Receive-path control handlers ------------------------------------------------------ */
 
-static hqq_status handle_create(hqq_adv *a, uint64_t id) {
+/* Queues the refusal of OpConnCreate id with code. Lock held. */
+static void refuse_create_locked(hqq_adv *a, uint64_t id, uint64_t code) {
     uint64_t ops[7];
-    hqq_stream *s;
+    memset(ops, 0, sizeof ops);
+    ops[0] = id;
+    ops[1] = code;
+    adv_queue_control_locked(a, HQQ_OP_ERROR, ops, NULL);
+}
+
+/* Holds OpConnCreate id, which arrived while the link is not listening, for the
+ * grace period. Returns 0 when the request must be refused at once: holding is
+ * disabled, or the bound is reached (the held requests and the accept slots in
+ * use must fit queue_size, so ListenStreams always finds room for each held
+ * request). Lock held. */
+static int hold_create_locked(hqq_adv *a, uint64_t id) {
+    uint64_t now;
+    adv_held *h;
+    if (a->listen_grace_ns == 0 || a->held_count + a->accept_reserved >= a->queue_size) {
+        return 0;
+    }
+    now = adv_mono();
+    h = &a->held[(a->held_head + a->held_count) % a->queue_size];
+    h->id = id;
+    h->deadline = a->listen_grace_ns > UINT64_MAX - now ? UINT64_MAX : now + a->listen_grace_ns;
+    a->held_count++;
+    adv_wake_locked(a); /* the control sender re-arms its timer for the new deadline */
+    return 1;
+}
+
+/* Queues the accept of stream id: the ID is valid and an accept slot is free.
+ * Lock held. */
+static hqq_status accept_locked(hqq_adv *a, uint64_t id) {
+    uint64_t ops[7];
+    hqq_stream *s = NULL;
+    hqq_status st;
+    if (adv_control_full_locked(a)) {
+        /* The accept reply cannot be queued: drop it (SPEC 10.3), counted. */
+        a->st_dropped++;
+        return HQQ_OK;
+    }
+    st = hqq_stream_new_internal(a, id, &s);
+    if (st != HQQ_OK) {
+        return st;
+    }
+    st = adv_stream_register(a, s);
+    if (st != HQQ_OK) {
+        return st;
+    }
+    a->accept_reserved++;
+    memset(ops, 0, sizeof ops);
+    ops[0] = id;
+    /* Queued now; the control sender publishes it and then makes the stream visible
+     * to AcceptStream, so data sent by the acceptor cannot overtake the accept. */
+    adv_queue_control_locked(a, HQQ_OP_CONN_ACCEPT, ops, s);
+    return HQQ_OK;
+}
+
+/* Admits the held requests in arrival order, as if each had just arrived while
+ * listening (ListenStreams, lock held). It never waits: hold_create_locked left
+ * room in the accept queue for every held request. */
+static void admit_held_locked(hqq_adv *a) {
+    while (a->held_count > 0) {
+        uint64_t id = a->held[a->held_head].id;
+        a->held_head = (a->held_head + 1) % a->queue_size;
+        a->held_count--;
+        if (!adv_peer_owns_id(a, id) || adv_stream_lookup_locked(a, id) != NULL) {
+            refuse_create_locked(a, id, ADV_CODE_INVALID_OP);
+        } else if (a->accept_reserved >= a->queue_size) {
+            /* Not reachable with the bound of hold_create_locked: refused, not waited for. */
+            a->st_dropped++;
+            refuse_create_locked(a, id, ADV_CODE_BUFFER_OVERFLOW);
+        } else if (accept_locked(a, id) != HQQ_OK) {
+            a->st_dropped++; /* out of memory: the request is dropped and counted */
+        }
+    }
+}
+
+/* Refuses the held requests whose grace period has ended by now (lock held). The
+ * requests share one grace period and are held in arrival order, so their
+ * deadlines are sorted. */
+void adv_held_expire_locked(hqq_adv *a, uint64_t now) {
+    while (a->held_count > 0 && a->held[a->held_head].deadline <= now) {
+        refuse_create_locked(a, a->held[a->held_head].id, ADV_CODE_CONN_NOT_FOUND);
+        a->held_head = (a->held_head + 1) % a->queue_size;
+        a->held_count--;
+    }
+}
+
+/* Ends the hold of every held request (lock held): each is refused when refuse is
+ * set (the link failed), and otherwise discarded and counted (the link closes). */
+void adv_held_release_locked(hqq_adv *a, int refuse) {
+    while (a->held_count > 0) {
+        if (refuse) {
+            refuse_create_locked(a, a->held[a->held_head].id, ADV_CODE_CONN_NOT_FOUND);
+        } else {
+            a->st_dropped++;
+        }
+        a->held_head = (a->held_head + 1) % a->queue_size;
+        a->held_count--;
+    }
+}
+
+/* Answers an OpConnCreate (SPEC 10.3). While the link is not listening the request
+ * is held (or refused at once when it cannot be held). Otherwise the request is
+ * accepted or refused; a full accept queue waits for AcceptStream only under
+ * HQQ_OVERFLOW_BLOCK. The receive path never waits for the tx ring. */
+static hqq_status handle_create(hqq_adv *a, uint64_t id) {
     hqq_status st;
 
     hqq_spin_lock(&a->lock);
-    for (;;) {
-        if (!a->listening) {
-            memset(ops, 0, sizeof ops);
-            ops[0] = id;
-            ops[1] = ADV_CODE_CONN_NOT_FOUND;
-            adv_queue_control_locked(a, HQQ_OP_ERROR, ops, NULL);
-            hqq_spin_unlock(&a->lock);
-            return HQQ_OK;
+    if (!a->listening) {
+        if (!hold_create_locked(a, id)) {
+            refuse_create_locked(a, id, ADV_CODE_CONN_NOT_FOUND);
         }
+        hqq_spin_unlock(&a->lock);
+        return HQQ_OK;
+    }
+    for (;;) {
         if (!adv_peer_owns_id(a, id) || adv_stream_lookup_locked(a, id) != NULL) {
-            memset(ops, 0, sizeof ops);
-            ops[0] = id;
-            ops[1] = ADV_CODE_INVALID_OP;
-            adv_queue_control_locked(a, HQQ_OP_ERROR, ops, NULL);
+            refuse_create_locked(a, id, ADV_CODE_INVALID_OP);
             hqq_spin_unlock(&a->lock);
             return HQQ_OK;
         }
@@ -126,10 +226,7 @@ static hqq_status handle_create(hqq_adv *a, uint64_t id) {
             break;
         }
         if (a->overflow == HQQ_OVERFLOW_DROP) {
-            memset(ops, 0, sizeof ops);
-            ops[0] = id;
-            ops[1] = ADV_CODE_BUFFER_OVERFLOW;
-            adv_queue_control_locked(a, HQQ_OP_ERROR, ops, NULL);
+            refuse_create_locked(a, id, ADV_CODE_BUFFER_OVERFLOW);
             hqq_spin_unlock(&a->lock);
             return HQQ_OK;
         }
@@ -143,30 +240,9 @@ static hqq_status handle_create(hqq_adv *a, uint64_t id) {
         }
         adv_park_locked(a, ADV_POLL_NS);
     }
-    if (adv_control_full_locked(a)) {
-        /* The accept reply cannot be queued: drop it (SPEC 10.3), counted. */
-        a->st_dropped++;
-        hqq_spin_unlock(&a->lock);
-        return HQQ_OK;
-    }
-    st = hqq_stream_new_internal(a, id, &s);
-    if (st != HQQ_OK) {
-        hqq_spin_unlock(&a->lock);
-        return st;
-    }
-    st = adv_stream_register(a, s);
-    if (st != HQQ_OK) {
-        hqq_spin_unlock(&a->lock);
-        return st;
-    }
-    a->accept_reserved++;
-    memset(ops, 0, sizeof ops);
-    ops[0] = id;
-    /* Queued now; the control sender publishes it and then makes the stream visible
-     * to AcceptStream, so data sent by the acceptor cannot overtake the accept. */
-    adv_queue_control_locked(a, HQQ_OP_CONN_ACCEPT, ops, s);
+    st = accept_locked(a, id);
     hqq_spin_unlock(&a->lock);
-    return HQQ_OK;
+    return st;
 }
 
 static void handle_accept(hqq_adv *a, uint64_t id) {
@@ -263,6 +339,7 @@ hqq_status hqq_adv_listen_streams(hqq_adv *a) {
             st = HQQ_ERR_ALREADY_LISTENING;
         } else {
             a->listening = 1;
+            admit_held_locked(a);
         }
         hqq_spin_unlock(&a->lock);
     }

@@ -693,6 +693,7 @@ struct hqq_acceptor {
     hqq_plat_thread *disp;
     hqq_plat_thread *hb;
     hqq_plat_event *hb_stop;
+    hqq_plat_event *ready;     /* manual reset: a link is in the backlog, or closing */
 
     _Atomic uint32_t closing;
     _Atomic uint32_t inflight; /* Accept calls in progress */
@@ -975,6 +976,7 @@ static void lsn_deliver(hqq_acceptor *a, hqq_adv *link) {
         if (a->bl_count < a->cfg.backlog) {
             a->backlog[(a->bl_head + a->bl_count) % a->cfg.backlog] = link;
             a->bl_count++;
+            hqq_plat_event_signal(a->ready);
             hqq_spin_unlock(&a->lock);
             return;
         }
@@ -1105,6 +1107,10 @@ static hqq_status lsn_start_threads(hqq_acceptor *a) {
     const hqq_allocator *al = lsn_acc_alloc(a);
     int os_err = 0;
 
+    a->ready = hqq_plat_event_create(al);
+    if (a->ready == NULL) {
+        return HQQ_ERR_NO_MEMORY;
+    }
     if (a->cfg.timing.heartbeat_interval_ns > 0) {
         a->hb_stop = hqq_plat_event_create(al);
         if (a->hb_stop == NULL) {
@@ -1138,6 +1144,9 @@ static void lsn_drain_backlog(hqq_acceptor *a) {
 
 static void lsn_destroy(hqq_acceptor *a) {
     const hqq_allocator *al = lsn_acc_alloc(a);
+    if (a->ready != NULL) {
+        hqq_plat_event_destroy(al, a->ready);
+    }
     if (a->jobs != NULL) {
         hqq_free(al, a->jobs, a->cfg.max_hs * sizeof *a->jobs);
     }
@@ -1154,6 +1163,9 @@ static hqq_status lsn_shutdown(hqq_acceptor *a) {
     hqq_status st;
 
     LSN_ST(&a->closing, 1);
+    if (a->ready != NULL) {
+        hqq_plat_event_signal(a->ready); /* wake Accept calls: they see closing */
+    }
     hqq_cancel_signal(&a->cancel);
     if (a->disp != NULL) {
         hqq_plat_thread_join(al, a->disp);
@@ -1301,7 +1313,9 @@ hqq_status hqq_acceptor_create(const char *name, const hqq_acceptor_options *in,
     return HQQ_OK;
 }
 
-/* Waits for a negotiated link in the backlog. */
+/* Waits for a negotiated link in the backlog. The ready event is reset under the lock
+ * when the backlog is empty and signalled under the same lock by lsn_deliver and by
+ * close, so a delivery can not be missed between the check and the wait. */
 static hqq_status lsn_accept_wait(hqq_acceptor *a, hqq_adv **out, const hqq_wait *wait) {
     hqq_ctx ctx;
     lsn_ctx_from_wait(wait, &ctx);
@@ -1319,11 +1333,13 @@ static hqq_status lsn_accept_wait(hqq_acceptor *a, hqq_adv **out, const hqq_wait
             LSN_ADD(&a->st_accepted, 1);
             return HQQ_OK;
         }
+        hqq_plat_event_reset(a->ready);
         hqq_spin_unlock(&a->lock);
-        st = hqq_ctx_sleep(&ctx, LSN_POLL_NS);
+        st = hqq_ctx_check(&ctx);
         if (st != HQQ_OK) {
             return st;
         }
+        (void)hqq_plat_event_wait(a->ready, LSN_SLICE_NS);
     }
 }
 

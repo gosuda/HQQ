@@ -37,6 +37,7 @@ func (l *AdvancedLink) dispatchLoop(ctx context.Context) {
 			}
 			l.setDispatchErr(err)
 			l.failPendingCalls(err)
+			l.releaseHeld(ctx.Err() == nil)
 			l.failPendingConnections(err)
 			return
 		}

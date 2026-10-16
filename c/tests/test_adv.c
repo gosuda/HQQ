@@ -159,7 +159,7 @@ static void check_streams(void) {
     hqq_msg *m = NULL;
     pair_open(&pr, ADV_COUNT, ADV_SIZE);
     negotiate_pair(&pr, HQQ_FEATURES_ALL, HQQ_FEATURES_ALL);
-    /* Not listening: the peer refuses with ErrConnNotFound. */
+    /* Not listening: the request is held for the grace period (2 s by default), then refused with ErrConnNotFound. */
     HQQ_CHECK_STATUS(hqq_adv_open_stream(pr.p, &ps, NULL), HQQ_ERR_CONN_NOT_FOUND);
     HQQ_CHECK_STATUS(hqq_adv_listen_streams(pr.s), HQQ_OK);
     HQQ_CHECK_STATUS(hqq_adv_listen_streams(pr.s), HQQ_ERR_ALREADY_LISTENING);

@@ -131,3 +131,4 @@ During a reuse (`Ready → Initializing`) the superblock keeps the previous sess
 
 * Two behavior fixes (F-02, F-04) are small enough to apply to the Go implementation before the C library mirrors it; F-04 changes a liveness decision (a creator may succeed where it used to get `ErrLinkBusy`).
 * The spec pins behavior that is accidental but harmless (F-06, F-10, F-11); changing any of it later would be a compatibility decision, not a bug fix.
+* Stream requests that arrive before `ListenStreams` are held for a grace period (SPEC 10.3) instead of refused at once: the refusal code is unchanged and only its timing moved, so a peer that refuses at once still interoperates.

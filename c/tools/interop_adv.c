@@ -1313,6 +1313,91 @@ static int a05_basic_opener(ihx_env *e, hqq_adv *link) {
     return ihx_barrier(e, "end");
 }
 
+/* held: the creator's OpenStream reaches the opener before it listens; the opener holds
+ * it (SPEC 10.3) and accepts it once ListenStreams runs. */
+static int a05_held_creator(ihx_env *e, hqq_adv *link) {
+    hqq_stream *st = NULL;
+    hqq_wait w = wait_left(e);
+    hqq_status rc;
+    uint64_t seed = e->cfg.seed;
+    uint64_t size = cfg_size(&e->cfg);
+    int ret;
+
+    ret = ihx_barrier(e, "p1");
+    if (ret != IHX_OK) {
+        return ret;
+    }
+    rc = hqq_adv_open_stream(link, &st, &w);
+    if (rc != HQQ_OK) {
+        return ihx_fail_status(e, rc, "OpenStream (held)");
+    }
+    ihx_check(e, "held stream has id 2", hqq_stream_id(st) == UINT64_C(2), "%llu",
+              (unsigned long long)hqq_stream_id(st));
+    ret = send_payload(e, st, seed, 0, size);
+    if (ret != IHX_OK) {
+        return ret;
+    }
+    {
+        hqq_msg *reply = NULL;
+        rc = hqq_stream_recv(st, &reply, &w);
+        if (rc != HQQ_OK) {
+            return ihx_fail_status(e, rc, "receive the reply");
+        }
+        ihx_check(e, "reply from the peer's stream is intact",
+                  ihx_payload_verify(seed + 1, 0, hqq_msg_data(reply), hqq_msg_len(reply)) == 0, "%s", "");
+        hqq_msg_release(reply);
+    }
+    ihx_check_status(e, "stream Close", hqq_stream_close(st), HQQ_OK);
+    e->sent = 1;
+    return ihx_barrier(e, "end");
+}
+
+static int a05_held_opener(ihx_env *e, hqq_adv *link) {
+    hqq_stream *st = NULL;
+    hqq_wait w = wait_left(e);
+    hqq_wait shortw = wait_ns(ADV_S(1));
+    hqq_status rc;
+    uint64_t seed = e->cfg.seed;
+    uint64_t size = cfg_size(&e->cfg);
+    int ret;
+
+    rc = hqq_adv_accept_stream(link, &st, &shortw);
+    ihx_check_status(e, "AcceptStream without ListenStreams is ErrNotListening", rc, HQQ_ERR_NOT_LISTENING);
+    ret = ihx_barrier(e, "p1");
+    if (ret != IHX_OK) {
+        return ret;
+    }
+    /* Gives the creator's request time to arrive while the link does not listen yet;
+     * the checks below hold whether or not it did. */
+    ihx_sleep_ns(e, UINT64_C(300) * 1000000u);
+    rc = hqq_adv_listen_streams(link);
+    if (rc != HQQ_OK) {
+        return ihx_fail_status(e, rc, "ListenStreams");
+    }
+    rc = hqq_adv_accept_stream(link, &st, &w);
+    if (rc != HQQ_OK) {
+        return ihx_fail_status(e, rc, "AcceptStream");
+    }
+    ihx_check(e, "held stream is accepted with id 2", hqq_stream_id(st) == UINT64_C(2), "%llu",
+              (unsigned long long)hqq_stream_id(st));
+    ret = recv_check(e, st, seed, 0, size, 1);
+    if (ret != IHX_OK) {
+        return ret;
+    }
+    ret = send_payload(e, st, seed + 1, 0, 10);
+    if (ret != IHX_OK) {
+        return ret;
+    }
+    {
+        hqq_msg *m = NULL;
+        rc = hqq_stream_recv(st, &m, &w);
+        ihx_check_status(e, "peer close is seen after the queued data as ErrPeerClosed", rc, HQQ_ERR_PEER_CLOSED);
+        hqq_msg_release(m);
+    }
+    e->received = 1;
+    return ihx_barrier(e, "end");
+}
+
 /* bad-parity and duplicate: the Primary sends a raw OpConnCreate that the Secondary refuses. */
 static int a05_invalid(ihx_env *e, hqq_adv *link) {
     int bad_parity = strcmp(e->cfg.variant, "bad-parity") == 0;
@@ -1395,7 +1480,8 @@ static int run_a05(ihx_env *e) {
     hqq_adv *link = NULL;
     int rc;
     const char *v = e->cfg.variant;
-    if (strcmp(v, "basic") != 0 && strcmp(v, "bad-parity") != 0 && strcmp(v, "duplicate") != 0) {
+    if (strcmp(v, "basic") != 0 && strcmp(v, "held") != 0 && strcmp(v, "bad-parity") != 0 &&
+        strcmp(v, "duplicate") != 0) {
         return ihx_fail(e, "CheckFailed", "unknown variant %s", v);
     }
     rc = adv_establish(e, &link);
@@ -1406,6 +1492,8 @@ static int run_a05(ihx_env *e) {
     if (rc == IHX_OK) {
         if (strcmp(v, "basic") == 0) {
             rc = e->cfg.role == 0 ? a05_basic_creator(e, link) : a05_basic_opener(e, link);
+        } else if (strcmp(v, "held") == 0) {
+            rc = e->cfg.role == 0 ? a05_held_creator(e, link) : a05_held_opener(e, link);
         } else {
             rc = a05_invalid(e, link);
         }
@@ -2232,6 +2320,7 @@ static const ihx_variant a05_variants[] = {
     ADV_VARIANT("basic", 4, 256, 0, 0, 0, 0, 0),
     ADV_VARIANT("bad-parity", 4, 256, 0, 0, 0, 0, 0),
     ADV_VARIANT("duplicate", 4, 256, 0, 0, 0, 0, 0),
+    ADV_VARIANT("held", 4, 256, 0, 0, 0, 0, 0),
 };
 
 static const ihx_variant a06_variants[] = {
@@ -2266,8 +2355,8 @@ const ihx_scenario ihx_adv_scenarios[] = {
      "advanced", "any", 30, 1, a03_variants, run_a03},
     {"X-A04", "request/response (X-18, SPEC 10.6): 16 concurrent calls whose handlers sleep inversely to the id (every answer is echoed, completion order is not the issue order); an error response with status 42 and payload; a call cancelled after 50 ms whose late response is discarded (AbandonedResponses >= 1); an unknown method answered with status 6 (ErrCodeInvalidOp). Features: messages and request-response (1.0 set, so late responses are sent)",
      "advanced", "any", 30, 1, a04_variants, run_a04},
-    {"X-A05", "streams (X-19, SPEC 10.2-10.3): basic: OpenStream refused while not listening (ErrConnNotFound), then ids 2 and 4 (Primary parity, never reused), data both ways, peer sees ErrPeerClosed after the queued data, stream 0 not closable (ErrInvalidOp), second Close ErrClosed. bad-parity: a raw OpConnCreate with an odd id is refused with ErrCodeInvalidOp (the creator's receive fails with ErrInvalidOp, nothing is accepted). duplicate: a raw OpConnCreate of an existing id is refused with ErrCodeInvalidOp. Payload stream: creator seed (2 messages on stream 2, 1 on stream 4), opener's reply seed + 1",
-     "advanced", "any", 30, 3, a05_variants, run_a05},
+    {"X-A05", "streams (X-19, SPEC 10.2-10.3): basic: OpenStream refused while not listening (ErrConnNotFound, once the peer's grace period ends), then ids 2 and 4 (Primary parity, never reused), data both ways, peer sees ErrPeerClosed after the queued data, stream 0 not closable (ErrInvalidOp), second Close ErrClosed. held: an OpenStream that reaches the opener before it listens is held there and accepted by its ListenStreams (id 2). bad-parity: a raw OpConnCreate with an odd id is refused with ErrCodeInvalidOp (the creator's receive fails with ErrInvalidOp, nothing is accepted). duplicate: a raw OpConnCreate of an existing id is refused with ErrCodeInvalidOp. Payload stream: creator seed (2 messages on stream 2, 1 on stream 4), opener's reply seed + 1",
+     "advanced", "any", 30, 4, a05_variants, run_a05},
     {"X-A06", "flood (X-20, SPEC 10.3): both endpoints send `messages` messages to each other on a 2-slot ring while each consumes one message per 1 ms. Both deliver every message intact (sequence and CRC) and finish; no deadlock: the receive path never waits for the tx ring. Variants: flood (size = bufferSize), flood-chunked (size 3 x bufferSize + 7). --long multiplies messages by 10. Payload stream: creator seed for the creator's messages, seed + 1 for the opener's",
      "advanced", "any", 30, 2, a06_variants, run_a06},
     {"X-A07", "cancel (1.1 FeatureCancel, PROTOCOL_1_1 section 2 and 4.2): cancel variant: a call without a deadline is cancelled after 200 ms and ends with context.Canceled; the responder's handler sees context.Canceled and CanceledRequests >= 1; an OpCancel for an unknown key (raw) is ignored and the link keeps serving calls. nocancel variant (FeatureCancel not negotiated): the cancelled call sends no OpCancel (the handler's context stays alive for 800 ms); a raw OpCancel from the peer fails the requester's receive path with ErrUnexpectedPacket. Raw frames used: creator (cancel), opener (nocancel)",

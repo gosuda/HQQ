@@ -482,6 +482,9 @@ func (l *AdvancedLink) cancelPending(key advancedCallKey) {
 //	err := link.Shutdown(ctx)
 //	link.Close()
 //
+// Stream requests held for ListenStreams are refused at once with
+// ErrConnNotFound (see AdvancedOptions.StreamListenGrace).
+//
 // The link must be negotiated.
 func (l *AdvancedLink) Shutdown(ctx context.Context) error {
 	if err := l.requireNegotiated(); err != nil {
@@ -489,6 +492,7 @@ func (l *AdvancedLink) Shutdown(ctx context.Context) error {
 	}
 	ctx = orBackground(ctx)
 	l.shuttingDown.Store(true)
+	l.releaseHeld(true)
 	for l.inflightN.Load() > 0 {
 		select {
 		case <-l.drained:

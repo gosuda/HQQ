@@ -13,12 +13,14 @@ import (
 func init() {
 	register(&scenario{
 		ID: "X-A05",
-		Title: "streams (X-19, SPEC 10.2-10.3): basic: OpenStream refused while not listening (ErrConnNotFound), " +
-			"then ids 2 and 4 (Primary parity, never reused), data both ways, peer sees ErrPeerClosed after the queued " +
-			"data, stream 0 not closable (ErrInvalidOp), second Close ErrClosed. bad-parity: a raw OpConnCreate with an odd " +
-			"id is refused with ErrCodeInvalidOp (the creator's receive fails with ErrInvalidOp, nothing is accepted). " +
-			"duplicate: a raw OpConnCreate of an existing id is refused with ErrCodeInvalidOp. " +
-			"Payload stream: creator seed (2 messages on stream 2, 1 on stream 4), opener's reply seed + 1",
+		Title: "streams (X-19, SPEC 10.2-10.3): basic: OpenStream refused while not listening (ErrConnNotFound, once the " +
+			"peer's grace period ends), then ids 2 and 4 (Primary parity, never reused), data both ways, peer sees " +
+			"ErrPeerClosed after the queued data, stream 0 not closable (ErrInvalidOp), second Close ErrClosed. " +
+			"held: an OpenStream that reaches the opener before it listens is held there and accepted by its " +
+			"ListenStreams (id 2). bad-parity: a raw OpConnCreate with an odd id is refused with ErrCodeInvalidOp (the " +
+			"creator's receive fails with ErrInvalidOp, nothing is accepted). duplicate: a raw OpConnCreate of an " +
+			"existing id is refused with ErrCodeInvalidOp. Payload stream: creator seed (2 messages on stream 2, 1 on " +
+			"stream 4), opener's reply seed + 1",
 		Kind:      "advanced",
 		Platforms: []string{"any"},
 		TimeoutS:  30,
@@ -26,6 +28,7 @@ func init() {
 			advVariant("basic", advBase()),
 			advVariant("bad-parity", advBase()),
 			advVariant("duplicate", advBase()),
+			advVariant("held", advBase()),
 		},
 		Run: runAdvStreams,
 	})
@@ -35,6 +38,8 @@ func runAdvStreams(e *env) error {
 	switch e.cfg.Variant {
 	case "basic":
 		return advStreamsBasic(e)
+	case "held":
+		return advStreamsHeld(e)
 	case "bad-parity", "duplicate":
 		return advStreamsInvalid(e)
 	}
@@ -145,6 +150,75 @@ func advStreamsBasic(e *env) error {
 	}
 	e.checkErr("stream 4 Close", st2.Close(), nil)
 	e.res.Sent = 3
+	return e.barrier("end")
+}
+
+// advStreamsHeld is X-A05 variant held: the creator's OpenStream reaches the
+// opener before it listens, is held there (SPEC 10.3) and is accepted by the
+// opener's ListenStreams.
+func advStreamsHeld(e *env) error {
+	nl, err := advEstablish(e)
+	if err != nil {
+		return err
+	}
+	defer nl.Close()
+	l := nl.AdvancedLink
+	if err := l.Negotiate(e.ctx, hqq.FeatureNone); err != nil {
+		return err
+	}
+	seed := e.cfg.Seed
+	if e.cfg.Role == "opener" {
+		// Starts the dispatcher; not listening yet, so the creator's request is held.
+		shortCtx, cancel := context.WithTimeout(e.ctx, time.Second)
+		_, err := l.AcceptStream(shortCtx)
+		cancel()
+		e.checkErr("AcceptStream without ListenStreams is ErrNotListening", err, hqq.ErrNotListening)
+		if err := e.barrier("p1"); err != nil {
+			return err
+		}
+		// Gives the creator's request time to arrive while the link does not
+		// listen yet. The check below holds whether or not it did.
+		time.Sleep(300 * time.Millisecond)
+		if err := l.ListenStreams(e.ctx); err != nil {
+			return err
+		}
+		st, err := l.AcceptStream(e.ctx)
+		if err != nil {
+			return err
+		}
+		e.check("held stream is accepted with id 2", st.ID() == 2, fmt.Sprint(st.ID()))
+		if err := advStreamRecvCheck(e, st, seed, 0, e.cfg.Size); err != nil {
+			return err
+		}
+		if err := st.Send(e.ctx, conformance.Payload(seed+1, 0, 10)); err != nil {
+			return err
+		}
+		_, err = st.Recv(e.ctx)
+		e.checkErr("peer close is seen after the queued data as ErrPeerClosed", err, hqq.ErrPeerClosed)
+		e.res.Received = 1
+		return e.barrier("end")
+	}
+
+	// Creator: the Primary allocates even ids.
+	if err := e.barrier("p1"); err != nil {
+		return err
+	}
+	st, err := l.OpenStream(e.ctx)
+	if err != nil {
+		return err
+	}
+	e.check("held stream has id 2", st.ID() == 2, fmt.Sprint(st.ID()))
+	if err := st.Send(e.ctx, conformance.Payload(seed, 0, e.cfg.Size)); err != nil {
+		return err
+	}
+	reply, err := st.Recv(e.ctx)
+	if err != nil {
+		return err
+	}
+	e.check("reply from the peer's stream is intact", conformance.VerifyPayload(seed+1, 0, reply.Bytes()) == nil, "")
+	reply.Release()
+	e.checkErr("stream Close", st.Close(), nil)
+	e.res.Sent = 1
 	return e.barrier("end")
 }
 

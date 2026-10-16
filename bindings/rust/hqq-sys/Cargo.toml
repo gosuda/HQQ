@@ -1,0 +1,12 @@
+[package]
+name = "hqq-sys"
+description = "Raw FFI bindings to libhqq; builds the in-tree C library from source"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+build = "build.rs"
+links = "hqq"
+
+[dependencies]

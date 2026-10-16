@@ -1,0 +1,266 @@
+name: Bindings
+
+# Builds and tests the language bindings of libhqq (bindings/cpp, bindings/rust,
+# bindings/zig). Every job builds the C library from the in-tree sources (c/),
+# runs the binding's own tests and examples, and then runs the interop matrix
+# (interop/, TestInteropMatrix) between the binding's hqq-interop helper and the
+# Go helper built from cmd/hqq-interop. The helper contract is
+# conformance/INTEROP_CLI.md; the C library is not changed by this workflow.
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'bindings/**'
+      - 'c/**'
+      - 'conformance/**'
+      - 'interop/**'
+      - 'cmd/hqq-interop/**'
+      - '.github/workflows/bindings.yml'
+  pull_request:
+    paths:
+      - 'bindings/**'
+      - 'c/**'
+      - 'conformance/**'
+      - 'interop/**'
+      - 'cmd/hqq-interop/**'
+      - '.github/workflows/bindings.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bindings-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Pinned Zig release of the Zig binding (bindings/zig targets the 0.15 build API).
+  ZIG_VERSION: '0.15.2'
+
+jobs:
+  # ---- C++ -------------------------------------------------------------------
+  # bindings/cpp: header-only C++17 wrapper, CMake target hqq::cpp.
+  cpp:
+    name: C++ ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux gcc
+            runner: ubuntu-24.04
+            cc: gcc
+            cxx: g++
+            build_type: Release
+            sanitize: none
+          - name: Linux clang
+            runner: ubuntu-24.04
+            cc: clang-18
+            cxx: clang++-18
+            build_type: Debug
+            sanitize: address+undefined
+          - name: macOS clang
+            runner: macos-latest
+            cc: clang
+            cxx: clang++
+            build_type: Release
+            sanitize: none
+          - name: Windows clang-cl
+            runner: windows-latest
+            cc: clang-cl
+            cxx: clang-cl
+            build_type: Release
+            sanitize: none
+
+    env:
+      CC: ${{ matrix.cc }}
+      CXX: ${{ matrix.cxx }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.2
+
+      - name: Install tools (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake ninja-build clang-18 libclang-rt-18-dev g++
+          ${CC} --version
+
+      - name: Set up MSVC developer environment (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1.13.0
+        with:
+          arch: x64
+
+      - name: Set up Go
+        uses: actions/setup-go@v6.4.0
+        with:
+          go-version-file: go.mod
+          check-latest: true
+          cache: true
+
+      - name: Configure
+        shell: bash
+        run: >
+          cmake -S bindings/cpp -B build-cpp -G Ninja
+          -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+          -DHQQ_CPP_WERROR=ON
+          -DHQQ_CPP_SANITIZE=${{ matrix.sanitize }}
+          -DCMAKE_C_COMPILER=${{ env.CC }} -DCMAKE_CXX_COMPILER=${{ env.CXX }}
+
+      - name: Build
+        run: cmake --build build-cpp
+
+      - name: Test
+        env:
+          ASAN_OPTIONS: detect_leaks=1:strict_string_checks=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: ctest --test-dir build-cpp --output-on-failure --timeout 180
+
+      - name: Build Go helper
+        shell: bash
+        run: |
+          ext=""
+          if [ "$RUNNER_OS" = "Windows" ]; then ext=".exe"; fi
+          go build -o "$RUNNER_TEMP/hqq-interop-go$ext" ./cmd/hqq-interop
+
+      - name: Interop matrix (Go and C++)
+        shell: bash
+        env:
+          HQQ_INTEROP_IMPLS_EXT: ${{ runner.os == 'Windows' && '.exe' || '' }}
+        run: |
+          ext="$HQQ_INTEROP_IMPLS_EXT"
+          HQQ_INTEROP_IMPLS="go=$RUNNER_TEMP/hqq-interop-go$ext,cpp=$GITHUB_WORKSPACE/build-cpp/hqq-interop$ext" \
+            go test ./interop -run '^TestInteropMatrix$' -count=1 -timeout 30m
+
+  # ---- Rust ------------------------------------------------------------------
+  # bindings/rust: workspace of hqq-sys (builds libhqq with the host C compiler),
+  # hqq (safe wrapper) and hqq-interop. No crates.io dependencies.
+  rust:
+    name: Rust ${{ matrix.os }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: Linux
+            runner: ubuntu-24.04
+          - os: macOS
+            runner: macos-latest
+          - os: Windows
+            runner: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.2
+
+      # The runners ship rustup with the stable toolchain; no third-party action is needed.
+      - name: Show toolchain
+        shell: bash
+        working-directory: bindings/rust
+        run: |
+          rustup show active-toolchain
+          cargo --version
+
+      - name: Set up MSVC developer environment (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1.13.0
+        with:
+          arch: x64
+
+      - name: Set up Go
+        uses: actions/setup-go@v6.4.0
+        with:
+          go-version-file: go.mod
+          check-latest: true
+          cache: true
+
+      - name: Build
+        working-directory: bindings/rust
+        run: cargo build --workspace --release --locked
+
+      - name: Test
+        working-directory: bindings/rust
+        run: cargo test --workspace --locked
+
+      - name: Examples
+        working-directory: bindings/rust
+        shell: bash
+        run: |
+          cargo run --release --locked -p hqq --example echo -- --selftest
+          cargo run --release --locked -p hqq --example rpc -- --selftest
+
+      - name: Build Go helper
+        shell: bash
+        run: |
+          ext=""
+          if [ "$RUNNER_OS" = "Windows" ]; then ext=".exe"; fi
+          go build -o "$RUNNER_TEMP/hqq-interop-go$ext" ./cmd/hqq-interop
+
+      - name: Interop matrix (Go and Rust)
+        shell: bash
+        run: |
+          ext=""
+          if [ "$RUNNER_OS" = "Windows" ]; then ext=".exe"; fi
+          HQQ_INTEROP_IMPLS="go=$RUNNER_TEMP/hqq-interop-go$ext,rust=$GITHUB_WORKSPACE/bindings/rust/target/release/hqq-interop$ext" \
+            go test ./interop -run '^TestInteropMatrix$' -count=1 -timeout 30m
+
+  # ---- Zig -------------------------------------------------------------------
+  # bindings/zig: build.zig compiles libhqq from c/ and the wrapper module, the
+  # examples and the hqq-interop helper. Pinned Zig release via mlugg/setup-zig.
+  zig:
+    name: Zig ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux
+            runner: ubuntu-24.04
+          - name: macOS
+            runner: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.2
+
+      - name: Set up Zig
+        uses: mlugg/setup-zig@v2.2.1
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Check formatting
+        working-directory: bindings/zig
+        run: zig fmt --check .
+
+      - name: Build
+        working-directory: bindings/zig
+        run: zig build
+
+      - name: Test
+        working-directory: bindings/zig
+        run: zig build test
+
+      - name: Set up Go
+        uses: actions/setup-go@v6.4.0
+        with:
+          go-version-file: go.mod
+          check-latest: true
+          cache: true
+
+      - name: Build Go helper
+        run: go build -o "$RUNNER_TEMP/hqq-interop-go" ./cmd/hqq-interop
+
+      - name: Interop matrix (Go and Zig)
+        run: |
+          HQQ_INTEROP_IMPLS="go=$RUNNER_TEMP/hqq-interop-go,zig=$GITHUB_WORKSPACE/bindings/zig/zig-out/bin/hqq-interop" \
+            go test ./interop -run '^TestInteropMatrix$' -count=1 -timeout 30m

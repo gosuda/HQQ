@@ -62,6 +62,7 @@
 #define ADV_POLL_NS (UINT64_C(50) * 1000u * 1000u)
 #define ADV_ABORT_NS (UINT64_C(100) * 1000u * 1000u)
 #define ADV_TIMER_NS (UINT64_C(2) * 1000u * 1000u)
+#define ADV_LISTEN_GRACE_NS (UINT64_C(2) * 1000u * 1000u * 1000u) /* default grace of held stream requests */
 #define ADV_MIN_CLASS 6u  /* smallest payload class: 64 bytes */
 #define ADV_MAX_CLASS 40u /* largest payload class */
 #define ADV_CLASS_COUNT (ADV_MAX_CLASS + 1u)
@@ -192,6 +193,12 @@ typedef struct adv_ctl_job {
     uint64_t ops[7];
     hqq_stream *accept;      /* OpConnAccept: stream to publish to AcceptStream */
 } adv_ctl_job;
+
+/* A stream request held while the link is not listening (SPEC 10.3). */
+typedef struct adv_held {
+    uint64_t id;
+    uint64_t deadline;       /* monotonic ns: refused when it has passed */
+} adv_held;
 
 /* ---- Request contexts ------------------------------------------------------------- */
 
@@ -326,6 +333,10 @@ struct hqq_adv {
     /* Control sender. */
     adv_ctl_job *ctl;
     uint64_t ctl_head, ctl_count;
+    /* Stream requests held while not listening: a FIFO ring of queue_size entries. */
+    adv_held *held;
+    uint64_t held_head, held_count;
+    uint64_t listen_grace_ns; /* 0: refuse at once */
 
     /* Statistics. */
     uint64_t st_messages, st_message_bytes, st_requests, st_responses;
@@ -404,6 +415,8 @@ void adv_stream_unregister_locked(hqq_adv *a, hqq_stream *s);
 hqq_stream *adv_stream_lookup_locked(hqq_adv *a, uint64_t id);
 int adv_peer_owns_id(const hqq_adv *a, uint64_t id);
 hqq_status adv_handle_control(hqq_adv *a, const hqq_packet *pkt);
+void adv_held_expire_locked(hqq_adv *a, uint64_t now);
+void adv_held_release_locked(hqq_adv *a, int refuse);
 
 /* ---- Messages, calls, serve (hqq_adv_msg.c) ------------------------------------------ */
 

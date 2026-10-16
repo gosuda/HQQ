@@ -97,6 +97,7 @@ typedef struct hqq_adv_options {
     uint64_t queue_size;            /* 0: buffer_count. Capacity of every incoming queue. */
     hqq_overflow overflow;          /* default HQQ_OVERFLOW_BLOCK */
     hqq_options link;               /* wait policy, heartbeat, peer and attach timeouts, allocator */
+    int64_t stream_listen_grace_ns; /* 0: 2 s. A stream request that arrives before ListenStreams is held this long; negative: refused at once. */
 } hqq_adv_options;
 
 HQQ_API void hqq_adv_options_init(hqq_adv_options *opts);
@@ -193,13 +194,18 @@ HQQ_API uint64_t hqq_adv_negotiated_features(const hqq_adv *link);
  * be closed. Valid after hqq_adv_open/create (before negotiation too). */
 HQQ_API hqq_stream *hqq_adv_stream0(hqq_adv *link);
 /* Enables incoming stream creation (Go ListenStreams). Idempotent-refusing:
- * HQQ_ERR_ALREADY_LISTENING on the second call. Requires negotiation. */
+ * HQQ_ERR_ALREADY_LISTENING on the second call. Requires negotiation. A stream
+ * request that arrived before this call was held (see stream_listen_grace_ns):
+ * the held requests are accepted now, in arrival order, and those whose grace
+ * period had ended were refused with HQQ_ERR_CONN_NOT_FOUND. */
 HQQ_API hqq_status hqq_adv_listen_streams(hqq_adv *link);
 /* Waits for an incoming stream (its OpConnAccept is already queued). */
 HQQ_API hqq_status hqq_adv_accept_stream(hqq_adv *link, hqq_stream **out, const hqq_wait *wait);
-/* Opens a stream of this endpoint's parity; waits for the peer's accept.
- * A refusal maps to HQQ_ERR_CONN_NOT_FOUND (not listening), HQQ_ERR_INVALID_OP
- * (parity or duplicate) or HQQ_ERR_BUFFER_OVERFLOW (accept queue full). */
+/* Opens a stream of this endpoint's parity; waits for the peer's accept. A
+ * request that reaches a peer which is not listening yet is held there for the
+ * peer's stream_listen_grace_ns first. A refusal maps to HQQ_ERR_CONN_NOT_FOUND
+ * (still not listening after the grace period), HQQ_ERR_INVALID_OP (parity or
+ * duplicate) or HQQ_ERR_BUFFER_OVERFLOW (accept queue full). */
 HQQ_API hqq_status hqq_adv_open_stream(hqq_adv *link, hqq_stream **out, const hqq_wait *wait);
 
 HQQ_API uint64_t hqq_stream_id(const hqq_stream *s);

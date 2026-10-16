@@ -1,0 +1,11 @@
+[package]
+name = "hqq"
+description = "Safe Rust wrapper for libhqq: shared-memory IPC links, streams, request/response"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+hqq-sys = { path = "../hqq-sys" }
