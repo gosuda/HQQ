@@ -1,5 +1,4 @@
 //go:build unix || linux || darwin || freebsd || openbsd
-// +build unix linux darwin freebsd openbsd
 
 package mmap
 
@@ -13,10 +12,12 @@ const (
 	MAP_PRIVATE = syscall.MAP_PRIVATE
 )
 
+// Map maps len bytes of the object referenced by fd starting at offset.
 func Map(fd uintptr, offset int, len int, prot int, flags int) ([]byte, error) {
 	return syscall.Mmap(int(fd), int64(offset), len, prot, flags)
 }
 
+// UnMap unmaps a region previously returned by Map.
 func UnMap(b []byte) error {
 	return syscall.Munmap(b)
 }

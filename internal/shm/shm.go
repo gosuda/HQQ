@@ -1,4 +1,18 @@
+// Package shm provides a minimal cross-platform wrapper around named shared
+// memory objects: POSIX shm_open on Linux (/dev/shm), macOS and FreeBSD, and
+// named file mappings on Windows.
 package shm
+
+import (
+	"errors"
+	"fmt"
+	"strings"
+)
+
+// ErrInvalidName reports a shared-memory name that is empty, contains path
+// separators or NUL bytes, refers to "." or "..", or exceeds the platform
+// limit.
+var ErrInvalidName = errors.New("shm: invalid shared memory name")
 
 // SharedMemory represents a shared memory region for inter-process communication
 // This structure provides a cross-platform interface for creating and managing
@@ -26,11 +40,31 @@ func (s *SharedMemory) Size() int {
 
 // FD returns the file descriptor or handle for the shared memory region
 // The exact type and meaning of this value depends on the platform:
-// - On Unix-like systems: file descriptor from shm_open() or mmap()
+// - On Unix-like systems: file descriptor from shm_open()
 // - On Windows: handle from CreateFileMapping()
 //
-// This low-level handle is used by the MPMC ring buffer implementation
-// to directly access the shared memory region
+// The handle is passed to mmap.Map to map the region into the process.
 func (s *SharedMemory) FD() uintptr {
 	return s.fd
+}
+
+// baseName validates name and returns it without its optional leading slash.
+// maxLen limits the length of the full name as passed by the caller
+// (0 means no extra limit).
+func baseName(name string, maxLen int) (string, error) {
+	if maxLen > 0 && len(name) > maxLen {
+		return "", fmt.Errorf("%w: %q is longer than %d bytes", ErrInvalidName, name, maxLen)
+	}
+	base := strings.TrimPrefix(name, "/")
+	switch {
+	case base == "":
+		return "", fmt.Errorf("%w: empty name", ErrInvalidName)
+	case base == "." || base == "..":
+		return "", fmt.Errorf("%w: %q", ErrInvalidName, name)
+	case strings.ContainsAny(base, "/\\\x00"):
+		return "", fmt.Errorf("%w: %q must not contain path separators or NUL", ErrInvalidName, name)
+	case len(base) > 255:
+		return "", fmt.Errorf("%w: %q is longer than 255 bytes", ErrInvalidName, name)
+	}
+	return base, nil
 }

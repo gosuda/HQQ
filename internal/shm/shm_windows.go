@@ -1,5 +1,4 @@
 //go:build windows
-// +build windows
 
 package shm
 
@@ -79,14 +78,22 @@ func nsOpenFileMapping(dwDesiredAccess uint32, bInheritHandle bool, lpName strin
 	return syscall.Handle(ret), nil
 }
 
+// OpenSharedMemory opens or creates the named file mapping name. Names
+// without a namespace prefix are created in the session-local "Local\"
+// namespace, which does not require SeCreateGlobalPrivilege. Pass an explicit
+// "Global\name" to share a mapping across sessions (for example between a
+// service and a desktop application). mode is ignored on Windows.
 func OpenSharedMemory(name string, size int, flags int, mode os.FileMode) (*SharedMemory, error) {
 	s := &SharedMemory{
 		name: name,
 		size: size,
 	}
 
-	_ = mode // Ignore FileMode
-	name = windowsSharedMemoryName(name)
+	_ = mode // Windows file mappings use security descriptors, not modes.
+	objectName, err := windowsSharedMemoryName(name)
+	if err != nil {
+		return nil, err
+	}
 
 	if flags&os.O_CREATE != 0 {
 		prot := 0
@@ -101,18 +108,14 @@ func OpenSharedMemory(name string, size int, flags int, mode os.FileMode) (*Shar
 			0,
 			uint32(prot),
 			uint64(size),
-			name,
+			objectName,
 		)
 		if err != nil {
-			return nil, err
+			return nil, &os.PathError{Op: "CreateFileMapping", Path: name, Err: err}
 		}
-		if alreadyExists {
-			if flags&os.O_EXCL != 0 {
-				_ = syscall.CloseHandle(fd)
-				return nil, os.ErrExist
-			}
-			s.fd = uintptr(fd)
-			return s, nil
+		if alreadyExists && flags&os.O_EXCL != 0 {
+			_ = syscall.CloseHandle(fd)
+			return nil, &os.PathError{Op: "CreateFileMapping", Path: name, Err: os.ErrExist}
 		}
 		s.fd = uintptr(fd)
 		return s, nil
@@ -125,25 +128,54 @@ func OpenSharedMemory(name string, size int, flags int, mode os.FileMode) (*Shar
 	fd, err := nsOpenFileMapping(
 		access,
 		false,
-		name,
+		objectName,
 	)
 	if err != nil {
-		return nil, err
+		return nil, &os.PathError{Op: "OpenFileMapping", Path: name, Err: err}
 	}
 	s.fd = uintptr(fd)
 
 	return s, nil
 }
 
-func (s *SharedMemory) Delete() error {
-	return nil // Do nothing
+// Unlink is a no-op on Windows: a file mapping object is destroyed when its
+// last handle is closed.
+func Unlink(name string) error {
+	_, err := windowsSharedMemoryName(name)
+	return err
 }
 
+// Delete is a no-op on Windows; see Unlink.
+func (s *SharedMemory) Delete() error {
+	return nil
+}
+
+// CurrentSize returns -1: a Windows file mapping is created with its final
+// size atomically, so there is no partially sized state to detect.
+func (s *SharedMemory) CurrentSize() (int64, error) {
+	return -1, nil
+}
+
+// Close closes the mapping handle. Views stay valid until unmapped.
 func (s *SharedMemory) Close() error {
 	return syscall.CloseHandle(syscall.Handle(s.fd))
 }
 
-func windowsSharedMemoryName(name string) string {
-	name = strings.TrimLeft(name, `/\`)
-	return `Global\` + name
+// windowsSharedMemoryName maps a portable name to a kernel object name.
+// "Global\x" and "Local\x" are kept; other names get the "Local\" prefix.
+func windowsSharedMemoryName(name string) (string, error) {
+	for _, prefix := range []string{`Global\`, `Local\`} {
+		if len(name) > len(prefix) && strings.EqualFold(name[:len(prefix)], prefix) {
+			base, err := baseName(name[len(prefix):], 0)
+			if err != nil {
+				return "", err
+			}
+			return prefix + base, nil
+		}
+	}
+	base, err := baseName(name, 0)
+	if err != nil {
+		return "", err
+	}
+	return `Local\` + base, nil
 }

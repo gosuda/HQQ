@@ -1,5 +1,4 @@
 //go:build windows
-// +build windows
 
 package mmap
 
@@ -50,6 +49,7 @@ func nsUnmapViewOfFile(lpBaseAddress uintptr) error {
 	return nil
 }
 
+// Map maps len bytes of the file-mapping handle fd starting at offset.
 func Map(fd uintptr, offset int, len int, prot int, flags int) ([]byte, error) {
 	_ = flags
 
@@ -68,9 +68,10 @@ func Map(fd uintptr, offset int, len int, prot int, flags int) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return unsafe.Slice((*byte)(unsafe.Pointer(base)), len), nil
+	return unsafe.Slice((*byte)(pointerFromAddress(base)), len), nil
 }
 
+// UnMap unmaps a view previously returned by Map.
 func UnMap(b []byte) error {
 	return nsUnmapViewOfFile(uintptr(unsafe.Pointer(unsafe.SliceData(b))))
 }

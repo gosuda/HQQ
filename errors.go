@@ -1,0 +1,173 @@
+package hqq
+
+import (
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"os"
+
+	"gosuda.org/hqq/internal/shm"
+)
+
+// ErrorCode represents HQQ-specific error codes carried in protocol packets
+// (OpError operand 1, tombstone reasons, and Advanced error statuses).
+type ErrorCode uint64
+
+const (
+	ErrCodeMemoryAlign    ErrorCode = 0x01 // Memory alignment violation
+	ErrCodeInvalidSize    ErrorCode = 0x02 // Invalid buffer count, size, index, or chunk bounds
+	ErrCodeMemorySmall    ErrorCode = 0x03 // Memory too small for configuration
+	ErrCodeFailedInit     ErrorCode = 0x04 // Failed to initialize or attach
+	ErrCodeConnNotFound   ErrorCode = 0x05 // Connection or request context not found
+	ErrCodeInvalidOp      ErrorCode = 0x06 // Unknown or unsupported operation
+	ErrCodeBufferOverflow ErrorCode = 0x07 // Payload exceeds configured limits
+)
+
+// Base errors. They are stable sentinels: compare with errors.Is.
+var (
+	ErrMemoryAlign    = errors.New("hqq: memory alignment violation")
+	ErrInvalidSize    = errors.New("hqq: invalid buffer ring size")
+	ErrMemorySmall    = errors.New("hqq: memory too small")
+	ErrFailedInit     = errors.New("hqq: failed to initialize buffer ring")
+	ErrConnNotFound   = errors.New("hqq: connection not found")
+	ErrInvalidOp      = errors.New("hqq: invalid operation")
+	ErrBufferOverflow = errors.New("hqq: buffer overflow")
+
+	// ErrTimeout is returned when a read or write deadline passes. It
+	// implements net.Error with Timeout() == true and matches
+	// os.ErrDeadlineExceeded, as net.PacketConn users expect.
+	ErrTimeout error = &timeoutError{}
+)
+
+// Refined errors. Each one wraps the base error it used to be reported as,
+// so existing errors.Is checks against the base errors keep working.
+var (
+	// ErrClosed is returned by operations on a link that has been closed
+	// locally. It matches net.ErrClosed.
+	ErrClosed = &hqqError{msg: "hqq: link closed", base: net.ErrClosed}
+
+	// ErrPeerClosed is returned by blocking operations after the peer
+	// endpoint closed the link gracefully and no buffered data remains.
+	// It matches io.EOF.
+	ErrPeerClosed = &hqqError{msg: "hqq: peer closed the link", base: io.EOF}
+
+	// ErrPeerGone is returned when the peer endpoint stopped heartbeating
+	// (crashed or hung) or the shared segment was re-initialized under this
+	// endpoint. The link must be closed and re-established.
+	ErrPeerGone = &hqqError{msg: "hqq: peer is gone (no heartbeat)", base: ErrConnNotFound}
+
+	// ErrLinkBusy is returned when both endpoints of a segment are already
+	// attached and alive.
+	ErrLinkBusy = &hqqError{msg: "hqq: link already has two live endpoints", base: ErrFailedInit}
+
+	// ErrIncompatibleLayout is returned when the shared segment was created by
+	// an incompatible HQQ version.
+	ErrIncompatibleLayout = &hqqError{msg: "hqq: incompatible shared memory layout", base: ErrFailedInit}
+
+	// ErrNotNegotiated is returned by Advanced APIs before successful
+	// protocol negotiation, or when the required feature was not negotiated.
+	ErrNotNegotiated = &hqqError{msg: "hqq: advanced protocol not negotiated", base: ErrInvalidOp}
+
+	// ErrAlreadyNegotiated is returned when negotiation is attempted twice.
+	ErrAlreadyNegotiated = &hqqError{msg: "hqq: protocol already negotiated or in progress", base: ErrInvalidOp}
+
+	// ErrNegotiationRejected is returned when the peer rejects negotiation or
+	// acknowledges an incompatible version or feature set.
+	ErrNegotiationRejected = &hqqError{msg: "hqq: protocol negotiation rejected", base: ErrInvalidOp}
+
+	// ErrUnexpectedPacket is returned when a packet arrives on an API that
+	// cannot consume it, for example an Advanced frame read through the
+	// Standard Read APIs. The offending packet is discarded.
+	ErrUnexpectedPacket = &hqqError{msg: "hqq: unexpected packet for this API", base: ErrInvalidOp}
+
+	// ErrProtocol is returned for malformed frames (bad flags, bounds, or
+	// chunk ordering).
+	ErrProtocol = &hqqError{msg: "hqq: protocol violation", base: ErrInvalidOp}
+
+	// ErrAdvancedActive is returned by the Standard Read/Write methods of an
+	// AdvancedLink after negotiation, because they would steal Advanced
+	// frames from the dispatcher.
+	ErrAdvancedActive = &hqqError{msg: "hqq: standard I/O is disabled on a negotiated advanced link", base: ErrInvalidOp}
+
+	// ErrNotListening is returned by Accept before Listen.
+	ErrNotListening = &hqqError{msg: "hqq: not listening for connections", base: ErrInvalidOp}
+
+	// ErrAlreadyListening is returned by a second Listen.
+	ErrAlreadyListening = &hqqError{msg: "hqq: already listening for connections", base: ErrInvalidOp}
+
+	// ErrIncomingOverflow is returned when the incoming queue is full and
+	// AdvancedOptions.IncomingOverflow is OverflowFail.
+	ErrIncomingOverflow = &hqqError{msg: "hqq: incoming message queue overflow", base: ErrBufferOverflow}
+
+	// ErrInvalidName is returned for shared-memory names that are empty,
+	// contain path separators or NUL bytes, or exceed the platform limit.
+	ErrInvalidName = shm.ErrInvalidName
+)
+
+// errSegmentNotReady is returned while a named segment exists but its
+// creator has not sized it yet. Dial retries on it.
+var errSegmentNotReady = &hqqError{msg: "hqq: shared memory segment is not initialized yet", base: ErrFailedInit}
+
+// hqqError is an error with a stable message that wraps a broader base error.
+type hqqError struct {
+	msg  string
+	base error
+}
+
+func (e *hqqError) Error() string { return e.msg }
+func (e *hqqError) Unwrap() error { return e.base }
+
+// timeoutError is the concrete type of ErrTimeout.
+type timeoutError struct{}
+
+func (*timeoutError) Error() string   { return "hqq: operation timed out" }
+func (*timeoutError) Timeout() bool   { return true }
+func (*timeoutError) Temporary() bool { return true }
+func (*timeoutError) Unwrap() error   { return os.ErrDeadlineExceeded }
+
+var _ net.Error = (*timeoutError)(nil)
+
+// unknownCodeError reports an OpError packet with an unknown code.
+type unknownCodeError struct{ code ErrorCode }
+
+func (e unknownCodeError) Error() string {
+	return fmt.Sprintf("hqq: peer reported unknown error code %#x", uint64(e.code))
+}
+
+// errorFromCode converts a protocol error code to an error.
+func errorFromCode(code ErrorCode) error {
+	switch code {
+	case ErrCodeMemoryAlign:
+		return ErrMemoryAlign
+	case ErrCodeInvalidSize:
+		return ErrInvalidSize
+	case ErrCodeMemorySmall:
+		return ErrMemorySmall
+	case ErrCodeFailedInit:
+		return ErrFailedInit
+	case ErrCodeConnNotFound:
+		return ErrConnNotFound
+	case ErrCodeInvalidOp:
+		return ErrInvalidOp
+	case ErrCodeBufferOverflow:
+		return ErrBufferOverflow
+	default:
+		return unknownCodeError{code}
+	}
+}
+
+// AdvancedResponseError reports an error response to an Advanced request.
+// Call returns it when the peer answered with RespondError; RPC handlers may
+// return it to choose the status and payload of the error response.
+type AdvancedResponseError struct {
+	Status  uint64
+	Payload []byte
+}
+
+func (e AdvancedResponseError) Error() string {
+	if len(e.Payload) > 0 && len(e.Payload) <= 256 {
+		return fmt.Sprintf("hqq: advanced response error (status %d): %s", e.Status, e.Payload)
+	}
+	return fmt.Sprintf("hqq: advanced response error (status %d, %d byte payload)", e.Status, len(e.Payload))
+}

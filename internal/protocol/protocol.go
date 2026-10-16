@@ -1,3 +1,5 @@
+// Package protocol defines the fixed 64-byte little-endian packet ABI and
+// opcodes used by HQQ Standard and Advanced shared-memory links.
 package protocol
 
 import "encoding/binary"

@@ -2,26 +2,12 @@
 
 package race
 
-import _ "unsafe"
-
-//go:linkname Disable internal/race.Disable
-func Disable()
-
-//go:linkname Enable internal/race.Enable
-func Enable()
-
-func Do(fn func()) {
-	Disable()
-	defer Enable()
-	fn()
-}
-
 // Copy performs a byte copy without race instrumentation for the copy itself.
 //
-// RaceDisable/Enable only suppress synchronization-event handling, not ordinary
-// memory-access instrumentation. Keep intentional shared-memory payload copies
-// in tiny //go:norace helpers so the rest of the StandardLink remains visible
-// to the race detector.
+// Shared-memory payload copies are ordered by the ring's atomic sequence
+// numbers, possibly across processes, which the race detector cannot observe.
+// Keeping them in tiny //go:norace helpers leaves the rest of the package
+// fully visible to the race detector.
 //
 //go:norace
 func Copy(dst, src []byte) int {

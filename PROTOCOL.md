@@ -4,36 +4,34 @@
 
 This document defines the HQQ shared-memory protocol family:
 
-- **Standard Protocol 1.0**: the `StandardLink` data path. It provides the fixed packet ABI, bidirectional lock-free rings, ring-slot-owned payload buffers, tombstones, and the basic `Read`/`Write`/zero-copy/reservation APIs.
-- **Advanced Protocol 1.0**: an optional overlay on top of the Standard Protocol. It keeps the same shared-memory layout and packet ABI, and adds only two protocol capabilities for now: large-data copy and request-response IPC.
+- **Standard Protocol 1.0**: the [`StandardLink`](standard.go) data path. It provides the fixed 64-byte packet ABI, bidirectional lock-free MPMC rings, ring-slot-owned payload buffers, tombstones, endpoint liveness/crash detection, and the basic `Read`/`Write`/zero-copy/reservation APIs.
+- **Advanced Protocol 1.0**: an optional negotiated overlay on top of the Standard Protocol. It keeps the same shared-memory layout and packet ABI, and adds multi-chunk large-data copy, concurrent request-response IPC, and logical stream multiplexing.
 
-The Advanced Protocol must not change Standard Protocol ownership rules. Every payload byte still lives in the same-index buffer owned by the claimed data-ring slot, and every reader must release the claimed slot promptly.
+The Advanced Protocol preserves Standard Protocol ownership rules: every payload byte lives in the same-index buffer owned by the claimed data-ring slot, and every reader releases the claimed slot promptly.
 
 ## Shared Design Goals
 
-1. **Fixed ABI**: packets have a stable byte layout independent of Go struct padding or `uintptr` width.
+1. **Fixed ABI**: packets have a stable 64-byte layout independent of Go struct padding or `uintptr` width.
 2. **Little-endian encoding**: all packet words are encoded with `binary.LittleEndian`.
-3. **Lock-free ownership transfer**: data ring slots own same-index payload buffers; no mutex is required for the StandardLink hot path.
+3. **Lock-free ownership transfer**: data ring slots own same-index payload buffers; no mutex is required on the `StandardLink` hot path.
 4. **No unread-buffer overwrite**: a payload buffer is recycled only after the receiver releases the owning ring slot.
 5. **Bounded memory**: all rings and payload buffers are allocated up front.
-6. **Composable dispatch**: automatic copy, zero-copy callback, and explicit reserve/commit APIs all operate on the same packet stream.
+6. **Composable dispatch**: automatic copy (`Read`/`Write`), zero-copy callbacks (`ReadZeroCopy`/`WriteZeroCopy`), and explicit reservations (`ReserveRead`/`ReserveWrite`) all operate on the same packet stream.
+7. **Deterministic lifecycle & crash detection**: endpoints advertise PID and heartbeat metadata in the superblock so peers distinguish graceful shutdown (`ErrPeerClosed`) from abrupt process termination (`ErrPeerGone`).
 
 ## Shared Memory Layout
 
-The protocol allocates two independent directions. Each direction has:
-
-- one packet ring for published data packets
-- one fixed-size payload buffer pool
+The protocol allocates a page-aligned superblock followed by two independent directional channels. Each direction has one packet ring and one fixed-size payload buffer pool:
 
 ```text
 PAGE_START
-  SUPERBLOCK    one page of protocol/configuration/init-state metadata
+  SUPERBLOCK    one page of protocol, configuration, init-state, and liveness metadata
 PAGE_BREAK
-  DATA_RING_0   protocol.Packet ring, Primary -> Secondary
+  DATA_RING_0   protocol.Packet MPMC ring, Primary -> Secondary
 PAGE_BREAK
   BUFFERS_0     bufferCount * bufferSize bytes, Primary -> Secondary payloads
 PAGE_BREAK
-  DATA_RING_1   protocol.Packet ring, Secondary -> Primary
+  DATA_RING_1   protocol.Packet MPMC ring, Secondary -> Primary
 PAGE_BREAK
   BUFFERS_1     bufferCount * bufferSize bytes, Secondary -> Primary payloads
 PAGE_END
@@ -41,21 +39,64 @@ PAGE_END
 
 All regions are page-aligned. `bufferCount` must be a power of two and at least 2. `bufferSize` must be at least 8 bytes and a multiple of 8. For each direction, `BUFFERS[i]` is owned by data-ring slot `i`.
 
-### Superblock
+### Superblock (`HQQ_STL2`)
 
-The first page is a shared initialization/configuration superblock. It is intentionally outside the hot path and is used to make attachment deterministic:
+The first page is a shared initialization, configuration, and endpoint-liveness superblock (`superblockMagic = 0x4851515F53544C32`, `"HQQ_STL2"`):
 
-| Field | Meaning |
-| --- | --- |
-| `Magic` | HQQ StandardLink layout magic |
-| `State` | `Empty`, `Initializing`, or `Ready` |
-| `Major` / `Minor` | Standard layout/protocol version |
-| `PageSize` | Page size used to compute region boundaries |
-| `BufferCount` | Configured ring-slot/buffer count per direction |
-| `BufferSize` | Configured bytes per slot-owned payload buffer |
-| `LayoutSize` | Total bytes returned by `SizeStandardLink` |
+| Offset | Field | Type | Meaning |
+| ---: | --- | --- | --- |
+| `0` | `Magic` | `uint64` | `0x4851515F53544C32` (`"HQQ_STL2"`) |
+| `8` | `State` | `uint32` | `0` (`Empty`), `1` (`Initializing`), or `2` (`Ready`) |
+| `12` | `Major` | `uint16` | Standard protocol major version (`1`) |
+| `14` | `Minor` | `uint16` | Standard protocol minor version (`0`) |
+| `16` | `PageSize` | `uint64` | OS page size used to compute region boundaries |
+| `24` | `BufferCount` | `uint64` | Configured ring-slot/buffer count per direction |
+| `32` | `BufferSize` | `uint64` | Configured bytes per slot-owned payload buffer |
+| `40` | `LayoutSize` | `uint64` | Total bytes returned by `SizeStandardLink` |
+| `48` | `Epoch` | `uint64` | Monotonic generation counter incremented on re-initialization |
+| `56` | `InitPID` | `uint64` | OS PID of the endpoint currently initializing the segment |
+| `64` | `InitHeartbeat` | `uint64` | Monotonic wall-clock timestamp (`UnixNano`) refreshed during initialization |
+| `128` | `Primary` | `64B` | Primary endpoint liveness record (`Token`, `PID`, `Heartbeat`, `Interval`) |
+| `192` | `Secondary` | `64B` | Secondary endpoint liveness record (`Token`, `PID`, `Heartbeat`, `Interval`) |
 
-The primary endpoint claims an empty superblock, initializes both rings, zeros both payload regions, writes the configuration, and only then publishes `State=Ready`. Secondary endpoints wait for `Ready` and reject mismatched configuration. This preserves the page-alignment rule and prevents attachers from observing a half-initialized payload region.
+#### Endpoint Liveness Record (64 bytes, cache-line aligned)
+
+| Offset | Field | Type | Meaning |
+| ---: | --- | --- | --- |
+| `+0` | `Token` | `uint64` | `0` = never attached, `1` = gracefully detached (`detachedToken`), `>= 2` = active session token |
+| `+8` | `PID` | `uint64` | OS process ID of the attached endpoint |
+| `+16` | `Heartbeat` | `uint64` | Last heartbeat timestamp (`UnixNano`) |
+| `+24` | `Interval` | `uint64` | Configured heartbeat interval in nanoseconds |
+
+#### Initialization, Takeover, and Stale Segment Reuse
+
+1. **Primary initialization**: The primary endpoint claims `State` via CAS (`Empty -> Initializing`), records `InitPID` and `InitHeartbeat`, formats both MPMC rings, zeros both payload pools while periodically refreshing `InitHeartbeat`, writes the layout fields, claims the `Primary` endpoint slot, and publishes `State = Ready`.
+2. **Initializer crash takeover**: If the initializing process crashes before publishing `State = Ready`, a subsequent opener detects that `InitPID` is no longer alive (or that `InitHeartbeat` has expired past `AttachTimeout`) and safely takes over initialization.
+3. **Third-endpoint rejection**: At most one Primary and one Secondary endpoint may be active simultaneously. If both endpoint slots hold live tokens, a third opener fails immediately with `ErrLinkBusy`.
+4. **Stale segment re-initialization**: When `CreateStandardLink` or `CreateAdvancedLink` opens an existing named segment whose previous endpoints are both dead or detached, it automatically increments `Epoch`, re-formats the rings, and re-initializes the superblock.
+
+### MPMC Ring Layout (v2)
+
+Each directional packet ring uses a 512-byte header (`mpmc.HeaderSize = 512`) split into four 128-byte cache-line-isolated regions to prevent false sharing between producers, consumers, and cross-process park/wake words:
+
+```text
+Offset   0..127 : w            (uint64 write cursor)
+Offset 128..255 : notEmpty     (uint32 sequence) + emptyWaiters (uint32 count)
+Offset 256..383 : r            (uint64 read cursor)
+Offset 384..511 : notFull      (uint32 sequence) + fullWaiters  (uint32 count)
+Offset 512..end : slots[0..N-1], each rounded up to a 64-byte multiple
+```
+
+Each slot consists of an 8-byte sequence number (`seq uint64`) followed by the 64-byte `protocol.Packet` and 56 bytes of padding (`slotStride = 128` bytes), guaranteeing that no two slots share a 64-byte cache line.
+
+When `WaitAdaptive` (the default `WaitPolicy`) is active:
+- Contended producers/consumers spin briefly with CPU pause hints (` PAUSE` on amd64, `YIELD` on arm64), then increment the corresponding waiter count (`emptyWaiters` or `fullWaiters`) and park in the OS kernel:
+  - **Linux**: `futex` (`FUTEX_WAIT = 0`, `FUTEX_WAKE = 1`, shared across processes without `FUTEX_PRIVATE_FLAG`)
+  - **macOS**: `__ulock_wait` / `__ulock_wake` (`UL_COMPARE_AND_WAIT_SHARED = 3`)
+  - **Other platforms / Windows**: bounded exponential sleep backoff (`20µs` to `2ms`)
+- Publishing a slot or releasing a slot bumps `notEmpty` or `notFull` and issues a kernel wake only when `emptyWaiters > 0` or `fullWaiters > 0`, keeping the uncontended fast path completely syscall-free.
+
+The core Vyukov MPMC state machine is formally specified in [`internal/mpmc/MPMC.tla`](internal/mpmc/MPMC.tla) and model-checked with TLC via [`scripts/tlc.sh`](scripts/tlc.sh) for writer/reader exclusivity (`NoRace`), payload integrity (`DataIntegrity`), FIFO claim order (`FIFOClaimOrder`), and lock-free system progress (`SystemProgress`).
 
 ## Packet ABI
 
@@ -87,7 +128,7 @@ Marks a claimed slot as intentionally empty.
 | `Operand2` | `ErrorCode` or reason code |
 | `Operand3..6` | Reserved, must be zero |
 
-Tombstones preserve ring progress when a producer reserves a slot but cannot publish a payload. Readers skip tombstones and release the slot immediately.
+Tombstones preserve ring progress when a producer reserves a slot but aborts before publishing a payload. Readers skip tombstones and release the slot immediately.
 
 ### `OpStandardLinkCopy` (`0xFF`)
 
@@ -97,10 +138,10 @@ Transfers one payload stored in a direction-local buffer pool.
 | --- | --- |
 | `Operand0` | `CopyID`, monotonically increasing per endpoint |
 | `Operand1` | `BufferIndex`, diagnostic mirror of the claimed data-ring slot index |
-| `Operand2` | `DataSize`, number of valid bytes in the buffer |
+| `Operand2` | `DataSize`, number of valid bytes in the buffer (`1 <= DataSize <= bufferSize`) |
 | `Operand3..6` | Reserved, must be zero |
 
-`DataSize` must satisfy `1 <= DataSize <= bufferSize`. Empty `Write` calls do not publish packets.
+Empty `Write` calls do not publish packets.
 
 ### Standard Buffer Ownership
 
@@ -109,342 +150,96 @@ Each direction starts with every data-ring slot available. Slot `i` owns `BUFFER
 #### Send path
 
 1. Sender claims one producer slot from the direction's data ring.
-2. Sender writes the payload into the same-index payload buffer, `BUFFERS[slot]`.
-3. Sender stores `OpStandardLinkCopy` in the claimed packet slot. `Operand1` mirrors `slot`. If the reserved write cannot be completed, sender stores `OpStandardLinkTombstone` instead.
-4. Sender publishes the packet by advancing the slot sequence.
+2. Sender writes the payload into `BUFFERS[slot]`.
+3. Sender stores `OpStandardLinkCopy` in the claimed packet slot (`Operand1` mirrors `slot`). If a reserved write is aborted, sender stores `OpStandardLinkTombstone` instead.
+4. Sender publishes the packet by advancing the slot sequence and wakes any parked consumer.
 
 #### Receive path
 
 1. Receiver claims one consumer slot from the direction's data ring.
-2. Receiver uses the claimed slot index to locate `BUFFERS[slot]` and validates `DataSize`.
-3. Receiver skips tombstones. For copy packets, it either copies payload bytes out of shared memory (`Read`) or passes the shared buffer directly to the callback (`ReadZeroCopy`/`ReserveRead`).
-4. Returning from the dequeue callback or calling `Release` releases the packet slot and `BUFFERS[slot]` back to producers.
+2. Receiver locates `BUFFERS[slot]` from the claimed slot index and validates `DataSize`.
+3. Receiver skips tombstones. If it encounters an Advanced frame (`OpConnCopy`, `OpProtoNegotiate`, etc.) on the raw Standard read path, it releases the slot and returns `ErrUnexpectedPacket`.
+4. Returning from the dequeue callback or calling `Release` releases the packet slot and `BUFFERS[slot]` back to producers and wakes any parked producer.
 
-This ties payload lifetime to ring-slot lifetime and prevents a producer from overwriting unread payloads.
-
-> WARNING: Zero-copy callbacks and read reservations hold the underlying ring slot. They must finish promptly; if they block or are retained, the whole direction can suffer head-of-line (HOL) blocking. The shared buffer must not be retained after release.
-
-### Standard Backpressure
-
-The protocol has one bounded backpressure point per direction:
-
-- **Data ring full**: every slot and therefore every same-index payload buffer is currently in flight; writers wait until receivers release slots.
-
-`StandardLink` exposes write deadlines through `net.PacketConn` deadline methods. On timeout, it returns `ErrTimeout` if no slot was claimed before the deadline. After a zero-copy callback starts, cancellation is not checked until the callback returns because the slot must be published or released to preserve ring progress.
-
-### StandardLink Semantics
-
-- `Write` publishes at most one packet and rejects payloads larger than `bufferSize` with `ErrBufferOverflow`.
-- `Read` returns after delivering data from one packet, or from a previously saved local remainder.
-- `Read` and `Write` are automatic-release/automatic-commit hot-path APIs for the same packet stream used by the explicit reservation APIs.
-- `WriteZeroCopy` and `ReadZeroCopy` expose the slot-owned payload buffer directly for the duration of the callback.
-- `ReserveWrite` and `ReserveRead` expose explicit slot lifetime control. `ReserveWrite` must be finished with `Commit` or `Abort`; `ReserveRead` must be finished with `Release`.
-- Dispatch methods can be mixed at message boundaries: `Write`, `WriteZeroCopy`, and `ReserveWrite` publish copy packets; `Read`, `ReadZeroCopy`, and `ReserveRead` consume copy packets and skip tombstones.
-- If the caller's read buffer is smaller than the payload, the unread tail is copied into a local per-link remainder buffer and the shared payload buffer is released as soon as the dequeue callback returns.
-- `ReadFrom` and `WriteTo` are thin `net.PacketConn` adapters over `Read` and `Write`.
+> [!WARNING]
+> Zero-copy callbacks and read reservations hold the underlying ring slot. They must finish promptly; if they block or are retained, the whole direction can suffer head-of-line (HOL) blocking. The shared buffer must not be retained after release.
 
 ## Advanced Protocol 1.0 Design
 
-The Advanced Protocol is an overlay over Standard Protocol 1.0. It does not allocate additional rings or buffer pools. It publishes Advanced packets through the same direction-local packet rings, and each Advanced payload chunk uses the same-index buffer owned by the claimed ring slot. Do not consume Advanced frames with Standard `Read`/`ReadZeroCopy` APIs in the same direction; use `AdvancedLink.Receive`, `Call`, or `CallOn` for Advanced traffic.
-
-Advanced packets are intended for users that need either:
-
-1. payloads larger than `bufferSize`
-2. request-response IPC, including function-call-style dispatch
+The Advanced Protocol is an overlay over Standard Protocol 1.0. It publishes Advanced packets through the same direction-local packet rings, and each Advanced payload chunk uses the same-index buffer owned by the claimed ring slot. Once an `AdvancedLink` is negotiated, direct `StandardLink.Read` and `StandardLink.Write` calls on that link are rejected with `ErrAdvancedActive`.
 
 ### Advanced IDs
 
 | ID | Scope | Purpose |
 | --- | --- | --- |
-| `ConnectionID` | Per link pair | Logical stream or endpoint. `0` is reserved for link-level request-response without an explicit stream. |
+| `ConnectionID` | Per link pair | Logical stream or endpoint (`0` is reserved for link-level calls and large transfers). Even non-zero IDs are allocated by Primary (`2, 4, ...`); odd IDs by Secondary (`1, 3, ...`). |
 | `MessageID` | Per sender | Large-copy transfer ID or request correlation ID. Responses reuse the request's `MessageID`. |
 | `MethodID` | Application-defined | Numeric function/procedure selector for request packets. |
 
-### Advanced Frame Flags
-
-`OpConnCopy.Operand5` stores a bitmask of frame flags:
+### Advanced Frame Flags (`OpConnCopy.Operand5`)
 
 | Flag | Value | Meaning |
 | --- | ---: | --- |
 | `AdvFlagBegin` | `1 << 0` | First chunk of a logical message. |
 | `AdvFlagEnd` | `1 << 1` | Final chunk of a logical message. |
-| `AdvFlagAbort` | `1 << 2` | Sender abandoned this logical message; receiver should discard partial state. |
+| `AdvFlagAbort` | `1 << 2` | Sender abandoned this logical message; receiver discards partial state. |
 | `AdvFlagRequest` | `1 << 3` | Chunk belongs to a request message. |
 | `AdvFlagResponse` | `1 << 4` | Chunk belongs to a response message. |
 | `AdvFlagError` | `1 << 5` | Response represents an application/protocol error. |
 
 For single-chunk messages, both `AdvFlagBegin` and `AdvFlagEnd` are set.
 
-### `OpConnCreate` (`0x01`)
+### `OpConnCreate` (`0x01`), `OpConnAccept` (`0x02`), `OpConnClose` (`0x03`)
 
-Creates a logical Advanced stream.
-
-| Operand | Meaning |
-| --- | --- |
-| `Operand0` | `ConnectionID` |
-| `Operand1` | Stream flags, reserved for now and written as zero |
-| `Operand2..6` | Reserved, must be zero |
-
-The peer replies with `OpConnAccept` for the same `ConnectionID`, or `OpError` if the stream cannot be created.
-
-### `OpConnAccept` (`0x02`)
-
-Accepts a logical Advanced stream.
-
-| Operand | Meaning |
-| --- | --- |
-| `Operand0` | `ConnectionID` |
-| `Operand1..6` | Reserved, must be zero |
-
-### `OpConnClose` (`0x03`)
-
-Closes a logical Advanced stream.
-
-| Operand | Meaning |
-| --- | --- |
-| `Operand0` | `ConnectionID` |
-| `Operand1` | Close reason code, or zero for normal close |
-| `Operand2..6` | Reserved, must be zero |
+- `OpConnCreate`: `Operand0 = ConnectionID`, `Operand1 = flags (0)`. Peer replies with `OpConnAccept` (`Operand0 = ConnectionID`) if listening, or `OpError` (`Operand0 = ConnectionID`, `Operand1 = ErrCodeConnNotFound`) if not listening.
+- `OpConnClose`: `Operand0 = ConnectionID`, `Operand1 = reason`.
 
 ### `OpConnCopy` (`0x04`)
 
-Transfers one Advanced chunk. This is the common data frame for both large-data copy and request-response IPC.
+Transfers one Advanced chunk for large-data copy or request-response IPC:
 
 | Operand | Meaning |
 | --- | --- |
-| `Operand0` | `ConnectionID`, or `0` for link-level request-response |
+| `Operand0` | `ConnectionID`, or `0` for link-level traffic |
 | `Operand1` | `MessageID` |
-| `Operand2` | `TotalSize`, the complete logical message size in bytes |
+| `Operand2` | `TotalSize`, complete logical message size in bytes |
 | `Operand3` | `ChunkOffset`, byte offset within the logical message |
 | `Operand4` | `ChunkSize`, valid bytes in the claimed slot-owned payload buffer |
 | `Operand5` | Advanced frame flags |
 | `Operand6` | `MethodID` for request begin frames; status/error code for response/error frames; otherwise zero |
 
-`ChunkSize` must satisfy `1 <= ChunkSize <= bufferSize`, except an empty logical message is encoded as a single `Begin|End` frame with `TotalSize == 0`, `ChunkOffset == 0`, and `ChunkSize == 0`. The receiver must use the claimed ring slot to locate non-empty payload bytes. `Operand3 + Operand4` must not exceed `Operand2`.
+### Protocol Negotiation (`OpProtoNegotiate` `0x05`, `OpProtoAck` `0x06`)
 
-## Advanced Large-Data Copy
+Negotiation is mandatory before using Advanced APIs.
+- **Role-agnostic negotiation**: `AdvancedLink.Negotiate(ctx, features)` automatically initiates negotiation on the Primary endpoint and waits for negotiation on the Secondary endpoint.
+- **Simultaneous initiation resolution**: If both endpoints call `NegotiateProtocol` concurrently, each endpoint in state `Negotiating` that receives a peer's `OpProtoNegotiate` packet computes the intersection of features/capabilities, replies with `OpProtoAck`, and transitions to `Negotiated` without deadlocking.
 
-Large-data copy sends one logical message as one or more `OpConnCopy` chunks. A payload is considered a large message when `TotalSize > bufferSize`; this value is exposed as `LargeMessageThreshold(bufferSize)` and `link.LargeMessageThreshold()` in the public API.
+### Dispatcher, Late-Response Handling, and Overflow Policy
 
-### Send path
+- **Single-chunk fast path**: Single-frame messages (`AdvFlagBegin | AdvFlagEnd`) allocate and copy directly without inserting into the multi-chunk reassembly map.
+- **Late responses to canceled calls**: When `Call` or `CallOn` times out or its `context.Context` is canceled while waiting for a response, the `(ConnectionID, MessageID)` key is recorded in a bounded ring of canceled calls. Subsequent response chunks for that call are silently drained and discarded rather than aborting the dispatcher.
+- **Incoming queue backpressure (`OverflowPolicy`)**:
+  - `OverflowBlock` (default): the dispatcher blocks until the application consumes from `Receive` or `Accept`, naturally propagating backpressure into the shared-memory ring.
+  - `OverflowDrop`: drops the newest incoming non-response message when the queue (`MaxIncomingMessages`) is full.
+  - `OverflowFail`: fails the dispatcher with `ErrIncomingOverflow`.
 
-1. Allocate a new `MessageID`.
-2. Split the payload into chunks where each `ChunkSize <= bufferSize`.
-3. For each chunk, claim a producer slot and copy/write the chunk into `BUFFERS[slot]`.
-4. Publish `OpConnCopy` with the same `ConnectionID`, same `MessageID`, same `TotalSize`, increasing `ChunkOffset`, and the chunk's `ChunkSize`.
-5. Set `AdvFlagBegin` on offset `0`; set `AdvFlagEnd` on the final chunk.
-6. If the sender cannot finish after publishing one or more chunks, publish an `AdvFlagAbort` frame for the same `MessageID`.
+## Error Hierarchy
 
-### Receive path
+All public errors support `errors.Is` both against specific HQQ sentinels and against standard library sentinels (`io.EOF`, `net.ErrClosed`, `os.ErrDeadlineExceeded`):
 
-The receiver may choose either assembly or streaming:
-
-- **Assembly mode**: allocate a destination of `TotalSize`, copy each chunk into `dst[ChunkOffset:ChunkOffset+ChunkSize]`, and deliver once `AdvFlagEnd` arrives and all bytes are present.
-- **Streaming mode**: deliver chunks to the application in arrival order for the same `MessageID`. This avoids a second full-size allocation and is preferred for very large data.
-
-A receiver must discard partial state if it receives `AdvFlagAbort`, invalid bounds, duplicate chunk ranges, or a stream close for the chunk's `ConnectionID`.
-
-Implementations must bound `TotalSize` before allocation. The Go implementation exposes this as `AdvancedOptions.MaxMessageSize` and rejects oversized sends or receives with `ErrBufferOverflow`.
-
-### Ordering
-
-The underlying ring preserves dequeue order per direction, but different `MessageID`s may be interleaved. Receivers must key reassembly state by `(ConnectionID, MessageID)` and must not assume only one large copy is active.
-
-## Advanced Request-Response IPC
-
-Request-response uses `OpConnCopy` chunks with `AdvFlagRequest` or `AdvFlagResponse`. A request body and response body may each be larger than `bufferSize`; in that case they use the same large-data chunking rules.
-
-### Request frame
-
-| Field | Meaning |
-| --- | --- |
-| `ConnectionID` | Logical stream, or `0` for link-level calls |
-| `MessageID` | Request ID generated by the caller |
-| `TotalSize` | Encoded request body size |
-| `ChunkOffset` / `ChunkSize` | Chunk bounds |
-| `Flags` | `AdvFlagRequest`, plus `Begin`/`End` as appropriate |
-| `Operand6` | `MethodID` on the begin frame; zero on continuation frames |
-
-The request body encoding is application-defined. The protocol treats it as opaque bytes.
-
-### Response frame
-
-| Field | Meaning |
-| --- | --- |
-| `ConnectionID` | Same value used by the request |
-| `MessageID` | Same request ID, used as the correlation ID |
-| `TotalSize` | Encoded response body size |
-| `ChunkOffset` / `ChunkSize` | Chunk bounds |
-| `Flags` | `AdvFlagResponse`, plus `Begin`/`End` as appropriate |
-| `Operand6` | Status code, or error code when `AdvFlagError` is set |
-
-A successful response uses `AdvFlagResponse`. A failed call uses `AdvFlagResponse | AdvFlagError`; the payload may contain an application-defined diagnostic body.
-
-### Request lifecycle
-
-1. Caller assigns `MessageID` and publishes request chunk(s).
-2. Callee reassembles or streams the request body, then dispatches by `MethodID`.
-3. Callee publishes response chunk(s) using the same `MessageID`.
-4. Caller matches response chunks to the pending call by `(ConnectionID, MessageID)`.
-5. Either side may close the stream with `OpConnClose`; pending calls on that stream fail with `ErrCodeConnNotFound` or a close-specific error mapping.
-
-### Concurrency
-
-Multiple requests may be outstanding on the same `ConnectionID`. Responses may arrive in a different order than requests. The caller must maintain a pending-call table keyed by `(ConnectionID, MessageID)`.
-
-The Go implementation uses a single dispatcher path per negotiated `AdvancedLink`. Direct `Receive` can drive that path synchronously for low latency, and a background dispatcher is started when asynchronous pending-call or stream-control routing is needed. The dispatcher assembles chunks, routes responses to a pending-call table keyed by `(ConnectionID, MessageID)`, and delivers non-response messages to `Receive`. This prevents concurrent `Call`/`Receive` operations from stealing each other's frames.
-
-## Advanced Protocol FSM Model
-
-The implementation may optimize these flows without materializing state-machine objects, but observable behavior should follow these FSMs.
-
-### Negotiation FSM
-
-| State | Event | Action | Next State |
-| --- | --- | --- | --- |
-| `None` | local `NegotiateProtocol` | send `OpProtoNegotiate` | `Negotiating` |
-| `None` | local `WaitForNegotiation` | wait for `OpProtoNegotiate` | `Negotiating` |
-| `Negotiating` | receive compatible negotiate request | intersect feature/capability bits, send `OpProtoAck` | `Negotiated` |
-| `Negotiating` | receive compatible ack | store negotiated version/features/capabilities | `Negotiated` |
-| `Negotiating` | context expires or peer rejects | return error | `Failed` |
-| `Negotiated` | duplicate negotiation attempt | reject locally | `Negotiated` |
-| `Failed` | any negotiation attempt | reject locally; caller must create a new link | `Failed` |
-
-### Large-Copy Sender FSM
-
-| State | Event | Action | Next State |
-| --- | --- | --- | --- |
-| `Idle` | `SendLarge(payload)` | allocate `MessageID`, compute chunks | `ReserveChunk` |
-| `ReserveChunk` | producer slot claimed | copy chunk into `BUFFERS[slot]` | `PublishChunk` |
-| `PublishChunk` | chunk ready | publish `OpConnCopy`; set `Begin` and/or `End` as needed | `Done` if final, otherwise `ReserveChunk` |
-| `ReserveChunk` | context expires before slot claim | return timeout/cancel error | `Failed` |
-| `PublishChunk` | local validation fails after earlier chunks | attempt `AdvFlagAbort` for same `MessageID` | `Failed` |
-| `Done` | return | report `MessageID` | `Idle` |
-
-### Large-Copy Receiver FSM
-
-| State | Event | Action | Next State |
-| --- | --- | --- | --- |
-| `Idle` | receive `Begin` chunk | create assembly keyed by `(ConnectionID, MessageID, kind)` | `Assembling` or `Complete` when `End` is also set |
-| `Assembling` | receive next valid chunk | copy bytes to `Payload[ChunkOffset:]` | `Assembling` |
-| `Assembling` | receive `End` and all bytes present | deliver complete `AdvancedMessage` | `Complete` |
-| `Assembling` | receive `Abort`, invalid bounds, duplicate/out-of-order range, or close | discard assembly | `Failed` |
-| `Complete` | caller consumes message | release assembly state | `Idle` |
-| `Failed` | error returned or abort delivered | release assembly state | `Idle` |
-
-### Request Caller FSM
-
-| State | Event | Action | Next State |
-| --- | --- | --- | --- |
-| `Idle` | `Call`/`CallOn` | allocate `MessageID`, send request chunks with `AdvFlagRequest` | `WaitingResponse` |
-| `WaitingResponse` | receive non-matching complete message | stash in pending queue | `WaitingResponse` |
-| `WaitingResponse` | receive matching `AdvFlagResponse` | return payload/status | `Done` |
-| `WaitingResponse` | receive matching `AdvFlagResponse|AdvFlagError` | return `AdvancedResponseError` or error message | `Done` |
-| `WaitingResponse` | context expires | return timeout/cancel error | `Failed` |
-| `Done` | caller returns | remove pending call state | `Idle` |
-
-### Request Callee FSM
-
-| State | Event | Action | Next State |
-| --- | --- | --- | --- |
-| `Idle` | receive complete `AdvFlagRequest` | deliver `AdvancedMessage` to application dispatcher | `Dispatching` |
-| `Dispatching` | application produces successful result | send response chunks with `AdvFlagResponse` | `Responding` |
-| `Dispatching` | application produces error | send response chunks with `AdvFlagResponse|AdvFlagError` | `Responding` |
-| `Responding` | final response chunk published | clear request-local state | `Idle` |
-| `Dispatching`/`Responding` | context expires or stream closes | return error and discard local response state | `Failed` |
-| `Failed` | error observed | clear request-local state | `Idle` |
-
-## Protocol Negotiation
-
-`OpProtoNegotiate` and `OpProtoAck` are reserved for enabling the Advanced Protocol over a `StandardLink` pair.
-
-Negotiation is mandatory before using Advanced large-copy, request-response, or logical-stream APIs. Peers reject incompatible major versions, clamp minor versions to the supported range, and acknowledge only the intersection of requested/supported feature and capability bits. Undefined feature bits are ignored and must not be echoed in `OpProtoAck`.
-
-### `OpProtoNegotiate` (`0x05`)
-
-| Operand | Meaning |
-| --- | --- |
-| `Operand0` | Protocol version encoded as `(major << 8) | minor` |
-| `Operand1` | Requested feature flags |
-| `Operand2` | Supported capability flags |
-| `Operand3..6` | Reserved, must be zero |
-
-### `OpProtoAck` (`0x06`)
-
-| Operand | Meaning |
-| --- | --- |
-| `Operand0` | Accepted protocol version encoded as `(major << 8) | minor` |
-| `Operand1` | Negotiated feature flags |
-| `Operand2` | Negotiated capability flags |
-| `Operand3..6` | Reserved, must be zero |
-
-### Advanced feature flags
-
-Only the following feature bits are defined for this design:
-
-| Feature | Value | Meaning |
-| --- | ---: | --- |
-| `FeatureLargeCopy` | `1 << 0` | Enables `OpConnCopy` chunking for payloads larger than `bufferSize`. |
-| `FeatureRequestResponse` | `1 << 1` | Enables request-response IPC over `OpConnCopy`. |
-
-Undefined feature bits must be ignored by the receiver and must not be echoed in `OpProtoAck`.
-
-### Advanced capability flags
-
-Only the following capability bits are defined for this design:
-
-| Capability | Value | Meaning |
-| --- | ---: | --- |
-| `CapabilityLargeBuffers` | `1 << 0` | Endpoint supports large configured payload buffers. |
-| `CapabilityHighThroughput` | `1 << 1` | Endpoint is optimized for high-throughput chunk streams. |
-| `CapabilityLowLatency` | `1 << 2` | Endpoint is optimized for low-latency request-response calls. |
-
-## Error Codes
-
-| Error Code | Hex | Meaning |
-| --- | ---: | --- |
-| `ErrCodeMemoryAlign` | `0x01` | Shared memory or buffer alignment violation |
-| `ErrCodeInvalidSize` | `0x02` | Invalid buffer count, buffer size, buffer index, or chunk bounds |
-| `ErrCodeMemorySmall` | `0x03` | Shared memory region is too small |
-| `ErrCodeFailedInit` | `0x04` | Ring initialization or attachment failed |
-| `ErrCodeConnNotFound` | `0x05` | Connection or request context not found |
-| `ErrCodeInvalidOp` | `0x06` | Unknown or unsupported opcode, method, or frame flag combination |
-| `ErrCodeBufferOverflow` | `0x07` | Payload or assembled message exceeds configured or negotiated limits |
-
-## Current Implementation Status
-
-Implemented and covered by tests:
-
-- fixed-size little-endian packet ABI
-- StandardLink primary/secondary creation
-- bidirectional StandardLink read/write
-- slot-owned payload-buffer transfer
-- zero-copy read/write callback APIs
-- Reserve/Commit read/write APIs
-- tombstone packets for abandoned write reservations
-- unread-buffer overwrite regression coverage
-- partial-read remainder handling
-- read/write deadline timeout behavior
-- mixed dispatch coverage across `Read`, `Write`, zero-copy, and reserve APIs
-- high-volume ordered delivery smoke test
-- StandardLink throughput benchmarks
-
-Implemented and covered by Advanced tests/benchmarks:
-
-- Advanced Protocol negotiation using only `FeatureLargeCopy` and `FeatureRequestResponse`
-- fixed feature/capability bit values matching this specification
-- background Advanced dispatcher with pending-call response routing
-- Advanced large-data copy over `OpConnCopy`
-- Advanced request-response IPC over `OpConnCopy`
-- concurrent out-of-order request-response matching
-- logical stream `Listen`/`Accept`/`Dial` over `OpConnCreate` and `OpConnAccept`
-- max-message-size enforcement for send and receive paths
-- public large-message threshold APIs
-- multi-process StandardLink and AdvancedLink smoke tests
-- Advanced error responses through `AdvFlagResponse | AdvFlagError`
-- Advanced packet constructor coverage and throughput benchmarks
-
-Designed but not implemented yet:
-
-- streaming large-copy receive callbacks that avoid full message assembly
-- cross-endian mixed-architecture process pairs beyond the packet ABI
+| Sentinel | Unwraps To | Meaning |
+| --- | --- | --- |
+| `ErrClosed` | `net.ErrClosed` | Local link was closed |
+| `ErrPeerClosed` | `io.EOF`, `net.ErrClosed` | Remote peer closed its link gracefully |
+| `ErrPeerGone` | `io.EOF`, `net.ErrClosed` | Remote peer process exited or crashed without closing |
+| `ErrTimeout` | `os.ErrDeadlineExceeded` | Operation timed out (implements `net.Error` with `Timeout() == true`) |
+| `ErrLinkBusy` | `ErrFailedInit` | Both endpoint slots are already occupied by live processes |
+| `ErrIncompatibleLayout` | `ErrInvalidSize` | Existing shared memory layout parameters do not match caller arguments |
+| `ErrInvalidName` | — | Shared memory name is empty, contains slashes/NUL, or exceeds OS length limits |
+| `ErrNotNegotiated` | `ErrInvalidOp` | Advanced API called before protocol negotiation succeeded |
+| `ErrAlreadyNegotiated` | `ErrInvalidOp` | Protocol negotiation attempted more than once |
+| `ErrNegotiationRejected` | `ErrFailedInit` | Peer rejected protocol negotiation |
+| `ErrUnexpectedPacket` | `ErrInvalidOp` | Unexpected opcode observed on the active link mode |
+| `ErrProtocol` | `ErrInvalidOp` | Malformed frame bounds or protocol state violation |
+| `ErrAdvancedActive` | `ErrInvalidOp` | Standard `Read`/`Write` called on a negotiated `AdvancedLink` |
+| `ErrIncomingOverflow` | `ErrBufferOverflow` | Incoming queue exceeded `MaxIncomingMessages` under `OverflowFail` |

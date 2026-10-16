@@ -122,6 +122,8 @@ func TestHQQMultiProcessChild(t *testing.T) {
 		runStandardLinkChildProcess(t, name, size, bufferCount, bufferSize)
 	case "advanced":
 		runAdvancedLinkChildProcess(t, name, size, bufferCount, bufferSize)
+	case "crash", "graceful":
+		runLivenessChildProcess(t, role, name, bufferCount, bufferSize)
 	default:
 		t.Fatalf("unknown child role %q", role)
 	}
@@ -191,6 +193,74 @@ func TestMultiProcessAdvancedLink(t *testing.T) {
 	}
 
 	waitMultiProcessChild(t, child, output)
+}
+
+// multiProcessCrashExitCode is the exit status of a child that simulates a
+// crash (it exits without closing its link).
+const multiProcessCrashExitCode = 3
+
+func runLivenessChildProcess(t *testing.T, role, name string, bufferCount, bufferSize int) {
+	link, err := OpenNamedStandardLinkWithOptions(name, bufferCount, bufferSize, LinkOptions{HeartbeatInterval: 20 * time.Millisecond})
+	if err != nil {
+		t.Fatalf("child open: %v", err)
+	}
+	if _, err := link.Write([]byte("child " + role)); err != nil {
+		t.Fatalf("child Write: %v", err)
+	}
+	if role == "crash" {
+		// Keep heartbeating for a moment, then die without Close: no
+		// deferred cleanup runs, exactly like a killed process.
+		time.Sleep(100 * time.Millisecond)
+		os.Exit(multiProcessCrashExitCode)
+	}
+	if err := link.Close(); err != nil {
+		t.Fatalf("child Close: %v", err)
+	}
+}
+
+func testMultiProcessLiveness(t *testing.T, role string, want error) {
+	const bufferCount, bufferSize = 16, 128
+	name := newPortableSharedMemoryName()
+	parent, err := CreateStandardLinkWithOptions(name, bufferCount, bufferSize, 0o600,
+		LinkOptions{HeartbeatInterval: 20 * time.Millisecond, PeerTimeout: 300 * time.Millisecond})
+	if err != nil {
+		if errors.Is(err, syscall.ENOSYS) {
+			t.Skipf("shared memory is not supported on this platform: %v", err)
+		}
+		t.Fatalf("CreateStandardLinkWithOptions: %v", err)
+	}
+	defer parent.Close()
+
+	child, output := startMultiProcessChild(t, role, name, int(SizeStandardLink(bufferCount, bufferSize)), bufferCount, bufferSize)
+	parent.SetReadDeadline(time.Now().Add(10 * time.Second))
+	buf := make([]byte, bufferSize)
+	n, err := parent.Read(buf)
+	if err != nil || string(buf[:n]) != "child "+role {
+		t.Fatalf("parent Read = %q, %v\nchild output:\n%s", buf[:n], err, output.String())
+	}
+	start := time.Now()
+	if _, err := parent.Read(buf); !errors.Is(err, want) {
+		t.Fatalf("parent Read after child %s = %v, want %v\nchild output:\n%s", role, err, want, output.String())
+	}
+	t.Logf("child %s detected after %v", role, time.Since(start))
+
+	err = child.Wait()
+	if role == "crash" {
+		var exitErr *exec.ExitError
+		if !errors.As(err, &exitErr) || exitErr.ExitCode() != multiProcessCrashExitCode {
+			t.Fatalf("crash child exit = %v, want status %d\nchild output:\n%s", err, multiProcessCrashExitCode, output.String())
+		}
+	} else if err != nil {
+		t.Fatalf("child failed: %v\nchild output:\n%s", err, output.String())
+	}
+}
+
+func TestMultiProcessPeerCrashIsDetected(t *testing.T) {
+	testMultiProcessLiveness(t, "crash", ErrPeerGone)
+}
+
+func TestMultiProcessPeerCloseIsDetected(t *testing.T) {
+	testMultiProcessLiveness(t, "graceful", ErrPeerClosed)
 }
 
 func multiProcessChildArgs(t *testing.T) []string {
@@ -1461,21 +1531,27 @@ func TestAdvancedLinkRequiresNegotiation(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
-	if _, err := link.SendLarge(ctx, 0, []byte("payload")); err != ErrInvalidOp {
-		t.Fatalf("SendLarge before negotiation = %v, want ErrInvalidOp", err)
+	if _, err := link.SendLarge(ctx, 0, []byte("payload")); !isNotNegotiated(err) {
+		t.Fatalf("SendLarge before negotiation = %v, want ErrNotNegotiated", err)
 	}
-	if _, err := link.Call(ctx, 1, []byte("payload")); err != ErrInvalidOp {
-		t.Fatalf("Call before negotiation = %v, want ErrInvalidOp", err)
+	if _, err := link.Call(ctx, 1, []byte("payload")); !isNotNegotiated(err) {
+		t.Fatalf("Call before negotiation = %v, want ErrNotNegotiated", err)
 	}
-	if _, err := link.Receive(ctx); err != ErrInvalidOp {
-		t.Fatalf("Receive before negotiation = %v, want ErrInvalidOp", err)
+	if _, err := link.Receive(ctx); !isNotNegotiated(err) {
+		t.Fatalf("Receive before negotiation = %v, want ErrNotNegotiated", err)
 	}
-	if err := link.Listen(ctx); err != ErrInvalidOp {
-		t.Fatalf("Listen before negotiation = %v, want ErrInvalidOp", err)
+	if err := link.Listen(ctx); !isNotNegotiated(err) {
+		t.Fatalf("Listen before negotiation = %v, want ErrNotNegotiated", err)
 	}
-	if _, err := link.Dial(ctx); err != ErrInvalidOp {
-		t.Fatalf("Dial before negotiation = %v, want ErrInvalidOp", err)
+	if _, err := link.Dial(ctx); !isNotNegotiated(err) {
+		t.Fatalf("Dial before negotiation = %v, want ErrNotNegotiated", err)
 	}
+}
+
+// isNotNegotiated reports whether err is ErrNotNegotiated and still matches
+// the broader ErrInvalidOp it used to be reported as.
+func isNotNegotiated(err error) bool {
+	return errors.Is(err, ErrNotNegotiated) && errors.Is(err, ErrInvalidOp)
 }
 
 func TestAdvancedLinkLargeCopy(t *testing.T) {
