@@ -2711,6 +2711,78 @@ func TestAdvancedReassemblyLimitDefaultAndRejectedBound(t *testing.T) {
 	if len(l.rejected) != maxRejectedMessages || len(l.rejectedOrder) != maxRejectedMessages {
 		t.Fatalf("rejected set holds %d/%d keys, want %d", len(l.rejected), len(l.rejectedOrder), maxRejectedMessages)
 	}
+	// The continuation of the oldest refused message was evicted from the set
+	// along with its entry; it is drained, not a protocol error (F-07).
+	continuation := protocol.NewConnCopyPacket(0, 1, 100, 16, 16, 0, 0)
+	if _, _, o, err := l.consumeAdvancedChunk(&continuation, buffer); err != nil || o != chunkPartial {
+		t.Fatalf("continuation of an evicted refusal: outcome %v, err %v", o, err)
+	}
+}
+
+// A message whose End chunk never arrives is reclaimed once it has been idle
+// for advancedAssemblyIdleChunks chunks and another message needs its budget
+// (F-09). Its remaining chunks are drained, and its response is reported as
+// reclaimed so that the waiting call does not hang.
+func TestAdvancedIdleAssemblyIsReclaimed(t *testing.T) {
+	const (
+		bufferSize = 64
+		overhead   = advancedAssemblyOverhead
+	)
+	l := newAdvancedLink(&StandardLink{bufferCount: 4}, AdvancedOptions{
+		MaxMessageSize:     1000,
+		MaxReassemblyBytes: 300 + overhead, // room for one 300-byte message
+	})
+	buffer := make([]byte, bufferSize)
+	consume := func(msg, total, off, size, flags uint64) (*Message, advHeader, chunkOutcome) {
+		t.Helper()
+		p := protocol.NewConnCopyPacket(0, msg, total, off, size, flags, 0)
+		m, hdr, o, err := l.consumeAdvancedChunk(&p, buffer)
+		if err != nil {
+			t.Fatalf("consume(msg %d off %d): %v", msg, off, err)
+		}
+		return m, hdr, o
+	}
+
+	// Response 1 loses its sender after the first chunk.
+	if _, _, o := consume(1, 300, 0, bufferSize, AdvFlagBegin|AdvFlagResponse); o != chunkPartial {
+		t.Fatalf("response 1 first chunk: outcome %v", o)
+	}
+	// While response 1 is not idle, the budget is full.
+	if _, hdr, o := consume(2, 300, 0, bufferSize, AdvFlagBegin|AdvFlagRequest); o != chunkRefused || !hdr.isRequest() {
+		t.Fatalf("request 2 while response 1 is active: outcome %v", o)
+	}
+	// The link carries other traffic until response 1 is idle.
+	for i := range advancedAssemblyIdleChunks {
+		m, _, o := consume(uint64(100+i), 1, 0, 1, AdvFlagBegin|AdvFlagEnd)
+		if o != chunkComplete {
+			t.Fatalf("single-chunk message %d: outcome %v", i, o)
+		}
+		m.Release()
+	}
+	// Request 3 needs the budget: response 1 is reclaimed and reported.
+	if _, _, o := consume(3, 300, 0, bufferSize, AdvFlagBegin|AdvFlagRequest); o != chunkPartial {
+		t.Fatalf("request 3 after the idle period: outcome %v", o)
+	}
+	if len(l.reclaimed) != 1 || !l.reclaimed[0].isResponse() || !l.reclaimed[0].isAbort() || l.reclaimed[0].messageID != 1 {
+		t.Fatalf("reclaimed = %+v, want the abort of response 1", l.reclaimed)
+	}
+	if l.assemblyBytes != 300+overhead || len(l.assemblies) != 1 {
+		t.Fatalf("after reclaim: %d bytes, %d assemblies; want request 3 alone", l.assemblyBytes, len(l.assemblies))
+	}
+	// The receive loop reports it, which fails the waiting call with
+	// ErrReassemblyLimit (no frame is read: the report is queued).
+	if m, hdr, abortErr, err := l.receiveNextLocked(context.Background(), false); m != nil || err != nil ||
+		!errors.Is(abortErr, ErrReassemblyLimit) || hdr.messageID != 1 || !hdr.isResponse() {
+		t.Fatalf("receive loop after the reclaim = %v, %+v, %v, %v", m, hdr, abortErr, err)
+	}
+	// The rest of response 1 is drained, not a protocol error.
+	if _, _, o := consume(1, 300, 64, bufferSize, AdvFlagResponse); o != chunkPartial {
+		t.Fatalf("continuation of reclaimed response 1: outcome %v", o)
+	}
+	// Request 3 is not idle, so another message is still refused.
+	if _, _, o := consume(4, 300, 0, bufferSize, AdvFlagBegin); o != chunkRefused {
+		t.Fatalf("message 4 while request 3 is active: outcome %v", o)
+	}
 }
 
 func TestAdvancedReassemblyLimitRefusesRequest(t *testing.T) {

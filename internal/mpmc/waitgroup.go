@@ -131,7 +131,7 @@ func (w *waiter) armContext(c *Cancel, site waitSite) {
 		w.stopped = stopped
 		w.stop = context.AfterFunc(c.Ctx, func() {
 			defer close(stopped)
-			site.wake()
+			site.wakeAll()
 		})
 	}
 }

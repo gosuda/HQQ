@@ -303,6 +303,10 @@ func openNamedInstance[L any](ctx context.Context, name string, bufferCount, buf
 		_ = m.release()
 		return zero, nil, err
 	}
+	// The segment is now claimed (or joined): it is no longer an object that
+	// nobody initialized, so a later Empty object under the same name is not
+	// ours (SPEC 11.4).
+	m.fresh = false
 	if create {
 		// We initialized the segment under a new creatorToken: the name is
 		// ours to remove.

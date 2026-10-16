@@ -89,6 +89,35 @@ func TestCloseDoesNotRemoveRecreatedName(t *testing.T) {
 	}
 }
 
+// After a successful create the segment is claimed, so a zero-filled object
+// (state Empty, no creatorToken) that replaced the name is not ours and Close
+// must leave it alone (SPEC 11.4).
+func TestNamedCloseKeepsEmptyReplacementAfterClaim(t *testing.T) {
+	if isWindows() {
+		t.Skip("Windows names cannot be unlinked while handles are open")
+	}
+	name := newPortableSharedMemoryName()
+	t.Cleanup(func() { _ = Unlink(name) })
+	a, err := CreateStandardLink(name, 4, 64, 0o600, LinkOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := Unlink(name); err != nil {
+		t.Fatal(err)
+	}
+	repl, err := shm.OpenSharedMemory(name, 2*int(pagesize), createFlags, 0o600)
+	if err != nil {
+		t.Fatalf("replacement create: %v", err)
+	}
+	defer repl.Close()
+	if err := a.Close(); err != nil {
+		t.Fatalf("Close = %v", err)
+	}
+	if !nameExists(t, name) {
+		t.Fatal("Close removed a zero-filled replacement that is not ours")
+	}
+}
+
 func TestCloseDoesNotRemoveReusedName(t *testing.T) {
 	name := newPortableSharedMemoryName()
 	a, err := CreateStandardLink(name, 4, 64, 0o600, fastLiveness)

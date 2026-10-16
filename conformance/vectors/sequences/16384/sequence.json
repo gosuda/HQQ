@@ -1,0 +1,91 @@
+{
+  "page_size": 16384,
+  "buffer_count": 2,
+  "buffer_size": 8,
+  "layout_size": 81920,
+  "seed": 1,
+  "steps": [
+    {
+      "name": "1-primary-ready",
+      "action": "a Primary creates the segment on caller memory (heartbeats disabled)",
+      "file": "sequences/16384/1-primary-ready.bin",
+      "epoch": 1,
+      "normalized": [
+        "initHeartbeat",
+        "endpoints[0].token",
+        "endpoints[0].pid",
+        "endpoints[0].heartbeat"
+      ]
+    },
+    {
+      "name": "2-secondary-joined",
+      "action": "a Secondary joins as the second endpoint",
+      "file": "sequences/16384/2-secondary-joined.bin",
+      "epoch": 1,
+      "normalized": [
+        "initHeartbeat",
+        "endpoints[0].token",
+        "endpoints[0].pid",
+        "endpoints[0].heartbeat",
+        "endpoints[1].token",
+        "endpoints[1].pid",
+        "endpoints[1].heartbeat"
+      ]
+    },
+    {
+      "name": "3-message-in-flight",
+      "action": "the Primary writes one message (Payload(1, 0, bufferSize)); the Secondary has not read it",
+      "file": "sequences/16384/3-message-in-flight.bin",
+      "epoch": 1,
+      "normalized": [
+        "initHeartbeat",
+        "endpoints[0].token",
+        "endpoints[0].pid",
+        "endpoints[0].heartbeat",
+        "endpoints[1].token",
+        "endpoints[1].pid",
+        "endpoints[1].heartbeat"
+      ]
+    },
+    {
+      "name": "4-message-consumed",
+      "action": "the Secondary reads the message",
+      "file": "sequences/16384/4-message-consumed.bin",
+      "epoch": 1,
+      "normalized": [
+        "initHeartbeat",
+        "endpoints[0].token",
+        "endpoints[0].pid",
+        "endpoints[0].heartbeat",
+        "endpoints[1].token",
+        "endpoints[1].pid",
+        "endpoints[1].heartbeat"
+      ]
+    },
+    {
+      "name": "5-both-closed",
+      "action": "the Primary and the Secondary close (both detach)",
+      "file": "sequences/16384/5-both-closed.bin",
+      "epoch": 1,
+      "normalized": [
+        "initHeartbeat",
+        "endpoints[0].pid",
+        "endpoints[0].heartbeat",
+        "endpoints[1].pid",
+        "endpoints[1].heartbeat"
+      ]
+    },
+    {
+      "name": "6-reinitialized",
+      "action": "a new Primary re-initializes the dead segment (epoch 2)",
+      "file": "sequences/16384/6-reinitialized.bin",
+      "epoch": 2,
+      "normalized": [
+        "initHeartbeat",
+        "endpoints[0].token",
+        "endpoints[0].pid",
+        "endpoints[0].heartbeat"
+      ]
+    }
+  ]
+}

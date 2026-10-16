@@ -394,8 +394,8 @@ func (m *MPMCRing[T]) Size() uint64 {
 // re-check their condition and cancellation state and park again if needed.
 // Call it after closing a Cancel.Closed channel.
 func (m *MPMCRing[T]) WakeAll() {
-	m.site(NotEmpty).wake()
-	m.site(NotFull).wake()
+	m.site(NotEmpty).wakeAll()
+	m.site(NotFull).wakeAll()
 }
 
 // Side names one of the two conditions a blocked operation waits for.
@@ -422,8 +422,11 @@ const (
 // Within one process only one goroutine per side (the leader of the
 // goroutines blocked on that side) registers and calls Park at a time, so n
 // counts parked processes, not goroutines. A process killed while parked
-// leaves its count raised until the ring is re-formatted (see Format), which
-// only costs surplus tokens.
+// leaves its count raised until the ring is re-formatted (see Format). The
+// ring therefore grants a single token per published or released slot and
+// uses the count only to decide whether to wake at all; WakeAll asks for the
+// whole count. Surplus tokens would otherwise accumulate for every later
+// slot, and after a reuse of the same name they would be inherited.
 //
 // Implementations must be safe for concurrent use and Wake must not block.
 type Parker interface {
@@ -451,14 +454,32 @@ func (m *MPMCRing[T]) site(side Side) waitSite {
 	return waitSite{&m.head.notFull, &m.head.fullWaiters, m.parker, side}
 }
 
-// wake wakes the waiters parked on s, in every process.
-func (s waitSite) wake() {
+// wakeOne grants the wake-up token of one published or released slot. Each
+// slot can serve one parked waiter, so one token suffices; the registered
+// count may be stale (see Parker) and must not be granted in full.
+func (s waitSite) wakeOne() {
+	if s.parker != nil {
+		if atomic.LoadUint32(s.waiters) != 0 {
+			s.parker.Wake(s.side, 1)
+		}
+		return
+	}
+	s.wakeWord()
+}
+
+// wakeAll wakes every waiter parked on s, in every process.
+func (s waitSite) wakeAll() {
 	if s.parker != nil {
 		if n := atomic.LoadUint32(s.waiters); n != 0 {
 			s.parker.Wake(s.side, n)
 		}
 		return
 	}
+	s.wakeWord()
+}
+
+// wakeWord bumps the wait word of s and wakes futex waiters on it.
+func (s waitSite) wakeWord() {
 	atomic.AddUint32(s.word, 1)
 	futexWake(s.word)
 }
@@ -471,14 +492,14 @@ func (m *MPMCRing[T]) elem(slot uint64) *_melem[T] {
 // notifyConsumers wakes parked consumers after a slot was published.
 func (m *MPMCRing[T]) notifyConsumers() {
 	if atomic.LoadUint32(&m.head.emptyWaiters) != 0 {
-		m.site(NotEmpty).wake()
+		m.site(NotEmpty).wakeOne()
 	}
 }
 
 // notifyProducers wakes parked producers after a slot was released.
 func (m *MPMCRing[T]) notifyProducers() {
 	if atomic.LoadUint32(&m.head.fullWaiters) != 0 {
-		m.site(NotFull).wake()
+		m.site(NotFull).wakeOne()
 	}
 }
 

@@ -530,7 +530,8 @@
     "FailedInit": 4,
     "ConnNotFound": 5,
     "InvalidOp": 6,
-    "BufferOverflow": 7
+    "BufferOverflow": 7,
+    "ShuttingDown": 8
   },
   "advanced": {
     "features": {

@@ -36,6 +36,7 @@ type advancedAssembly struct {
 	msg  *Message
 	size uint64 // announced message size
 	next uint64
+	seen uint64 // l.chunks when its last chunk arrived
 
 	recvAt time.Time // arrival of the first chunk, set only for AdvFlagMeta messages
 }
@@ -311,8 +312,9 @@ func (l *AdvancedLink) sendAdvancedChunk(c *mpmc.Cancel, connectionID, messageID
 // control packets inline. The caller holds receiveMu.
 //
 // It returns a complete message m, or, for a response the sender abandoned
-// or this endpoint refused, m == nil with the response header hdr and the
-// reason abortErr (ErrMessageAborted or ErrReassemblyLimit): the caller
+// or this endpoint refused or reclaimed it (F-09), m == nil with the response
+// header hdr and the reason abortErr (ErrMessageAborted or
+// ErrReassemblyLimit): the caller
 // fails the waiting call with it. Aborted messages that are not responses
 // and the remaining chunks of refused messages are dropped here; a refused
 // request is answered with an error response queued on the control sender,
@@ -320,6 +322,18 @@ func (l *AdvancedLink) sendAdvancedChunk(c *mpmc.Cancel, connectionID, messageID
 func (l *AdvancedLink) receiveNextLocked(ctx context.Context, serving bool) (m *Message, hdr advHeader, abortErr error, err error) {
 	rxBufs := l.slink.rxBufs
 	for {
+		if n := len(l.reclaimed); n > 0 {
+			// Report an assembly reclaimed for idleness (F-09) the way a
+			// refusal is reported: a response fails its call, and a request
+			// gets the error response a refused request gets.
+			h := l.reclaimed[n-1]
+			l.reclaimed = l.reclaimed[:n-1]
+			if h.isResponse() {
+				return nil, h, ErrReassemblyLimit, nil
+			}
+			l.refuseRequest(h, ErrCodeBufferOverflow)
+			continue
+		}
 		var (
 			msg      *Message
 			mh       advHeader
@@ -408,6 +422,7 @@ const (
 // caller owns) for chunkComplete, and only the header for chunkAborted and
 // chunkRefused.
 func (l *AdvancedLink) consumeAdvancedChunk(p *protocol.Packet, buffer []byte) (*Message, advHeader, chunkOutcome, error) {
+	l.chunks++
 	connectionID := p.Operand(0)
 	messageID := p.Operand(1)
 	totalSize := p.Operand(2)
@@ -484,6 +499,7 @@ func (l *AdvancedLink) consumeAdvancedChunk(p *protocol.Packet, buffer []byte) (
 		}
 		header := advHeader{connectionID, messageID, flags &^ (AdvFlagBegin | AdvFlagEnd), aux}
 		charge := totalSize + advancedAssemblyOverhead
+		l.reclaimIdle(charge)
 		if charge > l.maxReassemblyBytes || l.assemblyBytes > l.maxReassemblyBytes-charge {
 			l.rejectMessage(key)
 			header.flags |= AdvFlagAbort
@@ -501,8 +517,10 @@ func (l *AdvancedLink) consumeAdvancedChunk(p *protocol.Packet, buffer []byte) (
 		l.assemblyBytes += charge
 	}
 	if assembly == nil {
-		if l.isRejected(key) {
-			// Drain the remaining chunks of a refused message.
+		if l.isRejected(key) || l.rejectedEvicted {
+			// Drain the remaining chunks of a refused message. Once an entry
+			// was evicted from the set, any orphan continuation chunk is
+			// drained too: it may be the rest of an evicted refusal (F-07).
 			if flags&AdvFlagEnd != 0 {
 				l.forgetRejected(key)
 			}
@@ -510,6 +528,7 @@ func (l *AdvancedLink) consumeAdvancedChunk(p *protocol.Packet, buffer []byte) (
 		}
 		return nil, advHeader{}, chunkPartial, ErrProtocol
 	}
+	assembly.seen = l.chunks
 	if chunkOffset != assembly.next || assembly.size != totalSize {
 		return fail(ErrInvalidSize)
 	}
@@ -549,14 +568,52 @@ func (l *AdvancedLink) dropAssembly(key advancedMessageKey) {
 	}
 }
 
+// reclaimIdle makes room for a message of charge bytes by reclaiming the
+// incomplete messages that have been idle for advancedAssemblyIdleChunks
+// chunks, until the message fits (F-09). A sweep visits every assembly, so it
+// runs at most once per max(advancedAssemblyIdleChunks, len(assemblies))
+// chunks, which amortizes its cost over the chunks that caused it.
+func (l *AdvancedLink) reclaimIdle(charge uint64) {
+	if charge > l.maxReassemblyBytes || l.assemblyBytes <= l.maxReassemblyBytes-charge {
+		return
+	}
+	if l.chunks-l.chunksAtSweep < max(advancedAssemblyIdleChunks, uint64(len(l.assemblies))) {
+		return
+	}
+	l.chunksAtSweep = l.chunks
+	for key, a := range l.assemblies {
+		if l.assemblyBytes <= l.maxReassemblyBytes-charge {
+			return
+		}
+		if l.chunks-a.seen >= advancedAssemblyIdleChunks {
+			l.reclaim(key, a)
+		}
+	}
+}
+
+// reclaim abandons the incomplete message key: its budget is released and its
+// remaining chunks are drained, as for a refused message. A request or
+// response is queued for reporting (see receiveNextLocked).
+func (l *AdvancedLink) reclaim(key advancedMessageKey, a *advancedAssembly) {
+	hdr := a.hdr
+	hdr.flags |= AdvFlagAbort
+	l.dropAssembly(key)
+	l.rejectMessage(key)
+	l.stats.droppedMessages.Add(1)
+	if hdr.isRequest() || hdr.isResponse() {
+		l.reclaimed = append(l.reclaimed, hdr)
+	}
+}
+
 func (l *AdvancedLink) isRejected(key advancedMessageKey) bool {
 	_, ok := l.rejected[key]
 	return ok
 }
 
 // rejectMessage remembers that the chunks of key must be discarded. At most
-// maxRejectedMessages keys are remembered; a message pushed out of the set
-// by that many newer refusals fails with ErrProtocol on its next chunk.
+// maxRejectedMessages keys are remembered; a key pushed out of the set by
+// newer refusals is forgotten, and its remaining chunks are then drained
+// as orphans (rejectedEvicted, F-07).
 func (l *AdvancedLink) rejectMessage(key advancedMessageKey) {
 	if l.rejected == nil {
 		l.rejected = make(map[advancedMessageKey]struct{})
@@ -564,6 +621,7 @@ func (l *AdvancedLink) rejectMessage(key advancedMessageKey) {
 	if len(l.rejectedOrder) >= maxRejectedMessages {
 		delete(l.rejected, l.rejectedOrder[0])
 		l.rejectedOrder = l.rejectedOrder[1:]
+		l.rejectedEvicted = true
 	}
 	l.rejected[key] = struct{}{}
 	l.rejectedOrder = append(l.rejectedOrder, key)

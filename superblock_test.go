@@ -545,6 +545,11 @@ func TestZeroInChunksChecksBeforeEveryChunk(t *testing.T) {
 	}
 }
 
+// initOwner returns the ownership check of an initializer that holds token.
+func initOwner(sb *standardSuperblock, token uint64) func() error {
+	return (&initSession{sb: sb, token: token, ctx: context.Background()}).check
+}
+
 func TestPublishCommitsOwnership(t *testing.T) {
 	const token, other = 31, 42
 	size := SizeStandardLink(testBufferCount, testBufferSize)
@@ -553,7 +558,7 @@ func TestPublishCommitsOwnership(t *testing.T) {
 		_, sb := newSuperblockMem()
 		store(&sb.state, superblockStateInitializing)
 		store(&sb.initToken, token)
-		epoch, err := publishSuperblock(sb, testBufferCount, testBufferSize, size, token, fastInit)
+		epoch, err := publishSuperblock(sb, initOwner(sb, token), testBufferCount, testBufferSize, size, token, fastInit)
 		if err != nil || epoch != 1 {
 			t.Fatalf("publish = %d, %v", epoch, err)
 		}
@@ -580,7 +585,7 @@ func TestPublishCommitsOwnership(t *testing.T) {
 		_, sb := newSuperblockMem()
 		store(&sb.state, superblockStateInitializing)
 		store(&sb.initToken, other)
-		if _, err := publishSuperblock(sb, testBufferCount, testBufferSize, size, token, fastInit); err != errInitContended {
+		if _, err := publishSuperblock(sb, initOwner(sb, token), testBufferCount, testBufferSize, size, token, fastInit); err != errInitContended {
 			t.Fatalf("publish = %v, want errInitContended", err)
 		}
 		if load(&sb.state) != superblockStateInitializing || load(&sb.magic) != 0 || load(&sb.bufferCount) != 0 ||
@@ -588,6 +593,51 @@ func TestPublishCommitsOwnership(t *testing.T) {
 			t.Fatalf("a lost publish wrote the segment: %+v", *sb)
 		}
 	})
+}
+
+// A takeover that lands while a publish is under way stops the publish
+// before its next store, so the new initializer's view is not overwritten
+// (F-01). Step k is the k-th write of publishSuperblock.
+func TestPublishStopsAtTakeover(t *testing.T) {
+	const token, other = 31, 42
+	size := SizeStandardLink(testBufferCount, testBufferSize)
+	for k := 1; k <= 5; k++ {
+		_, sb := newSuperblockMem()
+		store(&sb.state, superblockStateInitializing)
+		store(&sb.initToken, token)
+		s := &initSession{sb: sb, token: token, ctx: context.Background()}
+		calls := 0
+		check := func() error {
+			calls++
+			if calls == k {
+				store(&sb.initToken, other) // the takeover happens here
+			}
+			return s.check()
+		}
+		if _, err := publishSuperblock(sb, check, testBufferCount, testBufferSize, size, token, fastInit); err != errInitContended {
+			t.Fatalf("takeover before step %d: publish = %v, want errInitContended", k, err)
+		}
+		if calls != k {
+			t.Fatalf("takeover before step %d: check ran %d times, want %d", k, calls, k)
+		}
+		if load(&sb.state) != superblockStateInitializing || load(&sb.epoch) != 0 || load(&sb.magic) != 0 {
+			t.Fatalf("takeover before step %d: segment published: %+v", k, *sb)
+		}
+		// Steps before k ran, steps from k on did not.
+		wantBufferCount, wantPrimary := uint64(0), uint64(0)
+		if k > 2 {
+			wantBufferCount = testBufferCount
+		}
+		if k > 4 {
+			wantPrimary = token
+		}
+		if got := load(&sb.bufferCount); got != wantBufferCount {
+			t.Fatalf("takeover before step %d: bufferCount = %d, want %d", k, got, wantBufferCount)
+		}
+		if got := load(&sb.endpoints[endpointPrimary].token); got != wantPrimary {
+			t.Fatalf("takeover before step %d: primary token = %d, want %d", k, got, wantPrimary)
+		}
+	}
 }
 
 func TestEndpointAliveAtOpenStopsWithContext(t *testing.T) {

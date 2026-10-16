@@ -80,7 +80,7 @@ const (
 	// Operands:
 	//   Operand0: Protocol version encoded as (major << 8) | minor
 	//   Operand1: Requested feature flags
-	//   Operand2: Supported capability flags
+	//   Operand2: reserved, sent as zero and ignored on receipt
 	OpProtoNegotiate OpCode = 0x05
 
 	// OpProtoAck (0x06): Protocol negotiation acknowledgment.
@@ -88,7 +88,7 @@ const (
 	// Operands:
 	//   Operand0: Accepted protocol version encoded as (major << 8) | minor
 	//   Operand1: Negotiated feature flags
-	//   Operand2: Negotiated capability flags
+	//   Operand2: reserved, sent as zero and ignored on receipt
 	OpProtoAck OpCode = 0x06
 
 	// OpCancel (0x07): Advanced Protocol request cancellation, valid only

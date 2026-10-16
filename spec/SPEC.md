@@ -293,7 +293,7 @@ A winner of `beginInit` MUST, in this order, **checking before every step that t
    * **Commit** `cas(initToken, token -> 0)`. **Only if the CAS succeeds**: `epoch = fetch_add(epoch, 1) + 1`, then `store(state = Ready)`. A failed CAS returns `errInitContended` and leaves the segment as it is.
 4. Attach to both rings (5.4).
 
-**Progress** = `if load(initToken) == token: store(initHeartbeat = nowUnixNanos())`; it keeps a slow but live initializer from being taken over.
+**Progress** = `if load(initToken) == token: store(initHeartbeat = nowUnixNanos())`; it keeps a slow but live initializer from being taken over. Every write step of publish (P1–P5 below) and every slice of the zeroing and formatting first checks ownership; a check and the store after it are not atomic, so an initializer suspended between them can still complete that one store (FINDINGS F-01).
 
 The `state = Ready` store is the **release point** of the whole initialization: every earlier store (rings formatted, buffers zeroed, superblock fields, records) happens-before any endpoint that observes `state == Ready` with an acquire load (MEMORY_MODEL.md 3.1).
 
@@ -340,7 +340,7 @@ if interval == 0:                   return alive                   # heartbeats 
 hb = load(heartbeat)
 if hb == 0:                         return alive                   # attached a moment ago
 timeout = max(callerPeerTimeout, 4 * interval)                      # callerPeerTimeout default 5 s
-if wallAge(hb) < timeout:           return alive                   # wallAge may be negative: counts as alive (FINDINGS F-04)
+if -1 s < wallAge(hb) < timeout:   return alive                   # a heartbeat more than 1 s in the future is not trusted: confirm by the watch (FINDINGS F-04)
 window = min(3 * interval, 2 s);  step = max(interval / 4, 1 ms)
 for until now + window:                                             # confirm by watching for progress
     sleep(step)
@@ -390,7 +390,7 @@ checkPeer():
 
 **[IOP] Writes after failure.** A send call first checks the recorded peer status and returns the corresponding error without publishing if the peer is already known to be `Closed` or `Gone`; while blocked on a full ring it re-checks at least every 50 ms.
 
-**[IMPL]** Whether the status is refreshed by a heartbeat thread, lazily by blocked calls, or both.
+**[IMPL]** Whether the status is refreshed by a heartbeat thread, lazily by blocked calls, or both. An endpoint without a heartbeat thread refreshes it at the start of each send (FINDINGS F-10).
 
 **[IMPL] Close.** `Close` sets a local closed flag, wakes blocked calls, waits for in-flight calls, stops the heartbeat, `cas(own.token, mine, 1)`, then wakes both rings once more so that a peer blocked on a ring notices promptly. The final wake is RECOMMENDED; the peer notices anyway within one check interval.
 
@@ -553,7 +553,7 @@ After `publish` (resp. `release`):
 ```text
 K1  store(seq = ...)                            # (seq_cst)
 K2  n = load(waiters of the opposite side)      # (seq_cst)
-K3  if n != 0:  fetch_add(word, 1)  then  wake_all(word)        # with a Parker: Wake(side, n)
+K3  if n != 0:  fetch_add(word, 1)  then  wake_all(word)        # with a Parker: Wake(side, 1) per slot; WakeAll: Wake(side, n)
 ```
 
 `word` is the NotEmpty word after a publish, the NotFull word after a release.
@@ -566,7 +566,7 @@ K3  if n != 0:  fetch_add(word, 1)  then  wake_all(word)        # with a Parker:
 
 **[IOP] `WakeAll`** (used on close and when the peer state changes) bumps **both** wake words and wakes unconditionally (not gated by the counts); with a Parker, it releases `n` tokens only if the count is non-zero.
 
-**[IOP] Stale counts.** A process killed while parked never runs W4, so its count stays raised until the ring is re-formatted (7.2). Consequences: one superfluous wake per publish/release (and, with Windows semaphores, surplus tokens). Correctness is not affected because the count is only a hint to wake.
+**[IOP] Stale counts.** A process killed while parked never runs W4, so its count stays raised until the ring is re-formatted (7.2). Consequences: one superfluous wake per publish/release. Correctness is not affected because the count is only a hint to wake. A waker therefore grants one token per slot, never the stale count (FINDINGS F-02).
 
 ### 8.4 Backoff schedule **[IMPL]** (Go defaults, RECOMMENDED)
 
@@ -582,7 +582,7 @@ A blocked operation escalates through three phases, re-checking the slot sequenc
 
 * **Linux [IOP]**: `futex(addr, FUTEX_WAIT = 0, v, timespec)` / `futex(addr, FUTEX_WAKE = 1, INT_MAX)` on the 32-bit wake word, **shared** (no `FUTEX_PRIVATE_FLAG`), because the word lives in a `MAP_SHARED` mapping and waiters are in different processes.
 * **macOS [IOP]**: `__ulock_wait(UL_COMPARE_AND_WAIT_SHARED = 3, addr, v, timeout_us)` (syscall 515) and `__ulock_wake(UL_COMPARE_AND_WAIT_SHARED | ULF_WAKE_ALL, addr, 0)` (syscall 516, `ULF_WAKE_ALL = 0x100`). These are private Darwin interfaces; errors are ignored and parking then degrades to bounded polling. The public alternative is `os_sync_wait_on_address`/`os_sync_wake_by_address_all` (macOS 14.4+, `OS_SYNC_WAIT_ON_ADDRESS_SHARED`); a port MAY use it. Both operate on the same 32-bit wake words and are interoperable at the protocol level because only the *word value* and the *waiter count* are shared state.
-* **Windows, named segments [IOP]**: Windows has no cross-process compare-and-wait on a shared-memory word (`WaitOnAddress`/`WakeByAddressAll` only match waiters and wakers of the same process). Each segment therefore has **four named kernel semaphores** (11.5): ring 0 notEmpty, ring 0 notFull, ring 1 notEmpty, ring 1 notFull. Protocol: the waiter registers (W1), re-checks (W3), and `WaitForSingleObject(sem, timeout)`; the waker, after publishing and seeing `n = load(waiters) != 0`, calls `ReleaseSemaphore(sem, min(n, INT_MAX))` (errors, including `ERROR_TOO_MANY_POSTS`, are ignored). The wake word is **not** used. Because tokens persist, a wake that runs between the waiter's re-check and its wait is not lost; tokens left for waiters that already gave up only cause one spurious return, after which waiters re-check. Each semaphore is created with initial count 0 and maximum count `2^31-1`.
+* **Windows, named segments [IOP]**: Windows has no cross-process compare-and-wait on a shared-memory word (`WaitOnAddress`/`WakeByAddressAll` only match waiters and wakers of the same process). Each segment therefore has **four named kernel semaphores** (11.5): ring 0 notEmpty, ring 0 notFull, ring 1 notEmpty, ring 1 notFull. Protocol: the waiter registers (W1), re-checks (W3), and `WaitForSingleObject(sem, timeout)`; the waker, after publishing and seeing `n = load(waiters) != 0`, calls `ReleaseSemaphore(sem, 1)` per published or released slot (`ReleaseSemaphore(sem, min(n, INT_MAX))` only for `WakeAll`; errors, including `ERROR_TOO_MANY_POSTS`, are ignored). The wake word is **not** used. Because tokens persist, a wake that runs between the waiter's re-check and its wait is not lost; tokens left for waiters that already gave up only cause one spurious return, after which waiters re-check. Each semaphore is created with initial count 0 and maximum count `2^31-1`.
 * **Windows, unnamed memory** and **other platforms [IMPL]**: the Go implementation uses `WaitOnAddress`/`WakeByAddressAll` (same-process only) bounded by an exponential backoff `20 µs → 2 ms`, or bare exponential sleep `20 µs → 2 ms`, so a wake from another process is noticed within one backoff step.
 
 ### 8.6 Process-local aggregation **[IMPL]**
@@ -751,7 +751,7 @@ For each `OpConnCopy` the receiver, holding the slot, validates and acts in this
 
 5. now an assembly must exist:
        if none: if key in the refused set: (drain) if End set, forget the key; discard this chunk and continue
-                else                                                         -> FAIL ErrProtocol
+                else, when no refused entry was ever evicted (FINDINGS F-07)     -> FAIL ErrProtocol
        if ChunkOffset != assembly.next or assembly.size != TotalSize         -> ErrInvalidSize
        append payload[0:ChunkSize] at ChunkOffset; assembly.next += ChunkSize
        if End not set: done (partial)
@@ -760,9 +760,9 @@ For each `OpConnCopy` the receiver, holding the slot, validates and acts in this
                  assemblyBytes -= charge; drop assembly; route it
 ```
 
-* **Reassembly limits [IOP]**: `MaxMessageSize` (default `64 MiB`) bounds `TotalSize`; `MaxReassemblyBytes` (default `4 × MaxMessageSize`, saturating) bounds the sum of `TotalSize + 256` over all incomplete multi-chunk messages; single-chunk messages are not charged. The memory actually held may exceed the charge (buffers are rounded up to a power of two) — that is an implementation matter. A port MUST NOT accept a multi-chunk message that would exceed the budget; it MUST drain the remaining chunks of a refused message (until its `End` chunk) instead of failing the path.
+* **Reassembly limits [IOP]**: `MaxMessageSize` (default `64 MiB`) bounds `TotalSize`; `MaxReassemblyBytes` (default `4 × MaxMessageSize`, saturating) bounds the sum of `TotalSize + 256` over all incomplete multi-chunk messages; single-chunk messages are not charged. The memory actually held may exceed the charge (buffers are rounded up to a power of two) — that is an implementation matter. A port MUST NOT accept a multi-chunk message that would exceed the budget; it MUST drain the remaining chunks of a refused message (until its `End` chunk) instead of failing the path. Receiver policy, not wire behavior: an incomplete message whose last chunk is at least `2^16` received chunks old may be reclaimed when a multi-chunk message needs its budget; it is then treated as refused (a response fails with `ErrReassemblyLimit`, a request is answered as below) and its remaining chunks are drained (FINDINGS F-09).
 * **Refusal handling [IOP]**: a refused **request** is answered with an error response: `OpConnCopy(conn, msgID, 0, 0, 0, Begin|End|Response|Error, aux = ErrCodeBufferOverflow)` (best effort; only if `FeatureRequestResponse` was negotiated; queued on the control sender); a refused **response** fails the waiting call with `ErrReassemblyLimit`; a refused **data** message is dropped. All refusals are counted.
-* **Frame validity [IOP]**: a non-`Begin` chunk with no assembly and no refused entry is `ErrProtocol`. Later chunks continue exactly at the previous end (`ChunkOffset == next`), use the announced `TotalSize`, and the `End` chunk completes `TotalSize` exactly. There is no timeout for a message whose `End` never arrives; its assembly stays charged until the link ends **[see FINDINGS F-09]**.
+* **Frame validity [IOP]**: a non-`Begin` chunk with no assembly and no refused entry is `ErrProtocol`, unless an entry was ever evicted from the refused set (at most 1024 keys), after which such chunks are drained (FINDINGS F-07). Later chunks continue exactly at the previous end (`ChunkOffset == next`), use the announced `TotalSize`, and the `End` chunk completes `TotalSize` exactly. A message whose `End` never arrives is reclaimed as described above (FINDINGS F-09).
 
 ### 10.6 Request / response correlation **[IOP]**
 

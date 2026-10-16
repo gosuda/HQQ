@@ -197,7 +197,7 @@ func openStandardLink(base unsafe.Pointer, bufferCount int, bufferSize int, opts
 		if err := session.zero(buffers1); err != nil {
 			return nil, err
 		}
-		if epoch, err = publishSuperblock(sb, bufferCount, bufferSize, requiredSize, token, opts); err != nil {
+		if epoch, err = publishSuperblock(sb, session.check, bufferCount, bufferSize, requiredSize, token, opts); err != nil {
 			return nil, err
 		}
 	} else {
@@ -308,6 +308,12 @@ func (l *StandardLink) enterTx(checkPeer bool) error {
 		return ErrClosed
 	}
 	if checkPeer {
+		// Without the heartbeat goroutine nothing else refreshes the peer
+		// status between blocking calls, so a send would keep publishing
+		// into a ring after the peer closed or died (F-10).
+		if l.hbStop == nil {
+			_ = l.checkPeer()
+		}
 		if err := PeerState(l.peer.status.Load()).err(); err != nil {
 			l.txActive.Add(-1)
 			return err

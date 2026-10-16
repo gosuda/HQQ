@@ -1,0 +1,126 @@
+name: Interop
+
+# Runs the HQQ interoperability matrix (interop/) over every implementation
+# that has a helper executable: the Go helper always, the C helper when present.
+# The helper contract is conformance/INTEROP_CLI.md.
+#
+# The C helper does not exist yet. The C steps below are guarded by
+#   if: hashFiles('c/tools/hqq_interop.c') != ''
+# and are skipped while that source file is absent. When it lands, the steps
+# build the CMake target named by HQQ_INTEROP_C_TARGET and the helper is added
+# to HQQ_INTEROP_IMPLS as c=<path>.
+#
+# To add another implementation (Rust, Zig, C++, ...): add a build step that
+# produces an executable named hqq-interop (hqq-interop.exe on Windows), then
+# append ",<label>=<path>" to HQQ_INTEROP_IMPLS in the "Run interop matrix" step.
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  schedule:
+    # Weekly, Monday 03:17 UTC: long soak sizes (HQQ_INTEROP_LONG=1).
+    - cron: '17 3 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: interop-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # CMake target of the C helper. Its executable is located under build-c/
+  # by name (hqq-interop or this target name), so the target can change here.
+  HQQ_INTEROP_C_TARGET: hqq_interop
+
+jobs:
+  interop:
+    name: Interop ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.2
+
+      - name: Set up Go
+        uses: actions/setup-go@v6.4.0
+        with:
+          go-version-file: go.mod
+          check-latest: true
+          cache: true
+
+      - name: Build Go helper
+        shell: bash
+        run: |
+          ext=""
+          if [ "$RUNNER_OS" = "Windows" ]; then ext=".exe"; fi
+          go build -o "$RUNNER_TEMP/hqq-interop-go$ext" ./cmd/hqq-interop
+
+      # C helper gate: every step below is skipped while the C helper source
+      # is absent (see the header comment).
+
+      - name: Configure C helper
+        if: hashFiles('c/tools/hqq_interop.c') != ''
+        shell: bash
+        run: cmake -S c -B build-c -DCMAKE_BUILD_TYPE=Release -DHQQ_WERROR=ON
+
+      - name: Build C helper
+        if: hashFiles('c/tools/hqq_interop.c') != ''
+        shell: bash
+        run: cmake --build build-c --config Release --target "$HQQ_INTEROP_C_TARGET"
+
+      - name: Locate C helper
+        id: c-helper
+        if: hashFiles('c/tools/hqq_interop.c') != ''
+        shell: bash
+        run: |
+          path="$(find build-c -type f \( -name hqq-interop -o -name hqq-interop.exe \
+            -o -name "$HQQ_INTEROP_C_TARGET" -o -name "$HQQ_INTEROP_C_TARGET.exe" \) | head -n 1)"
+          if [ -z "$path" ]; then
+            echo "C helper executable not found under build-c" >&2
+            exit 1
+          fi
+          # Absolute path: the driver runs from the package directory.
+          echo "path=$GITHUB_WORKSPACE/$path" >> "$GITHUB_OUTPUT"
+
+      # Vectors are checked on ubuntu-latest only. Superblock, ring, packet and
+      # frame vectors are host independent and are compared in full. Golden
+      # sequences exist per page family (only the host family is generated, and
+      # only the families that are committed are compared), so they are compared
+      # for the runner's page size alone.
+      - name: Check golden vectors are reproducible
+        if: runner.os == 'Linux'
+        run: |
+          go run ./cmd/hqq-interop gen-vectors --out "$RUNNER_TEMP/vectors"
+          diff -r -x sequences conformance/vectors "$RUNNER_TEMP/vectors"
+          page="$(getconf PAGESIZE)"
+          if [ -d "conformance/vectors/sequences/$page" ]; then
+            diff -r "conformance/vectors/sequences/$page" "$RUNNER_TEMP/vectors/sequences/$page"
+          fi
+
+      - name: Conformance tests
+        run: go test ./conformance/... -count=1 -timeout 15m
+
+      - name: Run interop matrix
+        shell: bash
+        env:
+          C_HELPER: ${{ steps.c-helper.outputs.path }}
+          HQQ_INTEROP_LONG: ${{ github.event_name == 'schedule' && '1' || '' }}
+        run: |
+          ext=""
+          if [ "$RUNNER_OS" = "Windows" ]; then ext=".exe"; fi
+          impls="go=$RUNNER_TEMP/hqq-interop-go$ext"
+          if [ -n "$C_HELPER" ]; then impls="$impls,c=$C_HELPER"; fi
+          HQQ_INTEROP_IMPLS="$impls" go test ./interop/... -count=1 -timeout 30m

@@ -1,0 +1,3940 @@
+{
+  "schema": 1,
+  "protocol": "1.1",
+  "segment_layout": "HQQ_STL3",
+  "ring_layout": 2,
+  "page_families": [
+    4096,
+    16384
+  ],
+  "normalized": [
+    {
+      "word": "endpoints[0].token",
+      "rule": "owner token -\u003e 0x1111111111111111 (0 and 1 kept)"
+    },
+    {
+      "word": "endpoints[1].token",
+      "rule": "owner token -\u003e 0x2222222222222222 (0 and 1 kept)"
+    },
+    {
+      "word": "endpoints[0].pid",
+      "rule": "nonzero -\u003e 0"
+    },
+    {
+      "word": "endpoints[1].pid",
+      "rule": "nonzero -\u003e 0"
+    },
+    {
+      "word": "endpoints[0].heartbeat",
+      "rule": "nonzero -\u003e 0"
+    },
+    {
+      "word": "endpoints[1].heartbeat",
+      "rule": "nonzero -\u003e 0"
+    },
+    {
+      "word": "initToken",
+      "rule": "nonzero -\u003e 0x3333333333333333"
+    },
+    {
+      "word": "initHeartbeat",
+      "rule": "nonzero -\u003e 0"
+    },
+    {
+      "word": "creatorToken",
+      "rule": "nonzero -\u003e 0x4444444444444444"
+    }
+  ],
+  "packets": [
+    {
+      "name": "standard_copy",
+      "source": "constants.json",
+      "opcode": 255,
+      "operands": [
+        1,
+        2,
+        3
+      ],
+      "hex": "ff000000000000000100000000000000020000000000000003000000000000000000000000000000000000000000000000000000000000000000000000000000"
+    },
+    {
+      "name": "standard_tombstone",
+      "source": "constants.json",
+      "opcode": 254,
+      "operands": [
+        1,
+        2,
+        6
+      ],
+      "hex": "fe000000000000000100000000000000020000000000000006000000000000000000000000000000000000000000000000000000000000000000000000000000"
+    },
+    {
+      "name": "error",
+      "source": "constants.json",
+      "opcode": 0,
+      "operands": [
+        9,
+        5
+      ],
+      "hex": "00000000000000000900000000000000050000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+    },
+    {
+      "name": "conn_create",
+      "source": "constants.json",
+      "opcode": 1,
+      "operands": [
+        2
+      ],
+      "hex": "01000000000000000200000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+    },
+    {
+      "name": "conn_accept",
+      "source": "constants.json",
+      "opcode": 2,
+      "operands": [
+        2
+      ],
+      "hex": "02000000000000000200000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+    },
+    {
+      "name": "conn_close",
+      "source": "constants.json",
+      "opcode": 3,
+      "operands": [
+        2,
+        0
+      ],
+      "hex": "03000000000000000200000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+    },
+    {
+      "name": "conn_copy",
+      "source": "constants.json",
+      "opcode": 4,
+      "operands": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        3,
+        7
+      ],
+      "hex": "04000000000000000100000000000000020000000000000003000000000000000400000000000000050000000000000003000000000000000700000000000000"
+    },
+    {
+      "name": "proto_negotiate",
+      "source": "constants.json",
+      "opcode": 5,
+      "operands": [
+        256,
+        3,
+        0
+      ],
+      "hex": "05000000000000000001000000000000030000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+    },
+    {
+      "name": "proto_ack",
+      "source": "constants.json",
+      "opcode": 6,
+      "operands": [
+        256,
+        3,
+        0
+      ],
+      "hex": "06000000000000000001000000000000030000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+    },
+    {
+      "name": "conn_copy_begin_end_request_meta",
+      "source": "extra",
+      "opcode": 4,
+      "operands": [
+        0,
+        1,
+        45,
+        0,
+        45,
+        75,
+        9
+      ],
+      "hex": "0400000000000000000000000000000001000000000000002d0000000000000000000000000000002d000000000000004b000000000000000900000000000000"
+    },
+    {
+      "name": "conn_copy_begin_end",
+      "source": "extra",
+      "opcode": 4,
+      "operands": [
+        0,
+        1,
+        5,
+        0,
+        5,
+        3,
+        0
+      ],
+      "hex": "04000000000000000000000000000000010000000000000005000000000000000000000000000000050000000000000003000000000000000000000000000000"
+    },
+    {
+      "name": "conn_copy_abort",
+      "source": "extra",
+      "opcode": 4,
+      "operands": [
+        0,
+        1,
+        0,
+        0,
+        0,
+        4,
+        0
+      ],
+      "hex": "04000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000004000000000000000000000000000000"
+    },
+    {
+      "name": "conn_copy_response_error",
+      "source": "extra",
+      "opcode": 4,
+      "operands": [
+        0,
+        1,
+        4,
+        0,
+        4,
+        51,
+        42
+      ],
+      "hex": "04000000000000000000000000000000010000000000000004000000000000000000000000000000040000000000000033000000000000002a00000000000000"
+    },
+    {
+      "name": "proto_negotiate_1_1_all",
+      "source": "extra",
+      "opcode": 5,
+      "operands": [
+        257,
+        15,
+        0
+      ],
+      "hex": "050000000000000001010000000000000f0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+    },
+    {
+      "name": "proto_ack_1_1_all",
+      "source": "extra",
+      "opcode": 6,
+      "operands": [
+        257,
+        15,
+        0
+      ],
+      "hex": "060000000000000001010000000000000f0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+    },
+    {
+      "name": "cancel_request_1",
+      "source": "extra",
+      "opcode": 7,
+      "operands": [
+        0,
+        1
+      ],
+      "hex": "07000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+    }
+  ],
+  "layouts": [
+    {
+      "source": "constants.json",
+      "page_size": 4096,
+      "buffer_count": 2,
+      "buffer_size": 8,
+      "ring0": 4096,
+      "buffers0": 8192,
+      "ring1": 12288,
+      "buffers1": 16384,
+      "total": 20480
+    },
+    {
+      "source": "constants.json",
+      "page_size": 4096,
+      "buffer_count": 256,
+      "buffer_size": 4096,
+      "ring0": 4096,
+      "buffers0": 40960,
+      "ring1": 1089536,
+      "buffers1": 1126400,
+      "total": 2174976
+    },
+    {
+      "source": "constants.json",
+      "page_size": 4096,
+      "buffer_count": 1024,
+      "buffer_size": 65536,
+      "ring0": 4096,
+      "buffers0": 139264,
+      "ring1": 67248128,
+      "buffers1": 67383296,
+      "total": 134492160
+    },
+    {
+      "source": "constants.json",
+      "page_size": 4096,
+      "buffer_count": 16,
+      "buffer_size": 800,
+      "ring0": 4096,
+      "buffers0": 8192,
+      "ring1": 24576,
+      "buffers1": 28672,
+      "total": 45056
+    },
+    {
+      "source": "constants.json",
+      "page_size": 16384,
+      "buffer_count": 2,
+      "buffer_size": 8,
+      "ring0": 16384,
+      "buffers0": 32768,
+      "ring1": 49152,
+      "buffers1": 65536,
+      "total": 81920
+    },
+    {
+      "source": "constants.json",
+      "page_size": 16384,
+      "buffer_count": 256,
+      "buffer_size": 4096,
+      "ring0": 16384,
+      "buffers0": 65536,
+      "ring1": 1114112,
+      "buffers1": 1163264,
+      "total": 2211840
+    },
+    {
+      "source": "constants.json",
+      "page_size": 16384,
+      "buffer_count": 1024,
+      "buffer_size": 65536,
+      "ring0": 16384,
+      "buffers0": 163840,
+      "ring1": 67272704,
+      "buffers1": 67420160,
+      "total": 134529024
+    },
+    {
+      "source": "constants.json",
+      "page_size": 16384,
+      "buffer_count": 16,
+      "buffer_size": 800,
+      "ring0": 16384,
+      "buffers0": 32768,
+      "ring1": 49152,
+      "buffers1": 65536,
+      "total": 81920
+    },
+    {
+      "source": "constants.json",
+      "page_size": 65536,
+      "buffer_count": 2,
+      "buffer_size": 8,
+      "ring0": 65536,
+      "buffers0": 131072,
+      "ring1": 196608,
+      "buffers1": 262144,
+      "total": 327680
+    },
+    {
+      "source": "constants.json",
+      "page_size": 65536,
+      "buffer_count": 256,
+      "buffer_size": 4096,
+      "ring0": 65536,
+      "buffers0": 131072,
+      "ring1": 1179648,
+      "buffers1": 1245184,
+      "total": 2293760
+    },
+    {
+      "source": "constants.json",
+      "page_size": 65536,
+      "buffer_count": 1024,
+      "buffer_size": 65536,
+      "ring0": 65536,
+      "buffers0": 262144,
+      "ring1": 67371008,
+      "buffers1": 67567616,
+      "total": 134676480
+    },
+    {
+      "source": "constants.json",
+      "page_size": 65536,
+      "buffer_count": 16,
+      "buffer_size": 800,
+      "ring0": 65536,
+      "buffers0": 131072,
+      "ring1": 196608,
+      "buffers1": 262144,
+      "total": 327680
+    },
+    {
+      "source": "extra",
+      "page_size": 4096,
+      "buffer_count": 4,
+      "buffer_size": 64,
+      "ring0": 4096,
+      "buffers0": 8192,
+      "ring1": 12288,
+      "buffers1": 16384,
+      "total": 20480
+    },
+    {
+      "source": "extra",
+      "page_size": 16384,
+      "buffer_count": 4,
+      "buffer_size": 64,
+      "ring0": 16384,
+      "buffers0": 32768,
+      "ring1": 49152,
+      "buffers1": 65536,
+      "total": 81920
+    },
+    {
+      "source": "extra",
+      "page_size": 65536,
+      "buffer_count": 4,
+      "buffer_size": 64,
+      "ring0": 65536,
+      "buffers0": 131072,
+      "ring1": 196608,
+      "buffers1": 262144,
+      "total": 327680
+    },
+    {
+      "source": "extra",
+      "page_size": 16384,
+      "buffer_count": 2,
+      "buffer_size": 4096,
+      "ring0": 16384,
+      "buffers0": 32768,
+      "ring1": 49152,
+      "buffers1": 65536,
+      "total": 81920
+    }
+  ],
+  "geometry": [
+    {
+      "buffer_count": 0,
+      "buffer_size": 8,
+      "valid": false,
+      "reason": "bufferCount \u003c 2"
+    },
+    {
+      "buffer_count": 1,
+      "buffer_size": 8,
+      "valid": false,
+      "reason": "bufferCount \u003c 2"
+    },
+    {
+      "buffer_count": 3,
+      "buffer_size": 8,
+      "valid": false,
+      "reason": "bufferCount not a power of two"
+    },
+    {
+      "buffer_count": 33554432,
+      "buffer_size": 8,
+      "valid": false,
+      "reason": "bufferCount \u003e 2^24"
+    },
+    {
+      "buffer_count": 2,
+      "buffer_size": 0,
+      "valid": false,
+      "reason": "bufferSize \u003c 8"
+    },
+    {
+      "buffer_count": 2,
+      "buffer_size": 4,
+      "valid": false,
+      "reason": "bufferSize \u003c 8"
+    },
+    {
+      "buffer_count": 2,
+      "buffer_size": 12,
+      "valid": false,
+      "reason": "bufferSize not a multiple of 8"
+    },
+    {
+      "buffer_count": 2,
+      "buffer_size": 1073741832,
+      "valid": false,
+      "reason": "bufferSize \u003e 2^30"
+    },
+    {
+      "buffer_count": 2,
+      "buffer_size": 1073741825,
+      "valid": false,
+      "reason": "bufferSize not a multiple of 8"
+    },
+    {
+      "buffer_count": 2,
+      "buffer_size": 8,
+      "valid": true,
+      "reason": ""
+    },
+    {
+      "buffer_count": 16777216,
+      "buffer_size": 8,
+      "valid": true,
+      "reason": ""
+    },
+    {
+      "buffer_count": 2,
+      "buffer_size": 1073741824,
+      "valid": true,
+      "reason": ""
+    }
+  ],
+  "names": [
+    {
+      "name": "",
+      "platform": "any",
+      "valid": false,
+      "source": "constants.json"
+    },
+    {
+      "name": "/",
+      "platform": "any",
+      "valid": false,
+      "source": "constants.json"
+    },
+    {
+      "name": ".",
+      "platform": "any",
+      "valid": false,
+      "source": "constants.json"
+    },
+    {
+      "name": "/.",
+      "platform": "any",
+      "valid": false,
+      "source": "constants.json"
+    },
+    {
+      "name": "..",
+      "platform": "any",
+      "valid": false,
+      "source": "constants.json"
+    },
+    {
+      "name": "a/b",
+      "platform": "any",
+      "valid": false,
+      "source": "constants.json"
+    },
+    {
+      "name": "a\\b",
+      "platform": "any",
+      "valid": false,
+      "source": "constants.json"
+    },
+    {
+      "name": "a\u0000b",
+      "platform": "any",
+      "valid": false,
+      "source": "constants.json"
+    },
+    {
+      "name": "//",
+      "platform": "any",
+      "valid": false,
+      "source": "constants.json"
+    },
+    {
+      "name": "abc",
+      "platform": "any",
+      "valid": true,
+      "source": "extra"
+    },
+    {
+      "name": "/abc",
+      "platform": "any",
+      "valid": true,
+      "source": "extra"
+    },
+    {
+      "name": "hqq-conf-nnnnnnnnnnnnnnnnnnnnn",
+      "platform": "darwin",
+      "valid": true,
+      "source": "extra"
+    },
+    {
+      "name": "hqq-conf-nnnnnnnnnnnnnnnnnnnnnn",
+      "platform": "darwin",
+      "valid": false,
+      "source": "extra"
+    },
+    {
+      "name": "abc",
+      "platform": "windows",
+      "valid": true,
+      "object": "Local\\abc",
+      "source": "constants.json"
+    },
+    {
+      "name": "Global\\abc",
+      "platform": "windows",
+      "valid": true,
+      "object": "Global\\abc",
+      "source": "constants.json"
+    },
+    {
+      "name": "global\\abc",
+      "platform": "windows",
+      "valid": true,
+      "object": "Global\\abc",
+      "source": "constants.json"
+    },
+    {
+      "name": "LOCAL\\abc",
+      "platform": "windows",
+      "valid": true,
+      "object": "Local\\abc",
+      "source": "constants.json"
+    },
+    {
+      "name": "/abc",
+      "platform": "windows",
+      "valid": true,
+      "object": "Local\\abc",
+      "source": "constants.json"
+    },
+    {
+      "name": "Global\\/abc",
+      "platform": "windows",
+      "valid": true,
+      "object": "Global\\abc",
+      "source": "constants.json"
+    },
+    {
+      "name": "",
+      "platform": "windows",
+      "valid": false,
+      "source": "constants.json"
+    },
+    {
+      "name": "Global\\",
+      "platform": "windows",
+      "valid": false,
+      "source": "constants.json"
+    },
+    {
+      "name": "Local\\",
+      "platform": "windows",
+      "valid": false,
+      "source": "constants.json"
+    },
+    {
+      "name": "a\\b",
+      "platform": "windows",
+      "valid": false,
+      "source": "constants.json"
+    },
+    {
+      "name": "Global\\a\\b",
+      "platform": "windows",
+      "valid": false,
+      "source": "constants.json"
+    }
+  ],
+  "error_codes": [
+    {
+      "name": "MemoryAlign",
+      "code": 1,
+      "error_kind": "ErrMemoryAlign",
+      "source": "constants.json"
+    },
+    {
+      "name": "InvalidSize",
+      "code": 2,
+      "error_kind": "ErrInvalidSize",
+      "source": "constants.json"
+    },
+    {
+      "name": "MemorySmall",
+      "code": 3,
+      "error_kind": "ErrMemorySmall",
+      "source": "constants.json"
+    },
+    {
+      "name": "FailedInit",
+      "code": 4,
+      "error_kind": "ErrFailedInit",
+      "source": "constants.json"
+    },
+    {
+      "name": "ConnNotFound",
+      "code": 5,
+      "error_kind": "ErrConnNotFound",
+      "source": "constants.json"
+    },
+    {
+      "name": "InvalidOp",
+      "code": 6,
+      "error_kind": "ErrInvalidOp",
+      "source": "constants.json"
+    },
+    {
+      "name": "BufferOverflow",
+      "code": 7,
+      "error_kind": "ErrBufferOverflow",
+      "source": "constants.json"
+    },
+    {
+      "name": "ShuttingDown",
+      "code": 8,
+      "error_kind": "ErrShuttingDown",
+      "source": "protocol_1_1"
+    },
+    {
+      "name": "unknown",
+      "code": 0,
+      "error_kind": "ErrProtocol",
+      "source": "extra"
+    },
+    {
+      "name": "unknown",
+      "code": 9,
+      "error_kind": "ErrProtocol",
+      "source": "extra"
+    },
+    {
+      "name": "unknown",
+      "code": 65535,
+      "error_kind": "ErrProtocol",
+      "source": "extra"
+    }
+  ],
+  "payloads": [
+    {
+      "seed": 1,
+      "seq": 0,
+      "size": 0
+    },
+    {
+      "seed": 1,
+      "seq": 0,
+      "size": 1,
+      "hex": "c1"
+    },
+    {
+      "seed": 1,
+      "seq": 0,
+      "size": 8,
+      "hex": "c15c0289ec2d0a91"
+    },
+    {
+      "seed": 1,
+      "seq": 0,
+      "size": 15,
+      "hex": "c15c0289ec2d0a9167ec8e65a18deb"
+    },
+    {
+      "seed": 1,
+      "seq": 0,
+      "size": 16,
+      "hex": "0000000000000000add8412cc15c0289"
+    },
+    {
+      "seed": 3735928559,
+      "seq": 7,
+      "size": 40,
+      "hex": "070000000000000047a0b1127536cc3826b6b2d2c8375c13ebdfc0ab9ca7d35f20744cb4782227b3"
+    },
+    {
+      "seed": 1,
+      "seq": 3,
+      "size": 24,
+      "hex": "0300000000000000cf4b1aab4db93b78fed3bd880d60923c"
+    },
+    {
+      "seed": 1,
+      "seq": 0,
+      "size": 1024,
+      "sha256": "eb146191619a06732f4b4595d599bdfdcb54731fc3e61577e80523ff1aa9be99",
+      "length": 1024
+    },
+    {
+      "seed": 1,
+      "seq": 0,
+      "size": 65536,
+      "sha256": "8b6ca383a16f79f7b66f7efd3d20c4d5c0e2ac9b55d15c9f8ce0be9d197ecb3f",
+      "length": 65536
+    }
+  ],
+  "superblocks": [
+    {
+      "id": "empty-zero",
+      "title": "Empty segment: zero first page",
+      "page_size": 4096,
+      "recorded_page_size": 4096,
+      "file": "images/4096/empty-zero.bin",
+      "file_bytes": 4096,
+      "full": false,
+      "segment_bytes": 20480,
+      "buffer_count": 2,
+      "buffer_size": 8,
+      "caller_buffer_count": 2,
+      "caller_buffer_size": 8,
+      "normalized": null,
+      "creator": {
+        "result": "primary",
+        "error": "",
+        "writes": "init"
+      },
+      "opener": {
+        "result": "",
+        "error": "ErrFailedInit",
+        "writes": "none"
+      },
+      "inmemory": {
+        "result": "primary",
+        "error": "",
+        "writes": "init"
+      }
+    },
+    {
+      "id": "empty-zero",
+      "title": "Empty segment: zero first page",
+      "page_size": 16384,
+      "recorded_page_size": 16384,
+      "file": "images/16384/empty-zero.bin",
+      "file_bytes": 16384,
+      "full": false,
+      "segment_bytes": 81920,
+      "buffer_count": 2,
+      "buffer_size": 8,
+      "caller_buffer_count": 2,
+      "caller_buffer_size": 8,
+      "normalized": null,
+      "creator": {
+        "result": "primary",
+        "error": "",
+        "writes": "init"
+      },
+      "opener": {
+        "result": "",
+        "error": "ErrFailedInit",
+        "writes": "none"
+      },
+      "inmemory": {
+        "result": "primary",
+        "error": "",
+        "writes": "init"
+      }
+    },
+    {
+      "id": "empty-foreign-last-word",
+      "title": "Empty state with one non-zero byte in the last word of the first page",
+      "page_size": 4096,
+      "recorded_page_size": 4096,
+      "file": "images/4096/empty-foreign-last-word.bin",
+      "file_bytes": 4096,
+      "full": false,
+      "segment_bytes": 20480,
+      "buffer_count": 2,
+      "buffer_size": 8,
+      "caller_buffer_count": 2,
+      "caller_buffer_size": 8,
+      "normalized": null,
+      "creator": {
+        "result": "",
+        "error": "ErrIncompatibleLayout",
+        "writes": "none"
+      },
+      "opener": {
+        "result": "",
+        "error": "ErrIncompatibleLayout",
+        "writes": "none"
+      },
+      "inmemory": {
+        "result": "",
+        "error": "ErrIncompatibleLayout",
+        "writes": "none"
+      }
+    },
+    {
+      "id": "empty-foreign-last-word",
+      "title": "Empty state with one non-zero byte in the last word of the first page",
+      "page_size": 16384,
+      "recorded_page_size": 16384,
+      "file": "images/16384/empty-foreign-last-word.bin",
+      "file_bytes": 16384,
+      "full": false,
+      "segment_bytes": 81920,
+      "buffer_count": 2,
+      "buffer_size": 8,
+      "caller_buffer_count": 2,
+      "caller_buffer_size": 8,
+      "normalized": null,
+      "creator": {
+        "result": "",
+        "error": "ErrIncompatibleLayout",
+        "writes": "none"
+      },
+      "opener": {
+        "result": "",
+        "error": "ErrIncompatibleLayout",
+        "writes": "none"
+      },
+      "inmemory": {
+        "result": "",
+        "error": "ErrIncompatibleLayout",
+        "writes": "none"
+      }
+    },
+    {
+      "id": "state-unknown",
+      "title": "state = 7 (unknown)",
+      "page_size": 4096,
+      "recorded_page_size": 4096,
+      "file": "images/4096/state-unknown.bin",
+      "file_bytes": 4096,
+      "full": false,
+      "segment_bytes": 20480,
+      "buffer_count": 2,
+      "buffer_size": 8,
+      "caller_buffer_count": 2,
+      "caller_buffer_size": 8,
+      "normalized": null,
+      "creator": {
+        "result": "",
+        "error": "ErrIncompatibleLayout",
+        "writes": "none"
+      },
+      "opener": {
+        "result": "",
+        "error": "ErrIncompatibleLayout",
+        "writes": "none"
+      },
+      "inmemory": {
+        "result": "",
+        "error": "ErrIncompatibleLayout",
+        "writes": "none"
+      }
+    },
+    {
+      "id": "state-unknown",
+      "title": "state = 7 (unknown)",
+      "page_size": 16384,
+      "recorded_page_size": 16384,
+      "file": "images/16384/state-unknown.bin",
+      "file_bytes": 16384,
+      "full": false,
+      "segment_bytes": 81920,
+      "buffer_count": 2,
+      "buffer_size": 8,
+      "caller_buffer_count": 2,
+      "caller_buffer_size": 8,
+      "normalized": null,
+      "creator": {
+        "result": "",
+        "error": "ErrIncompatibleLayout",
+        "writes": "none"
+      },
+      "opener": {
+        "result": "",
+        "error": "ErrIncompatibleLayout",
+        "writes": "none"
+      },
+      "inmemory": {
+        "result": "",
+        "error": "ErrIncompatibleLayout",
+        "writes": "none"
+      }
+    },
+    {
+      "id": "initializing-live-token",
+      "title": "Initializing with a nonzero initToken and an initHeartbeat that never changes (takeover after the stale window)",
+      "page_size": 4096,
+      "recorded_page_size": 4096,
+      "file": "images/4096/initializing-live-token.bin",
+      "file_bytes": 4096,
+      "full": false,
+      "segment_bytes": 20480,
+      "buffer_count": 2,
+      "buffer_size": 8,
+      "caller_buffer_count": 2,
+      "caller_buffer_size": 8,
+      "normalized": [
+        "initToken",
+        "initHeartbeat"
+      ],
+      "creator": {
+        "result": "primary",
+        "error": "",
+        "writes": "init"
+      },
+      "opener": {
+        "result": "",
+        "error": "ErrFailedInit",
+        "writes": "none"
+      },
+      "inmemory": {
+        "result": "primary",
+        "error": "",
+        "writes": "init"
+      }
+    },
+    {
+      "id": "initializing-live-token",
+      "title": "Initializing with a nonzero initToken and an initHeartbeat that never changes (takeover after the stale window)",
+      "page_size": 16384,
+      "recorded_page_size": 16384,
+      "file": "images/16384/initializing-live-token.bin",
+      "file_bytes": 16384,
+      "full": false,
+      "segment_bytes": 81920,
+      "buffer_count": 2,
+      "buffer_size": 8,
+      "caller_buffer_count": 2,
+      "caller_buffer_size": 8,
+      "normalized": [
+        "initToken",
+        "initHeartbeat"
+      ],
+      "creator": {
+        "result": "primary",
+        "error": "",
+        "writes": "init"
+      },
+      "opener": {
+        "result": "",
+        "error": "ErrFailedInit",
+        "writes": "none"
+      },
+      "inmemory": {
+        "result": "primary",
+        "error": "",
+        "writes": "init"
+      }
+    },
+    {
+      "id": "initializing-token-zero",
+      "title": "Initializing with initToken = 0 (takeover after the stale window)",
+      "page_size": 4096,
+      "recorded_page_size": 4096,
+      "file": "images/4096/initializing-token-zero.bin",
+      "file_bytes": 4096,
+      "full": false,
+      "segment_bytes": 20480,
+      "buffer_count": 2,
+      "buffer_size": 8,
+      "caller_buffer_count": 2,
+      "caller_buffer_size": 8,
+      "normalized": null,
+      "creator": {
+        "result": "primary",
+        "error": "",
+        "writes": "init"
+      },
+      "opener": {
+        "result": "",
+        "error": "ErrFailedInit",
+        "writes": "none"
+      },
+      "inmemory": {
+        "result": "primary",
+        "error": "",
+        "writes": "init"
+      }
+    },
+    {
+      "id": "initializing-token-zero",
+      "title": "Initializing with initToken = 0 (takeover after the stale window)",
+      "page_size": 16384,
+      "recorded_page_size": 16384,
+      "file": "images/16384/initializing-token-zero.bin",
+      "file_bytes": 16384,
+      "full": false,
+      "segment_bytes": 81920,
+      "buffer_count": 2,
+      "buffer_size": 8,
+      "caller_buffer_count": 2,
+      "caller_buffer_size": 8,
+      "normalized": null,
+      "creator": {
+        "result": "primary",
+        "error": "",
+        "writes": "init"
+      },
+      "opener": {
+        "result": "",
+        "error": "ErrFailedInit",
+        "writes": "none"
+      },
+      "inmemory": {
+        "result": "primary",
+        "error": "",
+        "writes": "init"
+      }
+    },
+    {
+      "id": "initializing-major-4",
+      "title": "Initializing with layout major 4",
+      "page_size": 4096,
+      "recorded_page_size": 4096,
+      "file": "images/4096/initializing-major-4.bin",
+      "file_bytes": 4096,
+      "full": false,
+      "segment_bytes": 20480,
+      "buffer_count": 2,
+      "buffer_size": 8,
+      "caller_buffer_count": 2,
+      "caller_buffer_size": 8,
+      "normalized": [
+        "initToken",
+        "initHeartbeat"
+      ],
+      "creator": {
+        "result": "",
+        "error": "ErrIncompatibleLayout",
+        "writes": "none"
+      },
+      "opener": {
+        "result": "",
+        "error": "ErrIncompatibleLayout",
+        "writes": "none"
+      },
+      "inmemory": {
+        "result": "",
+        "error": "ErrIncompatibleLayout",
+        "writes": "none"
+      }
+    },
+    {
+      "id": "initializing-major-4",
+      "title": "Initializing with layout major 4",
+      "page_size": 16384,
+      "recorded_page_size": 16384,
+      "file": "images/16384/initializing-major-4.bin",
+      "file_bytes": 16384,
+      "full": false,
+      "segment_bytes": 81920,
+      "buffer_count": 2,
+      "buffer_size": 8,
+      "caller_buffer_count": 2,
+      "caller_buffer_size": 8,
+      "normalized": [
+        "initToken",
+        "initHeartbeat"
+      ],
+      "creator": {
+        "result": "",
+        "error": "ErrIncompatibleLayout",
+        "writes": "none"
+      },
+      "opener": {
+        "result": "",
+        "error": "ErrIncompatibleLayout",
+        "writes": "none"
+      },
+      "inmemory": {
+        "result": "",
+        "error": "ErrIncompatibleLayout",
+        "writes": "none"
+      }
+    },
+    {
+      "id": "ready-magic-stl2",
+      "title": "Ready with magic HQQ_STL2",
+      "page_size": 4096,
+      "recorded_page_size": 4096,
+      "file": "images/4096/ready-magic-stl2.bin",
+      "file_bytes": 4096,
+      "full": false,
+      "segment_bytes": 20480,
+      "buffer_count": 2,
+      "buffer_size": 8,
+      "caller_buffer_count": 2,
+      "caller_buffer_size": 8,
+      "normalized": null,
+      "creator": {
+        "result": "",
+        "error": "ErrIncompatibleLayout",
+        "writes": "none"
+      },
+      "opener": {
+        "result": "",
+        "error": "ErrIncompatibleLayout",
+        "writes": "none"
+      },
+      "inmemory": {
+        "result": "",
+        "error": "ErrIncompatibleLayout",
+        "writes": "none"
+      }
+    },
+    {
+      "id": "ready-magic-stl2",
+      "title": "Ready with magic HQQ_STL2",
+      "page_size": 16384,
+      "recorded_page_size": 16384,
+      "file": "images/16384/ready-magic-stl2.bin",
+      "file_bytes": 16384,
+      "full": false,
+      "segment_bytes": 81920,
+      "buffer_count": 2,
+      "buffer_size": 8,
+      "caller_buffer_count": 2,
+      "caller_buffer_size": 8,
+      "normalized": null,
+      "creator": {
+        "result": "",
+        "error": "ErrIncompatibleLayout",
+        "writes": "none"
+      },
+      "opener": {
+        "result": "",
+        "error": "ErrIncompatibleLayout",
+        "writes": "none"
+      },
+      "inmemory": {
+        "result": "",
+        "error": "ErrIncompatibleLayout",
+        "writes": "none"
+      }
+    },
+    {
+      "id": "ready-required-feature",
+      "title": "Ready with requiredFeatures bit 0 set",
+      "page_size": 4096,
+      "recorded_page_size": 4096,
+      "file": "images/4096/ready-required-feature.bin",
+      "file_bytes": 4096,
+      "full": false,
+      "segment_bytes": 20480,
+      "buffer_count": 2,
+      "buffer_size": 8,
+      "caller_buffer_count": 2,
+      "caller_buffer_size": 8,
+      "normalized": null,
+      "creator": {
+        "result": "",
+        "error": "ErrIncompatibleLayout",
+        "writes": "none"
+      },
+      "opener": {
+        "result": "",
+        "error": "ErrIncompatibleLayout",
+        "writes": "none"
+      },
+      "inmemory": {
+        "result": "",
+        "error": "ErrIncompatibleLayout",
+        "writes": "none"
+      }
+    },
+    {
+      "id": "ready-required-feature",
+      "title": "Ready with requiredFeatures bit 0 set",
+      "page_size": 16384,
+      "recorded_page_size": 16384,
+      "file": "images/16384/ready-required-feature.bin",
+      "file_bytes": 16384,
+      "full": false,
+      "segment_bytes": 81920,
+      "buffer_count": 2,
+      "buffer_size": 8,
+      "caller_buffer_count": 2,
+      "caller_buffer_size": 8,
+      "normalized": null,
+      "creator": {
+        "result": "",
+        "error": "ErrIncompatibleLayout",
+        "writes": "none"
+      },
+      "opener": {
+        "result": "",
+        "error": "ErrIncompatibleLayout",
+        "writes": "none"
+      },
+      "inmemory": {
+        "result": "",
+        "error": "ErrIncompatibleLayout",
+        "writes": "none"
+      }
+    },
+    {
+      "id": "ready-both-dead",
+      "title": "Ready, both endpoints dead (owner tokens, interval \u003e 0, heartbeat 1)",
+      "page_size": 4096,
+      "recorded_page_size": 4096,
+      "file": "images/4096/ready-both-dead.bin",
+      "file_bytes": 4096,
+      "full": false,
+      "segment_bytes": 20480,
+      "buffer_count": 2,
+      "buffer_size": 8,
+      "caller_buffer_count": 2,
+      "caller_buffer_size": 8,
+      "normalized": [
+        "creatorToken",
+        "endpoints[0].token",
+        "endpoints[0].heartbeat",
+        "endpoints[1].token",
+        "endpoints[1].heartbeat"
+      ],
+      "creator": {
+        "result": "primary",
+        "error": "",
+        "writes": "init"
+      },
+      "opener": {
+        "result": "",
+        "error": "ErrFailedInit",
+        "writes": "none"
+      },
+      "inmemory": {
+        "result": "primary",
+        "error": "",
+        "writes": "init"
+      }
+    },
+    {
+      "id": "ready-both-dead",
+      "title": "Ready, both endpoints dead (owner tokens, interval \u003e 0, heartbeat 1)",
+      "page_size": 16384,
+      "recorded_page_size": 16384,
+      "file": "images/16384/ready-both-dead.bin",
+      "file_bytes": 16384,
+      "full": false,
+      "segment_bytes": 81920,
+      "buffer_count": 2,
+      "buffer_size": 8,
+      "caller_buffer_count": 2,
+      "caller_buffer_size": 8,
+      "normalized": [
+        "creatorToken",
+        "endpoints[0].token",
+        "endpoints[0].heartbeat",
+        "endpoints[1].token",
+        "endpoints[1].heartbeat"
+      ],
+      "creator": {
+        "result": "primary",
+        "error": "",
+        "writes": "init"
+      },
+      "opener": {
+        "result": "",
+        "error": "ErrFailedInit",
+        "writes": "none"
+      },
+      "inmemory": {
+        "result": "primary",
+        "error": "",
+        "writes": "init"
+      }
+    },
+    {
+      "id": "ready-primary-detached",
+      "title": "Ready, primary detached (token 1), secondary empty",
+      "page_size": 4096,
+      "recorded_page_size": 4096,
+      "file": "images/4096/ready-primary-detached.bin",
+      "file_bytes": 4096,
+      "full": false,
+      "segment_bytes": 20480,
+      "buffer_count": 2,
+      "buffer_size": 8,
+      "caller_buffer_count": 2,
+      "caller_buffer_size": 8,
+      "normalized": [
+        "creatorToken"
+      ],
+      "creator": {
+        "result": "primary",
+        "error": "",
+        "writes": "init"
+      },
+      "opener": {
+        "result": "",
+        "error": "ErrFailedInit",
+        "writes": "none"
+      },
+      "inmemory": {
+        "result": "primary",
+        "error": "",
+        "writes": "init"
+      }
+    },
+    {
+      "id": "ready-primary-detached",
+      "title": "Ready, primary detached (token 1), secondary empty",
+      "page_size": 16384,
+      "recorded_page_size": 16384,
+      "file": "images/16384/ready-primary-detached.bin",
+      "file_bytes": 16384,
+      "full": false,
+      "segment_bytes": 81920,
+      "buffer_count": 2,
+      "buffer_size": 8,
+      "caller_buffer_count": 2,
+      "caller_buffer_size": 8,
+      "normalized": [
+        "creatorToken"
+      ],
+      "creator": {
+        "result": "primary",
+        "error": "",
+        "writes": "init"
+      },
+      "opener": {
+        "result": "",
+        "error": "ErrFailedInit",
+        "writes": "none"
+      },
+      "inmemory": {
+        "result": "primary",
+        "error": "",
+        "writes": "init"
+      }
+    },
+    {
+      "id": "ready-primary-live-secondary-free",
+      "title": "Ready, primary live (interval 0), secondary free; rings formatted so that a join can attach",
+      "page_size": 4096,
+      "recorded_page_size": 4096,
+      "file": "images/4096/ready-primary-live-secondary-free.bin",
+      "file_bytes": 20480,
+      "full": true,
+      "segment_bytes": 20480,
+      "buffer_count": 2,
+      "buffer_size": 8,
+      "caller_buffer_count": 2,
+      "caller_buffer_size": 8,
+      "normalized": [
+        "creatorToken",
+        "endpoints[0].token"
+      ],
+      "creator": {
+        "result": "",
+        "error": "ErrLinkBusy",
+        "writes": "none"
+      },
+      "opener": {
+        "result": "secondary",
+        "error": "",
+        "writes": "join"
+      },
+      "inmemory": {
+        "result": "secondary",
+        "error": "",
+        "writes": "join"
+      }
+    },
+    {
+      "id": "ready-primary-live-secondary-free",
+      "title": "Ready, primary live (interval 0), secondary free; rings formatted so that a join can attach",
+      "page_size": 16384,
+      "recorded_page_size": 16384,
+      "file": "images/16384/ready-primary-live-secondary-free.bin",
+      "file_bytes": 81920,
+      "full": true,
+      "segment_bytes": 81920,
+      "buffer_count": 2,
+      "buffer_size": 8,
+      "caller_buffer_count": 2,
+      "caller_buffer_size": 8,
+      "normalized": [
+        "creatorToken",
+        "endpoints[0].token"
+      ],
+      "creator": {
+        "result": "",
+        "error": "ErrLinkBusy",
+        "writes": "none"
+      },
+      "opener": {
+        "result": "secondary",
+        "error": "",
+        "writes": "join"
+      },
+      "inmemory": {
+        "result": "secondary",
+        "error": "",
+        "writes": "join"
+      }
+    },
+    {
+      "id": "ready-both-live",
+      "title": "Ready, both endpoints live (interval 0)",
+      "page_size": 4096,
+      "recorded_page_size": 4096,
+      "file": "images/4096/ready-both-live.bin",
+      "file_bytes": 4096,
+      "full": false,
+      "segment_bytes": 20480,
+      "buffer_count": 2,
+      "buffer_size": 8,
+      "caller_buffer_count": 2,
+      "caller_buffer_size": 8,
+      "normalized": [
+        "creatorToken",
+        "endpoints[0].token",
+        "endpoints[1].token"
+      ],
+      "creator": {
+        "result": "",
+        "error": "ErrLinkBusy",
+        "writes": "none"
+      },
+      "opener": {
+        "result": "",
+        "error": "ErrLinkBusy",
+        "writes": "none"
+      },
+      "inmemory": {
+        "result": "",
+        "error": "ErrLinkBusy",
+        "writes": "none"
+      }
+    },
+    {
+      "id": "ready-both-live",
+      "title": "Ready, both endpoints live (interval 0)",
+      "page_size": 16384,
+      "recorded_page_size": 16384,
+      "file": "images/16384/ready-both-live.bin",
+      "file_bytes": 16384,
+      "full": false,
+      "segment_bytes": 81920,
+      "buffer_count": 2,
+      "buffer_size": 8,
+      "caller_buffer_count": 2,
+      "caller_buffer_size": 8,
+      "normalized": [
+        "creatorToken",
+        "endpoints[0].token",
+        "endpoints[1].token"
+      ],
+      "creator": {
+        "result": "",
+        "error": "ErrLinkBusy",
+        "writes": "none"
+      },
+      "opener": {
+        "result": "",
+        "error": "ErrLinkBusy",
+        "writes": "none"
+      },
+      "inmemory": {
+        "result": "",
+        "error": "ErrLinkBusy",
+        "writes": "none"
+      }
+    },
+    {
+      "id": "ready-primary-live-secondary-detached",
+      "title": "Ready, primary live, secondary owned by a detached endpoint (token 1)",
+      "page_size": 4096,
+      "recorded_page_size": 4096,
+      "file": "images/4096/ready-primary-live-secondary-detached.bin",
+      "file_bytes": 4096,
+      "full": false,
+      "segment_bytes": 20480,
+      "buffer_count": 2,
+      "buffer_size": 8,
+      "caller_buffer_count": 2,
+      "caller_buffer_size": 8,
+      "normalized": [
+        "creatorToken",
+        "endpoints[0].token"
+      ],
+      "creator": {
+        "result": "",
+        "error": "ErrLinkBusy",
+        "writes": "none"
+      },
+      "opener": {
+        "result": "",
+        "error": "ErrLinkBusy",
+        "writes": "none"
+      },
+      "inmemory": {
+        "result": "",
+        "error": "ErrLinkBusy",
+        "writes": "none"
+      }
+    },
+    {
+      "id": "ready-primary-live-secondary-detached",
+      "title": "Ready, primary live, secondary owned by a detached endpoint (token 1)",
+      "page_size": 16384,
+      "recorded_page_size": 16384,
+      "file": "images/16384/ready-primary-live-secondary-detached.bin",
+      "file_bytes": 16384,
+      "full": false,
+      "segment_bytes": 81920,
+      "buffer_count": 2,
+      "buffer_size": 8,
+      "caller_buffer_count": 2,
+      "caller_buffer_size": 8,
+      "normalized": [
+        "creatorToken",
+        "endpoints[0].token"
+      ],
+      "creator": {
+        "result": "",
+        "error": "ErrLinkBusy",
+        "writes": "none"
+      },
+      "opener": {
+        "result": "",
+        "error": "ErrLinkBusy",
+        "writes": "none"
+      },
+      "inmemory": {
+        "result": "",
+        "error": "ErrLinkBusy",
+        "writes": "none"
+      }
+    },
+    {
+      "id": "geometry-mismatch-count",
+      "title": "Ready, primary live and secondary free; the attach calls use bufferCount 4",
+      "page_size": 4096,
+      "recorded_page_size": 4096,
+      "file": "images/4096/geometry-mismatch-count.bin",
+      "file_bytes": 4096,
+      "full": false,
+      "segment_bytes": 20480,
+      "buffer_count": 2,
+      "buffer_size": 8,
+      "caller_buffer_count": 4,
+      "caller_buffer_size": 8,
+      "normalized": [
+        "creatorToken",
+        "endpoints[0].token"
+      ],
+      "creator": {
+        "result": "",
+        "error": "ErrLinkBusy",
+        "writes": "none"
+      },
+      "opener": {
+        "result": "",
+        "error": "ErrInvalidSize",
+        "writes": "none"
+      },
+      "inmemory": {
+        "result": "",
+        "error": "ErrInvalidSize",
+        "writes": "none"
+      }
+    },
+    {
+      "id": "geometry-mismatch-count",
+      "title": "Ready, primary live and secondary free; the attach calls use bufferCount 4",
+      "page_size": 16384,
+      "recorded_page_size": 16384,
+      "file": "images/16384/geometry-mismatch-count.bin",
+      "file_bytes": 16384,
+      "full": false,
+      "segment_bytes": 81920,
+      "buffer_count": 2,
+      "buffer_size": 8,
+      "caller_buffer_count": 4,
+      "caller_buffer_size": 8,
+      "normalized": [
+        "creatorToken",
+        "endpoints[0].token"
+      ],
+      "creator": {
+        "result": "",
+        "error": "ErrLinkBusy",
+        "writes": "none"
+      },
+      "opener": {
+        "result": "",
+        "error": "ErrInvalidSize",
+        "writes": "none"
+      },
+      "inmemory": {
+        "result": "",
+        "error": "ErrInvalidSize",
+        "writes": "none"
+      }
+    },
+    {
+      "id": "geometry-mismatch-size",
+      "title": "Ready, primary live and secondary free; the attach calls use bufferSize 16",
+      "page_size": 4096,
+      "recorded_page_size": 4096,
+      "file": "images/4096/geometry-mismatch-size.bin",
+      "file_bytes": 4096,
+      "full": false,
+      "segment_bytes": 20480,
+      "buffer_count": 2,
+      "buffer_size": 8,
+      "caller_buffer_count": 2,
+      "caller_buffer_size": 16,
+      "normalized": [
+        "creatorToken",
+        "endpoints[0].token"
+      ],
+      "creator": {
+        "result": "",
+        "error": "ErrLinkBusy",
+        "writes": "none"
+      },
+      "opener": {
+        "result": "",
+        "error": "ErrInvalidSize",
+        "writes": "none"
+      },
+      "inmemory": {
+        "result": "",
+        "error": "ErrInvalidSize",
+        "writes": "none"
+      }
+    },
+    {
+      "id": "geometry-mismatch-size",
+      "title": "Ready, primary live and secondary free; the attach calls use bufferSize 16",
+      "page_size": 16384,
+      "recorded_page_size": 16384,
+      "file": "images/16384/geometry-mismatch-size.bin",
+      "file_bytes": 16384,
+      "full": false,
+      "segment_bytes": 81920,
+      "buffer_count": 2,
+      "buffer_size": 8,
+      "caller_buffer_count": 2,
+      "caller_buffer_size": 16,
+      "normalized": [
+        "creatorToken",
+        "endpoints[0].token"
+      ],
+      "creator": {
+        "result": "",
+        "error": "ErrLinkBusy",
+        "writes": "none"
+      },
+      "opener": {
+        "result": "",
+        "error": "ErrInvalidSize",
+        "writes": "none"
+      },
+      "inmemory": {
+        "result": "",
+        "error": "ErrInvalidSize",
+        "writes": "none"
+      }
+    },
+    {
+      "id": "ready-recorded-page-65536",
+      "title": "Ready, primary live and secondary free, recorded page size 65536 (never the host page below 64 KiB)",
+      "page_size": 16384,
+      "recorded_page_size": 65536,
+      "file": "images/16384/ready-recorded-page-65536.bin",
+      "file_bytes": 16384,
+      "full": false,
+      "segment_bytes": 81920,
+      "buffer_count": 2,
+      "buffer_size": 8,
+      "caller_buffer_count": 2,
+      "caller_buffer_size": 8,
+      "normalized": [
+        "creatorToken",
+        "endpoints[0].token"
+      ],
+      "creator": {
+        "result": "",
+        "error": "ErrLinkBusy",
+        "writes": "none"
+      },
+      "opener": {
+        "result": "",
+        "error": "ErrInvalidSize",
+        "writes": "none"
+      },
+      "inmemory": {
+        "result": "",
+        "error": "ErrInvalidSize",
+        "writes": "none"
+      }
+    }
+  ],
+  "rings": [
+    {
+      "id": "formatted-empty",
+      "title": "Both rings formatted and empty; one write fits ring 1",
+      "page_size": 4096,
+      "file": "rings/4096/formatted-empty.bin",
+      "buffer_count": 4,
+      "buffer_size": 16,
+      "seed": 24301,
+      "ring0": {
+        "r": "0x0",
+        "w": "0x0",
+        "published": []
+      },
+      "ring1": {
+        "r": "0x0",
+        "w": "0x0",
+        "published": []
+      },
+      "dequeue": [
+        {
+          "kind": "empty"
+        }
+      ],
+      "write": [
+        {
+          "kind": "written",
+          "n": 16
+        }
+      ]
+    },
+    {
+      "id": "formatted-empty",
+      "title": "Both rings formatted and empty; one write fits ring 1",
+      "page_size": 16384,
+      "file": "rings/16384/formatted-empty.bin",
+      "buffer_count": 4,
+      "buffer_size": 16,
+      "seed": 24301,
+      "ring0": {
+        "r": "0x0",
+        "w": "0x0",
+        "published": []
+      },
+      "ring1": {
+        "r": "0x0",
+        "w": "0x0",
+        "published": []
+      },
+      "dequeue": [
+        {
+          "kind": "empty"
+        }
+      ],
+      "write": [
+        {
+          "kind": "written",
+          "n": 16
+        }
+      ]
+    },
+    {
+      "id": "wrapped",
+      "title": "Cursors past three laps: r = 12, w = 15 with N = 4 (SPEC 7.4 slot sequences)",
+      "page_size": 4096,
+      "file": "rings/4096/wrapped.bin",
+      "buffer_count": 4,
+      "buffer_size": 16,
+      "seed": 24301,
+      "ring0": {
+        "r": "0xc",
+        "w": "0xf",
+        "published": [
+          "0xc",
+          "0xd",
+          "0xe"
+        ]
+      },
+      "ring1": {
+        "r": "0x0",
+        "w": "0x0",
+        "published": []
+      },
+      "dequeue": [
+        {
+          "kind": "message",
+          "hex": "0c000000000000001b376610dd20bb6b"
+        },
+        {
+          "kind": "message",
+          "hex": "0d000000000000008d51e62bc272ff59"
+        },
+        {
+          "kind": "message",
+          "hex": "0e00000000000000113c16a4283562c8"
+        },
+        {
+          "kind": "empty"
+        }
+      ]
+    },
+    {
+      "id": "wrapped",
+      "title": "Cursors past three laps: r = 12, w = 15 with N = 4 (SPEC 7.4 slot sequences)",
+      "page_size": 16384,
+      "file": "rings/16384/wrapped.bin",
+      "buffer_count": 4,
+      "buffer_size": 16,
+      "seed": 24301,
+      "ring0": {
+        "r": "0xc",
+        "w": "0xf",
+        "published": [
+          "0xc",
+          "0xd",
+          "0xe"
+        ]
+      },
+      "ring1": {
+        "r": "0x0",
+        "w": "0x0",
+        "published": []
+      },
+      "dequeue": [
+        {
+          "kind": "message",
+          "hex": "0c000000000000001b376610dd20bb6b"
+        },
+        {
+          "kind": "message",
+          "hex": "0d000000000000008d51e62bc272ff59"
+        },
+        {
+          "kind": "message",
+          "hex": "0e00000000000000113c16a4283562c8"
+        },
+        {
+          "kind": "empty"
+        }
+      ]
+    },
+    {
+      "id": "wrapped-2pow64",
+      "title": "Positions near 2^64: r = 2^64-2, w = 1 (modulo arithmetic), published M-2, M-1, 0",
+      "page_size": 4096,
+      "file": "rings/4096/wrapped-2pow64.bin",
+      "buffer_count": 4,
+      "buffer_size": 16,
+      "seed": 24301,
+      "ring0": {
+        "r": "0xfffffffffffffffe",
+        "w": "0x1",
+        "published": [
+          "0xfffffffffffffffe",
+          "0xffffffffffffffff",
+          "0x0"
+        ]
+      },
+      "ring1": {
+        "r": "0x0",
+        "w": "0x0",
+        "published": []
+      },
+      "dequeue": [
+        {
+          "kind": "message",
+          "hex": "feffffffffffffff3a146aa7f4cf8251"
+        },
+        {
+          "kind": "message",
+          "hex": "ffffffffffffffff593ea648406f40ab"
+        },
+        {
+          "kind": "message",
+          "hex": "000000000000000039d048e8b4a9f003"
+        },
+        {
+          "kind": "empty"
+        }
+      ]
+    },
+    {
+      "id": "wrapped-2pow64",
+      "title": "Positions near 2^64: r = 2^64-2, w = 1 (modulo arithmetic), published M-2, M-1, 0",
+      "page_size": 16384,
+      "file": "rings/16384/wrapped-2pow64.bin",
+      "buffer_count": 4,
+      "buffer_size": 16,
+      "seed": 24301,
+      "ring0": {
+        "r": "0xfffffffffffffffe",
+        "w": "0x1",
+        "published": [
+          "0xfffffffffffffffe",
+          "0xffffffffffffffff",
+          "0x0"
+        ]
+      },
+      "ring1": {
+        "r": "0x0",
+        "w": "0x0",
+        "published": []
+      },
+      "dequeue": [
+        {
+          "kind": "message",
+          "hex": "feffffffffffffff3a146aa7f4cf8251"
+        },
+        {
+          "kind": "message",
+          "hex": "ffffffffffffffff593ea648406f40ab"
+        },
+        {
+          "kind": "message",
+          "hex": "000000000000000039d048e8b4a9f003"
+        },
+        {
+          "kind": "empty"
+        }
+      ]
+    },
+    {
+      "id": "empty-at-2pow64",
+      "title": "Empty rings with r = w = 2^64-2; each slot's sequence is the first position of the next lap that maps to it; ring 1 accepts a write across the wrap",
+      "page_size": 4096,
+      "file": "rings/4096/empty-at-2pow64.bin",
+      "buffer_count": 4,
+      "buffer_size": 16,
+      "seed": 24301,
+      "ring0": {
+        "r": "0xfffffffffffffffe",
+        "w": "0xfffffffffffffffe",
+        "published": []
+      },
+      "ring1": {
+        "r": "0xfffffffffffffffe",
+        "w": "0xfffffffffffffffe",
+        "published": []
+      },
+      "dequeue": [
+        {
+          "kind": "empty"
+        }
+      ],
+      "write": [
+        {
+          "kind": "written",
+          "n": 16
+        }
+      ]
+    },
+    {
+      "id": "empty-at-2pow64",
+      "title": "Empty rings with r = w = 2^64-2; each slot's sequence is the first position of the next lap that maps to it; ring 1 accepts a write across the wrap",
+      "page_size": 16384,
+      "file": "rings/16384/empty-at-2pow64.bin",
+      "buffer_count": 4,
+      "buffer_size": 16,
+      "seed": 24301,
+      "ring0": {
+        "r": "0xfffffffffffffffe",
+        "w": "0xfffffffffffffffe",
+        "published": []
+      },
+      "ring1": {
+        "r": "0xfffffffffffffffe",
+        "w": "0xfffffffffffffffe",
+        "published": []
+      },
+      "dequeue": [
+        {
+          "kind": "empty"
+        }
+      ],
+      "write": [
+        {
+          "kind": "written",
+          "n": 16
+        }
+      ]
+    },
+    {
+      "id": "full",
+      "title": "Ring 1 full (two published, not yet released): a Secondary Write times out",
+      "page_size": 4096,
+      "file": "rings/4096/full.bin",
+      "buffer_count": 2,
+      "buffer_size": 8,
+      "seed": 24301,
+      "ring0": {
+        "r": "0x0",
+        "w": "0x0",
+        "published": []
+      },
+      "ring1": {
+        "r": "0x0",
+        "w": "0x2",
+        "published": [
+          "0x0",
+          "0x1"
+        ]
+      },
+      "dequeue": [
+        {
+          "kind": "empty"
+        }
+      ],
+      "write": [
+        {
+          "kind": "error",
+          "error": "ErrTimeout"
+        }
+      ]
+    },
+    {
+      "id": "full",
+      "title": "Ring 1 full (two published, not yet released): a Secondary Write times out",
+      "page_size": 16384,
+      "file": "rings/16384/full.bin",
+      "buffer_count": 2,
+      "buffer_size": 8,
+      "seed": 24301,
+      "ring0": {
+        "r": "0x0",
+        "w": "0x0",
+        "published": []
+      },
+      "ring1": {
+        "r": "0x0",
+        "w": "0x2",
+        "published": [
+          "0x0",
+          "0x1"
+        ]
+      },
+      "dequeue": [
+        {
+          "kind": "empty"
+        }
+      ],
+      "write": [
+        {
+          "kind": "error",
+          "error": "ErrTimeout"
+        }
+      ]
+    },
+    {
+      "id": "half-published",
+      "title": "Ring 0: position 2 claimed but not published (w advanced, seq unchanged)",
+      "page_size": 4096,
+      "file": "rings/4096/half-published.bin",
+      "buffer_count": 4,
+      "buffer_size": 16,
+      "seed": 24301,
+      "ring0": {
+        "r": "0x0",
+        "w": "0x3",
+        "published": [
+          "0x0",
+          "0x1"
+        ],
+        "claimed": [
+          "0x2"
+        ]
+      },
+      "ring1": {
+        "r": "0x0",
+        "w": "0x0",
+        "published": []
+      },
+      "dequeue": [
+        {
+          "kind": "message",
+          "hex": "000000000000000039d048e8b4a9f003"
+        },
+        {
+          "kind": "message",
+          "hex": "0100000000000000c8d44124f704a467"
+        },
+        {
+          "kind": "empty"
+        }
+      ]
+    },
+    {
+      "id": "half-published",
+      "title": "Ring 0: position 2 claimed but not published (w advanced, seq unchanged)",
+      "page_size": 16384,
+      "file": "rings/16384/half-published.bin",
+      "buffer_count": 4,
+      "buffer_size": 16,
+      "seed": 24301,
+      "ring0": {
+        "r": "0x0",
+        "w": "0x3",
+        "published": [
+          "0x0",
+          "0x1"
+        ],
+        "claimed": [
+          "0x2"
+        ]
+      },
+      "ring1": {
+        "r": "0x0",
+        "w": "0x0",
+        "published": []
+      },
+      "dequeue": [
+        {
+          "kind": "message",
+          "hex": "000000000000000039d048e8b4a9f003"
+        },
+        {
+          "kind": "message",
+          "hex": "0100000000000000c8d44124f704a467"
+        },
+        {
+          "kind": "empty"
+        }
+      ]
+    }
+  ],
+  "advanced_frames": [
+    {
+      "id": "G10-01",
+      "title": "single chunk data message",
+      "target": "recv",
+      "frames": [
+        {
+          "op": "OpProtoNegotiate",
+          "operands": [
+            257,
+            15,
+            0
+          ],
+          "packet": "050000000000000001010000000000000f0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+        },
+        {
+          "op": "OpConnCopy",
+          "operands": [
+            0,
+            1,
+            5,
+            0,
+            5,
+            3,
+            0
+          ],
+          "payload": "68656c6c6f",
+          "packet": "04000000000000000000000000000000010000000000000005000000000000000000000000000000050000000000000003000000000000000000000000000000"
+        }
+      ],
+      "effect": "deliver",
+      "deliver": [
+        {
+          "kind": "data",
+          "payload": "68656c6c6f"
+        }
+      ],
+      "sentinel": true,
+      "ack_features": 15
+    },
+    {
+      "id": "G10-02",
+      "title": "zero-length message (TotalSize 0, Begin|End only)",
+      "target": "recv",
+      "frames": [
+        {
+          "op": "OpProtoNegotiate",
+          "operands": [
+            257,
+            15,
+            0
+          ],
+          "packet": "050000000000000001010000000000000f0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+        },
+        {
+          "op": "OpConnCopy",
+          "operands": [
+            0,
+            1,
+            0,
+            0,
+            0,
+            3,
+            0
+          ],
+          "packet": "04000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000003000000000000000000000000000000"
+        }
+      ],
+      "effect": "deliver",
+      "deliver": [
+        {
+          "kind": "data",
+          "payload": ""
+        }
+      ],
+      "sentinel": true,
+      "ack_features": 15
+    },
+    {
+      "id": "G10-03",
+      "title": "two chunks (SPEC 10.4 chunking)",
+      "target": "recv",
+      "frames": [
+        {
+          "op": "OpProtoNegotiate",
+          "operands": [
+            257,
+            15,
+            0
+          ],
+          "packet": "050000000000000001010000000000000f0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+        },
+        {
+          "op": "OpConnCopy",
+          "operands": [
+            0,
+            2,
+            12,
+            0,
+            8,
+            1,
+            0
+          ],
+          "payload": "6162636465666768",
+          "packet": "0400000000000000000000000000000002000000000000000c000000000000000000000000000000080000000000000001000000000000000000000000000000"
+        },
+        {
+          "op": "OpConnCopy",
+          "operands": [
+            0,
+            2,
+            12,
+            8,
+            4,
+            2,
+            0
+          ],
+          "payload": "696a6b6c",
+          "packet": "0400000000000000000000000000000002000000000000000c000000000000000800000000000000040000000000000002000000000000000000000000000000"
+        }
+      ],
+      "effect": "deliver",
+      "deliver": [
+        {
+          "kind": "data",
+          "payload": "6162636465666768696a6b6c"
+        }
+      ],
+      "sentinel": true,
+      "ack_features": 15
+    },
+    {
+      "id": "G10-04",
+      "title": "three chunks, middle chunk without flags",
+      "target": "recv",
+      "frames": [
+        {
+          "op": "OpProtoNegotiate",
+          "operands": [
+            257,
+            15,
+            0
+          ],
+          "packet": "050000000000000001010000000000000f0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+        },
+        {
+          "op": "OpConnCopy",
+          "operands": [
+            0,
+            3,
+            10,
+            0,
+            4,
+            1,
+            0
+          ],
+          "payload": "30313233",
+          "packet": "0400000000000000000000000000000003000000000000000a000000000000000000000000000000040000000000000001000000000000000000000000000000"
+        },
+        {
+          "op": "OpConnCopy",
+          "operands": [
+            0,
+            3,
+            10,
+            4,
+            4,
+            0,
+            0
+          ],
+          "payload": "34353637",
+          "packet": "0400000000000000000000000000000003000000000000000a000000000000000400000000000000040000000000000000000000000000000000000000000000"
+        },
+        {
+          "op": "OpConnCopy",
+          "operands": [
+            0,
+            3,
+            10,
+            8,
+            2,
+            2,
+            0
+          ],
+          "payload": "3839",
+          "packet": "0400000000000000000000000000000003000000000000000a000000000000000800000000000000020000000000000002000000000000000000000000000000"
+        }
+      ],
+      "effect": "deliver",
+      "deliver": [
+        {
+          "kind": "data",
+          "payload": "30313233343536373839"
+        }
+      ],
+      "sentinel": true,
+      "ack_features": 15
+    },
+    {
+      "id": "G10-05",
+      "title": "abort after the first chunk: partial data dropped silently",
+      "target": "recv",
+      "frames": [
+        {
+          "op": "OpProtoNegotiate",
+          "operands": [
+            257,
+            15,
+            0
+          ],
+          "packet": "050000000000000001010000000000000f0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+        },
+        {
+          "op": "OpConnCopy",
+          "operands": [
+            0,
+            4,
+            8,
+            0,
+            4,
+            1,
+            0
+          ],
+          "payload": "61626364",
+          "packet": "04000000000000000000000000000000040000000000000008000000000000000000000000000000040000000000000001000000000000000000000000000000"
+        },
+        {
+          "op": "OpConnCopy",
+          "operands": [
+            0,
+            4,
+            0,
+            0,
+            0,
+            4,
+            0
+          ],
+          "packet": "04000000000000000000000000000000040000000000000000000000000000000000000000000000000000000000000004000000000000000000000000000000"
+        }
+      ],
+      "effect": "drop",
+      "sentinel": true,
+      "ack_features": 15
+    },
+    {
+      "id": "G10-06",
+      "title": "abort frame accepted whatever the other operands are (SPEC 10.5 step 2)",
+      "target": "recv",
+      "frames": [
+        {
+          "op": "OpProtoNegotiate",
+          "operands": [
+            257,
+            15,
+            0
+          ],
+          "packet": "050000000000000001010000000000000f0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+        },
+        {
+          "op": "OpConnCopy",
+          "operands": [
+            0,
+            5,
+            99,
+            7,
+            3,
+            7,
+            3
+          ],
+          "packet": "04000000000000000000000000000000050000000000000063000000000000000700000000000000030000000000000007000000000000000300000000000000"
+        }
+      ],
+      "effect": "drop",
+      "sentinel": true,
+      "ack_features": 15
+    },
+    {
+      "id": "G10-07",
+      "title": "abort of a response: the waiting call fails, the path survives",
+      "target": "call",
+      "frames": [
+        {
+          "op": "OpProtoNegotiate",
+          "operands": [
+            257,
+            15,
+            0
+          ],
+          "packet": "050000000000000001010000000000000f0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+        },
+        {
+          "op": "OpConnCopy",
+          "operands": [
+            0,
+            1,
+            8,
+            0,
+            4,
+            17,
+            0
+          ],
+          "payload": "61626364",
+          "packet": "04000000000000000000000000000000010000000000000008000000000000000000000000000000040000000000000011000000000000000000000000000000"
+        },
+        {
+          "op": "OpConnCopy",
+          "operands": [
+            0,
+            1,
+            0,
+            0,
+            0,
+            20,
+            0
+          ],
+          "packet": "04000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000014000000000000000000000000000000"
+        }
+      ],
+      "effect": "fail",
+      "fail_scope": "call",
+      "error": "ErrMessageAborted",
+      "sentinel": true,
+      "ack_features": 15
+    },
+    {
+      "id": "G10-08",
+      "title": "request with metadata block in one chunk (budget, caller, trace; SPEC PROTOCOL_1_1 3.3)",
+      "target": "serve",
+      "frames": [
+        {
+          "op": "OpProtoNegotiate",
+          "operands": [
+            257,
+            15,
+            0
+          ],
+          "packet": "050000000000000001010000000000000f0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+        },
+        {
+          "op": "OpConnCopy",
+          "operands": [
+            0,
+            1,
+            45,
+            0,
+            45,
+            75,
+            9
+          ],
+          "payload": "26000000010800f2052a0100000002088877665544332211031001000000000000000000000000000000616263",
+          "packet": "0400000000000000000000000000000001000000000000002d0000000000000000000000000000002d000000000000004b000000000000000900000000000000"
+        }
+      ],
+      "effect": "deliver",
+      "deliver": [
+        {
+          "kind": "request",
+          "payload": "616263",
+          "method": 9,
+          "caller": 1234605616436508552,
+          "trace": "01000000000000000000000000000000"
+        }
+      ],
+      "sentinel": true,
+      "ack_features": 15
+    },
+    {
+      "id": "G10-09",
+      "title": "request with metadata block split over two chunks",
+      "target": "serve",
+      "frames": [
+        {
+          "op": "OpProtoNegotiate",
+          "operands": [
+            257,
+            15,
+            0
+          ],
+          "packet": "050000000000000001010000000000000f0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+        },
+        {
+          "op": "OpConnCopy",
+          "operands": [
+            0,
+            1,
+            45,
+            0,
+            32,
+            73,
+            9
+          ],
+          "payload": "26000000010800f2052a01000000020888776655443322110310010000000000",
+          "packet": "0400000000000000000000000000000001000000000000002d000000000000000000000000000000200000000000000049000000000000000900000000000000"
+        },
+        {
+          "op": "OpConnCopy",
+          "operands": [
+            0,
+            1,
+            45,
+            32,
+            13,
+            74,
+            0
+          ],
+          "payload": "00000000000000000000616263",
+          "packet": "0400000000000000000000000000000001000000000000002d0000000000000020000000000000000d000000000000004a000000000000000000000000000000"
+        }
+      ],
+      "effect": "deliver",
+      "deliver": [
+        {
+          "kind": "request",
+          "payload": "616263",
+          "method": 9,
+          "caller": 1234605616436508552,
+          "trace": "01000000000000000000000000000000"
+        }
+      ],
+      "sentinel": true,
+      "ack_features": 15
+    },
+    {
+      "id": "G10-10",
+      "title": "metadata flag on a data message (only requests may carry it)",
+      "target": "recv",
+      "frames": [
+        {
+          "op": "OpProtoNegotiate",
+          "operands": [
+            257,
+            15,
+            0
+          ],
+          "packet": "050000000000000001010000000000000f0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+        },
+        {
+          "op": "OpConnCopy",
+          "operands": [
+            0,
+            1,
+            5,
+            0,
+            5,
+            67,
+            0
+          ],
+          "payload": "68656c6c6f",
+          "packet": "04000000000000000000000000000000010000000000000005000000000000000000000000000000050000000000000043000000000000000000000000000000"
+        }
+      ],
+      "effect": "fail",
+      "fail_scope": "path",
+      "error": "ErrProtocol",
+      "sentinel": false,
+      "ack_features": 15
+    },
+    {
+      "id": "G10-11",
+      "title": "metadata on a request while FeatureMetadata is not negotiated",
+      "target": "serve",
+      "frames": [
+        {
+          "op": "OpProtoNegotiate",
+          "operands": [
+            257,
+            7,
+            0
+          ],
+          "packet": "05000000000000000101000000000000070000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+        },
+        {
+          "op": "OpConnCopy",
+          "operands": [
+            0,
+            1,
+            45,
+            0,
+            45,
+            75,
+            9
+          ],
+          "payload": "26000000010800f2052a0100000002088877665544332211031001000000000000000000000000000000616263",
+          "packet": "0400000000000000000000000000000001000000000000002d0000000000000000000000000000002d000000000000004b000000000000000900000000000000"
+        }
+      ],
+      "effect": "fail",
+      "fail_scope": "path",
+      "error": "ErrProtocol",
+      "sentinel": false,
+      "ack_features": 7
+    },
+    {
+      "id": "G10-12",
+      "title": "metadata block longer than the message (tlvLen 32, 14 bytes)",
+      "target": "serve",
+      "frames": [
+        {
+          "op": "OpProtoNegotiate",
+          "operands": [
+            257,
+            15,
+            0
+          ],
+          "packet": "050000000000000001010000000000000f0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+        },
+        {
+          "op": "OpConnCopy",
+          "operands": [
+            0,
+            1,
+            14,
+            0,
+            14,
+            75,
+            9
+          ],
+          "payload": "20000000010800f2052a01000000",
+          "packet": "0400000000000000000000000000000001000000000000000e0000000000000000000000000000000e000000000000004b000000000000000900000000000000"
+        }
+      ],
+      "effect": "fail",
+      "fail_scope": "path",
+      "error": "ErrProtocol",
+      "sentinel": false,
+      "ack_features": 15
+    },
+    {
+      "id": "G10-13",
+      "title": "known metadata tag with the wrong length (budget of 4 bytes)",
+      "target": "serve",
+      "frames": [
+        {
+          "op": "OpProtoNegotiate",
+          "operands": [
+            257,
+            15,
+            0
+          ],
+          "packet": "050000000000000001010000000000000f0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+        },
+        {
+          "op": "OpConnCopy",
+          "operands": [
+            0,
+            1,
+            10,
+            0,
+            10,
+            75,
+            9
+          ],
+          "payload": "06000000010401020304",
+          "packet": "0400000000000000000000000000000001000000000000000a0000000000000000000000000000000a000000000000004b000000000000000900000000000000"
+        }
+      ],
+      "effect": "fail",
+      "fail_scope": "path",
+      "error": "ErrProtocol",
+      "sentinel": false,
+      "ack_features": 15
+    },
+    {
+      "id": "G10-14",
+      "title": "metadata TLV overruns tlvLen (budget tag of 8 bytes in 3 bytes)",
+      "target": "serve",
+      "frames": [
+        {
+          "op": "OpProtoNegotiate",
+          "operands": [
+            257,
+            15,
+            0
+          ],
+          "packet": "050000000000000001010000000000000f0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+        },
+        {
+          "op": "OpConnCopy",
+          "operands": [
+            0,
+            1,
+            7,
+            0,
+            7,
+            75,
+            9
+          ],
+          "payload": "03000000010800",
+          "packet": "0400000000000000000000000000000001000000000000000700000000000000000000000000000007000000000000004b000000000000000900000000000000"
+        }
+      ],
+      "effect": "fail",
+      "fail_scope": "path",
+      "error": "ErrProtocol",
+      "sentinel": false,
+      "ack_features": 15
+    },
+    {
+      "id": "G10-15",
+      "title": "unknown metadata tag is skipped (caller ID after it, user payload ok)",
+      "target": "serve",
+      "frames": [
+        {
+          "op": "OpProtoNegotiate",
+          "operands": [
+            257,
+            15,
+            0
+          ],
+          "packet": "050000000000000001010000000000000f0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+        },
+        {
+          "op": "OpConnCopy",
+          "operands": [
+            0,
+            1,
+            20,
+            0,
+            20,
+            75,
+            9
+          ],
+          "payload": "0e0000007f02aabb020888776655443322116f6b",
+          "packet": "0400000000000000000000000000000001000000000000001400000000000000000000000000000014000000000000004b000000000000000900000000000000"
+        }
+      ],
+      "effect": "deliver",
+      "deliver": [
+        {
+          "kind": "request",
+          "payload": "6f6b",
+          "method": 9,
+          "caller": 1234605616436508552
+        }
+      ],
+      "sentinel": true,
+      "ack_features": 15
+    },
+    {
+      "id": "G10-16",
+      "title": "metadata block shorter than its 4-byte header",
+      "target": "serve",
+      "frames": [
+        {
+          "op": "OpProtoNegotiate",
+          "operands": [
+            257,
+            15,
+            0
+          ],
+          "packet": "050000000000000001010000000000000f0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+        },
+        {
+          "op": "OpConnCopy",
+          "operands": [
+            0,
+            1,
+            2,
+            0,
+            2,
+            75,
+            9
+          ],
+          "payload": "6162",
+          "packet": "0400000000000000000000000000000001000000000000000200000000000000000000000000000002000000000000004b000000000000000900000000000000"
+        }
+      ],
+      "effect": "fail",
+      "fail_scope": "path",
+      "error": "ErrProtocol",
+      "sentinel": false,
+      "ack_features": 15
+    },
+    {
+      "id": "G10-17",
+      "title": "flag bit above the known set (0x80)",
+      "target": "recv",
+      "frames": [
+        {
+          "op": "OpProtoNegotiate",
+          "operands": [
+            257,
+            15,
+            0
+          ],
+          "packet": "050000000000000001010000000000000f0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+        },
+        {
+          "op": "OpConnCopy",
+          "operands": [
+            0,
+            1,
+            2,
+            0,
+            2,
+            131,
+            0
+          ],
+          "payload": "6869",
+          "packet": "04000000000000000000000000000000010000000000000002000000000000000000000000000000020000000000000083000000000000000000000000000000"
+        }
+      ],
+      "effect": "fail",
+      "fail_scope": "path",
+      "error": "ErrProtocol",
+      "sentinel": false,
+      "ack_features": 15
+    },
+    {
+      "id": "G10-18",
+      "title": "Request and Response together (SPEC 10.5 step 1)",
+      "target": "recv",
+      "frames": [
+        {
+          "op": "OpProtoNegotiate",
+          "operands": [
+            257,
+            15,
+            0
+          ],
+          "packet": "050000000000000001010000000000000f0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+        },
+        {
+          "op": "OpConnCopy",
+          "operands": [
+            0,
+            1,
+            2,
+            0,
+            2,
+            27,
+            0
+          ],
+          "payload": "6869",
+          "packet": "0400000000000000000000000000000001000000000000000200000000000000000000000000000002000000000000001b000000000000000000000000000000"
+        }
+      ],
+      "effect": "fail",
+      "fail_scope": "path",
+      "error": "ErrProtocol",
+      "sentinel": false,
+      "ack_features": 15
+    },
+    {
+      "id": "G10-19",
+      "title": "Error without Response (SPEC 10.5 step 1)",
+      "target": "recv",
+      "frames": [
+        {
+          "op": "OpProtoNegotiate",
+          "operands": [
+            257,
+            15,
+            0
+          ],
+          "packet": "050000000000000001010000000000000f0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+        },
+        {
+          "op": "OpConnCopy",
+          "operands": [
+            0,
+            1,
+            2,
+            0,
+            2,
+            35,
+            0
+          ],
+          "payload": "6869",
+          "packet": "04000000000000000000000000000000010000000000000002000000000000000000000000000000020000000000000023000000000000000000000000000000"
+        }
+      ],
+      "effect": "fail",
+      "fail_scope": "path",
+      "error": "ErrProtocol",
+      "sentinel": false,
+      "ack_features": 15
+    },
+    {
+      "id": "G10-20",
+      "title": "response success: delivered to the waiting call",
+      "target": "call",
+      "frames": [
+        {
+          "op": "OpProtoNegotiate",
+          "operands": [
+            257,
+            15,
+            0
+          ],
+          "packet": "050000000000000001010000000000000f0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+        },
+        {
+          "op": "OpConnCopy",
+          "operands": [
+            0,
+            1,
+            4,
+            0,
+            4,
+            19,
+            0
+          ],
+          "payload": "706f6e67",
+          "packet": "04000000000000000000000000000000010000000000000004000000000000000000000000000000040000000000000013000000000000000000000000000000"
+        }
+      ],
+      "effect": "deliver",
+      "deliver": [
+        {
+          "kind": "response",
+          "payload": "706f6e67"
+        }
+      ],
+      "sentinel": true,
+      "ack_features": 15
+    },
+    {
+      "id": "G10-21",
+      "title": "error response: the call fails with ResponseError{Status 42, Payload}",
+      "target": "call",
+      "frames": [
+        {
+          "op": "OpProtoNegotiate",
+          "operands": [
+            257,
+            15,
+            0
+          ],
+          "packet": "050000000000000001010000000000000f0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+        },
+        {
+          "op": "OpConnCopy",
+          "operands": [
+            0,
+            1,
+            4,
+            0,
+            4,
+            51,
+            42
+          ],
+          "payload": "626f6f6d",
+          "packet": "04000000000000000000000000000000010000000000000004000000000000000000000000000000040000000000000033000000000000002a00000000000000"
+        }
+      ],
+      "effect": "fail",
+      "fail_scope": "call",
+      "error": "ResponseError",
+      "sentinel": true,
+      "ack_features": 15
+    },
+    {
+      "id": "G10-22",
+      "title": "TotalSize 0 with ChunkOffset != 0 (SPEC 10.5 step 3)",
+      "target": "recv",
+      "frames": [
+        {
+          "op": "OpProtoNegotiate",
+          "operands": [
+            257,
+            15,
+            0
+          ],
+          "packet": "050000000000000001010000000000000f0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+        },
+        {
+          "op": "OpConnCopy",
+          "operands": [
+            0,
+            6,
+            0,
+            1,
+            0,
+            3,
+            0
+          ],
+          "packet": "04000000000000000000000000000000060000000000000000000000000000000100000000000000000000000000000003000000000000000000000000000000"
+        }
+      ],
+      "effect": "fail",
+      "fail_scope": "path",
+      "error": "ErrInvalidSize",
+      "sentinel": false,
+      "ack_features": 15
+    },
+    {
+      "id": "G10-23",
+      "title": "TotalSize 0 without Begin|End",
+      "target": "recv",
+      "frames": [
+        {
+          "op": "OpProtoNegotiate",
+          "operands": [
+            257,
+            15,
+            0
+          ],
+          "packet": "050000000000000001010000000000000f0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+        },
+        {
+          "op": "OpConnCopy",
+          "operands": [
+            0,
+            6,
+            0,
+            0,
+            0,
+            1,
+            0
+          ],
+          "packet": "04000000000000000000000000000000060000000000000000000000000000000000000000000000000000000000000001000000000000000000000000000000"
+        }
+      ],
+      "effect": "fail",
+      "fail_scope": "path",
+      "error": "ErrInvalidSize",
+      "sentinel": false,
+      "ack_features": 15
+    },
+    {
+      "id": "G10-24",
+      "title": "TotalSize \u003e 0 with ChunkSize 0",
+      "target": "recv",
+      "frames": [
+        {
+          "op": "OpProtoNegotiate",
+          "operands": [
+            257,
+            15,
+            0
+          ],
+          "packet": "050000000000000001010000000000000f0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+        },
+        {
+          "op": "OpConnCopy",
+          "operands": [
+            0,
+            6,
+            4,
+            0,
+            0,
+            1,
+            0
+          ],
+          "packet": "04000000000000000000000000000000060000000000000004000000000000000000000000000000000000000000000001000000000000000000000000000000"
+        }
+      ],
+      "effect": "fail",
+      "fail_scope": "path",
+      "error": "ErrInvalidSize",
+      "sentinel": false,
+      "ack_features": 15
+    },
+    {
+      "id": "G10-25",
+      "title": "ChunkSize larger than the buffer (64 bytes)",
+      "target": "recv",
+      "frames": [
+        {
+          "op": "OpProtoNegotiate",
+          "operands": [
+            257,
+            15,
+            0
+          ],
+          "packet": "050000000000000001010000000000000f0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+        },
+        {
+          "op": "OpConnCopy",
+          "operands": [
+            0,
+            6,
+            65,
+            0,
+            65,
+            3,
+            0
+          ],
+          "payload": "78787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878",
+          "packet": "04000000000000000000000000000000060000000000000041000000000000000000000000000000410000000000000003000000000000000000000000000000"
+        }
+      ],
+      "effect": "fail",
+      "fail_scope": "path",
+      "error": "ErrInvalidSize",
+      "sentinel": false,
+      "ack_features": 15
+    },
+    {
+      "id": "G10-26",
+      "title": "ChunkOffset beyond TotalSize",
+      "target": "recv",
+      "frames": [
+        {
+          "op": "OpProtoNegotiate",
+          "operands": [
+            257,
+            15,
+            0
+          ],
+          "packet": "050000000000000001010000000000000f0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+        },
+        {
+          "op": "OpConnCopy",
+          "operands": [
+            0,
+            6,
+            4,
+            6,
+            1,
+            1,
+            0
+          ],
+          "payload": "78",
+          "packet": "04000000000000000000000000000000060000000000000004000000000000000600000000000000010000000000000001000000000000000000000000000000"
+        }
+      ],
+      "effect": "fail",
+      "fail_scope": "path",
+      "error": "ErrInvalidSize",
+      "sentinel": false,
+      "ack_features": 15
+    },
+    {
+      "id": "G10-27",
+      "title": "TotalSize above MaxMessageSize (64 MiB)",
+      "target": "recv",
+      "frames": [
+        {
+          "op": "OpProtoNegotiate",
+          "operands": [
+            257,
+            15,
+            0
+          ],
+          "packet": "050000000000000001010000000000000f0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+        },
+        {
+          "op": "OpConnCopy",
+          "operands": [
+            0,
+            6,
+            67108865,
+            0,
+            8,
+            1,
+            0
+          ],
+          "payload": "7878787878787878",
+          "packet": "04000000000000000000000000000000060000000000000001000004000000000000000000000000080000000000000001000000000000000000000000000000"
+        }
+      ],
+      "effect": "fail",
+      "fail_scope": "path",
+      "error": "ErrBufferOverflow",
+      "sentinel": false,
+      "ack_features": 15
+    },
+    {
+      "id": "G10-28",
+      "title": "duplicate Begin of an assembling message",
+      "target": "recv",
+      "frames": [
+        {
+          "op": "OpProtoNegotiate",
+          "operands": [
+            257,
+            15,
+            0
+          ],
+          "packet": "050000000000000001010000000000000f0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+        },
+        {
+          "op": "OpConnCopy",
+          "operands": [
+            0,
+            7,
+            12,
+            0,
+            4,
+            1,
+            0
+          ],
+          "payload": "61626364",
+          "packet": "0400000000000000000000000000000007000000000000000c000000000000000000000000000000040000000000000001000000000000000000000000000000"
+        },
+        {
+          "op": "OpConnCopy",
+          "operands": [
+            0,
+            7,
+            12,
+            0,
+            4,
+            1,
+            0
+          ],
+          "payload": "61626364",
+          "packet": "0400000000000000000000000000000007000000000000000c000000000000000000000000000000040000000000000001000000000000000000000000000000"
+        }
+      ],
+      "effect": "fail",
+      "fail_scope": "path",
+      "error": "ErrInvalidSize",
+      "sentinel": false,
+      "ack_features": 15
+    },
+    {
+      "id": "G10-29",
+      "title": "continuation chunk without an assembly (SPEC 10.5 step 5)",
+      "target": "recv",
+      "frames": [
+        {
+          "op": "OpProtoNegotiate",
+          "operands": [
+            257,
+            15,
+            0
+          ],
+          "packet": "050000000000000001010000000000000f0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+        },
+        {
+          "op": "OpConnCopy",
+          "operands": [
+            0,
+            8,
+            8,
+            4,
+            4,
+            2,
+            0
+          ],
+          "payload": "65666768",
+          "packet": "04000000000000000000000000000000080000000000000008000000000000000400000000000000040000000000000002000000000000000000000000000000"
+        }
+      ],
+      "effect": "fail",
+      "fail_scope": "path",
+      "error": "ErrProtocol",
+      "sentinel": false,
+      "ack_features": 15
+    },
+    {
+      "id": "G10-30",
+      "title": "continuation offset differs from the bytes received",
+      "target": "recv",
+      "frames": [
+        {
+          "op": "OpProtoNegotiate",
+          "operands": [
+            257,
+            15,
+            0
+          ],
+          "packet": "050000000000000001010000000000000f0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+        },
+        {
+          "op": "OpConnCopy",
+          "operands": [
+            0,
+            9,
+            12,
+            0,
+            4,
+            1,
+            0
+          ],
+          "payload": "61626364",
+          "packet": "0400000000000000000000000000000009000000000000000c000000000000000000000000000000040000000000000001000000000000000000000000000000"
+        },
+        {
+          "op": "OpConnCopy",
+          "operands": [
+            0,
+            9,
+            12,
+            8,
+            4,
+            2,
+            0
+          ],
+          "payload": "696a6b6c",
+          "packet": "0400000000000000000000000000000009000000000000000c000000000000000800000000000000040000000000000002000000000000000000000000000000"
+        }
+      ],
+      "effect": "fail",
+      "fail_scope": "path",
+      "error": "ErrInvalidSize",
+      "sentinel": false,
+      "ack_features": 15
+    },
+    {
+      "id": "G10-31",
+      "title": "Begin with ChunkOffset != 0",
+      "target": "recv",
+      "frames": [
+        {
+          "op": "OpProtoNegotiate",
+          "operands": [
+            257,
+            15,
+            0
+          ],
+          "packet": "050000000000000001010000000000000f0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+        },
+        {
+          "op": "OpConnCopy",
+          "operands": [
+            0,
+            9,
+            8,
+            4,
+            4,
+            3,
+            0
+          ],
+          "payload": "61626364",
+          "packet": "04000000000000000000000000000000090000000000000008000000000000000400000000000000040000000000000003000000000000000000000000000000"
+        }
+      ],
+      "effect": "fail",
+      "fail_scope": "path",
+      "error": "ErrInvalidSize",
+      "sentinel": false,
+      "ack_features": 15
+    },
+    {
+      "id": "G10-32",
+      "title": "non-zero aux on a continuation chunk",
+      "target": "recv",
+      "frames": [
+        {
+          "op": "OpProtoNegotiate",
+          "operands": [
+            257,
+            15,
+            0
+          ],
+          "packet": "050000000000000001010000000000000f0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+        },
+        {
+          "op": "OpConnCopy",
+          "operands": [
+            0,
+            10,
+            8,
+            0,
+            4,
+            1,
+            0
+          ],
+          "payload": "61626364",
+          "packet": "040000000000000000000000000000000a0000000000000008000000000000000000000000000000040000000000000001000000000000000000000000000000"
+        },
+        {
+          "op": "OpConnCopy",
+          "operands": [
+            0,
+            10,
+            8,
+            4,
+            4,
+            2,
+            7
+          ],
+          "payload": "65666768",
+          "packet": "040000000000000000000000000000000a0000000000000008000000000000000400000000000000040000000000000002000000000000000700000000000000"
+        }
+      ],
+      "effect": "fail",
+      "fail_scope": "path",
+      "error": "ErrInvalidSize",
+      "sentinel": false,
+      "ack_features": 15
+    },
+    {
+      "id": "G10-33",
+      "title": "single chunk with End but ChunkSize != TotalSize",
+      "target": "recv",
+      "frames": [
+        {
+          "op": "OpProtoNegotiate",
+          "operands": [
+            257,
+            15,
+            0
+          ],
+          "packet": "050000000000000001010000000000000f0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+        },
+        {
+          "op": "OpConnCopy",
+          "operands": [
+            0,
+            11,
+            8,
+            0,
+            4,
+            3,
+            0
+          ],
+          "payload": "61626364",
+          "packet": "040000000000000000000000000000000b0000000000000008000000000000000000000000000000040000000000000003000000000000000000000000000000"
+        }
+      ],
+      "effect": "fail",
+      "fail_scope": "path",
+      "error": "ErrInvalidSize",
+      "sentinel": false,
+      "ack_features": 15
+    },
+    {
+      "id": "G10-34",
+      "title": "End chunk before TotalSize is reached",
+      "target": "recv",
+      "frames": [
+        {
+          "op": "OpProtoNegotiate",
+          "operands": [
+            257,
+            15,
+            0
+          ],
+          "packet": "050000000000000001010000000000000f0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+        },
+        {
+          "op": "OpConnCopy",
+          "operands": [
+            0,
+            12,
+            8,
+            0,
+            4,
+            1,
+            0
+          ],
+          "payload": "61626364",
+          "packet": "040000000000000000000000000000000c0000000000000008000000000000000000000000000000040000000000000001000000000000000000000000000000"
+        },
+        {
+          "op": "OpConnCopy",
+          "operands": [
+            0,
+            12,
+            8,
+            4,
+            2,
+            2,
+            0
+          ],
+          "payload": "6566",
+          "packet": "040000000000000000000000000000000c0000000000000008000000000000000400000000000000020000000000000002000000000000000000000000000000"
+        }
+      ],
+      "effect": "fail",
+      "fail_scope": "path",
+      "error": "ErrInvalidSize",
+      "sentinel": false,
+      "ack_features": 15
+    },
+    {
+      "id": "G10-35",
+      "title": "reassembly refused (MaxReassemblyBytes 100): remaining chunks drained",
+      "target": "recv",
+      "max_reassembly_bytes": 100,
+      "frames": [
+        {
+          "op": "OpProtoNegotiate",
+          "operands": [
+            257,
+            15,
+            0
+          ],
+          "packet": "050000000000000001010000000000000f0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+        },
+        {
+          "op": "OpConnCopy",
+          "operands": [
+            0,
+            13,
+            8,
+            0,
+            4,
+            1,
+            0
+          ],
+          "payload": "61626364",
+          "packet": "040000000000000000000000000000000d0000000000000008000000000000000000000000000000040000000000000001000000000000000000000000000000"
+        },
+        {
+          "op": "OpConnCopy",
+          "operands": [
+            0,
+            13,
+            8,
+            4,
+            4,
+            2,
+            0
+          ],
+          "payload": "65666768",
+          "packet": "040000000000000000000000000000000d0000000000000008000000000000000400000000000000040000000000000002000000000000000000000000000000"
+        }
+      ],
+      "effect": "drain",
+      "sentinel": true,
+      "ack_features": 15
+    },
+    {
+      "id": "G10-36",
+      "title": "refused response fails its call with ErrReassemblyLimit; the rest is drained",
+      "target": "call",
+      "max_reassembly_bytes": 100,
+      "frames": [
+        {
+          "op": "OpProtoNegotiate",
+          "operands": [
+            257,
+            15,
+            0
+          ],
+          "packet": "050000000000000001010000000000000f0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+        },
+        {
+          "op": "OpConnCopy",
+          "operands": [
+            0,
+            1,
+            8,
+            0,
+            4,
+            17,
+            0
+          ],
+          "payload": "61626364",
+          "packet": "04000000000000000000000000000000010000000000000008000000000000000000000000000000040000000000000011000000000000000000000000000000"
+        },
+        {
+          "op": "OpConnCopy",
+          "operands": [
+            0,
+            1,
+            8,
+            4,
+            4,
+            18,
+            0
+          ],
+          "payload": "65666768",
+          "packet": "04000000000000000000000000000000010000000000000008000000000000000400000000000000040000000000000012000000000000000000000000000000"
+        }
+      ],
+      "effect": "fail",
+      "fail_scope": "call",
+      "error": "ErrReassemblyLimit",
+      "sentinel": true,
+      "ack_features": 15
+    },
+    {
+      "id": "G10-37",
+      "title": "refused request is drained and never handed to the handler",
+      "target": "serve",
+      "max_reassembly_bytes": 100,
+      "frames": [
+        {
+          "op": "OpProtoNegotiate",
+          "operands": [
+            257,
+            15,
+            0
+          ],
+          "packet": "050000000000000001010000000000000f0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+        },
+        {
+          "op": "OpConnCopy",
+          "operands": [
+            0,
+            14,
+            8,
+            0,
+            4,
+            9,
+            9
+          ],
+          "payload": "61626364",
+          "packet": "040000000000000000000000000000000e0000000000000008000000000000000000000000000000040000000000000009000000000000000900000000000000"
+        },
+        {
+          "op": "OpConnCopy",
+          "operands": [
+            0,
+            14,
+            8,
+            4,
+            4,
+            10,
+            0
+          ],
+          "payload": "65666768",
+          "packet": "040000000000000000000000000000000e000000000000000800000000000000040000000000000004000000000000000a000000000000000000000000000000"
+        }
+      ],
+      "effect": "drain",
+      "sentinel": true,
+      "ack_features": 15
+    },
+    {
+      "id": "G10-38",
+      "title": "cancel of a running request: the handler context is canceled and no response is sent",
+      "target": "serve",
+      "frames": [
+        {
+          "op": "OpProtoNegotiate",
+          "operands": [
+            257,
+            15,
+            0
+          ],
+          "packet": "050000000000000001010000000000000f0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+        },
+        {
+          "op": "OpConnCopy",
+          "operands": [
+            0,
+            15,
+            4,
+            0,
+            4,
+            11,
+            1
+          ],
+          "payload": "736c6f77",
+          "packet": "040000000000000000000000000000000f000000000000000400000000000000000000000000000004000000000000000b000000000000000100000000000000"
+        }
+      ],
+      "late_frames": [
+        {
+          "op": "OpCancel",
+          "operands": [
+            0,
+            15
+          ],
+          "packet": "070000000000000000000000000000000f0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+        }
+      ],
+      "effect": "deliver",
+      "deliver": [
+        {
+          "kind": "request",
+          "payload": "736c6f77",
+          "method": 1
+        }
+      ],
+      "sentinel": false,
+      "ack_features": 15
+    },
+    {
+      "id": "G10-39",
+      "title": "OpCancel without FeatureCancel is an unexpected packet",
+      "target": "recv",
+      "frames": [
+        {
+          "op": "OpProtoNegotiate",
+          "operands": [
+            257,
+            11,
+            0
+          ],
+          "packet": "050000000000000001010000000000000b0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+        },
+        {
+          "op": "OpCancel",
+          "operands": [
+            0,
+            1
+          ],
+          "packet": "07000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+        }
+      ],
+      "effect": "fail",
+      "fail_scope": "path",
+      "error": "ErrUnexpectedPacket",
+      "sentinel": false,
+      "ack_features": 11
+    },
+    {
+      "id": "G10-40",
+      "title": "OpCancel for an unknown request is ignored",
+      "target": "recv",
+      "frames": [
+        {
+          "op": "OpProtoNegotiate",
+          "operands": [
+            257,
+            15,
+            0
+          ],
+          "packet": "050000000000000001010000000000000f0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+        },
+        {
+          "op": "OpCancel",
+          "operands": [
+            0,
+            99
+          ],
+          "packet": "07000000000000000000000000000000630000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+        },
+        {
+          "op": "OpConnCopy",
+          "operands": [
+            0,
+            16,
+            5,
+            0,
+            5,
+            3,
+            0
+          ],
+          "payload": "6166746572",
+          "packet": "04000000000000000000000000000000100000000000000005000000000000000000000000000000050000000000000003000000000000000000000000000000"
+        }
+      ],
+      "effect": "deliver",
+      "deliver": [
+        {
+          "kind": "data",
+          "payload": "6166746572"
+        }
+      ],
+      "sentinel": true,
+      "ack_features": 15
+    },
+    {
+      "id": "G10-41",
+      "title": "data for an unknown stream is dropped (stream 5)",
+      "target": "recv",
+      "frames": [
+        {
+          "op": "OpProtoNegotiate",
+          "operands": [
+            257,
+            15,
+            0
+          ],
+          "packet": "050000000000000001010000000000000f0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+        },
+        {
+          "op": "OpConnCopy",
+          "operands": [
+            5,
+            17,
+            5,
+            0,
+            5,
+            3,
+            0
+          ],
+          "payload": "6f74686572",
+          "packet": "04000000000000000500000000000000110000000000000005000000000000000000000000000000050000000000000003000000000000000000000000000000"
+        }
+      ],
+      "effect": "drop",
+      "sentinel": true,
+      "ack_features": 15
+    },
+    {
+      "id": "G10-42",
+      "title": "unknown opcode on the Advanced receive path",
+      "target": "recv",
+      "frames": [
+        {
+          "op": "OpProtoNegotiate",
+          "operands": [
+            257,
+            15,
+            0
+          ],
+          "packet": "050000000000000001010000000000000f0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+        },
+        {
+          "op": "0x10",
+          "operands": [
+            1,
+            2
+          ],
+          "packet": "10000000000000000100000000000000020000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+        }
+      ],
+      "effect": "fail",
+      "fail_scope": "path",
+      "error": "ErrUnexpectedPacket",
+      "sentinel": false,
+      "ack_features": 15
+    },
+    {
+      "id": "G10-43",
+      "title": "OpError with an unknown code surfaces as ErrProtocol",
+      "target": "recv",
+      "frames": [
+        {
+          "op": "OpProtoNegotiate",
+          "operands": [
+            257,
+            15,
+            0
+          ],
+          "packet": "050000000000000001010000000000000f0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+        },
+        {
+          "op": "OpError",
+          "operands": [
+            0,
+            9
+          ],
+          "packet": "00000000000000000000000000000000090000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+        }
+      ],
+      "effect": "fail",
+      "fail_scope": "path",
+      "error": "ErrProtocol",
+      "sentinel": false,
+      "ack_features": 15
+    },
+    {
+      "id": "G10-44",
+      "title": "OpError with code 5 surfaces as ErrConnNotFound",
+      "target": "recv",
+      "frames": [
+        {
+          "op": "OpProtoNegotiate",
+          "operands": [
+            257,
+            15,
+            0
+          ],
+          "packet": "050000000000000001010000000000000f0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+        },
+        {
+          "op": "OpError",
+          "operands": [
+            0,
+            5
+          ],
+          "packet": "00000000000000000000000000000000050000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+        }
+      ],
+      "effect": "fail",
+      "fail_scope": "path",
+      "error": "ErrConnNotFound",
+      "sentinel": false,
+      "ack_features": 15
+    }
+  ]
+}

@@ -1047,3 +1047,20 @@ func TestErrorCompatibility(t *testing.T) {
 func isWindows() bool {
 	return os.PathSeparator == '\\'
 }
+
+// Without heartbeats nothing refreshes the peer status in the background, so
+// a send must still notice that the peer closed instead of publishing into
+// the ring (F-10).
+func TestSendNoticesPeerCloseWithoutHeartbeat(t *testing.T) {
+	opts := LinkOptions{HeartbeatInterval: -1, AttachTimeout: time.Second}
+	_, primary, secondary := newMemoryPair(t, 8, 64, opts)
+	if _, err := primary.Write([]byte("before")); err != nil {
+		t.Fatalf("Write while the peer is attached: %v", err)
+	}
+	if err := secondary.Close(); err != nil {
+		t.Fatalf("peer Close: %v", err)
+	}
+	if _, err := primary.Write([]byte("after")); !errors.Is(err, ErrPeerClosed) {
+		t.Fatalf("Write after peer Close = %v, want ErrPeerClosed", err)
+	}
+}

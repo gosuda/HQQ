@@ -650,26 +650,38 @@ func zeroInChunks(b []byte, chunk int, check func() error, progress func()) erro
 // publishSuperblock finishes initialization and makes the segment Ready with
 // the caller as the live primary endpoint. It returns the new epoch.
 //
+// check runs before every write step (SPEC 5.3), so an initializer that was
+// suspended and lost ownership stops before its next store instead of after
+// the whole publish (F-01). A check cannot be atomic with the store that
+// follows it: the residual window is one step.
+//
 // All fields are written first; the initializer's ownership is then released
 // with CAS(initToken, token, 0), which fails if another endpoint took the
 // initialization over, in which case the segment is not marked Ready.
-func publishSuperblock(sb *standardSuperblock, bufferCount, bufferSize int, layoutSize uintptr, token uint64, opts LinkOptions) (uint64, error) {
-	if atomic.LoadUint64(&sb.initToken) != token {
-		// Another endpoint took over initialization.
-		return 0, errInitContended
+func publishSuperblock(sb *standardSuperblock, check func() error, bufferCount, bufferSize int, layoutSize uintptr, token uint64, opts LinkOptions) (uint64, error) {
+	writes := [...]func(){
+		func() { stampLayout(sb) },
+		func() {
+			atomic.StoreUint64(&sb.pageSize, uint64(pagesize))
+			atomic.StoreUint64(&sb.bufferCount, uint64(bufferCount))
+			atomic.StoreUint64(&sb.bufferSize, uint64(bufferSize))
+			atomic.StoreUint64(&sb.layoutSize, uint64(layoutSize))
+		},
+		func() { clearEndpoint(&sb.endpoints[endpointSecondary]) },
+		func() {
+			prim := &sb.endpoints[endpointPrimary]
+			atomic.StoreUint64(&prim.token, token)
+			fillEndpoint(prim, opts)
+		},
+		func() { atomic.StoreUint64(&sb.magic, superblockMagic) },
 	}
-	stampLayout(sb)
-	atomic.StoreUint64(&sb.pageSize, uint64(pagesize))
-	atomic.StoreUint64(&sb.bufferCount, uint64(bufferCount))
-	atomic.StoreUint64(&sb.bufferSize, uint64(bufferSize))
-	atomic.StoreUint64(&sb.layoutSize, uint64(layoutSize))
-
-	clearEndpoint(&sb.endpoints[endpointSecondary])
-	prim := &sb.endpoints[endpointPrimary]
-	atomic.StoreUint64(&prim.token, token)
-	fillEndpoint(prim, opts)
-
-	atomic.StoreUint64(&sb.magic, superblockMagic)
+	for _, write := range writes {
+		if err := check(); err != nil {
+			// Another endpoint took over initialization.
+			return 0, err
+		}
+		write()
+	}
 	return commitInit(sb, token)
 }
 

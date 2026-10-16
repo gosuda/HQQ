@@ -20,11 +20,15 @@ Impact: needs a pause of at least the stale window precisely during init; the wi
 
 Recommendation: keep the window large; bound the write granularity (`zeroChunk` of 1 MiB, `Format` in slot-count slices with a check between slices) so that the exposure is microseconds; document that initializers must not be suspended. A complete fix would need a generation number in the ring header (ABI), which is not worth it. Class (b) because the mitigation is behavioral. SPEC 5.3 requires the pre-step checks; MEMORY_MODEL 5 refers here.
 
+**Status: mitigated; residual window remains.** `publishSuperblock` checks ownership before each write step (P1–P5) in addition to the checks before each `Format` slice and each zeroing slice (`zeroSlice` = 256 KiB, `FormatSlice` = 1024 slots). The check and the store after it are still not atomic, so a frozen initializer can complete one slice or one publish step after losing ownership; that residual window is documented in SPEC 5.3. Regression: `TestPublishStopsAtTakeover`, `TestInitializerStopsWithinOneSlice`.
+
 ### F-02 (b) — Windows semaphore tokens: `Release(n)` with a stale waiter count
 
 `mpmc.waitSite.wake` with a Parker calls `Wake(side, n)` with `n = load(waiters)` (`internal/mpmc/mpmc.go:420-425`), and `shm.semaphore.Release` adds `n` tokens (`internal/shm/shm_windows.go:219-227`, max `2^31-1`). A process killed while parked leaves its count raised until `Format`; every later publish/release then adds `n >= 1` tokens to a semaphore nobody waits on. If the same Windows name is **reused** (the creator opens the existing mapping and its semaphores and re-initializes — SPEC 11.5), the new session's waiters inherit up to millions of leftover tokens and return from `Park` immediately many times (spurious wakes: re-check, not loss of correctness, but a burst of CPU).
 
 Recommendation: `Release(1)` per wake per side suffices because the specified topology has at most one parked process per side; and/or drain the four semaphores at `Format` time of a reused mapping. A port SHOULD cap `n` to 1. Class (b).
+
+**Status: fixed.** A waker grants one token per published or released slot (`Wake(side, 1)`); the registered count only decides whether to wake, and `WakeAll` still grants the whole count. Regression: `TestStaleWaiterCountGrantsOneTokenPerSlot` (internal/mpmc; fails with the count-granting wake). The Windows semaphore path is compiled and vetted only (GOOS=windows); it was not run.
 
 ### F-03 (a) — Documentation inaccuracies found
 
@@ -36,11 +40,15 @@ Recommendation: `Release(1)` per wake per side suffices because the specified to
 6. `PROTOCOL.md`'s claim-loop text says a stalled initializer is "given its whole window even if that runs past `AttachTimeout`"; the precise rule (`limit = max(deadline, watch.since + initStale)` only if the watch began before `deadline`, `superblock.go:530-538`) is in SPEC 5.1.
 7. The Go code comments in `mpmc.go` state the waiter count "counts registered waiters ... with waiter aggregation at most one per process"; the protocol-level definition is "parked processes". SPEC 8.1 defines it as processes and allows a port to over-count.
 
+**Status:** item 1 fixed (the `OpProtoNegotiate`/`OpProtoAck` operand 2 comments now say reserved, sent as zero, ignored). Items 2–6 are documentation outside the Go sources (`PROTOCOL.md`, README), not changed here. Item 7: the `mpmc.go` comments already describe processes; no change beyond the wake-path comments.
+
 ### F-04 (b) — A heartbeat timestamp in the future makes a dead endpoint look alive
 
 `endpointAliveAtOpen` (`superblock.go:253`) tests `wallAge(hb) < effectivePeerTimeout(...)`. `wallAge` is negative when the wall clock was stepped **backwards** after the last heartbeat (NTP step, VM restore, manual change) or when the heartbeat was written by a host with a clock ahead. A negative age is `< timeout`, so the record is judged alive **without** the progress-confirmation watch. Result: a creator gets `ErrLinkBusy` and an opener joins a dead Primary until the wall clock passes the stale value (potentially hours). The check was designed to be robust against wall-clock jumps (the confirmation watch) but is not in this direction.
 
 Recommendation: treat `age < 0` like "stale" and fall through to the progress watch (`sleep(step)` until `heartbeat`/`token` change or the window ends). One-line fix, no ABI change. SPEC 6.2 pseudocode documents the current behavior and calls this out; ports should implement the fix (an implementation that does is still conforming: it only turns a false "alive" into a false-negative-free "confirm by watching").
+
+**Status: fixed (verified).** The fix is present in the tree (committed in `0b3245e`): `heartbeatFresh` accepts a heartbeat only when it is less than `heartbeatFutureSlack` (1 s) in the future and younger than the timeout; anything else goes to the progress watch. Regression: `TestEndpointAliveAtOpenFutureHeartbeat`, `TestClaimReusesSegmentWithFutureHeartbeat` (both fail with the former `age < timeout` test).
 
 ### F-05 (a) — `Negotiate(0)` versus `NegotiateProtocol(version, 0)`
 
@@ -54,6 +62,8 @@ Recommendation: treat `age < 0` like "stale" and fall through to the progress wa
 
 At most 1024 refused keys are remembered (`maxRejectedMessages`). If more than 1024 newer refusals push a key out while its chunks are still arriving, the next chunk of that message finds no assembly and no refused entry and fails the **whole receive path** with `ErrProtocol` (`advanced_io.go` `rejectMessage`, documented in a code comment only). A peer can trigger this by interleaving many oversized multi-chunk messages. Recommendation: either never evict (bound the set by messages in flight instead) or treat a non-`Begin` chunk with an unknown key after a recent refusal as "drain" rather than fatal. Class (b).
 
+**Status: fixed.** Once an entry has been evicted from the refused set (`rejectedEvicted`), an orphan continuation chunk is drained instead of failing the receive path with `ErrProtocol`. The set stays bounded by `maxRejectedMessages`. Regression: `TestAdvancedReassemblyLimitDefaultAndRejectedBound` (fails without the drain).
+
 ### F-08 (a) — Reserved operands
 
 The following operand words are reserved: `OpConnCreate` operand 1, `OpConnClose` operand 1 (always sent as 0), `OpProtoNegotiate`/`OpProtoAck` operand 2, all operands above those listed for every opcode, and bits 8..63 of word 0. Senders write zeros, receivers ignore them (SPEC 9.1/9.2). This is the forward-compatibility rule that the 1.1 extension work can rely on.
@@ -62,9 +72,13 @@ The following operand words are reserved: `OpConnCreate` operand 1, `OpConnClose
 
 A multi-chunk message whose `End` chunk never arrives (sender died after chunk 1 without the abort frame, a buggy peer, or a deliberate one) keeps its assembly buffer and its `TotalSize + 256` charge **until the link ends**. A peer can therefore exhaust `MaxReassemblyBytes` (default 256 MiB) by starting messages it never finishes, causing later large messages to be refused. Peer death is detected by the heartbeat, but a live buggy peer is not. Recommendation: an idle timeout per assembly (for example the peer timeout) or a hard limit on the number of concurrent assemblies. Class (b).
 
+**Status: fixed (receiver policy, no wire change).** An incomplete message that has received no chunk for `advancedAssemblyIdleChunks` (2^16) received chunks is reclaimed when a multi-chunk message would otherwise be refused: its budget is released, its remaining chunks are drained, and a reclaimed response fails its call with `ErrReassemblyLimit` (a request gets the refusal error response). The idle clock counts received chunks, not wall time, so a paused or slow peer or reader does not age a message. Sweeps are amortized to at most one per `max(2^16, #assemblies)` chunks. Regression: `TestAdvancedIdleAssemblyIsReclaimed` (fails with reclaim disabled; it also checks that the receive loop reports the reclaimed response). The refused-request path of the report is not covered by a test.
+
 ### F-10 (b) — An endpoint with heartbeats disabled does not learn about the peer's failure unless it blocks
 
 The peer monitor (`checkPeer`) is run by the heartbeat goroutine (only started when `HeartbeatInterval > 0`, `standard.go` end of `openStandardLink`), by the `Check` hook of a **blocked** ring operation, and once at Secondary join. `enterTx(true)` only reads the recorded status. An endpoint with `HeartbeatInterval < 0` therefore keeps successfully publishing into a ring with free slots after its peer closed or died, until a call blocks. SPEC 6.4 makes the refresh strategy **[IMPL]**; a port SHOULD run `checkPeer` also at the start of each send call or at least every N sends.
+
+**Status: fixed.** With heartbeats disabled, `enterTx(true)` runs `checkPeer` before every send, so a send notices a peer that closed or died. Heartbeat-enabled links are unchanged (no extra work on the hot path). Regression: `TestSendNoticesPeerCloseWithoutHeartbeat` (fails without the refresh).
 
 ### F-11 (a) — The initialization-stale window is the claimer's own `PeerTimeout`
 

@@ -369,9 +369,11 @@ func TestSpecVersionsAndEnums(t *testing.T) {
 	}
 
 	codes := map[string]ErrorCode{"MemoryAlign": ErrCodeMemoryAlign, "InvalidSize": ErrCodeInvalidSize, "MemorySmall": ErrCodeMemorySmall,
-		"FailedInit": ErrCodeFailedInit, "ConnNotFound": ErrCodeConnNotFound, "InvalidOp": ErrCodeInvalidOp, "BufferOverflow": ErrCodeBufferOverflow}
+		"FailedInit": ErrCodeFailedInit, "ConnNotFound": ErrCodeConnNotFound, "InvalidOp": ErrCodeInvalidOp, "BufferOverflow": ErrCodeBufferOverflow,
+		"ShuttingDown": ErrCodeShuttingDown}
 	sentinels := map[string]error{"MemoryAlign": ErrMemoryAlign, "InvalidSize": ErrInvalidSize, "MemorySmall": ErrMemorySmall,
-		"FailedInit": ErrFailedInit, "ConnNotFound": ErrConnNotFound, "InvalidOp": ErrInvalidOp, "BufferOverflow": ErrBufferOverflow}
+		"FailedInit": ErrFailedInit, "ConnNotFound": ErrConnNotFound, "InvalidOp": ErrInvalidOp, "BufferOverflow": ErrBufferOverflow,
+		"ShuttingDown": ErrInvalidOp}
 	for name, want := range c.ErrorCodes {
 		got, ok := codes[name]
 		if !ok {
@@ -905,7 +907,7 @@ func TestSpecClaimTable(t *testing.T) {
 			t.Fatal(err)
 		}
 		opts := quick(roleCreator)
-		epoch, err := publishSuperblock(sb, count, size, layoutSize, 0xabc, opts)
+		epoch, err := publishSuperblock(sb, initOwner(sb, 0xabc), count, size, layoutSize, 0xabc, opts)
 		if err != nil || epoch != 1 {
 			t.Fatalf("publish = %d, %v", epoch, err)
 		}
@@ -920,7 +922,7 @@ func TestSpecClaimTable(t *testing.T) {
 			t.Fatal(err)
 		}
 		atomic.StoreUint64(&sb2.initToken, 0xdead)
-		if _, err := publishSuperblock(sb2, count, size, layoutSize, 0xabc, opts); !errors.Is(err, errInitContended) {
+		if _, err := publishSuperblock(sb2, initOwner(sb2, 0xabc), count, size, layoutSize, 0xabc, opts); !errors.Is(err, errInitContended) {
 			t.Errorf("publish after losing initToken: err = %v, want errInitContended", err)
 		}
 		specEq(t, "state stays Initializing", atomic.LoadUint64(&sb2.state), superblockStateInitializing)

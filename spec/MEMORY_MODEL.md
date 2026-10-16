@@ -145,7 +145,7 @@ All of them are 64-bit atomics; **no tearing**. Their orders are in section 2. T
 * **Token CAS is the only arbitration** on endpoint records: Secondary join (`0 → token`), detach (`token → 1`), and the Primary's publish store (done while the initializer owns `initToken`, hence exclusive). Use AR.
 * **`state` store `Ready` and the `epoch` increment are ordered**: the commit CAS on `initToken` is followed by `epoch.fetch_add`, then `state.store(Ready, REL)`. A reader that sees `Ready` sees the new epoch.
 * **Clock sources.** Wall clock (`CLOCK_REALTIME`, UnixNano) is written into `heartbeat`/`initHeartbeat`; any time-based decision a monitor makes on its own uses a monotonic clock. Never compare a stored wall-clock value to the local monotonic clock.
-* **A process that is frozen** (SIGSTOP, debugger, VM pause) longer than the initialization-stale window or the peer timeout *will* be treated as dead, and the segment may be taken over or reused under it (SPEC 5.1, 6.2). It detects this on resume through `epoch`/`token` (`ErrPeerGone`) — but see FINDINGS F-01 for the one hazard this leaves.
+* **A process that is frozen** (SIGSTOP, debugger, VM pause) longer than the initialization-stale window or the peer timeout *will* be treated as dead, and the segment may be taken over or reused under it (SPEC 5.1, 6.2). It detects this on resume through `epoch`/`token` (`ErrPeerGone`). A frozen initializer can still complete the one store that follows its last ownership check (SPEC 5.3, FINDINGS F-01).
 
 ## 6. Alignment and 64-bit atomics
 

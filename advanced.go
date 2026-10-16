@@ -75,6 +75,13 @@ const (
 	// maxRejectedMessages bounds the memory used to drain the remaining
 	// chunks of messages refused by the reassembly limit.
 	maxRejectedMessages = 1024
+
+	// advancedAssemblyIdleChunks is how many chunks must arrive on the link
+	// after the last chunk of an incomplete message before the message may be
+	// reclaimed to make room for another one. It counts received chunks rather
+	// than time, so a message whose next chunk is queued behind a slow reader
+	// is not mistaken for an abandoned one.
+	advancedAssemblyIdleChunks = 1 << 16
 )
 
 // ProtocolVersion represents a protocol version using semantic versioning
@@ -271,11 +278,22 @@ type AdvancedLink struct {
 	// assemblyBytes is the memory charged by assemblies against
 	// maxReassemblyBytes. rejected remembers (FIFO, at most
 	// maxRejectedMessages) the messages refused by that limit whose remaining
-	// chunks must be discarded. All of these are guarded by receiveMu.
+	// chunks must be discarded. rejectedEvicted is set once an entry was
+	// pushed out of rejected: the continuation chunks of such a message are
+	// then drained instead of being a protocol error (F-07). chunks counts
+	// the chunk frames received; an assembly idle for
+	// advancedAssemblyIdleChunks of them is reclaimed when its budget is
+	// needed (F-09), and reclaimed holds the requests and responses that
+	// receiveNextLocked must still report. All of these are guarded by
+	// receiveMu.
 	assemblyBytes      uint64
 	maxReassemblyBytes uint64
 	rejected           map[advancedMessageKey]struct{}
 	rejectedOrder      []advancedMessageKey
+	rejectedEvicted    bool
+	chunks             uint64
+	chunksAtSweep      uint64
+	reclaimed          []advHeader
 
 	maxMessageSize uint64
 	overflow       OverflowPolicy
