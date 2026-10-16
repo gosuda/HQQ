@@ -2,10 +2,7 @@
 
 **HQQ** (`gosuda.org/hqq`) is a Go inter-process communication (IPC) library built on shared memory, lock-free Vyukov-style MPMC rings, and slot-owned payload buffers.
 
-On an earlier revision it measured **sub-microsecond round-trip latency (~258 ns)** and **multi-GB/s throughput (27–64 GB/s)** on `darwin/arm64` while idle blocked callers parked in the kernel instead of spinning (`futex` on Linux, `__ulock_wait` on macOS, named kernel semaphores on Windows). See [Benchmarks](#benchmarks): those numbers predate v0.3.0 and have not been re-measured.
-
-> [!IMPORTANT]
-> v0.3.0 is a breaking release (public API and shared-memory ABI). Segments written by earlier revisions (`HQQ_STL2`) are rejected with `ErrIncompatibleLayout` and left untouched, so remove a name left behind by an older version with `hqq.Unlink(name)` (or by deleting `/dev/shm/<name>` on Linux) before reusing it. Both endpoints of a link must run v0.3.0. See the migration table in [CHANGELOG.md](CHANGELOG.md).
+It delivers **sub-microsecond round-trip latency (~240 ns)** and **multi-GB/s throughput (24–64 GB/s)** while keeping idle blocked callers parked in the kernel instead of spinning (`futex` on Linux, `__ulock_wait` on macOS, named kernel semaphores on Windows).
 
 ---
 
@@ -199,28 +196,28 @@ See [PROTOCOL.md](PROTOCOL.md) for the full wire and memory layout specification
 
 ## Benchmarks
 
-> [!NOTE]
-> The tables below were measured on an earlier revision (before the v0.3.0 hardening pass) on `darwin/arm64` (Go 1.24, `go test . -bench 'Benchmark(StandardLink|AdvancedLink|Compare)' -benchmem`). They have not been re-measured. In v0.3.0, completing a slot through a copyable handle (`WriteZeroCopy`, `ReserveWrite`/`Commit`/`Abort`, `ReserveRead`/`Release`) uses a compare-and-swap instead of a plain store, and waiters are aggregated per process; re-run the benchmarks on your hardware before relying on absolute numbers.
+Measured on `darwin/arm64` (Go 1.27, `go test . -bench 'Benchmark(StandardLink|AdvancedLink|Compare)' -benchmem`, median of 6 runs); idle CPU from `HQQ_PERF_TESTS=1 go test -run 'TestIdleLinkDoesNotBurnCPU|TestMPMCWaitSpinBurnsCPU' ./...`.
 
 ### HQQ vs Unix Domain Socket (`SOCK_STREAM`) vs OS Pipe
 
 | Benchmark | HQQ (`WaitAdaptive`) | HQQ (`WaitSpin`) | Unix Domain Socket | OS Pipe | HQQ Speedup |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| **64 B Round-Trip Latency** | **258 ns/op** | 259 ns/op | 3,134 ns/op | 3,362 ns/op | **12.1×–13.0× faster** |
-| **4 KiB Unidirectional Throughput** | **27,507 MB/s** (149 ns/op) | 26,722 MB/s | 2,594 MB/s | 4,312 MB/s | **6.4×–10.6× higher** |
-| **64 KiB Unidirectional Throughput** | **29,774 MB/s** (2.20 µs/op) | 28,029 MB/s | 3,073 MB/s | 11,812 MB/s | **2.5×–9.7× higher** |
-| **Idle Blocked Reader CPU** | **~0.1% CPU** | ~100% CPU | ~0% CPU | ~0% CPU | Kernel futex/ulock parking |
+| **64 B Round-Trip Latency** | **239 ns/op** | 235 ns/op | 3,121 ns/op | 3,379 ns/op | **13.1×–14.1× faster** |
+| **4 KiB Unidirectional Throughput** | **24,180 MB/s** (169 ns/op) | 24,976 MB/s | 2,619 MB/s | 4,201 MB/s | **5.8×–9.2× higher** |
+| **64 KiB Unidirectional Throughput** | **28,420 MB/s** (2.31 µs/op) | 27,817 MB/s | 3,093 MB/s | 11,540 MB/s | **2.5×–9.2× higher** |
+| **Idle Blocked Callers** | **~1% CPU** (2 blocked calls, incl. heartbeats) | >100% CPU (one core per blocked call) | blocks in the kernel | blocks in the kernel | kernel parking |
 
 ### StandardLink & AdvancedLink Microbenchmarks
 
 | Operation | Latency | Throughput | Allocs |
 | --- | ---: | ---: | ---: |
-| `StandardLink` Zero-Copy (`4 KiB`) | **63.6 ns/op** | **64,364 MB/s** | `0 B/op`, `0 allocs/op` |
-| `StandardLink` Reserve/Commit (`4 KiB`) | **87.6 ns/op** | **46,738 MB/s** | `0 B/op`, `0 allocs/op` |
-| `StandardLink` Pipeline (`64 B`) | **50.6 ns/op** | **1,265 MB/s** | `0 B/op`, `0 allocs/op` |
-| `StandardLink` Pipeline (`4 KiB`) | **138.6 ns/op** | **29,543 MB/s** | `0 B/op`, `0 allocs/op` |
-| `AdvancedLink` Large Copy (`16 KiB` over `4 KiB` chunks) | **1.64 µs/op** | **2,494 MB/s** | `4,192 B/op`, `2 allocs/op` |
-| `AdvancedLink` Request-Response RPC (`2 KiB` req + `2 KiB` resp) | **1.47 µs/op** | **1,396 MB/s** | `2,241 B/op`, `4 allocs/op` |
+| `StandardLink` Read/Write (`8 B`) | **61.1 ns/op** | **131 MB/s** | `0 B/op`, `0 allocs/op` |
+| `StandardLink` Zero-Copy (`4 KiB`) | **63.7 ns/op** | **64,342 MB/s** | `0 B/op`, `0 allocs/op` |
+| `StandardLink` Reserve/Commit (`4 KiB`) | **82.4 ns/op** | **49,690 MB/s** | `0 B/op`, `0 allocs/op` |
+| `StandardLink` Pipeline (`64 B`) | **52.8 ns/op** | **1,212 MB/s** | `0 B/op`, `0 allocs/op` |
+| `StandardLink` Pipeline (`4 KiB`) | **125.5 ns/op** | **32,637 MB/s** | `0 B/op`, `0 allocs/op` |
+| `AdvancedLink` Large Copy (`4 KiB` over `256 B` chunks) | **1.57 µs/op** | **2,614 MB/s** | `4,192 B/op`, `2 allocs/op` |
+| `AdvancedLink` Request-Response RPC (`1 KiB` req + `1 KiB` resp, `256 B` chunks) | **1.50 µs/op** | **1,365 MB/s** | `2,240 B/op`, `4 allocs/op` |
 
 ---
 

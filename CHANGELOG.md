@@ -4,9 +4,9 @@ All notable changes to **HQQ** (`gosuda.org/hqq`) are documented in this file.
 
 The project follows [Semantic Versioning](https://semver.org/). While in `v0.x`, minor versions may introduce breaking wire-layout improvements accompanied by migration notes below.
 
-## [Unreleased] — v0.3.0
+## v0.4.1 — 2026-10-16
 
-A hardening pass over the public API, the shared-memory ABI, segment lifecycle, the MPMC ring, and the Advanced dispatcher. **Both the Go API and the shared-memory ABI change incompatibly**: all endpoints of a link must be upgraded together, and segments created by earlier revisions are rejected. No version has been tagged yet (`git tag --list` is empty); the migration table below is relative to the previous revision (v0.2.0, untagged).
+A hardening pass over the public API, the shared-memory ABI, segment lifecycle, the MPMC ring, and the Advanced dispatcher. **Both the Go API and the shared-memory ABI change incompatibly**: all endpoints of a link must be upgraded together, and segments created by earlier revisions are rejected. This is the first tagged release; the migration table below is relative to the previous, untagged revision (v0.2.0).
 
 ### Breaking
 
@@ -64,7 +64,7 @@ A hardening pass over the public API, the shared-memory ABI, segment lifecycle, 
 - `NamedStandardLink.Unlink`/`NamedAdvancedLink.Unlink` return nil for a missing name.
 - The `unsafe.Pointer` open path is a single function (`NewStandardLink` → `openStandardLink`); `createAlignedBuffer` is removed.
 - `mpmc`: `T` must not contain Go pointers (documented); `park_darwin.go` documents the private `__ulock_*` interface and `os_sync_wait_on_address` (macOS 14.4+) as the public alternative.
-- Documentation (README, PROTOCOL.md, package comment) rewritten for the above. Benchmark numbers in the README are from an earlier revision and have not been re-measured.
+- Documentation (README, PROTOCOL.md, package comment) rewritten for the above; README benchmarks re-measured.
 
 ### Fixed
 
@@ -89,7 +89,7 @@ A hardening pass over the public API, the shared-memory ABI, segment lifecycle, 
 
 ### Migration
 
-| v0.2.0 | v0.3.0 |
+| v0.2.0 | v0.4.1 |
 | --- | --- |
 | `OpenStandardLink(offset uintptr, n, size)` | removed; `NewStandardLink(mem, n, size, LinkOptions{})` |
 | `OpenStandardLinkWithOptions(offset, n, size, opts)` | `NewStandardLink(mem []byte, n, size, opts)` |
