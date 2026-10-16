@@ -1,0 +1,21 @@
+C hqq_wake_handshake_sc
+(* Store-buffering (Dekker) shape of the wait/wake handshake, all seq_cst.
+   P0 is the waker: publishes the slot (store seq), then reads the waiter count.
+   P1 is the waiter: registers (fetch_add waiters), then re-checks the slot
+   (load seq).
+   The lost-wakeup outcome is: waker reads waiters == 0 AND waiter reads the
+   OLD seq (0), i.e. nobody wakes the waiter although it parks.
+   Expected herd7 result under seq_cst: "Never". *)
+{ }
+
+P0 (atomic_int* seq, atomic_int* waiters) {
+  atomic_store_explicit(seq, 1, memory_order_seq_cst);
+  int r0 = atomic_load_explicit(waiters, memory_order_seq_cst);
+}
+
+P1 (atomic_int* seq, atomic_int* waiters) {
+  int r2 = atomic_fetch_add_explicit(waiters, 1, memory_order_seq_cst);
+  int r1 = atomic_load_explicit(seq, memory_order_seq_cst);
+}
+
+exists (0:r0=0 /\ 1:r1=0)

@@ -16,7 +16,21 @@ const (
 	FeatureMessages        uint64 = 1 << 0 // Enable OpConnCopy messages (Stream.Send and Recv), chunked when larger than bufferSize.
 	FeatureRequestResponse uint64 = 1 << 1 // Enable request-response IPC over OpConnCopy.
 
-	supportedFeatures = FeatureMessages | FeatureRequestResponse
+	// FeatureCancel (protocol 1.1) enables OpCancel: a Call whose context
+	// ends while it waits tells the peer, which cancels the context of the
+	// request's handler.
+	FeatureCancel uint64 = 1 << 2
+
+	// FeatureMetadata (protocol 1.1) enables the metadata block of requests
+	// (AdvFlagMeta): the caller's remaining time budget, which becomes the
+	// deadline of the handler's context, and the optional caller and trace
+	// IDs of CallOptions.
+	FeatureMetadata uint64 = 1 << 3
+
+	supportedFeatures = FeatureMessages | FeatureRequestResponse | FeatureCancel | FeatureMetadata
+
+	// featuresSince11 are the features that exist only from protocol 1.1.
+	featuresSince11 = FeatureCancel | FeatureMetadata
 )
 
 // Advanced Protocol frame flags stored in OpConnCopy operand 5.
@@ -27,6 +41,12 @@ const (
 	AdvFlagRequest
 	AdvFlagResponse
 	AdvFlagError
+
+	// AdvFlagMeta (protocol 1.1, FeatureMetadata) marks a request whose
+	// payload starts with a metadata block. It is set on every chunk of the
+	// request, like AdvFlagRequest, and is a protocol error on any other
+	// frame or when FeatureMetadata was not negotiated.
+	AdvFlagMeta
 )
 
 const (
@@ -166,8 +186,10 @@ type AdvancedStats struct {
 	MessageBytes       uint64 // payload bytes of those messages
 	Requests           uint64
 	Responses          uint64
-	DroppedMessages    uint64 // messages discarded by OverflowDrop, for an unknown or closed stream, as a response without a waiting call, refused by MaxReassemblyBytes, or whose control reply was dropped because the control queue was full
+	DroppedMessages    uint64 // messages discarded by OverflowDrop, for an unknown or closed stream, as a response without a waiting call, refused by MaxReassemblyBytes, or whose control reply (including an OpCancel) was dropped because the control queue was full
 	AbandonedResponses uint64 // late responses to canceled calls that were discarded
+	CanceledRequests   uint64 // requests whose handler context was canceled by the peer's OpCancel
+	RefusedRequests    uint64 // requests answered with ErrCodeShuttingDown after Shutdown
 }
 
 type advancedCounters struct {
@@ -178,6 +200,8 @@ type advancedCounters struct {
 	responses          atomic.Uint64
 	droppedMessages    atomic.Uint64
 	abandonedResponses atomic.Uint64
+	canceledRequests   atomic.Uint64
+	refusedRequests    atomic.Uint64
 
 	// Serve execution model (see Serve): handlers handed to worker
 	// goroutines, and times the receiver role moved on because an inline
@@ -203,10 +227,18 @@ type advancedCounters struct {
 // messages for others; a background dispatcher is started as soon as
 // several goroutines wait concurrently or streams are used. The receive path
 // never waits for the tx ring: the replies it generates (stream accepts and
-// refusals, error responses to requests refused by MaxReassemblyBytes) are
-// sent by a separate control-sender goroutine through a bounded queue; a
-// reply that does not fit is dropped and counted in
-// AdvancedStats.DroppedMessages.
+// refusals, error responses to requests refused by MaxReassemblyBytes or by
+// Shutdown, and OpCancel frames of canceled calls) are sent by a separate
+// control-sender goroutine through a bounded queue; a reply that does not fit
+// is dropped and counted in AdvancedStats.DroppedMessages.
+//
+// Protocol 1.1 (FeatureCancel, FeatureMetadata): a Call whose context has a
+// deadline sends the remaining time with the request, and a Call whose
+// context ends while it waits tells the peer (OpCancel); Serve hands every
+// handler a context of its own that reflects both, the closing of its stream
+// and the end of Serve (see Handler). CallOptions attach a caller and trace
+// ID. Shutdown stops accepting requests and drains the running ones. Peers
+// that negotiate only the 1.0 features see the 1.0 behavior.
 type AdvancedLink struct {
 	slink *StandardLink // Wrapped standard link
 
@@ -277,6 +309,19 @@ type AdvancedLink struct {
 	abandoned      map[advancedCallKey]struct{}
 	abandonedOrder []advancedCallKey
 
+	// Requests received and not yet answered, with the context of each (see
+	// reqCtx). inflightN counts them; shuttingDown, drained and serveStop
+	// implement Shutdown.
+	inflightMu    sync.Mutex
+	inflight      map[advancedCallKey]*reqCtx
+	inflightN     atomic.Int64
+	shuttingDown  atomic.Bool
+	drained       chan struct{} // capacity 1: the last in-flight request ended
+	serveStopped  atomic.Bool   // Shutdown completed: Serve returns nil
+	serveStop     chan struct{} // closed with serveStopped
+	serveStopOnce sync.Once
+	serveWakeFn   func() time.Time // ring DeadlineFunc of receivers that serve
+
 	stats     advancedCounters
 	closeOnce sync.Once
 	closeErr  error
@@ -327,7 +372,11 @@ func newAdvancedLink(slink *StandardLink, opts AdvancedOptions) *AdvancedLink {
 		requests:           make(chan *Message, incomingQueueSize),
 		pendingCalls:       make(map[advancedCallKey]chan advancedDispatchResult),
 		abandoned:          make(map[advancedCallKey]struct{}),
+		inflight:           make(map[advancedCallKey]*reqCtx),
+		drained:            make(chan struct{}, 1),
+		serveStop:          make(chan struct{}),
 	}
+	l.serveWakeFn = l.serveWakeDeadline
 	l.lifeCtx, l.lifeCancel = context.WithCancel(context.Background())
 	l.stream0 = newStream(l, 0)
 	return l
@@ -336,7 +385,10 @@ func newAdvancedLink(slink *StandardLink, opts AdvancedOptions) *AdvancedLink {
 // Close stops the dispatcher and the control sender, fails pending calls and
 // dials with ErrClosed, and closes the underlying StandardLink. Control
 // replies still queued are discarded. Receive operations blocked on the link
-// or on one of its streams return ErrClosed. Close is idempotent.
+// or on one of its streams return ErrClosed. The contexts of the handlers that
+// are running are canceled at once and Serve returns ErrClosed; Close does not
+// wait for the handlers and does not drain: use Shutdown before Close for a
+// graceful stop. A Shutdown that waits returns ErrClosed. Close is idempotent.
 func (l *AdvancedLink) Close() error {
 	l.closeOnce.Do(func() {
 		l.dispatchMu.Lock()
@@ -346,6 +398,7 @@ func (l *AdvancedLink) Close() error {
 		l.dispatchMu.Unlock()
 
 		l.lifeCancel()
+		l.cancelAllRequests()
 		l.closeErr = l.slink.Close()
 		if started {
 			<-l.dispatchDone
@@ -445,7 +498,7 @@ func (l *AdvancedLink) sendPacket(ctx context.Context, packet protocol.Packet) e
 // payload-carrying frames are allowed).
 func (l *AdvancedLink) recvPacket(ctx context.Context) (protocol.Packet, error) {
 	var packet protocol.Packet
-	err := l.dequeue(ctx, func(_ uint64, p *protocol.Packet) {
+	err := l.dequeue(ctx, false, func(_ uint64, p *protocol.Packet) {
 		packet = *p
 	})
 	return packet, err
@@ -453,13 +506,18 @@ func (l *AdvancedLink) recvPacket(ctx context.Context) (protocol.Packet, error) 
 
 // dequeue consumes one packet from the receive direction; fn runs while the
 // slot is claimed.
-func (l *AdvancedLink) dequeue(ctx context.Context, fn func(slot uint64, p *protocol.Packet)) error {
+//
+// serving marks the receive of Serve: it ends once Shutdown completed.
+func (l *AdvancedLink) dequeue(ctx context.Context, serving bool, fn func(slot uint64, p *protocol.Packet)) error {
 	s := l.slink
 	if err := s.enterRx(); err != nil {
 		return err
 	}
 	defer s.exitRx()
 	c := l.ringCancel(ctx)
+	if serving {
+		c.DeadlineFunc = l.serveWakeFn
+	}
 	if err := dequeueDrained(s.rxRing, &c, fn); err != nil {
 		return mapCtxErr(ctx, err)
 	}
@@ -626,6 +684,9 @@ func (l *AdvancedLink) answerNegotiation(ctx context.Context, p protocol.Packet,
 	}
 	version := ProtocolVersion{Major: requested.Major, Minor: min(requested.Minor, uint8(protocol.HQQProtocolMinorVersion))}
 	features := p.Operand(1) & supportedFeatures & allowed
+	if version.Minor < 1 {
+		features &^= featuresSince11
+	}
 
 	ack := protocol.NewPacket(protocol.OpProtoAck, version.encode(), features, 0)
 	if err := l.sendPacket(ctx, ack); err != nil {
@@ -665,6 +726,8 @@ func (l *AdvancedLink) Stats() AdvancedStats {
 		Responses:          l.stats.responses.Load(),
 		DroppedMessages:    l.stats.droppedMessages.Load(),
 		AbandonedResponses: l.stats.abandonedResponses.Load(),
+		CanceledRequests:   l.stats.canceledRequests.Load(),
+		RefusedRequests:    l.stats.refusedRequests.Load(),
 	}
 }
 

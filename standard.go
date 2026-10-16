@@ -180,13 +180,15 @@ func openStandardLink(base unsafe.Pointer, bufferCount int, bufferSize int, opts
 	if mustInit {
 		// Every step first checks that this endpoint still owns the
 		// initialization: an endpoint that lost it must not touch the
-		// segment any more.
+		// segment any more. A frozen initializer can still resume inside a
+		// write phase it entered legitimately, so the check also runs
+		// between the slices of a Format and of the zeroing; the residual
+		// window is one slice (SPEC 5.3).
 		session := &initSession{sb: sb, token: token, ctx: ctx}
 		for _, ringOff := range [2]uintptr{layout.ring0, layout.ring1} {
-			if err := session.check(); err != nil {
+			if err := mpmc.FormatGuarded[protocol.Packet](unsafe.Add(base, ringOff), uint64(bufferCount), session.check); err != nil {
 				return nil, err
 			}
-			mpmc.Format[protocol.Packet](unsafe.Add(base, ringOff), uint64(bufferCount))
 			session.progress()
 		}
 		if err := session.zero(buffers0); err != nil {

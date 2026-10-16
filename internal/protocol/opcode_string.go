@@ -15,23 +15,24 @@ func _() {
 	_ = x[OpConnCopy-4]
 	_ = x[OpProtoNegotiate-5]
 	_ = x[OpProtoAck-6]
+	_ = x[OpCancel-7]
 	_ = x[OpStandardLinkTombstone-254]
 	_ = x[OpStandardLinkCopy-255]
 }
 
 const (
-	_OpCode_name_0 = "OpErrorOpConnCreateOpConnAcceptOpConnCloseOpConnCopyOpProtoNegotiateOpProtoAck"
+	_OpCode_name_0 = "OpErrorOpConnCreateOpConnAcceptOpConnCloseOpConnCopyOpProtoNegotiateOpProtoAckOpCancel"
 	_OpCode_name_1 = "OpStandardLinkTombstoneOpStandardLinkCopy"
 )
 
 var (
-	_OpCode_index_0 = [...]uint8{0, 7, 19, 31, 42, 52, 68, 78}
+	_OpCode_index_0 = [...]uint8{0, 7, 19, 31, 42, 52, 68, 78, 86}
 	_OpCode_index_1 = [...]uint8{0, 23, 41}
 )
 
 func (i OpCode) String() string {
 	switch {
-	case i <= 6:
+	case i <= 7:
 		return _OpCode_name_0[_OpCode_index_0[i]:_OpCode_index_0[i+1]]
 	case 254 <= i && i <= 255:
 		i -= 254

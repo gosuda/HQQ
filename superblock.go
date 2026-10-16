@@ -55,8 +55,14 @@ const (
 	endpointPrimary   = 0
 	endpointSecondary = 1
 
-	// zeroChunk bounds the work between initializer progress updates.
+	// zeroChunk is the largest amount of buffer memory the initializer
+	// zeroes between two progress updates (the protocol bound).
 	zeroChunk = 8 << 20
+
+	// zeroSlice is the amount of buffer memory zeroed between two ownership
+	// checks. It bounds what an initializer that was suspended between a
+	// check and the write can still clear in a segment it no longer owns.
+	zeroSlice = 256 << 10
 
 	// detachedToken marks an endpoint slot whose owner closed gracefully.
 	// It persists until the segment is re-initialized, so a peer that
@@ -221,6 +227,20 @@ func wallAge(ts uint64) time.Duration {
 	return time.Since(time.Unix(0, int64(ts)))
 }
 
+// heartbeatFutureSlack bounds how far in the future a heartbeat timestamp may
+// lie and still count as fresh. A larger lead means the wall clock was stepped
+// backwards after the timestamp was written (or the writer's clock runs
+// ahead); such a timestamp says nothing about liveness, so it is confirmed by
+// the progress watch like a stale one.
+const heartbeatFutureSlack = time.Second
+
+// heartbeatFresh reports whether the wall-clock heartbeat ts is younger than
+// timeout and not further in the future than heartbeatFutureSlack.
+func heartbeatFresh(ts uint64, timeout time.Duration) bool {
+	age := wallAge(ts)
+	return age > -heartbeatFutureSlack && age < timeout
+}
+
 // effectivePeerTimeout never declares a peer dead before it missed several
 // of its own heartbeats.
 func effectivePeerTimeout(opts LinkOptions, interval time.Duration) time.Duration {
@@ -250,7 +270,7 @@ func endpointAliveAtOpen(ctx context.Context, rec *endpointRecord, opts LinkOpti
 		// Attached a moment ago; first heartbeat not written yet.
 		return true, nil
 	}
-	if wallAge(hb) < effectivePeerTimeout(opts, interval) {
+	if heartbeatFresh(hb, effectivePeerTimeout(opts, interval)) {
 		return true, nil
 	}
 	window := min(3*interval, 2*time.Second)
@@ -600,10 +620,16 @@ func (s *initSession) progress() {
 	}
 }
 
-// zero clears b, checking ownership before every chunk.
+// zero clears b in slices of zeroSlice bytes, checking ownership before every
+// slice and refreshing the initializer heartbeat after every slice (so the
+// time between two progress updates stays far below the protocol bound
+// zeroChunk).
 func (s *initSession) zero(b []byte) error {
-	return zeroInChunks(b, zeroChunk, s.check, s.progress)
+	return zeroInChunks(b, zeroSlice, s.check, s.progress)
 }
+
+// A slice must not exceed the progress bound.
+const _ = uint(zeroChunk - zeroSlice)
 
 // zeroInChunks clears b in chunks of at most chunk bytes. check runs before
 // every chunk and aborts the operation with its error; progress runs after

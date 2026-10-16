@@ -22,6 +22,7 @@ const (
 	ErrCodeConnNotFound   ErrorCode = 0x05 // Connection or request context not found
 	ErrCodeInvalidOp      ErrorCode = 0x06 // Unknown or unsupported operation
 	ErrCodeBufferOverflow ErrorCode = 0x07 // Payload exceeds configured limits
+	ErrCodeShuttingDown   ErrorCode = 0x08 // Request refused: the endpoint is shutting down (AdvancedLink.Shutdown)
 )
 
 // Base errors. They are stable sentinels: compare with errors.Is.
@@ -109,6 +110,12 @@ var (
 	// reach Stream.Recv or Serve: they are dropped, because they were never
 	// complete.
 	ErrMessageAborted = &hqqError{msg: "hqq: message aborted by sender", base: ErrProtocol}
+
+	// ErrShuttingDown is the error a request fails with when the peer's
+	// AdvancedLink.Shutdown refused it. Stream.Call returns a ResponseError
+	// with Status ErrCodeShuttingDown, and errors.Is(err, ErrShuttingDown)
+	// reports true for it.
+	ErrShuttingDown = &hqqError{msg: "hqq: peer is shutting down", base: ErrInvalidOp}
 
 	// ErrReassemblyLimit is returned by Stream.Call when this endpoint
 	// refused to assemble the response because incomplete messages already
@@ -212,6 +219,8 @@ func errorFromCode(code ErrorCode) error {
 		return ErrConnNotFound
 	case ErrCodeInvalidOp:
 		return ErrInvalidOp
+	case ErrCodeShuttingDown:
+		return ErrShuttingDown
 	case ErrCodeBufferOverflow:
 		return ErrBufferOverflow
 	default:
@@ -232,4 +241,10 @@ func (e ResponseError) Error() string {
 		return fmt.Sprintf("hqq: response error (status %d): %s", e.Status, e.Payload)
 	}
 	return fmt.Sprintf("hqq: response error (status %d, %d byte payload)", e.Status, len(e.Payload))
+}
+
+// Is reports whether e is the error response of a refused request:
+// errors.Is(e, ErrShuttingDown) holds for Status ErrCodeShuttingDown.
+func (e ResponseError) Is(target error) bool {
+	return target == ErrShuttingDown && e.Status == uint64(ErrCodeShuttingDown)
 }

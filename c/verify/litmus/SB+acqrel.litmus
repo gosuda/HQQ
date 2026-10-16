@@ -1,0 +1,15 @@
+C SB+acqrel
+(* Store buffering with release/acquire only. Expected: Sometimes (lost wake-up is possible). *)
+{}
+
+P0 (atomic_int* x, atomic_int* y) {
+  atomic_store_explicit(x, 1, memory_order_release);
+  int r0 = atomic_load_explicit(y, memory_order_acquire);
+}
+
+P1 (atomic_int* x, atomic_int* y) {
+  atomic_store_explicit(y, 1, memory_order_release);
+  int r1 = atomic_load_explicit(x, memory_order_acquire);
+}
+
+exists (0:r0=0 /\ 1:r1=0)

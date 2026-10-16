@@ -192,3 +192,130 @@ func TestStreamCallServeZeroAlloc(t *testing.T) {
 		})
 	}
 }
+
+// TestStreamCallServeProtocol11ZeroAlloc proves that the protocol 1.1
+// features cost no allocation per call once negotiated: the deadline budget,
+// CallOptions metadata, the pooled per-request context (also when the handler
+// polls it), OpCancel registration and the deadline timer.
+func TestStreamCallServeProtocol11ZeroAlloc(t *testing.T) {
+	type variant struct {
+		name     string
+		deadline bool
+		opts     CallOptions
+		onStream bool
+	}
+	variants := []variant{
+		{name: "negotiated"},
+		{name: "deadline", deadline: true},
+		{name: "options", opts: CallOptions{Caller: 7, Trace: [16]byte{1, 2, 3}}},
+		{name: "deadline+options", deadline: true, opts: CallOptions{Caller: 7, Trace: [16]byte{1, 2, 3}}},
+		{name: "stream/deadline+options", deadline: true, opts: CallOptions{Caller: 7}, onStream: true},
+	}
+	for _, v := range variants {
+		for _, tc := range zeroAllocCases() {
+			t.Run(v.name+"/"+tc.name, func(t *testing.T) {
+				client, server := newNegotiatedPair(t, 1024, 256, AdvancedOptions{}, AdvancedOptions{})
+				if tc.dispatcher {
+					if err := client.startDispatcher(); err != nil {
+						t.Fatal(err)
+					}
+					if err := server.startDispatcher(); err != nil {
+						t.Fatal(err)
+					}
+				}
+				stream := client.Stream()
+				if v.onStream {
+					stream, _ = openStreamPair(t, client, server)
+				}
+				serveDone := make(chan error, 1)
+				response := patternedBytes(tc.size, 9)
+				go func() {
+					serveDone <- server.Serve(context.Background(), HandlerFunc(func(ctx context.Context, w *ResponseWriter, req *Request) {
+						// The handler polls the per-request context and
+						// reads the metadata: neither may allocate.
+						if ctx.Err() != nil {
+							w.WriteError(0, nil)
+							return
+						}
+						_, _ = ctx.Deadline()
+						_ = req.Caller()
+						_ = req.Trace()
+						_, _ = w.Write(response)
+					}))
+				}()
+				defer func() {
+					_ = server.Close()
+					if err := <-serveDone; !errors.Is(err, ErrClosed) {
+						t.Errorf("Serve = %v, want ErrClosed", err)
+					}
+				}()
+				callCtx := context.Background()
+				if v.deadline {
+					var cancel context.CancelFunc
+					callCtx, cancel = context.WithTimeout(context.Background(), time.Hour)
+					defer cancel()
+				}
+				request := patternedBytes(tc.size, 4)
+				var failure error
+				allocs := measureAllocs(t, func() {
+					m, err := stream.CallWith(callCtx, 7, request, v.opts)
+					if err != nil {
+						failure = err
+						return
+					}
+					if !bytes.Equal(m.Bytes(), response) {
+						failure = ErrProtocol
+					}
+					m.Release()
+				})
+				if failure != nil {
+					t.Fatal(failure)
+				}
+				// A caller context with a deadline has a Done channel, so a
+				// synchronous ring wait that has to park arms a context
+				// wake-up, which allocates (as in protocol 1.0, for every
+				// cancelable context). How often the wait parks depends on
+				// scheduling, so this case tolerates a few parks per hundred
+				// calls; a per-call allocation would be 1.0 or more.
+				limit := 0.0
+				if v.deadline && !tc.dispatcher {
+					limit = 0.25
+				}
+				if allocs > limit {
+					t.Fatalf("CallWith+Release with Serve allocates %v per operation (both endpoints), want at most %v", allocs, limit)
+				}
+			})
+		}
+	}
+}
+
+// TestCanceledCallAllocations measures the cancel path: a Call whose context
+// ends while the handler runs, with OpCancel reaching the handler. It is not
+// allocation-free and is documented as such: the canceled call registers an
+// entry in the abandoned set, the caller's cancelable context arms wake-ups,
+// and the handler's Done channel is created. The test only bounds it.
+func TestCanceledCallAllocations(t *testing.T) {
+	client, server := newNegotiatedPair(t, 64, 256, AdvancedOptions{}, AdvancedOptions{})
+	serveDone := make(chan error, 1)
+	go func() {
+		serveDone <- server.Serve(context.Background(), HandlerFunc(func(ctx context.Context, _ *ResponseWriter, _ *Request) {
+			<-ctx.Done()
+		}))
+	}()
+	defer func() {
+		_ = server.Close()
+		<-serveDone
+	}()
+	request := patternedBytes(64, 4)
+	allocs := measureAllocs(t, func() {
+		ctx, cancel := context.WithCancel(context.Background())
+		time.AfterFunc(50*time.Microsecond, cancel)
+		if _, err := client.Call(ctx, 7, request); !errors.Is(err, context.Canceled) {
+			t.Errorf("Call = %v, want Canceled", err)
+		}
+	})
+	t.Logf("canceled Call allocates %.1f objects per operation (both endpoints)", allocs)
+	if allocs > 40 {
+		t.Fatalf("canceled Call allocates %v per operation, want a small bounded number", allocs)
+	}
+}

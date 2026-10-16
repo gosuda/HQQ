@@ -1,0 +1,11 @@
+add_executable(test_smoke test_smoke.c)
+target_link_libraries(test_smoke PRIVATE hqq::hqq)
+hqq_apply_compile_options(test_smoke)
+add_test(NAME smoke COMMAND test_smoke)
+
+if(HQQ_BUILD_CXX_CHECK)
+  add_executable(test_cxx17 test_cxx17.cpp)
+  target_link_libraries(test_cxx17 PRIVATE hqq::hqq)
+  hqq_apply_compile_options(test_cxx17)
+  add_test(NAME cxx17 COMMAND test_cxx17)
+endif()

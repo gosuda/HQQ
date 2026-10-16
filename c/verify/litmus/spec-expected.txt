@@ -1,0 +1,9 @@
+# Verdicts for the tests in spec/litmus (maintained by the spec owner); each
+# test's own header comment states the expected result.
+mp_publish_acqrel                    Never
+mp_publish_relaxed_bug               Bug
+slot_wraparound_handoff              Never
+slot_wraparound_handoff_relaxed_bug  Bug
+wake_handshake_sc                    Never
+wake_handshake_acqrel                Sometimes
+wake_handshake_fences                Never

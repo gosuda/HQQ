@@ -2222,7 +2222,7 @@ func injectAdvancedFrame(t *testing.T, l *AdvancedLink, connectionID, messageID,
 	}
 	defer s.exitTx()
 	c := mpmc.Cancel{Closed: s.closeCh, Check: s.checkFn, Deadline: time.Now().Add(2 * time.Second)}
-	if err := l.sendAdvancedChunk(&c, connectionID, messageID, totalSize, chunkOffset, flags, aux, chunk); err != nil {
+	if err := l.sendAdvancedChunk(&c, connectionID, messageID, totalSize, chunkOffset, flags, aux, chunk, nil); err != nil {
 		t.Fatalf("inject frame: %v", err)
 	}
 }

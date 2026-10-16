@@ -1,0 +1,6 @@
+# test            expected herd7 verdict for the `exists` condition
+SB+sc             Never
+SB+acqrel         Sometimes
+SB+fences         Never
+MP+relacq         Never
+MP+rlx            Sometimes

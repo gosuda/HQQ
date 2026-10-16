@@ -14,8 +14,29 @@ import (
 // response. A handler that writes nothing answers with an empty success
 // response; WriteError turns the response into an error response.
 //
-// ctx is the context passed to Serve. w and req are pooled: they are valid
-// only until ServeHQQ returns, so a handler must not retain them or
+// ctx is the context of this request (protocol 1.1). Its Done channel is
+// closed, and Err returns context.Canceled or context.DeadlineExceeded, when
+//
+//   - the caller gave up (its Call ctx ended; FeatureCancel) or the response
+//     is otherwise no longer wanted: Canceled;
+//   - the deadline the caller sent expired (FeatureMetadata): DeadlineExceeded;
+//     ctx.Deadline reports it;
+//   - the stream the request arrived on was closed, by either side: Canceled;
+//   - the Serve context ended, Serve returned (for example after the link
+//     failed) or the link was closed: Canceled.
+//
+// ctx.Value delegates to the Serve context. The context is valid only during
+// ServeHQQ: when the handler returns it is canceled and its memory is
+// recycled for later requests, so a handler must not keep it, nor use it
+// after it returned. A handler may derive contexts from it or wait on
+// ctx.Done() in goroutines it waits for before returning. Calling Done
+// allocates the channel (once per request); a handler that only polls
+// ctx.Err() allocates nothing.
+//
+// A request that was canceled before its handler started is not handed to
+// the handler at all, and a response is not sent when the caller gave up or
+// the deadline passed while the handler ran. w and req are pooled: they are
+// valid only until ServeHQQ returns, so a handler must not retain them or
 // req.Payload(), nor use them from a goroutine it started.
 type Handler interface {
 	ServeHQQ(ctx context.Context, w *ResponseWriter, req *Request)
@@ -30,7 +51,8 @@ func (f HandlerFunc) ServeHQQ(ctx context.Context, w *ResponseWriter, req *Reque
 }
 
 // Request is a request received by Serve. It is pooled and valid only during
-// ServeHQQ.
+// ServeHQQ. Its metadata accessors (Caller, Trace) return zero values when
+// the caller sent none.
 type Request struct {
 	msg *Message
 }
@@ -61,6 +83,7 @@ type ResponseWriter struct {
 	body   *Message // pooled response buffer, body.n bytes written; nil if empty
 	status uint64   // error status, meaningful if failed
 	failed bool
+	skip   bool // the caller gave up: send no response
 }
 
 // Write appends p to the response body and returns len(p). A response body
@@ -186,8 +209,14 @@ func (m *Mux) ServeHQQ(ctx context.Context, w *ResponseWriter, req *Request) {
 // is the only consumer of requests: Stream.Recv never returns one. A request
 // whose sender aborted it mid-transfer is dropped and never reaches h.
 //
+// Every handler receives its own context (see Handler): it ends when the
+// caller cancels or its deadline expires, when the stream closes, and when
+// Serve ends, which cancels the contexts of the handlers still running
+// before it waits for them.
+//
 // It returns ctx.Err() when ctx ends, nil when the peer closed the link
-// gracefully, and the receive error otherwise. The link must be negotiated
+// gracefully or Shutdown completed (also if it completed before Serve was
+// called), and the receive error otherwise. The link must be negotiated
 // with FeatureRequestResponse.
 func (l *AdvancedLink) Serve(ctx context.Context, h Handler) error {
 	if h == nil {
@@ -195,6 +224,9 @@ func (l *AdvancedLink) Serve(ctx context.Context, h Handler) error {
 	}
 	if err := l.requireFeature(FeatureRequestResponse); err != nil {
 		return err
+	}
+	if l.serveStopped.Load() {
+		return nil
 	}
 	ctx = orBackground(ctx)
 	n := max(l.BufferCount(), 1)
@@ -212,6 +244,7 @@ func (l *AdvancedLink) Serve(ctx context.Context, h Handler) error {
 
 	err, final := s.run()
 	if final {
+		s.stop()
 		close(s.work)
 		s.wg.Wait()
 		return err
@@ -245,6 +278,10 @@ type server struct {
 	slots  chan struct{} // one token per handler in flight that the receiver does not run inline
 	work   chan *Message // unbuffered: a send succeeds only if a worker is idle
 	result chan error    // Serve's result, sent by the final receiver if it is not Serve's goroutine
+	// stopped is set when receiving ended, before the handlers still running
+	// are canceled: a handler that starts later is not run (see
+	// reqCtx.begin).
+	stopped atomic.Bool
 
 	// Inline execution: timer fires escalate if a handler outlives
 	// inlineLimit; state holds the epoch and phase of the current inline run
@@ -262,12 +299,21 @@ type server struct {
 	wg sync.WaitGroup // every goroutine except Serve's own
 }
 
+// stop ends the handlers of this Serve call: the ones running are canceled
+// and the ones handed to a worker but not yet started will not run.
+func (s *server) stop() {
+	s.stopped.Store(true)
+	s.l.cancelServerRequests(s)
+}
+
 // mapError converts the error that ended the receive loop into Serve's
 // result.
 func (s *server) mapError(err error) error {
 	switch {
 	case s.ctx.Err() != nil:
 		return s.ctx.Err()
+	case s.l.serveStopped.Load():
+		return nil
 	case errors.Is(err, ErrPeerClosed):
 		return nil
 	default:
@@ -344,6 +390,7 @@ func (s *server) escalate() {
 func (s *server) receiver() {
 	defer s.wg.Done()
 	if err, final := s.run(); final {
+		s.stop()
 		s.result <- err
 		close(s.work)
 	}
@@ -404,18 +451,33 @@ func (s *server) runPooled(m *Message) {
 }
 
 // handle runs the handler for request message m.
+//
+// A request that was canceled before it started is not handed to the
+// handler: handle returns (nil, nil) and respond only releases m.
 func (s *server) handle(m *Message) (*Request, *ResponseWriter) {
+	rc := m.rc
+	if !rc.begin(s, m) {
+		rc.end()
+		return nil, nil
+	}
 	req := requestPool.Get().(*Request)
 	req.msg = m
 	w := writerPool.Get().(*ResponseWriter)
 	w.link = s.l
-	s.h.ServeHQQ(s.ctx, w, req)
+	s.h.ServeHQQ(rc, w, req)
+	w.skip = rc.end()
 	return req, w
 }
 
 // respond sends the response assembled in w and recycles everything.
 func (s *server) respond(m *Message, req *Request, w *ResponseWriter) {
-	s.l.sendResponse(s.ctx, w, m)
+	if req == nil {
+		m.Release()
+		return
+	}
+	if !w.skip {
+		s.l.sendResponse(s.ctx, w, m)
+	}
 	w.body.Release()
 	*w = ResponseWriter{}
 	writerPool.Put(w)
@@ -437,7 +499,7 @@ func (l *AdvancedLink) sendResponse(ctx context.Context, w *ResponseWriter, req 
 	if w.body != nil {
 		payload = w.body.Bytes()
 	}
-	if err := l.sendAdvancedPayload(ctx, req.streamID, req.messageID, flags, status, payload); err == nil {
+	if err := l.sendAdvancedPayload(ctx, req.streamID, req.messageID, flags, status, nil, payload); err == nil {
 		l.stats.responses.Add(1)
 	}
 }

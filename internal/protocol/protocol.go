@@ -12,7 +12,7 @@ import "encoding/binary"
 // local machine's native byte order.
 const (
 	HQQProtocolMajorVersion = 1
-	HQQProtocolMinorVersion = 0
+	HQQProtocolMinorVersion = 1
 )
 
 const (
@@ -90,6 +90,18 @@ const (
 	//   Operand1: Negotiated feature flags
 	//   Operand2: Negotiated capability flags
 	OpProtoAck OpCode = 0x06
+
+	// OpCancel (0x07): Advanced Protocol request cancellation, valid only
+	// when FeatureCancel was negotiated (protocol 1.1).
+	//
+	// The sender of a request tells the receiver that it no longer waits for
+	// the response. It is advisory and carries no reply.
+	//
+	// Operands:
+	//   Operand0: ConnectionID of the request (zero for link-level requests)
+	//   Operand1: MessageID of the request
+	//   Operand2..6: reserved, zero
+	OpCancel OpCode = 0x07
 
 	// OpStandardLinkTombstone (0xFE): Empty Standard Protocol slot marker.
 	//

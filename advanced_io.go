@@ -36,6 +36,8 @@ type advancedAssembly struct {
 	msg  *Message
 	size uint64 // announced message size
 	next uint64
+
+	recvAt time.Time // arrival of the first chunk, set only for AdvFlagMeta messages
 }
 
 var assemblyPool = sync.Pool{
@@ -65,7 +67,9 @@ var pendingPool = sync.Pool{
 // receiving (lowest latency), routing every message it receives to its
 // destination, and otherwise lets the dispatcher fill the queue.
 func (l *AdvancedLink) receiveQueued(ctx context.Context, q chan *Message, st *Stream) (*Message, error) {
-	var done <-chan struct{} // nil blocks forever: the request queue never closes
+	// The request queue never closes; its consumer, Serve, stops when
+	// Shutdown completed.
+	done := l.serveStop
 	if st != nil {
 		done = st.done
 	}
@@ -74,6 +78,8 @@ func (l *AdvancedLink) receiveQueued(ctx context.Context, q chan *Message, st *S
 			if st.state.Load()&streamLocalClosed != 0 {
 				return nil, ErrClosed
 			}
+		} else if l.serveStopped.Load() {
+			return nil, errServeStopped
 		}
 		select {
 		case m := <-q:
@@ -127,7 +133,7 @@ func (l *AdvancedLink) receiveQueued(ctx context.Context, q chan *Message, st *S
 			return m, nil
 		default:
 		}
-		if err := l.receiveRoute(ctx); err != nil {
+		if err := l.receiveRoute(ctx, st == nil); err != nil {
 			select {
 			case m := <-q:
 				return m, nil
@@ -161,7 +167,7 @@ func (l *AdvancedLink) awaitResponse(ctx context.Context, key advancedCallKey, p
 				pendingPool.Put(pending)
 				return result.msg, result.err
 			case <-ctx.Done():
-				l.abandonCall(key, pending)
+				l.giveUp(key, pending, true)
 				return nil, ctx.Err()
 			case <-st.done:
 			case <-l.dispatchDone:
@@ -196,8 +202,8 @@ func (l *AdvancedLink) awaitResponse(ctx context.Context, key advancedCallKey, p
 			return result.msg, result.err
 		default:
 		}
-		if err := l.receiveRoute(ctx); err != nil {
-			l.abandonCall(key, pending)
+		if err := l.receiveRoute(ctx, false); err != nil {
+			l.giveUp(key, pending, ctx.Err() != nil)
 			return nil, err
 		}
 	}
@@ -212,8 +218,11 @@ func (l *AdvancedLink) awaitResponse(ctx context.Context, key advancedCallKey, p
 // (under OverflowBlock): the delivery is handed over to a goroutine that
 // takes over receiveMu, which keeps the order, and the dispatcher started by
 // the callers' next iteration continues after it.
-func (l *AdvancedLink) receiveRoute(ctx context.Context) error {
-	m, hdr, abortErr, err := l.receiveNextLocked(ctx)
+//
+// serving tells that the receiver is Serve: a completed Shutdown then ends
+// its wait on the ring (see serveWakeDeadline).
+func (l *AdvancedLink) receiveRoute(ctx context.Context, serving bool) error {
+	m, hdr, abortErr, err := l.receiveNextLocked(ctx, serving)
 	if err != nil {
 		l.receiveMu.Unlock()
 		return err
@@ -234,9 +243,10 @@ func (l *AdvancedLink) nextMessageID() uint64 {
 	return l.messageIDGenerator.Add(1)
 }
 
-// sendAdvancedPayload publishes payload as one logical message.
-func (l *AdvancedLink) sendAdvancedPayload(ctx context.Context, connectionID, messageID, baseFlags, aux uint64, payload []byte) error {
-	totalSize := uint64(len(payload))
+// sendAdvancedPayload publishes prefix followed by payload as one logical
+// message (prefix is the metadata block of a request, nil otherwise).
+func (l *AdvancedLink) sendAdvancedPayload(ctx context.Context, connectionID, messageID, baseFlags, aux uint64, prefix, payload []byte) error {
+	totalSize := uint64(len(prefix)) + uint64(len(payload))
 	if l.maxMessageSize > 0 && totalSize > l.maxMessageSize {
 		return ErrBufferOverflow
 	}
@@ -248,7 +258,7 @@ func (l *AdvancedLink) sendAdvancedPayload(ctx context.Context, connectionID, me
 
 	c := l.ringCancel(ctx)
 	if totalSize == 0 {
-		return mapCtxErr(ctx, l.sendAdvancedChunk(&c, connectionID, messageID, 0, 0, AdvFlagBegin|AdvFlagEnd|baseFlags, aux, nil))
+		return mapCtxErr(ctx, l.sendAdvancedChunk(&c, connectionID, messageID, 0, 0, AdvFlagBegin|AdvFlagEnd|baseFlags, aux, nil, nil))
 	}
 
 	chunkSize := uint64(s.bufferSize)
@@ -265,12 +275,20 @@ func (l *AdvancedLink) sendAdvancedPayload(ctx context.Context, connectionID, me
 		if offset == 0 {
 			chunkAux = aux
 		}
-		if err := l.sendAdvancedChunk(&c, connectionID, messageID, totalSize, offset, flags, chunkAux, payload[offset:end]); err != nil {
+		// The chunk covers bytes [offset, end) of prefix||payload.
+		var head, tail []byte
+		if offset < uint64(len(prefix)) {
+			head = prefix[offset:min(end, uint64(len(prefix)))]
+		}
+		if end > uint64(len(prefix)) {
+			tail = payload[max(offset, uint64(len(prefix)))-uint64(len(prefix)) : end-uint64(len(prefix))]
+		}
+		if err := l.sendAdvancedChunk(&c, connectionID, messageID, totalSize, offset, flags, chunkAux, head, tail); err != nil {
 			if offset > 0 {
 				// Tell the receiver to drop the partial message. Use a short
 				// independent deadline: ctx may already be done.
 				abort := mpmc.Cancel{Closed: s.closeCh, Check: s.checkFn, Deadline: time.Now().Add(100 * time.Millisecond)}
-				_ = l.sendAdvancedChunk(&abort, connectionID, messageID, 0, 0, AdvFlagAbort|baseFlags, 0, nil)
+				_ = l.sendAdvancedChunk(&abort, connectionID, messageID, 0, 0, AdvFlagAbort|baseFlags, 0, nil, nil)
 			}
 			return mapCtxErr(ctx, err)
 		}
@@ -278,13 +296,14 @@ func (l *AdvancedLink) sendAdvancedPayload(ctx context.Context, connectionID, me
 	return nil
 }
 
-func (l *AdvancedLink) sendAdvancedChunk(c *mpmc.Cancel, connectionID, messageID, totalSize, chunkOffset, flags, aux uint64, chunk []byte) error {
+// sendAdvancedChunk publishes one frame whose payload is head followed by
+// tail.
+func (l *AdvancedLink) sendAdvancedChunk(c *mpmc.Cancel, connectionID, messageID, totalSize, chunkOffset, flags, aux uint64, head, tail []byte) error {
 	s := l.slink
 	return s.txRing.EnqueueZeroCopyCancel(c, func(slot uint64, p *protocol.Packet) {
-		if len(chunk) > 0 {
-			copy(s.txBufs[slot], chunk)
-		}
-		*p = protocol.NewConnCopyPacket(connectionID, messageID, totalSize, chunkOffset, uint64(len(chunk)), flags, aux)
+		n := copy(s.txBufs[slot], head)
+		n += copy(s.txBufs[slot][n:], tail)
+		*p = protocol.NewConnCopyPacket(connectionID, messageID, totalSize, chunkOffset, uint64(n), flags, aux)
 	})
 }
 
@@ -298,7 +317,7 @@ func (l *AdvancedLink) sendAdvancedChunk(c *mpmc.Cancel, connectionID, messageID
 // and the remaining chunks of refused messages are dropped here; a refused
 // request is answered with an error response queued on the control sender,
 // so receiveNextLocked never waits for the tx ring.
-func (l *AdvancedLink) receiveNextLocked(ctx context.Context) (m *Message, hdr advHeader, abortErr error, err error) {
+func (l *AdvancedLink) receiveNextLocked(ctx context.Context, serving bool) (m *Message, hdr advHeader, abortErr error, err error) {
 	rxBufs := l.slink.rxBufs
 	for {
 		var (
@@ -307,9 +326,9 @@ func (l *AdvancedLink) receiveNextLocked(ctx context.Context) (m *Message, hdr a
 			outcome  chunkOutcome
 			frameErr error
 			control  protocol.Packet
-			kind     int // 0: data/none, 1: control, 2: error packet
+			kind     int // 0: data/none, 1: control, 2: error packet, 3: cancel
 		)
-		err := l.dequeue(ctx, func(slot uint64, p *protocol.Packet) {
+		err := l.dequeue(ctx, serving, func(slot uint64, p *protocol.Packet) {
 			switch p.Op() {
 			case protocol.OpStandardLinkTombstone:
 			case protocol.OpConnCopy:
@@ -318,6 +337,12 @@ func (l *AdvancedLink) receiveNextLocked(ctx context.Context) (m *Message, hdr a
 				control, kind = *p, 1
 			case protocol.OpError:
 				control, kind = *p, 2
+			case protocol.OpCancel:
+				if l.negotiated.Load()&FeatureCancel == 0 {
+					frameErr = ErrUnexpectedPacket
+				} else {
+					control, kind = *p, 3
+				}
 			default:
 				frameErr = ErrUnexpectedPacket
 			}
@@ -337,6 +362,8 @@ func (l *AdvancedLink) receiveNextLocked(ctx context.Context) (m *Message, hdr a
 			if !l.routeControlError(&control) {
 				return nil, advHeader{}, nil, errorFromCode(ErrorCode(control.Operand(1)))
 			}
+		case kind == 3:
+			l.handleCancelPacket(&control)
 		case outcome == chunkComplete:
 			return msg, mh, nil, nil
 		case outcome == chunkAborted:
@@ -352,7 +379,7 @@ func (l *AdvancedLink) receiveNextLocked(ctx context.Context) (m *Message, hdr a
 			case mh.isRequest():
 				// Best effort: the peer's Call otherwise waits for a
 				// response that will never come.
-				l.refuseRequest(mh)
+				l.refuseRequest(mh, ErrCodeBufferOverflow)
 			}
 		}
 	}
@@ -388,9 +415,14 @@ func (l *AdvancedLink) consumeAdvancedChunk(p *protocol.Packet, buffer []byte) (
 	chunkSize := p.Operand(4)
 	flags := p.Operand(5)
 	aux := p.Operand(6)
-	if flags&^advancedKnownFlags != 0 ||
+	known := advancedKnownFlags
+	if l.negotiated.Load()&FeatureMetadata != 0 {
+		known |= AdvFlagMeta
+	}
+	if flags&^known != 0 ||
 		flags&AdvFlagRequest != 0 && flags&AdvFlagResponse != 0 ||
-		flags&AdvFlagError != 0 && flags&AdvFlagResponse == 0 {
+		flags&AdvFlagError != 0 && flags&AdvFlagResponse == 0 ||
+		flags&AdvFlagMeta != 0 && flags&AdvFlagRequest == 0 {
 		return nil, advHeader{}, chunkPartial, ErrProtocol
 	}
 	kind := flags & (AdvFlagRequest | AdvFlagResponse)
@@ -435,9 +467,19 @@ func (l *AdvancedLink) consumeAdvancedChunk(p *protocol.Packet, buffer []byte) (
 			if chunkSize != totalSize {
 				return fail(ErrInvalidSize)
 			}
+			var recvAt time.Time
+			if flags&AdvFlagMeta != 0 {
+				recvAt = time.Now()
+			}
 			m := l.pool.get(int(totalSize))
 			m.advHeader = advHeader{connectionID, messageID, flags, aux}
 			copy(m.data, buffer[:chunkSize])
+			if flags&AdvFlagMeta != 0 {
+				if err := m.stripMeta(recvAt); err != nil {
+					m.Release()
+					return nil, advHeader{}, chunkPartial, err
+				}
+			}
 			return m, m.advHeader, chunkComplete, nil
 		}
 		header := advHeader{connectionID, messageID, flags &^ (AdvFlagBegin | AdvFlagEnd), aux}
@@ -452,6 +494,9 @@ func (l *AdvancedLink) consumeAdvancedChunk(p *protocol.Packet, buffer []byte) (
 		assembly.msg = l.pool.get(int(totalSize))
 		assembly.size = totalSize
 		assembly.next = 0
+		if flags&AdvFlagMeta != 0 {
+			assembly.recvAt = time.Now()
+		}
 		l.assemblies[key] = assembly
 		l.assemblyBytes += charge
 	}
@@ -480,8 +525,15 @@ func (l *AdvancedLink) consumeAdvancedChunk(p *protocol.Packet, buffer []byte) (
 	m := assembly.msg
 	m.advHeader = assembly.hdr
 	m.flags |= AdvFlagBegin | AdvFlagEnd
+	recvAt := assembly.recvAt
 	assembly.msg = nil // the message leaves with the caller
 	l.dropAssembly(key)
+	if m.flags&AdvFlagMeta != 0 {
+		if err := m.stripMeta(recvAt); err != nil {
+			m.Release()
+			return nil, advHeader{}, chunkPartial, err
+		}
+	}
 	return m, m.advHeader, chunkComplete, nil
 }
 

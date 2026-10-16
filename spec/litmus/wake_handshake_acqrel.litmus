@@ -1,0 +1,20 @@
+C hqq_wake_handshake_acqrel
+(* The same handshake with release/acquire only (release store of seq,
+   acquire load of waiters, acq_rel RMW for the registration, acquire load of
+   seq). Store buffering is allowed by release/acquire: the lost-wakeup outcome
+   is REACHABLE. Expected herd7 result: "Sometimes". This is the counter-example
+   that motivates MEMORY_MODEL.md section 4: these four accesses MUST be
+   seq_cst (or separated by seq_cst fences). *)
+{ }
+
+P0 (atomic_int* seq, atomic_int* waiters) {
+  atomic_store_explicit(seq, 1, memory_order_release);
+  int r0 = atomic_load_explicit(waiters, memory_order_acquire);
+}
+
+P1 (atomic_int* seq, atomic_int* waiters) {
+  int r2 = atomic_fetch_add_explicit(waiters, 1, memory_order_acq_rel);
+  int r1 = atomic_load_explicit(seq, memory_order_acquire);
+}
+
+exists (0:r0=0 /\ 1:r1=0)

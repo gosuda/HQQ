@@ -258,6 +258,11 @@ func validRingSize(n uint64) bool {
 	return n >= 2 && n&(n-1) == 0
 }
 
+// FormatSlice is the number of slots FormatGuarded writes between two calls
+// of its check function. It bounds how much a writer that lost ownership of
+// the memory while it was suspended can still write.
+const FormatSlice = 1024
+
 // Format unconditionally initializes a ring at p with exactly size slots. The
 // caller must guarantee that no other party is using the memory while Format
 // runs, and that it spans at least SizeMPMCRing[T](size) bytes.
@@ -272,8 +277,27 @@ func validRingSize(n uint64) bool {
 //
 //go:nocheckptr
 func Format[T any](p unsafe.Pointer, size uint64) {
+	_ = FormatGuarded[T](p, size, nil)
+}
+
+// FormatGuarded is Format for memory whose ownership can be lost while the
+// caller is suspended. check, if not nil, runs before the first write, before
+// every FormatSlice slots and before the header words are completed; if it
+// returns an error, FormatGuarded stops and returns that error without
+// writing any more. The ring is then unusable (its magic is cleared by the
+// first write), exactly as if the caller had crashed in the middle of Format.
+// A check cannot make the check and the following write atomic: a caller
+// suspended between them can still write up to FormatSlice slots.
+//
+//go:nocheckptr
+func FormatGuarded[T any](p unsafe.Pointer, size uint64, check func() error) error {
 	if !validRingSize(size) {
 		panic("mpmc: ring size must be a power of two of at least 2")
+	}
+	if check != nil {
+		if err := check(); err != nil {
+			return err
+		}
 	}
 	hdr := (*_mring)(p)
 	atomic.StoreUint64(&hdr._flag, 0)
@@ -282,9 +306,19 @@ func Format[T any](p unsafe.Pointer, size uint64) {
 	st := stride[T]()
 	data := unsafe.Add(p, HeaderSize)
 	for i := uint64(0); i < size; i++ {
+		if check != nil && i != 0 && i%FormatSlice == 0 {
+			if err := check(); err != nil {
+				return err
+			}
+		}
 		e := (*_melem[T])(unsafe.Add(data, uintptr(i)*st))
 		e._data = *new(T)
 		atomic.StoreUint64(&e._seq, i)
+	}
+	if check != nil {
+		if err := check(); err != nil {
+			return err
+		}
 	}
 
 	atomic.StoreUint64(&hdr.r, 0)
@@ -298,6 +332,7 @@ func Format[T any](p unsafe.Pointer, size uint64) {
 	atomic.StoreUint64(&hdr._version, layoutVersion)
 	atomic.StoreUint64(&hdr._magic, _mpmc_magic)
 	atomic.StoreUint64(&hdr._flag, uint64(_mpmc_init))
+	return nil
 }
 
 // MPMCAttach attaches to the ring at address h, waiting up to timeout for it

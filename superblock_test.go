@@ -11,6 +11,9 @@ import (
 	"testing"
 	"time"
 	"unsafe"
+
+	"gosuda.org/hqq/internal/mpmc"
+	"gosuda.org/hqq/internal/protocol"
 )
 
 // fastInit makes initializer takeovers and stale-endpoint decisions
@@ -716,4 +719,156 @@ func TestCheckedLayoutArithmetic(t *testing.T) {
 			t.Fatalf("offset %d is not page aligned in %+v", off, l)
 		}
 	}
+}
+
+// A heartbeat that lies in the future by more than heartbeatFutureSlack (the
+// wall clock was stepped backwards, or the writer's clock runs ahead) must be
+// confirmed by the progress watch instead of counting as fresh (F-04).
+func TestEndpointAliveAtOpenFutureHeartbeat(t *testing.T) {
+	opts := LinkOptions{PeerTimeout: 150 * time.Millisecond}.normalized()
+	future := func(d time.Duration) uint64 { return uint64(time.Now().Add(d).UnixNano()) }
+	newRec := func(hb uint64) *endpointRecord {
+		_, sb := newSuperblockMem()
+		rec := &sb.endpoints[endpointPrimary]
+		store(&rec.token, 5)
+		store(&rec.interval, uint64(5*time.Millisecond))
+		store(&rec.heartbeat, hb)
+		return rec
+	}
+
+	t.Run("dead owner", func(t *testing.T) {
+		rec := newRec(future(time.Hour))
+		start := time.Now()
+		alive, err := endpointAliveAtOpen(t.Context(), rec, opts)
+		if err != nil || alive {
+			t.Fatalf("endpointAliveAtOpen = %v, %v; a dead endpoint with a far-future heartbeat must be dead", alive, err)
+		}
+		if time.Since(start) < 10*time.Millisecond {
+			t.Fatalf("answered after %v without watching for progress", time.Since(start))
+		}
+	})
+
+	t.Run("live owner after clock step", func(t *testing.T) {
+		rec := newRec(future(time.Hour))
+		stop := make(chan struct{})
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			for {
+				select {
+				case <-stop:
+					return
+				case <-time.After(2 * time.Millisecond):
+					store(&rec.heartbeat, nowNanos())
+				}
+			}
+		}()
+		alive, err := endpointAliveAtOpen(t.Context(), rec, opts)
+		close(stop)
+		<-done
+		if err != nil || !alive {
+			t.Fatalf("endpointAliveAtOpen = %v, %v; a beating endpoint must be alive", alive, err)
+		}
+	})
+
+	t.Run("small lead is fresh", func(t *testing.T) {
+		rec := newRec(future(heartbeatFutureSlack / 4))
+		start := time.Now()
+		alive, err := endpointAliveAtOpen(t.Context(), rec, opts)
+		if err != nil || !alive || time.Since(start) > 5*time.Millisecond {
+			t.Fatalf("endpointAliveAtOpen = %v, %v after %v; a small lead is clock jitter", alive, err, time.Since(start))
+		}
+	})
+}
+
+// A creator must reclaim a segment whose dead primary left a far-future
+// heartbeat behind (F-04), instead of failing with ErrLinkBusy.
+func TestClaimReusesSegmentWithFutureHeartbeat(t *testing.T) {
+	mem, sb := newSuperblockMem()
+	p, err := NewStandardLink(mem, testBufferCount, testBufferSize, fastInit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Simulate a killed primary: stop its heartbeat and leave a timestamp
+	// from before a backwards clock step.
+	close(p.hbStop)
+	<-p.hbDone
+	p.hbStop = nil
+	store(&sb.endpoints[endpointPrimary].heartbeat, uint64(time.Now().Add(time.Hour).UnixNano()))
+	defer p.Close()
+
+	opts := fastInit
+	opts.ctx = t.Context()
+	opts.role = roleCreator
+	_, mustInit, err := claimSuperblock(sb, testBufferCount, testBufferSize, uintptr(len(mem)), newToken(), opts)
+	if err != nil || !mustInit {
+		t.Fatalf("creator claim = %v, %v; want a reuse of the dead segment", mustInit, err)
+	}
+}
+
+// An initializer that loses ownership while it formats a ring or zeroes a
+// buffer pool stops within one slice instead of finishing the whole phase
+// (F-01).
+func TestInitializerStopsWithinOneSlice(t *testing.T) {
+	const token, other = 11, 22
+	const slots = 4 * mpmc.FormatSlice
+	_, sb := newSuperblockMem()
+	s := &initSession{sb: sb, token: token, ctx: context.Background()}
+
+	t.Run("format", func(t *testing.T) {
+		store(&sb.initToken, token)
+		mem := AlignedBuffer(mpmc.SizeMPMCRing[protocol.Packet](slots))
+		p := unsafe.Pointer(unsafe.SliceData(mem))
+		mpmc.Format[protocol.Packet](p, slots)
+		// The new initializer owns the ring and uses it: leave a mark in the
+		// sequence word of the last slot.
+		stride := (mpmc.SizeMPMCRing[protocol.Packet](4) - mpmc.SizeMPMCRing[protocol.Packet](2)) / 2
+		last := mem[mpmc.HeaderSize+(slots-1)*stride:][:8]
+		copy(last, []byte{1, 2, 3, 4, 5, 6, 7, 8})
+		calls := 0
+		err := mpmc.FormatGuarded[protocol.Packet](p, slots, func() error {
+			calls++
+			if calls == 3 { // the takeover happens while the initializer is suspended
+				store(&sb.initToken, other)
+			}
+			return s.check()
+		})
+		if err != errInitContended {
+			t.Fatalf("FormatGuarded = %v, want errInitContended", err)
+		}
+		if calls != 3 {
+			t.Fatalf("check ran %d times, want 3 (start, two slice boundaries)", calls)
+		}
+		if !bytes.Equal(last, []byte{1, 2, 3, 4, 5, 6, 7, 8}) {
+			t.Fatal("a lost initializer kept formatting after the takeover")
+		}
+	})
+
+	t.Run("zero", func(t *testing.T) {
+		store(&sb.initToken, token)
+		region := bytes.Repeat([]byte{0xff}, 8*zeroSlice)
+		checks := 0
+		err := zeroInChunks(region, zeroSlice, func() error {
+			checks++
+			if checks == 3 {
+				store(&sb.initToken, other)
+			}
+			return s.check()
+		}, s.progress)
+		if err != errInitContended || checks != 3 {
+			t.Fatalf("zero: err %v after %d checks", err, checks)
+		}
+		if !bytes.Equal(region[:2*zeroSlice], make([]byte, 2*zeroSlice)) ||
+			!bytes.Equal(region[2*zeroSlice:], bytes.Repeat([]byte{0xff}, 6*zeroSlice)) {
+			t.Fatal("zeroing did not stop at the slice boundary of the takeover")
+		}
+	})
+
+	t.Run("session slices", func(t *testing.T) {
+		store(&sb.initToken, token)
+		region := bytes.Repeat([]byte{0xff}, 3*zeroSlice)
+		if err := s.zero(region); err != nil || !bytes.Equal(region, make([]byte, len(region))) {
+			t.Fatalf("zero = %v", err)
+		}
+	})
 }

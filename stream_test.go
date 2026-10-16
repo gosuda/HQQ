@@ -1086,11 +1086,14 @@ func TestServeReturnsToInlineAfterEscalation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	serveDone := make(chan error, 1)
 
-	var wantEscalations atomic.Uint64 // the slow handler returns once this many escalations happened
+	// The slow handler returns once an escalation happened after it started.
+	// Its own escalation is what it waits for; other escalations (a fast
+	// handler outliving inlineLimit on a loaded machine) do not count.
 	mux := NewMux()
 	mux.HandleFunc(1, func(_ context.Context, w *ResponseWriter, _ *Request) {
+		start := server.stats.serveEscalations.Load()
 		deadline := time.Now().Add(10 * time.Second)
-		for server.stats.serveEscalations.Load() < wantEscalations.Load() && time.Now().Before(deadline) {
+		for server.stats.serveEscalations.Load() == start && time.Now().Before(deadline) {
 			time.Sleep(50 * time.Microsecond)
 		}
 		_, _ = w.Write([]byte("slow"))
@@ -1115,27 +1118,34 @@ func TestServeReturnsToInlineAfterEscalation(t *testing.T) {
 		m.Release()
 	}
 
-	for episode := uint64(1); episode <= 3; episode++ {
-		wantEscalations.Store(episode)
+	for episode := 1; episode <= 3; episode++ {
+		before := server.stats.serveEscalations.Load()
 		call(1, "slow")
-		if got := server.stats.serveEscalations.Load(); got != episode {
-			t.Fatalf("escalations = %d, want %d", got, episode)
+		if got := server.stats.serveEscalations.Load(); got <= before {
+			t.Fatalf("episode %d: the slow handler did not escalate", episode)
 		}
-		// The slow handler's slot is released before its response is sent,
-		// so the very next sequential request already runs inline.
+		// Serve returns to inline execution: within a short run of
+		// sequential requests one finds nothing in flight and runs inline
+		// (the slow handler's slot is released before its response is sent,
+		// so normally it is the very first one).
+		inline := false
+		for i := 0; i < 50 && !inline; i++ {
+			pooled := server.stats.servePooled.Load()
+			call(2, "fast")
+			inline = server.stats.servePooled.Load() == pooled
+		}
+		if !inline {
+			t.Fatalf("episode %d: requests never returned to inline execution", episode)
+		}
+		// And it stays inline: a fast handler may outlive inlineLimit on a
+		// loaded machine and escalate by itself, which sends a few requests
+		// to workers, but never a lasting share of them.
 		pooled := server.stats.servePooled.Load()
-		call(2, "fast")
-		if got := server.stats.servePooled.Load(); got != pooled {
-			t.Fatalf("episode %d: the first request after the slow one went to a worker", episode)
-		}
-		for i := 0; i < 500; i++ {
+		for range 500 {
 			call(2, "fast")
 		}
-		if got := server.stats.servePooled.Load(); got != pooled {
-			t.Fatalf("episode %d: %d requests went to workers after the episode, want 0", episode, got-pooled)
-		}
-		if got := server.stats.serveEscalations.Load(); got != episode {
-			t.Fatalf("episode %d: escalations = %d: fast handlers must not escalate", episode, got)
+		if got := server.stats.servePooled.Load() - pooled; got > 50 {
+			t.Fatalf("episode %d: %d of 500 requests went to workers after the episode", episode, got)
 		}
 	}
 

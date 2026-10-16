@@ -1,0 +1,15 @@
+C MP+rlx
+(* Message passing with relaxed publication. Expected: Sometimes (payload may be stale). *)
+{}
+
+P0 (atomic_int* x, atomic_int* y) {
+  atomic_store_explicit(x, 1, memory_order_relaxed);
+  atomic_store_explicit(y, 1, memory_order_relaxed);
+}
+
+P1 (atomic_int* x, atomic_int* y) {
+  int r0 = atomic_load_explicit(y, memory_order_acquire);
+  int r1 = atomic_load_explicit(x, memory_order_relaxed);
+}
+
+exists (1:r0=1 /\ 1:r1=0)

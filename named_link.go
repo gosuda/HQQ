@@ -259,6 +259,16 @@ func (a namedAttach) apply(opts LinkOptions) LinkOptions {
 // and opens a link on it with open, which receives the mapped memory and the
 // attach parameters. ctx bounds the wait for the segment to become usable.
 func openNamed[L any](ctx context.Context, name string, bufferCount, bufferSize int, create bool, mode os.FileMode, open func(mem []byte, a namedAttach) (L, error)) (L, *namedMapping, error) {
+	return openNamedInstance(ctx, name, bufferCount, bufferSize, create, mode, 0, open)
+}
+
+// openNamedInstance is openNamed with an optional instance check for
+// openers: if expect is not zero, the segment must be the instance whose
+// creatorToken is expect (the one a connecting client announced, see
+// Acceptor). The token is checked before the endpoint attaches, so that a
+// name that was replaced meanwhile is not joined, and once more after the
+// attach; a mismatch fails with errInstanceMismatch.
+func openNamedInstance[L any](ctx context.Context, name string, bufferCount, bufferSize int, create bool, mode os.FileMode, expect uint64, open func(mem []byte, a namedAttach) (L, error)) (L, *namedMapping, error) {
 	var zero L
 	size := SizeStandardLink(bufferCount, bufferSize)
 	if size == 0 {
@@ -281,6 +291,13 @@ func openNamed[L any](ctx context.Context, name string, bufferCount, bufferSize 
 	}
 	attach.parkers = m.parkers
 	m.instance = attach.creatorToken
+	if expect != 0 && !create {
+		sb := (*standardSuperblock)(unsafe.Pointer(unsafe.SliceData(m.mapping)))
+		if atomic.LoadUint64(&sb.creatorToken) != expect {
+			_ = m.release()
+			return zero, nil, errInstanceMismatch
+		}
+	}
 	link, err := open(m.mapping, attach)
 	if err != nil {
 		_ = m.release()
@@ -293,6 +310,15 @@ func openNamed[L any](ctx context.Context, name string, bufferCount, bufferSize 
 	} else {
 		sb := (*standardSuperblock)(unsafe.Pointer(unsafe.SliceData(m.mapping)))
 		m.instance = atomic.LoadUint64(&sb.creatorToken)
+		if expect != 0 && m.instance != expect {
+			// The segment was re-initialized between the check and the
+			// attach: detach again.
+			if c, ok := any(link).(interface{ Close() error }); ok {
+				_ = c.Close()
+			}
+			_ = m.release()
+			return zero, nil, errInstanceMismatch
+		}
 	}
 	return link, m, nil
 }
@@ -386,7 +412,13 @@ func OpenAdvancedLink(name string, bufferCount int, bufferSize int, opts Advance
 }
 
 func openNamedAdvanced(ctx context.Context, name string, bufferCount, bufferSize int, create bool, mode os.FileMode, opts AdvancedOptions) (*NamedAdvancedLink, error) {
-	link, m, err := openNamed(ctx, name, bufferCount, bufferSize, create, mode, func(mem []byte, a namedAttach) (*AdvancedLink, error) {
+	return openNamedAdvancedInstance(ctx, name, bufferCount, bufferSize, create, mode, 0, opts)
+}
+
+// openNamedAdvancedInstance is openNamedAdvanced with the instance check of
+// openNamedInstance.
+func openNamedAdvancedInstance(ctx context.Context, name string, bufferCount, bufferSize int, create bool, mode os.FileMode, expect uint64, opts AdvancedOptions) (*NamedAdvancedLink, error) {
+	link, m, err := openNamedInstance(ctx, name, bufferCount, bufferSize, create, mode, expect, func(mem []byte, a namedAttach) (*AdvancedLink, error) {
 		opts.Link = a.apply(opts.Link)
 		return NewAdvancedLink(mem, bufferCount, bufferSize, opts)
 	})

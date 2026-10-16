@@ -26,7 +26,7 @@ func (l *AdvancedLink) dispatchLoop(ctx context.Context) {
 	defer close(l.dispatchDone)
 	for {
 		l.receiveMu.Lock()
-		m, hdr, abortErr, err := l.receiveNextLocked(ctx)
+		m, hdr, abortErr, err := l.receiveNextLocked(ctx, false)
 		l.receiveMu.Unlock()
 		if err == nil {
 			_, err = l.route(ctx, m, hdr, abortErr, true)
@@ -94,7 +94,7 @@ func (l *AdvancedLink) route(ctx context.Context, m *Message, hdr advHeader, abo
 		l.routeResponse(m.advHeader, m, nil)
 		return stalledDelivery{}, nil
 	case m.isRequest():
-		return l.deliver(ctx, l.requests, nil, m, blocking)
+		return l.routeRequest(ctx, m, blocking)
 	}
 	st := l.lookupStream(m.streamID)
 	if st == nil || st.state.Load() != 0 {
@@ -232,13 +232,16 @@ func (l *AdvancedLink) unregisterPendingCall(key advancedCallKey, ch chan advanc
 // abandonCall removes a call that gives up before its response arrived and
 // remembers its key so that a late response is discarded (and counted in
 // AbandonedResponses) instead of being dropped as unmatched.
-func (l *AdvancedLink) abandonCall(key advancedCallKey, ch chan advancedDispatchResult) {
+//
+// It reports whether the call was still pending; if not, a response (or a
+// failure) was already routed to ch.
+func (l *AdvancedLink) abandonCall(key advancedCallKey, ch chan advancedDispatchResult) bool {
 	l.pendingMu.Lock()
 	defer l.pendingMu.Unlock()
 	if l.pendingCalls[key] != ch {
 		// Already routed or failed; the result is simply dropped. The
 		// channel may still receive a value, so it is not recycled.
-		return
+		return false
 	}
 	delete(l.pendingCalls, key)
 	if len(l.abandonedOrder) >= maxAbandonedCalls {
@@ -248,6 +251,16 @@ func (l *AdvancedLink) abandonCall(key advancedCallKey, ch chan advancedDispatch
 	}
 	l.abandoned[key] = struct{}{}
 	l.abandonedOrder = append(l.abandonedOrder, key)
+	return true
+}
+
+// giveUp abandons a call that stops waiting. If the call ended because its
+// context did (canceled), the peer is told with OpCancel (FeatureCancel), so
+// that its handler stops working for a response nobody reads.
+func (l *AdvancedLink) giveUp(key advancedCallKey, ch chan advancedDispatchResult, canceled bool) {
+	if l.abandonCall(key, ch) && canceled {
+		l.cancelPending(key)
+	}
 }
 
 func (l *AdvancedLink) failPendingCalls(err error) {

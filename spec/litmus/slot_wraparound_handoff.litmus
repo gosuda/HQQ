@@ -1,0 +1,32 @@
+C hqq_slot_wraparound_handoff
+(* Slot reuse across a lap (1-slot view of a ring with mask+1 == 2: producer
+   publishes seq = pos+1 = 1, consumer releases seq = pos+mask+1 = 2, producer
+   reuses the slot on the next lap once it observes seq == 2).
+   P0 = producer: writes lap-0 payload, publishes (release); later acquire-loads
+        seq and, when it sees the release value 2, overwrites the payload.
+   P1 = consumer: acquire-loads seq; if published reads the payload, then
+        releases the slot (release store of 2).
+   Forbidden: the consumer's payload read observes the lap-1 write (2): the
+   lap-1 write happens-after the consumer's release store.
+   Expected herd7 result: "Never", no data-race flag. *)
+{ }
+
+P0 (atomic_int* seq, int* d) {
+  *d = 1;
+  atomic_store_explicit(seq, 1, memory_order_release);
+  int r1 = atomic_load_explicit(seq, memory_order_acquire);
+  if (r1 == 2) {
+    *d = 2;
+  }
+}
+
+P1 (atomic_int* seq, int* d) {
+  int r0 = atomic_load_explicit(seq, memory_order_acquire);
+  int r2 = 0;
+  if (r0 == 1) {
+    r2 = *d;
+    atomic_store_explicit(seq, 2, memory_order_release);
+  }
+}
+
+exists (1:r0=1 /\ 1:r2=2)

@@ -35,15 +35,20 @@ func (h advHeader) isAbort() bool    { return h.flags&AdvFlagAbort != 0 }
 type Message struct {
 	advHeader
 	data  []byte // backing buffer, len == cap == capacity of the size class
-	n     int    // payload length, n <= len(data)
+	off   int    // start of the payload in data (after a metadata block), off+n <= len(data)
+	n     int    // payload length
 	class uint8  // size class index in pool.classes
 	pool  *msgPool
+
+	// Request state, set by the receive path for requests only.
+	meta msgMeta
+	rc   *reqCtx // context of the request, released with the message
 }
 
 // Bytes returns the message payload. The slice is valid until Release and
 // has no spare capacity, so appending to it never overwrites the buffer.
 func (m *Message) Bytes() []byte {
-	return m.data[:m.n:m.n]
+	return m.data[m.off : m.off+m.n : m.off+m.n]
 }
 
 // Len returns the payload length in bytes.
@@ -65,7 +70,15 @@ func (m *Message) Release() {
 		return
 	}
 	m.advHeader = advHeader{}
-	m.n = 0
+	m.off, m.n = 0, 0
+	if m.meta.present {
+		m.meta = msgMeta{}
+	}
+	if m.rc != nil {
+		rc := m.rc
+		m.rc = nil
+		rc.release()
+	}
 	m.pool.put(m)
 }
 

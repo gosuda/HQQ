@@ -134,6 +134,7 @@ func (l *AdvancedLink) handlePeerClose(connID uint64) {
 	l.controlMu.Unlock()
 	if st != nil {
 		st.markClosed(streamPeerClosed)
+		l.cancelStreamRequests(connID)
 	}
 }
 

@@ -1,0 +1,17 @@
+C SB+fences
+(* Store buffering with a seq_cst fence between store and load. Expected: Never. *)
+{}
+
+P0 (atomic_int* x, atomic_int* y) {
+  atomic_store_explicit(x, 1, memory_order_release);
+  atomic_thread_fence(memory_order_seq_cst);
+  int r0 = atomic_load_explicit(y, memory_order_relaxed);
+}
+
+P1 (atomic_int* x, atomic_int* y) {
+  atomic_store_explicit(y, 1, memory_order_release);
+  atomic_thread_fence(memory_order_seq_cst);
+  int r1 = atomic_load_explicit(x, memory_order_relaxed);
+}
+
+exists (0:r0=0 /\ 1:r1=0)

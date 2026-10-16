@@ -548,12 +548,23 @@ func TestStandardReadsRejectAdvancedFrames(t *testing.T) {
 
 func newNegotiatedPair(t testing.TB, bufferCount, bufferSize int, primaryOpts, secondaryOpts AdvancedOptions) (*AdvancedLink, *AdvancedLink) {
 	t.Helper()
+	return newNegotiatedPairFeatures(t, bufferCount, bufferSize, primaryOpts, secondaryOpts, 0, 0)
+}
+
+// legacyFeatures are the features of protocol 1.0: a peer that offers only
+// these behaves like v0.5.0 (no OpCancel, no metadata block).
+const legacyFeatures = FeatureMessages | FeatureRequestResponse
+
+// newNegotiatedPairFeatures negotiates a pair whose endpoints offer the given
+// features (zero: all supported features).
+func newNegotiatedPairFeatures(t testing.TB, bufferCount, bufferSize int, primaryOpts, secondaryOpts AdvancedOptions, primaryFeatures, secondaryFeatures uint64) (*AdvancedLink, *AdvancedLink) {
+	t.Helper()
 	primary, secondary := newAdvancedPairWithOptions(t, bufferCount, bufferSize, primaryOpts, secondaryOpts)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	errCh := make(chan error, 2)
-	go func() { errCh <- primary.Negotiate(ctx, 0) }()
-	go func() { errCh <- secondary.Negotiate(ctx, 0) }()
+	go func() { errCh <- primary.Negotiate(ctx, primaryFeatures) }()
+	go func() { errCh <- secondary.Negotiate(ctx, secondaryFeatures) }()
 	for i := 0; i < 2; i++ {
 		if err := <-errCh; err != nil {
 			t.Fatalf("Negotiate: %v", err)
@@ -689,8 +700,11 @@ func TestSimultaneousNegotiateProtocolDoesNotDeadlock(t *testing.T) {
 	resp.Release()
 }
 
+// TestCanceledCallLateResponseIsDiscarded runs against a protocol 1.0 peer:
+// without FeatureCancel and FeatureMetadata the server does not learn that
+// the caller gave up, answers late, and the client discards the response.
 func TestCanceledCallLateResponseIsDiscarded(t *testing.T) {
-	client, server := newNegotiatedPair(t, 16, 32, AdvancedOptions{}, AdvancedOptions{})
+	client, server := newNegotiatedPairFeatures(t, 16, 32, AdvancedOptions{}, AdvancedOptions{}, legacyFeatures, 0)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 

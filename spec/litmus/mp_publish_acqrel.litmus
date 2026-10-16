@@ -1,0 +1,23 @@
+C hqq_mp_publish_acqrel
+(* Publish/consume message passing over one slot sequence word.
+   P0 is the producer: fills the packet/payload (plain memory), then
+   publishes with a release store of seq (pos+1 == 1 for pos 0).
+   P1 is the consumer: acquire-loads seq; if it reads the published value it
+   may read the payload. Forbidden: consumer sees seq == 1 but a stale payload.
+   Expected herd7 result: "Never", no data-race flag. *)
+{ }
+
+P0 (atomic_int* seq, int* d) {
+  *d = 42;
+  atomic_store_explicit(seq, 1, memory_order_release);
+}
+
+P1 (atomic_int* seq, int* d) {
+  int r0 = atomic_load_explicit(seq, memory_order_acquire);
+  int r1 = 0;
+  if (r0 == 1) {
+    r1 = *d;
+  }
+}
+
+exists (1:r0=1 /\ 1:r1=0)

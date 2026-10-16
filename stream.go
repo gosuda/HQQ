@@ -4,6 +4,7 @@ import (
 	"context"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"gosuda.org/hqq/internal/protocol"
 )
@@ -107,7 +108,7 @@ func (s *Stream) Send(ctx context.Context, p []byte) error {
 	if err := s.closedErr(); err != nil {
 		return err
 	}
-	if err := l.sendAdvancedPayload(orBackground(ctx), s.id, l.nextMessageID(), 0, 0, p); err != nil {
+	if err := l.sendAdvancedPayload(orBackground(ctx), s.id, l.nextMessageID(), 0, 0, nil, p); err != nil {
 		return err
 	}
 	l.stats.messages.Add(1)
@@ -148,7 +149,22 @@ func (s *Stream) Recv(ctx context.Context) (*Message, error) {
 // refused under AdvancedOptions.MaxReassemblyBytes with ErrReassemblyLimit.
 // Call returns ErrClosed after a local Close, and ErrPeerClosed after the
 // peer closed the stream, also when that happens while Call is waiting.
+//
+// Protocol 1.1 (negotiated features): if ctx has a deadline, the remaining
+// time is sent with the request (FeatureMetadata) and becomes the deadline of
+// the context the peer's handler receives; if ctx ends while Call waits, the
+// peer is told to cancel the handler's context (FeatureCancel, best effort).
+// Against a peer that does not negotiate them Call behaves as in protocol
+// 1.0. Call is CallWith with zero CallOptions.
 func (s *Stream) Call(ctx context.Context, method uint64, req []byte) (*Message, error) {
+	return s.CallWith(ctx, method, req, CallOptions{})
+}
+
+// CallWith is Call with request metadata: opts.Caller and opts.Trace are
+// delivered to the peer's handler (Request.Caller and Request.Trace) if
+// FeatureMetadata was negotiated, and ignored otherwise. opts is passed by
+// value and attaching it allocates nothing.
+func (s *Stream) CallWith(ctx context.Context, method uint64, req []byte, opts CallOptions) (*Message, error) {
 	l := s.link
 	if err := l.requireFeature(FeatureRequestResponse); err != nil {
 		return nil, err
@@ -157,11 +173,29 @@ func (s *Stream) Call(ctx context.Context, method uint64, req []byte) (*Message,
 		return nil, err
 	}
 	ctx = orBackground(ctx)
+
+	// Request metadata (protocol 1.1): the time budget left on ctx and the
+	// caller's options travel in a block in front of the payload.
+	flags := AdvFlagRequest
+	var block [metaMaxBlock]byte
+	var meta []byte
+	if l.negotiated.Load()&FeatureMetadata != 0 {
+		var budget int64
+		if deadline, ok := ctx.Deadline(); ok {
+			if budget = int64(time.Until(deadline)); budget <= 0 {
+				return nil, context.DeadlineExceeded
+			}
+		}
+		if meta = putMeta(&block, budget, opts); meta != nil {
+			flags |= AdvFlagMeta
+		}
+	}
+
 	messageID := l.nextMessageID()
 	key := advancedCallKey{streamID: s.id, messageID: messageID}
 	pending := l.registerPendingCall(key)
 
-	if err := l.sendAdvancedPayload(ctx, s.id, messageID, AdvFlagRequest, method, req); err != nil {
+	if err := l.sendAdvancedPayload(ctx, s.id, messageID, flags, method, meta, req); err != nil {
 		l.unregisterPendingCall(key, pending)
 		return nil, err
 	}
@@ -188,9 +222,10 @@ func (s *Stream) Call(ctx context.Context, method uint64, req []byte) (*Message,
 // the tx ring and returns the error of sending OpConnClose; the stream is
 // closed locally even then, and the peer keeps its side until the link closes.
 //
-// Stream IDs are never reused. Requests already in flight on the stream are
-// not affected: Serve still answers them. The link-level stream 0 cannot be
-// closed: Close returns ErrInvalidOp.
+// Stream IDs are never reused. Requests already received on the stream stay
+// with Serve, which still answers them as far as the peer's stream exists,
+// but the contexts of their handlers are canceled. The link-level stream 0
+// cannot be closed: Close returns ErrInvalidOp.
 func (s *Stream) Close() error {
 	if s.id == 0 {
 		return ErrInvalidOp
@@ -204,6 +239,7 @@ func (s *Stream) Close() error {
 		return ErrClosed
 	}
 	l.forgetConnection(s.id)
+	l.cancelStreamRequests(s.id)
 	s.drain()
 	if peerClosed {
 		return nil // the peer already forgot the stream
@@ -230,4 +266,9 @@ func (l *AdvancedLink) Recv(ctx context.Context) (*Message, error) {
 // Call is l.Stream().Call.
 func (l *AdvancedLink) Call(ctx context.Context, method uint64, req []byte) (*Message, error) {
 	return l.stream0.Call(ctx, method, req)
+}
+
+// CallWith is l.Stream().CallWith.
+func (l *AdvancedLink) CallWith(ctx context.Context, method uint64, req []byte, opts CallOptions) (*Message, error) {
+	return l.stream0.CallWith(ctx, method, req, opts)
 }

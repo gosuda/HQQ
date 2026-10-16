@@ -1,0 +1,361 @@
+name: C
+
+# Builds, tests and verifies the C reference library under c/. The Go CI
+# (ci.yml) is independent of this workflow.
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'c/**'
+      - 'spec/**'
+      - '.github/workflows/c.yml'
+  pull_request:
+    paths:
+      - 'c/**'
+      - 'spec/**'
+      - '.github/workflows/c.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: c-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Pinned tool versions for the memory-model job (see c/verify/ and
+  # spec/toolchain/VERIFICATION_TOOLING.md).
+  GENMC_COMMIT: 9f6c4c0772d0c42b325681581acc6a0f3eb9b5f7 # v0.19.0
+  GENMC_LLVM_MAJOR: '19'
+  HERDTOOLS_VERSION: '7.58'
+
+jobs:
+  # Linux, x86_64 and arm64 (arm64 is real weak-memory hardware).
+  linux:
+    name: Linux ${{ matrix.arch }} ${{ matrix.cc }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+        cc: [gcc-13, gcc-14, clang-18, clang-20]
+        include:
+          - runner: ubuntu-24.04
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+          - cc: gcc-13
+            cxx: g++-13
+            packages: gcc-13 g++-13
+          - cc: gcc-14
+            cxx: g++-14
+            packages: gcc-14 g++-14
+          - cc: clang-18
+            cxx: clang++-18
+            packages: clang-18 libclang-rt-18-dev
+          - cc: clang-20
+            cxx: clang++-20
+            packages: clang-20 libclang-rt-20-dev
+
+    env:
+      CC: ${{ matrix.cc }}
+      CXX: ${{ matrix.cxx }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.2
+
+      - name: Install compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ${{ matrix.packages }} cmake ninja-build
+          ${CC} --version
+          cmake --version
+
+      - name: Configure
+        run: cmake -S c -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DHQQ_WERROR=ON
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure --timeout 120
+
+      - name: Weak-memory stress (arm64 only, bounded)
+        if: matrix.arch == 'arm64'
+        run: |
+          # Three bounded passes of at most 3 s per test; the strong variants
+          # must never show a forbidden outcome.
+          for _ in 1 2 3; do
+            build/verify/stress/hqq_stress_litmus --iterations 400000 --seconds 3
+          done
+
+  # AddressSanitizer + UBSan and ThreadSanitizer on Linux.
+  linux-sanitizers:
+    name: Linux ${{ matrix.arch }} ${{ matrix.sanitizer }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+        sanitizer: [address+undefined, thread]
+        include:
+          - runner: ubuntu-24.04
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+
+    env:
+      CC: clang-18
+      CXX: clang++-18
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.2
+
+      - name: Install compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang-18 libclang-rt-18-dev cmake ninja-build
+          # TSan cannot map its shadow memory with the default 32 bits of ASLR
+          # entropy on recent kernels.
+          sudo sysctl -w vm.mmap_rnd_bits=28 || true
+
+      - name: Configure
+        run: >
+          cmake -S c -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DHQQ_WERROR=ON
+          -DHQQ_SANITIZE=${{ matrix.sanitizer }}
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Test
+        env:
+          ASAN_OPTIONS: detect_leaks=1:strict_string_checks=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+          TSAN_OPTIONS: halt_on_error=1:second_deadlock_stack=1
+        run: ctest --test-dir build --output-on-failure --timeout 300
+
+  # macOS: arm64 (Apple clang) and Intel.
+  macos:
+    name: macOS ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-latest
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x86_64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.2
+
+      - name: Configure
+        run: cmake -S c -B build -DCMAKE_BUILD_TYPE=Release -DHQQ_WERROR=ON
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure --timeout 120
+
+  # ThreadSanitizer / ASan on macOS arm64. Best effort: sanitizer support on
+  # hosted macOS images depends on the OS release (ASLR vs shadow memory).
+  macos-sanitizers:
+    name: macOS arm64 ${{ matrix.sanitizer }} (best effort)
+    runs-on: macos-latest
+    timeout-minutes: 20
+    continue-on-error: true
+
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [address+undefined, thread]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.2
+
+      - name: Configure
+        run: >
+          cmake -S c -B build -DCMAKE_BUILD_TYPE=Debug -DHQQ_WERROR=ON
+          -DHQQ_SANITIZE=${{ matrix.sanitizer }}
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure --timeout 300
+
+  # Windows. clang-cl is the supported compiler; cl.exe (MSVC) relies on the
+  # experimental /experimental:c11atomics switch and is best effort. See
+  # spec/toolchain/C_TOOLCHAIN.md.
+  windows:
+    name: Windows ${{ matrix.arch }} ${{ matrix.compiler }}${{ matrix.experimental && ' (best effort)' || '' }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25
+    continue-on-error: ${{ matrix.experimental }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-latest
+            arch: x64
+            compiler: clang-cl
+            cc: clang-cl
+            cxx: clang-cl
+            experimental: false
+          - runner: windows-latest
+            arch: x64
+            compiler: msvc
+            cc: cl
+            cxx: cl
+            experimental: true
+          - runner: windows-11-arm
+            arch: arm64
+            compiler: clang-cl
+            cc: clang-cl
+            cxx: clang-cl
+            experimental: true
+          - runner: windows-11-arm
+            arch: arm64
+            compiler: msvc
+            cc: cl
+            cxx: cl
+            experimental: true
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.2
+
+      - name: Set up MSVC developer environment
+        uses: ilammy/msvc-dev-cmd@v1.13.0
+        with:
+          arch: ${{ matrix.arch }}
+
+      - name: Configure
+        shell: bash
+        run: >
+          cmake -S c -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DHQQ_WERROR=ON
+          -DCMAKE_C_COMPILER=${{ matrix.cc }} -DCMAKE_CXX_COMPILER=${{ matrix.cxx }}
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure --timeout 120
+
+  # C++17 consumers of the public header (extern "C", no <stdatomic.h>).
+  cxx17:
+    name: C++17 ${{ matrix.cxx }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - cc: gcc-14
+            cxx: g++-14
+            packages: gcc-14 g++-14
+          - cc: clang-18
+            cxx: clang++-18
+            packages: clang-18
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.2
+
+      - name: Install compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ${{ matrix.packages }} cmake ninja-build
+
+      - name: Header-only syntax checks
+        env:
+          CC: ${{ matrix.cc }}
+          CXX: ${{ matrix.cxx }}
+        run: |
+          for std in c++17 c++20 c++23; do
+            "$CXX" -x c++ "-std=$std" -Wall -Wextra -Wpedantic -Werror \
+              -fsyntax-only c/include/hqq/hqq.h
+          done
+          "$CC" -x c -std=c11 -Wall -Wextra -Wpedantic -Werror \
+            -fsyntax-only c/include/hqq/hqq.h
+
+      - name: Build and run the C++17 consumer
+        env:
+          CC: ${{ matrix.cc }}
+          CXX: ${{ matrix.cxx }}
+        run: |
+          cmake -S c -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DHQQ_WERROR=ON \
+            "-DCMAKE_C_COMPILER=$CC" "-DCMAKE_CXX_COMPILER=$CXX"
+          cmake --build build --target test_cxx17
+          build/tests/test_cxx17
+
+  # Memory-model verification: GenMC (C11/RC11 model checker) and herd7
+  # (axiomatic litmus tests). See spec/toolchain/VERIFICATION_TOOLING.md.
+  memory-model:
+    name: Memory model (GenMC, herd7)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.2
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake make bc \
+            "llvm-${GENMC_LLVM_MAJOR}-dev" "clang-${GENMC_LLVM_MAJOR}" "libclang-${GENMC_LLVM_MAJOR}-dev" \
+            libffi-dev zlib1g-dev libedit-dev \
+            opam ocaml-nox build-essential libgmp-dev pkg-config m4 unzip curl git
+
+      - name: Cache GenMC
+        id: genmc-cache
+        uses: actions/cache@v6.1.0
+        with:
+          path: ~/.local/genmc
+          key: genmc-${{ runner.os }}-${{ runner.arch }}-${{ env.GENMC_COMMIT }}-llvm${{ env.GENMC_LLVM_MAJOR }}-${{ hashFiles('c/verify/install-genmc.sh') }}
+
+      - name: Build GenMC
+        if: steps.genmc-cache.outputs.cache-hit != 'true'
+        env:
+          LLVM_MAJOR: ${{ env.GENMC_LLVM_MAJOR }}
+          GENMC_COMMIT: ${{ env.GENMC_COMMIT }}
+          JOBS: '4'
+        run: c/verify/install-genmc.sh "$HOME/.local/genmc"
+
+      - name: GenMC proof of concept (acq/rel fails, seq_cst passes)
+        run: c/verify/genmc/run.sh "$HOME/.local/genmc/bin/genmc"
+
+      - name: Cache herdtools7
+        id: herd-cache
+        uses: actions/cache@v6.1.0
+        with:
+          path: ~/.opam
+          key: herdtools7-${{ runner.os }}-${{ runner.arch }}-${{ env.HERDTOOLS_VERSION }}-${{ hashFiles('c/verify/install-herd.sh') }}
+
+      - name: Install herdtools7
+        if: steps.herd-cache.outputs.cache-hit != 'true'
+        run: c/verify/install-herd.sh
+
+      - name: herd7 litmus tests (C11)
+        run: |
+          eval "$(opam env --switch=herd)"
+          c/verify/litmus/run-herd.sh "$(command -v herd7)"

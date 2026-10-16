@@ -1,0 +1,22 @@
+C hqq_mp_publish_relaxed_bug
+(* NEGATIVE test: the same publish/consume shape with relaxed accesses on seq.
+   Without release/acquire the consumer may observe seq == 1 and still read the
+   old payload (and the plain accesses race). Expected herd7 result:
+   "Sometimes" (or Ok with a data-race flag): this is why the slot sequence
+   store MUST be release and the claim load MUST be acquire. *)
+{ }
+
+P0 (atomic_int* seq, int* d) {
+  *d = 42;
+  atomic_store_explicit(seq, 1, memory_order_relaxed);
+}
+
+P1 (atomic_int* seq, int* d) {
+  int r0 = atomic_load_explicit(seq, memory_order_relaxed);
+  int r1 = 0;
+  if (r0 == 1) {
+    r1 = *d;
+  }
+}
+
+exists (1:r0=1 /\ 1:r1=0)

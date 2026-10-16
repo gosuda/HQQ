@@ -132,16 +132,17 @@ func (l *AdvancedLink) refuseStream(connID uint64, code ErrorCode) {
 	}
 }
 
-// refuseRequest queues the error response (ErrCodeBufferOverflow) of a
-// request refused by MaxReassemblyBytes. It is best effort: the response is
-// not sent if FeatureRequestResponse is not negotiated or the queue is full.
-func (l *AdvancedLink) refuseRequest(request advHeader) {
+// refuseRequest queues the error response, with status code, of a request
+// that was refused: by MaxReassemblyBytes (ErrCodeBufferOverflow) or by
+// Shutdown (ErrCodeShuttingDown). It is best effort: the response is not
+// sent if FeatureRequestResponse is not negotiated or the queue is full.
+func (l *AdvancedLink) refuseRequest(request advHeader, code ErrorCode) {
 	if l.requireFeature(FeatureRequestResponse) != nil {
 		return
 	}
 	const flags = AdvFlagBegin | AdvFlagEnd | AdvFlagResponse | AdvFlagError
 	l.enqueueControl(controlJob{
-		packet: protocol.NewConnCopyPacket(request.streamID, request.messageID, 0, 0, 0, flags, uint64(ErrCodeBufferOverflow)),
+		packet: protocol.NewConnCopyPacket(request.streamID, request.messageID, 0, 0, 0, flags, uint64(code)),
 		kind:   controlRefusedRequest,
 	})
 }
