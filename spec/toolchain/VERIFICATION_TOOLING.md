@@ -1,6 +1,7 @@
 # Memory-model verification tooling
 
-Status: draft for milestone M3a. The Go implementation gets sequential
+Status: milestone M3c. The GenMC harnesses for the real ring core are in
+section 3.2 (GenMC runs only in CI). The Go implementation gets sequential
 consistency for free (all Go atomics are seq_cst). A C (or Rust/Zig/C++)
 implementation chooses a memory order per access, and the choice is
 load-bearing in exactly one place that is easy to get wrong: the **wake
@@ -72,7 +73,7 @@ Local reproduction in Docker (arm64 or amd64 host):
 
 ```sh
 docker build -t hqq-genmc -f c/verify/genmc/Dockerfile c/verify
-docker run --rm -v "$PWD":/src:ro hqq-genmc /src/c/verify/genmc/run.sh genmc
+docker run --rm -v "$PWD":/src:ro hqq-genmc /src/c/verify/genmc/run.sh --genmc genmc
 ```
 
 Notes learned while building it: `GenMCDriver.cpp` needs more than 2 GB of RAM
@@ -105,10 +106,79 @@ turns the CI job red.
 
 Limits: GenMC checks a program of two threads and one slot, not the library; it
 treats `waiters`/`seq` as ints and does not model futex/semaphore blocking, a
-process dying while parked, or mixed-size accesses. When the C ring lands, the
-real `enqueue`/`dequeue`/`wake`/`park` functions should be driven by a GenMC
-harness (small ring, 2 to 3 threads) with `-rc11`, using
-`__VERIFIER_assume` and bounded loops (`-unroll=N`).
+process dying while parked, or mixed-size accesses. The ring-core harnesses of
+section 3.2 use the real header, with the same blind spots: the wait hook is a
+recording stub, not a blocking kernel call.
+
+### 3.2 Harnesses for the real ring core (M3c)
+
+GenMC runs only in the CI `memory-model` job. It is not run on the development
+hosts (no docker, no heavy installs), so nothing in this section has been
+observed under GenMC yet.
+
+The harnesses check the protocol of the real header, `c/src/hqq_ring.h`, which
+they include unmodified through `c/verify/genmc/hqq_model.h`. Each drives the ring
+through a small fixed scenario:
+
+| Harness | Scenario | Checked in every execution | Positive (must pass) | Negative (must fail) |
+|---|---|---|---|---|
+| `ring_mp.c` | 1 producer, 1 consumer, 2 slots, 4 messages (messages 2 and 3 wrap onto slots 0 and 1) | FIFO delivery, each payload once; the payload read is ordered after its publish (otherwise a race on plain memory) | `run.sh mp` | `-DHQQ_VERIFY_WEAKEN_RELAXED`: publication race |
+| `ring_wake.c` | waiter (peek, `hqq_ring_park`, peek) and waker (claim, write, `hqq_ring_publish`), 2 slots | no lost wake-up: if the waiter sleeps on word `v`, the waker bumps the word after the waiter's read | `run.sh wake` | `-DHQQ_VERIFY_WEAKEN_ACQREL`: lost wake-up |
+| `ring_reserve.c` | main claims one reservation; two completers, each with its own copy of the handle, call `hqq_ring_publish_guarded` | exactly one completion; a stale copy changes nothing; the payload is consumed once from the reserved position | `run.sh reserve` | `-DHQQ_VERIFY_UNGUARDED` (plain `hqq_ring_publish`): two completions |
+| `ring_claim.c` | 2 producers race for the producer cursor (CAS); the main thread consumes after the join | the two claims are distinct; each payload arrives once, from the position its producer got | `run.sh claim` | none: the cursor CAS is an RMW and stays atomic under acquire/release |
+
+The PoC `mp_wake.c` is still run, as target `poc`.
+
+**Weakened builds.** `hqq_model.h` rebinds the atomic macros only in the weakened
+builds (through the clang `__c11_atomic` builtins). `HQQ_VERIFY_WEAKEN_ACQREL`
+turns every seq_cst access of the ring core into the strongest acquire, release,
+or acq_rel order valid for that operation (CAS: acq_rel on success, acquire on
+failure). `HQQ_VERIFY_WEAKEN_RELAXED` makes them all relaxed. The header's own
+acquire/release/relaxed accesses are not changed, and the harness code never uses
+seq_cst. The LLVM IR of the ACQREL build was inspected on the host: the handshake
+accesses are acquire loads, release stores and acq_rel RMWs.
+
+**Hooks.** `hqq_ring_ops.wait` is a recording stub that returns at once, so a
+GenMC waiter never blocks and its continuation is explored. A kernel
+`wait(word, v)` blocks forever only if the word still equals `v` when the waiter
+sleeps and nobody bumps it later. So `ring_wake.c` asserts, whenever the waiter
+went to sleep, that the word differs from `v` at the end. That is exactly "no
+lost wake-up". Producer and consumer retries use `__VERIFIER_assume` (`HQV_AWAIT`):
+an execution in which a retry still fails is discarded, not reported. run.sh
+requires at least one complete execution for every positive variant, so a
+vacuous pass fails.
+
+**Host build** (`-DHQQ_VERIFY_HOST`). The same files compile as ordinary pthread
+programs. The hooks are a mutex and condition variable, and a waiter still asleep
+on an unchanged word after 5 s aborts. `run.sh --host N` runs each harness N times.
+
+```sh
+c/verify/genmc/run.sh --genmc PATH [poc|mp|wake|reserve|claim ...]   # GenMC, CI only
+CC=clang c/verify/genmc/run.sh --check      # host syntax, every variant (weakened: clang)
+c/verify/genmc/run.sh --host 20000          # host pthread run
+```
+
+**Observed on the host** (macOS arm64, Apple clang 21): `run.sh --check` passes
+for every variant under `-std=c11 -Wall -Wextra -Wpedantic -Werror`, with and
+without `-DHQQ_VERIFY_HOST`. Each of the four harnesses ran 10 000 iterations
+natively with exit status 0.
+
+**GenMC verdicts: not observed.** The expectations above are the design
+expectations. They are unverified until the CI job reports them. Risks to check
+in that first run: (1) GenMC's handling of the CAS retry loops in the header's
+claim functions. They iterate only after a failed CAS or a reload, which
+coherence bounds in these scenarios. If GenMC reports an unbounded loop, bound it
+with its loop-unrolling option, whose exact name must be checked against
+GenMC v0.19.0 (not assumed here). (2) Blocked executions (`assume` failures) are
+counted by GenMC, not reported as errors.
+
+### 3.3 Status summary
+
+| Item | Status |
+|---|---|
+| PoC `mp_wake.c` (4 variants) | written; GenMC verdicts observed (section 3) |
+| Harnesses `ring_mp`, `ring_wake`, `ring_reserve`, `ring_claim` (positive and negative) | written; host syntax and native run observed; GenMC **not run** |
+
 
 ## 4. herd7 (herdtools7)
 
@@ -223,7 +293,10 @@ TSan.
 
 ```sh
 # GenMC (needs the installed prefix or the hqq-genmc image)
-c/verify/genmc/run.sh "$HOME/.local/genmc/bin/genmc"
+c/verify/genmc/run.sh --genmc "$HOME/.local/genmc/bin/genmc"     # all GenMC targets (CI)
+c/verify/genmc/run.sh --genmc "$HOME/.local/genmc/bin/genmc" wake # one harness
+CC=clang c/verify/genmc/run.sh --check   # host syntax of every variant
+c/verify/genmc/run.sh --host 20000       # host pthread run of the ring harnesses
 # herd7
 c/verify/litmus/run-herd.sh "$(command -v herd7)"
 # stress on this machine
@@ -232,8 +305,9 @@ cmake -S c -B build -DHQQ_WERROR=ON && cmake --build build && build/verify/stres
 
 ## 8. Open items
 
-- Drive the real C ring (not a model) with GenMC once it exists, including
-  slot wrap-around and the CAS completion path.
+- The real ring core is driven by the GenMC harnesses of section 3.2. They have
+  not been run under GenMC yet: the first CI run of the `memory-model` job is
+  the first observation, and its verdicts are to be recorded in section 3.2.
 - Port the stress harness to Windows threads (needed to promote MSVC).
 - A cross-process stress run over a shared mapping (two processes) once
   the segment code exists; the stress harness above uses threads.

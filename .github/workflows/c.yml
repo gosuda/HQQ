@@ -326,6 +326,13 @@ jobs:
             libffi-dev zlib1g-dev libedit-dev \
             opam ocaml-nox build-essential libgmp-dev pkg-config m4 unzip curl git
 
+      - name: Harness host checks (syntax of every variant, then a short native pthread run)
+        env:
+          CC: clang-${{ env.GENMC_LLVM_MAJOR }}
+        run: |
+          c/verify/genmc/run.sh --check
+          c/verify/genmc/run.sh --host 5000
+
       - name: Cache GenMC
         id: genmc-cache
         uses: actions/cache@v6.1.0
@@ -341,8 +348,8 @@ jobs:
           JOBS: '4'
         run: c/verify/install-genmc.sh "$HOME/.local/genmc"
 
-      - name: GenMC proof of concept (acq/rel fails, seq_cst passes)
-        run: c/verify/genmc/run.sh "$HOME/.local/genmc/bin/genmc"
+      - name: GenMC (ring core harnesses and handshake PoC; positive variants verify, negative variants fail)
+        run: c/verify/genmc/run.sh --genmc "$HOME/.local/genmc/bin/genmc"
 
       - name: Cache herdtools7
         id: herd-cache

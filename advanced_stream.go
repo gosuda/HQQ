@@ -13,10 +13,9 @@ func (l *AdvancedLink) ListenStreams(ctx context.Context) error {
 	if err := l.requireNegotiated(); err != nil {
 		return err
 	}
-	if err := l.startDispatcher(); err != nil {
-		return err
-	}
 	ctx = orBackground(ctx)
+	// Listening must be set before the dispatcher starts: a stream request
+	// routed in between would be refused although ListenStreams is running.
 	l.controlMu.Lock()
 	if l.listening {
 		l.controlMu.Unlock()
@@ -24,6 +23,12 @@ func (l *AdvancedLink) ListenStreams(ctx context.Context) error {
 	}
 	l.listening = true
 	l.controlMu.Unlock()
+	if err := l.startDispatcher(); err != nil {
+		l.controlMu.Lock()
+		l.listening = false
+		l.controlMu.Unlock()
+		return err
+	}
 
 	if done := ctx.Done(); done != nil {
 		go func() {
