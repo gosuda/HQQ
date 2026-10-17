@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"gosuda.org/hqq"
+	"gosuda.org/hqq/sqlite/internal/convert"
 	"gosuda.org/hqq/sqlite/internal/wire"
 )
 
@@ -259,10 +260,10 @@ func sqlIsolation(level driver.IsolationLevel) bool {
 }
 
 // CheckNamedValue implements driver.NamedValueChecker. It converts every
-// argument with the rules of argValue, so database/sql's default converter is
+// argument with the rules of convert.ArgValue, so database/sql's default converter is
 // never used (it would store json.RawMessage as a BLOB, for example).
 func (cn *conn) CheckNamedValue(nv *driver.NamedValue) error {
-	v, err := argValue(nv.Value)
+	v, err := convert.ArgValue(nv.Value)
 	if err != nil {
 		return err
 	}
@@ -389,11 +390,11 @@ func wireParams(args []driver.NamedValue) ([]wire.Param, error) {
 		if a.Ordinal < 1 {
 			return nil, fmt.Errorf("sqlite: argument ordinal %d is invalid", a.Ordinal)
 		}
-		name, err := paramName(a.Name)
+		name, err := convert.ParamName(a.Name, wire.MaxNameBytes)
 		if err != nil {
 			return nil, err
 		}
-		v, err := argValue(a.Value)
+		v, err := convert.ArgValue(a.Value)
 		if err != nil {
 			return nil, fmt.Errorf("sqlite: argument %d: %w", a.Ordinal, err)
 		}

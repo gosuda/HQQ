@@ -7,14 +7,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net/url"
-	"sort"
-	"strconv"
-	"strings"
 	"sync"
 	"time"
 
 	"gosuda.org/hqq"
+	dsnparse "gosuda.org/hqq/sqlite/internal/dsn"
 	"gosuda.org/hqq/sqlite/internal/wire"
 )
 
@@ -202,91 +199,22 @@ func (cfg Config) linkConfig() hqq.Config {
 // and returns the listener name and the Config. Unknown options are errors, so
 // misspelled options are not ignored. Every option may appear once.
 func ParseDSN(dsn string) (string, Config, error) {
-	var cfg Config
-	u, err := url.Parse(dsn)
+	o, err := dsnparse.Parse(dsn)
 	if err != nil {
-		return "", cfg, fmt.Errorf("sqlite: invalid DSN: %w", err)
+		return "", Config{}, err
 	}
-	if u.Scheme != "hqq" {
-		return "", cfg, fmt.Errorf("sqlite: DSN scheme must be hqq, got %q", u.Scheme)
+	cfg := Config{
+		Database:    o.Database,
+		Mode:        Mode(o.Mode),
+		Timeout:     o.Timeout,
+		FetchSize:   o.Fetch,
+		BusyTimeout: o.Busy,
+		TxMode:      TxMode(o.TxLock),
 	}
-	if u.Host == "" || u.Path != "" || u.User != nil {
-		return "", cfg, errors.New("sqlite: DSN must be hqq://<listener>?<options>")
+	for _, p := range o.Pragmas {
+		cfg.Pragmas = append(cfg.Pragmas, Pragma{Name: p.Name, Value: p.Value})
 	}
-	q := u.Query()
-	var pragmas []Pragma
-	for key, vals := range q {
-		if !strings.HasPrefix(key, "pragma.") {
-			continue
-		}
-		if len(vals) != 1 {
-			return "", cfg, fmt.Errorf("sqlite: option %s must be given once", key)
-		}
-		pragmas = append(pragmas, Pragma{Name: strings.TrimPrefix(key, "pragma."), Value: vals[0]})
-	}
-	sort.Slice(pragmas, func(i, j int) bool { return pragmas[i].Name < pragmas[j].Name })
-	cfg.Pragmas = pragmas
-	for key, vals := range q {
-		if strings.HasPrefix(key, "pragma.") {
-			continue
-		}
-		if len(vals) != 1 {
-			return "", cfg, fmt.Errorf("sqlite: option %s must be given once", key)
-		}
-		v := vals[0]
-		switch key {
-		case "db":
-			cfg.Database = v
-		case "mode":
-			switch v {
-			case "rwc", "":
-				cfg.Mode = ModeReadWriteCreate
-			case "rw":
-				cfg.Mode = ModeReadWrite
-			case "ro":
-				cfg.Mode = ModeReadOnly
-			default:
-				return "", cfg, fmt.Errorf("sqlite: invalid mode %q", v)
-			}
-		case "timeout":
-			cfg.Timeout, err = parseDuration(key, v)
-		case "busy":
-			cfg.BusyTimeout, err = parseDuration(key, v)
-		case "fetch":
-			cfg.FetchSize, err = strconv.Atoi(v)
-			if err != nil {
-				err = fmt.Errorf("sqlite: invalid fetch %q", v)
-			}
-		case "txlock":
-			switch strings.ToLower(v) {
-			case "deferred", "":
-				cfg.TxMode = TxDeferred
-			case "immediate":
-				cfg.TxMode = TxImmediate
-			case "exclusive":
-				cfg.TxMode = TxExclusive
-			default:
-				return "", cfg, fmt.Errorf("sqlite: invalid txlock %q", v)
-			}
-		default:
-			return "", cfg, fmt.Errorf("sqlite: unknown DSN option %q", key)
-		}
-		if err != nil {
-			return "", cfg, err
-		}
-	}
-	if cfg.Database == "" {
-		return "", cfg, errors.New("sqlite: DSN option db is required")
-	}
-	return u.Host, cfg, nil
-}
-
-func parseDuration(key, v string) (time.Duration, error) {
-	d, err := time.ParseDuration(v)
-	if err != nil {
-		return 0, fmt.Errorf("sqlite: invalid %s %q: %w", key, v, err)
-	}
-	return d, nil
+	return o.Listener, cfg, nil
 }
 
 // Connector connects to one service. All connections of a Connector are

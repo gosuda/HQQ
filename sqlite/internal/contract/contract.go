@@ -18,6 +18,16 @@ type Capabilities struct {
 	// FullSQL is true for real SQLite. It enables the cases that need
 	// arithmetic, ORDER BY, typeof(), aggregates, recursive CTEs, and so on.
 	FullSQL bool
+	// NoInterrupt is true for an engine that cannot interrupt a statement that
+	// is running on the server: when the caller's context ends, the driver
+	// abandons the call and discards the connection, but the statement runs to
+	// its end. The case "deadline interrupts a long query" then runs a statement
+	// that ends by itself after a few seconds instead of one that never ends, so
+	// that the server can stop afterwards. It still requires that the caller
+	// gets the deadline error at the deadline and that the next statement runs.
+	// The zero value, an engine that interrupts the statement, keeps the
+	// original case.
+	NoInterrupt bool
 }
 
 // fetchRows is the driver's default fetch size (DefaultFetchRows).

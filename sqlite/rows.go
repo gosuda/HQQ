@@ -7,10 +7,9 @@ import (
 	"fmt"
 	"io"
 	"reflect"
-	"strings"
-	"time"
 
 	"gosuda.org/hqq"
+	"gosuda.org/hqq/sqlite/internal/convert"
 	"gosuda.org/hqq/sqlite/internal/wire"
 )
 
@@ -22,7 +21,7 @@ type rows struct {
 	ctx     context.Context // context of the query: it ends the fetch-ahead too
 	cursor  uint32
 	cols    []wire.Column
-	types   []columnType
+	types   []convert.Column
 	open    bool         // the server still holds the cursor
 	cur     *hqq.Message // batch being read
 	dec     *wire.Decoder
@@ -32,13 +31,6 @@ type rows struct {
 	valid   bool         // vals holds the row the last successful Next returned
 	err     error        // sticky: io.EOF, or the error that ended the rows
 	closed  bool
-}
-
-// columnType is the per-column metadata derived from the declared type.
-type columnType struct {
-	decl   string       // declared type, uppercased; "" when none
-	scan   reflect.Type // type a Scan into this column expects
-	isTime bool         // DATE, DATETIME, or TIMESTAMP: TEXT values parsed as time
 }
 
 // batch is the result of one Fetch, or of the first batch of a Query.
@@ -57,7 +49,7 @@ func newRows(ctx context.Context, cn *conn, msg *hqq.Message, d *wire.Decoder, h
 		ctx:    ctx,
 		cursor: h.Cursor,
 		cols:   h.Columns,
-		types:  make([]columnType, len(h.Columns)),
+		types:  make([]convert.Column, len(h.Columns)),
 		open:   h.More,
 		cur:    msg,
 		dec:    d,
@@ -65,52 +57,13 @@ func newRows(ctx context.Context, cn *conn, msg *hqq.Message, d *wire.Decoder, h
 		vals:   make([]wire.Value, len(h.Columns)),
 	}
 	for i, c := range h.Columns {
-		r.types[i] = newColumnType(c.Decltype)
+		r.types[i] = convert.NewColumn(c.Decltype)
 	}
 	if r.open {
 		r.startPrefetch()
 	}
 	return r
 }
-
-// newColumnType derives the metadata of a column from its declared type. The
-// scan type follows SQLite's type affinity rules (sqlite.org/datatype3.html,
-// section 3.1): INTEGER, TEXT, REAL, and BLOB declarations scan into int64,
-// string, float64, and []byte. A column with no declared type, and one with
-// NUMERIC affinity, scans into any. SQLite is dynamically typed, so a value
-// may differ from its column's scan type (see ColumnTypeScanType).
-func newColumnType(decl string) columnType {
-	ct := columnType{decl: strings.ToUpper(decl), scan: anyType}
-	base, _, _ := strings.Cut(strings.TrimSpace(ct.decl), "(")
-	switch strings.TrimSpace(base) {
-	case "DATE", "DATETIME", "TIMESTAMP":
-		ct.isTime = true
-		ct.scan = timeType
-		return ct
-	}
-	switch {
-	case ct.decl == "":
-		// No declared type: the value keeps its storage class.
-	case strings.Contains(ct.decl, "BLOB"):
-		ct.scan = bytesType
-	case strings.Contains(ct.decl, "INT"):
-		ct.scan = int64Type
-	case strings.Contains(ct.decl, "CHAR"), strings.Contains(ct.decl, "CLOB"), strings.Contains(ct.decl, "TEXT"):
-		ct.scan = stringType
-	case strings.Contains(ct.decl, "REAL"), strings.Contains(ct.decl, "FLOA"), strings.Contains(ct.decl, "DOUB"):
-		ct.scan = float64Type
-	}
-	return ct
-}
-
-var (
-	anyType     = reflect.TypeFor[any]()
-	bytesType   = reflect.TypeFor[[]byte]()
-	timeType    = reflect.TypeFor[time.Time]()
-	int64Type   = reflect.TypeFor[int64]()
-	stringType  = reflect.TypeFor[string]()
-	float64Type = reflect.TypeFor[float64]()
-)
 
 // fetchBatch sends Fetch for n rows of the cursor and parses the reply.
 func (cn *conn) fetchBatch(ctx context.Context, cursor uint32, n int) batch {
@@ -194,7 +147,7 @@ func (r *rows) Columns() []string {
 // the current row: INTEGER, REAL, TEXT, BLOB, or NULL. Before the first row
 // and after the end, it is "".
 func (r *rows) ColumnTypeDatabaseTypeName(i int) string {
-	if d := r.types[i].decl; d != "" {
+	if d := r.types[i].Decl; d != "" {
 		return d
 	}
 	if !r.valid {
@@ -202,24 +155,24 @@ func (r *rows) ColumnTypeDatabaseTypeName(i int) string {
 	}
 	switch r.vals[i].Type {
 	case wire.TypeInteger:
-		return "INTEGER"
+		return convert.ClassInteger
 	case wire.TypeFloat:
-		return "REAL"
+		return convert.ClassReal
 	case wire.TypeText:
-		return "TEXT"
+		return convert.ClassText
 	case wire.TypeBlob:
-		return "BLOB"
+		return convert.ClassBlob
 	case wire.TypeNull:
-		return "NULL"
+		return convert.ClassNull
 	}
 	return ""
 }
 
 // ColumnTypeScanType implements driver.RowsColumnTypeScanType. See
-// newColumnType. SQLite is dynamically typed, so a value may not match the
+// convert.NewColumn. SQLite is dynamically typed, so a value may not match the
 // affinity type: scan into an interface, a string, or a []byte in that case.
 func (r *rows) ColumnTypeScanType(i int) reflect.Type {
-	return r.types[i].scan
+	return r.types[i].Scan
 }
 
 // Next implements driver.Rows. It returns io.EOF after the last row, and the
@@ -256,7 +209,7 @@ func (r *rows) Next(dest []driver.Value) error {
 // driverValue converts a protocol value of column i to a driver.Value. Text
 // and blobs are copied, because the message buffer is released with the batch.
 // A TEXT value of a DATE, DATETIME, or TIMESTAMP column becomes a time.Time when
-// it parses (see parseTime); otherwise it stays a string.
+// it parses (see convert.ParseTime); otherwise it stays a string.
 func (r *rows) driverValue(i int, v wire.Value) driver.Value {
 	switch v.Type {
 	case wire.TypeInteger:
@@ -264,12 +217,7 @@ func (r *rows) driverValue(i int, v wire.Value) driver.Value {
 	case wire.TypeFloat:
 		return v.Float
 	case wire.TypeText:
-		if r.types[i].isTime {
-			if t, ok := parseTime(string(v.Bytes)); ok {
-				return t
-			}
-		}
-		return string(v.Bytes)
+		return r.types[i].TextValue(v.Bytes)
 	case wire.TypeBlob:
 		b := make([]byte, len(v.Bytes))
 		copy(b, v.Bytes)

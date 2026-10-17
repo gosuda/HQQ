@@ -28,6 +28,10 @@ func testContext(t *testing.T, db *sql.DB, caps Capabilities) {
 		query := "SELECT hqq_sleep(10000)"
 		if caps.FullSQL {
 			query = "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) SELECT count(*) FROM c"
+			if caps.NoInterrupt {
+				// About a second of work, well past the deadline, and finite.
+				query = "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 10000000) SELECT count(*) FROM c"
+			}
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 		defer cancel()
