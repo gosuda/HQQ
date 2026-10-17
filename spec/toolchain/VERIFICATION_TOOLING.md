@@ -166,24 +166,20 @@ for every variant under `-std=c11 -Wall -Wextra -Wpedantic -Werror`, with and
 without `-DHQQ_VERIFY_HOST`. Each of the four harnesses ran 10 000 iterations
 natively with exit status 0.
 
-**GenMC verdicts (CI run 38945948026, job `memory-model`).** The four PoC verdicts
-matched the table above. Three ring-harness verdicts did not: `mp (none)` and
-`mp -DHQQ_VERIFY_WEAKEN_RELAXED` failed without the expected output (no
-`Number of complete executions` and no `Error` line, so GenMC stopped abnormally;
-the cause is not known yet), and `wake (none)` was the stub defect fixed above.
-`reserve (none)` did not finish within the 60-minute job limit. `run.sh` now bounds
-each GenMC run with `GENMC_TIMEOUT` (300 s in CI; a hang reports `TIMEOUT`) and prints
-the last 40 lines of GenMC's output on every mismatch. The first suspect for the
-`mp` failure is the unbounded CAS retry loops of the claim functions (risk (1) above);
-a loop-bounding option must be checked against GenMC v0.19.0 before use. The herd7
-steps run regardless of GenMC (`if: always()`); neither tool has a passing CI verdict yet.
+**GenMC verdicts and fixes.** CI run 38945948026 (job `memory-model`): the four PoC verdicts matched the table above; `wake (none)` was the stub defect fixed above; `mp` failed without the expected output, and `reserve (none)` did not finish. CI run 38986334680 (GenMC v0.19.0, commit `9f6c4c0`) gave the causes below, each with its fix. Citations are to that commit.
+
+- `mp`, `wake`, `claim`: `ERROR: Tried to execute an unknown external function: __VERIFIER_assume` (exit 17). GenMC v0.19 maps only `__VERIFIER_assume_internal` (`passes/passes/InternalFunction.def`). `__VERIFIER_assume(cond)` is a macro of `<genmc.h>` (`lli/runtime-include/c/genmc.h`), and the harness declared its own `void __VERIFIER_assume(int)`, which is an unknown external. Fix: GenMC builds `#include <genmc.h>`; the host build does not.
+- `reserve (none)`: timeout (observed). Cause (from the GenMC source, not from a trace): each successful weak CAS pushes its spurious failure as an extra execution (`genmc/genmc/Verification/GenMCDriver.cpp`, `maybePushWeakCasFailure`). The claim loop then retries, succeeds again, and pushes another, without bound. Fix: GenMC builds rebind `atomic_compare_exchange_weak_explicit` to the strong CAS (GenMC's own advice, `passes/passes/Transforms/StrengthenCASPass.cpp`: "Strong CASes enable more effective verification"). A spurious failure only repeats a cursor read and retries, so the outcomes are unchanged [INFERENCE, argued in `hqq_model.h`, not checked by GenMC].
+- `reserve -DHQQ_VERIFY_UNGUARDED`: `in-place revisiting (IPR)` error with 0 executions (`GenMCDriver.cpp`, `checkIPRValidity`: unordered writes on an annotated read become an error under IPR). Fix: `-disable-ipr` (`lli/main.cpp`), passed for every case, so the weakened `mp` negative cannot end on that error instead of the race.
+
+`run.sh` now passes `-rc11 -disable-mm-detector -disable-estimation -disable-ipr -unroll=128`. `-unroll` bounds every loop (`doc/manual/cli.md`). A bound-cut thread is a `ThreadKill` terminator (`GenMCDriver.cpp`, `handleThreadKill`), which counts as a complete execution, so it cannot be seen in the output. The harness loops are constant-bounded (at most 64 iterations) or terminate under the strong CAS, so the bound must not bind; it guards only against a hang. A positive case passes only with exit 0 and a complete execution; a negative case needs exit 42 (GenMC `EVERIFY`) and its needles, and every mismatch or timeout prints the command and the last `GENMC_TAIL` (200) lines. None of these verdicts has been observed yet: the next CI run of the `memory-model` job is the first observation. The herd7 steps run regardless of GenMC (`if: always()`).
 
 ### 3.3 Status summary
 
 | Item | Status |
 |---|---|
 | PoC `mp_wake.c` (4 variants) | written; GenMC verdicts observed (section 3) |
-| Harnesses `ring_mp`, `ring_wake`, `ring_reserve`, `ring_claim` (positive and negative) | written; host syntax and native run observed; GenMC **not run** |
+| Harnesses `ring_mp`, `ring_wake`, `ring_reserve`, `ring_claim` (positive and negative) | written; host syntax and native run observed; GenMC-mode compile observed (LLVM IR with the real `genmc.h`); GenMC **not run** (fixes below, CI pending) |
 
 
 ## 4. herd7 (herdtools7)

@@ -19,6 +19,10 @@
  *     sched_yield(). The hooks are a mutex and condition variable; a waiter
  *     still asleep on an unchanged word after 5 s is a lost wake-up and aborts.
  *
+ * GenMC-only model choices (documented at their definitions below): every weak
+ * CAS is modelled as the strong CAS, and run.sh runs GenMC with -disable-ipr
+ * and -unroll=128 (see run.sh for the reasons).
+ *
  * Weakened variants (GenMC only; they must FAIL). Define at most one of:
  *   -DHQQ_VERIFY_WEAKEN_ACQREL   every seq_cst access of the ring core becomes
  *                                the strongest acquire/release order valid for
@@ -55,6 +59,9 @@
 #  include <stdio.h>
 #  include <time.h>
 #endif
+#ifndef HQQ_VERIFY_HOST
+#  include <genmc.h> /* GenMC v0.19: __VERIFIER_assume(cond) is a macro of this header */
+#endif
 
 #if defined(HQQ_VERIFY_WEAKEN_ACQREL) && defined(HQQ_VERIFY_WEAKEN_RELAXED)
 #  error "define at most one of HQQ_VERIFY_WEAKEN_ACQREL and HQQ_VERIFY_WEAKEN_RELAXED"
@@ -89,9 +96,18 @@
 #  undef atomic_compare_exchange_strong_explicit
 #  define atomic_compare_exchange_strong_explicit(obj, exp, des, ok, fail) \
        __c11_atomic_compare_exchange_strong((obj), (exp), (des), HQQ_V_CAS_OK(ok), HQQ_V_CAS_FAIL(fail))
+#endif
+#if !defined(HQQ_VERIFY_HOST) || defined(HQQ_VERIFY_WEAKEN_ACQREL) || defined(HQQ_VERIFY_WEAKEN_RELAXED)
+/* A weak CAS may fail spuriously, and GenMC explores each spurious failure of
+ * a successful weak CAS as an extra execution (genmc/genmc/Verification/
+ * GenMCDriver.cpp, maybePushWeakCasFailure). The claim loops of hqq_ring.h
+ * retry after such a failure, succeed again, and push another one: an
+ * unbounded chain of executions (CI run 38986334680: reserve timed out).
+ * A spurious failure only repeats a cursor read and retries, so the GenMC
+ * model uses the strong CAS. Host builds keep the real weak CAS. */
 #  undef atomic_compare_exchange_weak_explicit
 #  define atomic_compare_exchange_weak_explicit(obj, exp, des, ok, fail) \
-       __c11_atomic_compare_exchange_weak((obj), (exp), (des), HQQ_V_CAS_OK(ok), HQQ_V_CAS_FAIL(fail))
+       atomic_compare_exchange_strong_explicit((obj), (exp), (des), (ok), (fail))
 #endif
 
 /* The real ring core. Included after the weakening macros, which must
@@ -103,7 +119,6 @@
 #ifdef HQQ_VERIFY_HOST
 #  define HQV_AWAIT(cond) do { while (!(cond)) { sched_yield(); } } while (0)
 #else
-void __VERIFIER_assume(int);
 #  define HQV_AWAIT(cond) __VERIFIER_assume(!!(cond))
 #endif
 
