@@ -166,7 +166,7 @@ jobs:
         run: |
           set -o pipefail
           export HQQ_SQLITE_SERVER="$GITHUB_WORKSPACE/dist/$BINARY"
-          go test -count=1 -timeout 10m -v ./sqlite/... 2>&1 | tee smoke.log
+          go test -p 1 -count=1 -timeout 6m -v ./sqlite/... 2>&1 | tee smoke.log
           # The e2e package skips without a usable binary. Run it alone and fail
           # on any skip except the TestHelper* re-exec helpers, which always skip.
           go test -count=1 -timeout 10m -v ./sqlite/e2e/... 2>&1 | tee e2e.log
@@ -283,7 +283,7 @@ jobs:
         run: |
           set -o pipefail
           export HQQ_SQLITE_SERVER="$GITHUB_WORKSPACE/dist/$BINARY"
-          go test -count=1 -timeout 10m -v ./sqlite/... 2>&1 | tee smoke.log
+          go test -p 1 -count=1 -timeout 6m -v ./sqlite/... 2>&1 | tee smoke.log
           go test -count=1 -timeout 10m -v ./sqlite/e2e/... 2>&1 | tee e2e.log
           if grep -- '--- SKIP' e2e.log | grep -v -- 'SKIP: TestHelper' | grep -qv -- '/fake/'; then
             echo "::error::an end-to-end test was skipped; the binary was not exercised"

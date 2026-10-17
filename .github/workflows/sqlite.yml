@@ -198,7 +198,9 @@ jobs:
         run: |
           set -o pipefail
           export HQQ_SQLITE_SERVER="$GITHUB_WORKSPACE/build/sqlite-server/hqq-sqlite-server.exe"
-          go test -count=1 -timeout 10m -v ./sqlite/... 2>&1 | tee e2e.log
+          # -p 1: the e2e and launcher packages each start real servers with 20 ms
+          # heartbeats; running them at once on a small runner starves both.
+          go test -p 1 -count=1 -timeout 6m -v ./sqlite/... 2>&1 | tee e2e.log
           # The e2e packages skip without a usable binary. Fail on any skip except the
           # TestHelper* re-exec helpers (they always skip) and the Go fake server's
           # own contract cases (TestContractFake/TestContractDSN .../fake/...), which

@@ -6,6 +6,7 @@ package launcher_test
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
@@ -14,6 +15,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -72,20 +74,66 @@ func dbConfig() sqlite.Config {
 	}
 }
 
+// lockedBuffer is a bytes.Buffer safe for the launcher's output goroutines.
+type lockedBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (l *lockedBuffer) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.Write(p)
+}
+
+func (l *lockedBuffer) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.String()
+}
+
+// Watchdog bounds of one contract subtest. The contract's context-free calls
+// (db.Exec) wait for a response without a deadline, so a server that stops
+// answering would hold the run until the go test timeout. After
+// watchdogKill the server is killed and its output logged; if the test is
+// still stuck watchdogPanic later, the process panics, which dumps every
+// goroutine.
+const (
+	watchdogKill  = 60 * time.Second
+	watchdogPanic = 30 * time.Second
+)
+
 // contractDB starts one server (with its own allow directory) for the calling
 // subtest and returns a *sql.DB on its "main" database. Both are closed by
 // t.Cleanup, DB first.
 func contractDB(t *testing.T) *sql.DB {
 	t.Helper()
 	bin, sum := serverBinary(t)
-	m, err := launcher.OpenManaged(context.Background(), e2eConfig(bin, sum, t.TempDir()),
+	cfg := e2eConfig(bin, sum, t.TempDir())
+	out := &lockedBuffer{}
+	cfg.Stderr = out
+	m, err := launcher.OpenManaged(context.Background(), cfg,
 		launcher.WithDatabase("main"), launcher.WithSQLiteConfig(dbConfig()))
 	if err != nil {
 		t.Fatal(err)
 	}
+	name := t.Name()
+	hang := time.AfterFunc(watchdogKill, func() {
+		t.Logf("%s: no progress for %v; killing the server (pid %d)\nserver stderr:\n%s",
+			name, watchdogKill, m.Server.PID(), out.String())
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		_ = m.Server.Stop(ctx) // a canceled context kills it
+		time.Sleep(watchdogPanic)
+		panic(fmt.Sprintf("%s still stuck %v after the server was killed", name, watchdogPanic))
+	})
 	t.Cleanup(func() {
+		hang.Stop()
 		if err := m.Close(); err != nil {
 			t.Errorf("close: %v", err)
+		}
+		if t.Failed() {
+			t.Logf("server stderr:\n%s", out.String())
 		}
 	})
 	return m.DB
