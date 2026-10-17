@@ -67,6 +67,12 @@ func testPool(t *testing.T, db *sql.DB, caps Capabilities) {
 	})
 
 	t.Run("concurrent use with one key per goroutine", func(t *testing.T) {
+		// 32 writers on one file: in rollback-journal mode every commit costs
+		// several fsyncs and SQLite's busy handler is unfair, which starves
+		// writers for minutes on slow-sync filesystems (Windows runners).
+		// WAL keeps commits short. The test is about the connection pool, not
+		// about SQLite's lock fairness.
+		exec(t, db, "PRAGMA journal_mode=WAL")
 		const workers, rounds = 32, 50
 		errc := make(chan error, workers)
 		var wg sync.WaitGroup
