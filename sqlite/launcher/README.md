@@ -189,8 +189,8 @@ compromised expected digest are out of scope.
 - The server must not fork and keep running: the lifeline thread does not exist
   in a fork child (see `examples/sqlite/server/README.md`, "Zombie-free guarantee and its limits").
 - `Stop` and the kill signal target the server process only, not its children.
-- The launcher does not restart the server. Use `supervisor` (`cmd/hqqd`) for that.
-  Its `parent_pipe` and `sha256`/`manifest` options use the same mechanisms.
+- The launcher does not restart the server; the caller does. `Config.SHA256`,
+  `Config.Manifest`, and the lifeline use `secureexec` and `lifeline`, which any parent can use.
 - A `Config.Perm` of zero means the server default (0600), so mode 0000 cannot be
   requested.
 

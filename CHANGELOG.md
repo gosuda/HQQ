@@ -20,7 +20,6 @@ The project follows [Semantic Versioning](https://semver.org/). While in `v0.x`,
 - **Verified executables**: package `secureexec` (`Verify`, `Verified`, `Start`, `Process`, `HashFile`, `ParseHash`, `CleanVaults`, `Policy`, `WithPolicy`, and the `With*` options). It runs the bytes it hashed: a sealed memfd on Linux, a private 0700 vault on other POSIX systems, and a share-locked handle on Windows. Errors: `ErrHashMismatch` (`*HashMismatchError`), `ErrNotRegular`, and `ErrUnsupported`.
 - **Signed release manifests**: package `secureexec/manifest` (version 1 `manifest.json` with a detached ed25519 signature that is checked before the manifest is parsed; `Parse`, `Verify`, `Scan`, `Sign`, `VerifyFiles`, `Marshal`, `GenerateKey`, and the key text functions), and the command `cmd/hqq-manifest` (`keygen`, `gen`, `sign`, `verify`, `hash`).
 - **SQLite launcher**: package `sqlite/launcher` (`Start`, `Open`, `OpenManaged`, `Server`, `Managed`, `Config`, `ManifestSource`, `ReleasePublicKey`). It verifies the server binary with `secureexec` before it runs, and starts it with `--parent-stdin` unless `DisableLifeline` is set. Errors: `ErrConfig`, `ErrManifest`, `ErrNoArtifact`, `ErrNoReleaseKey`, `ErrReadyTimeout`, and `ErrStopTimeout`.
-- **hqqd verified and parent-pipe services**: the `sha256` and `manifest` fields (mutually exclusive) run a service's executable from a verified snapshot at every start, and `parent_pipe` ties the service's standard input to hqqd. Status reports `verified` and `mechanism` while a verified process runs. `hqqd check` validates these fields.
 - **Release pipeline**: `.github/workflows/release.yml` builds, tests, and smoke-tests the SQLite server on each platform, writes `manifest.json`, `licenses.tar.gz`, and `SHA256SUMS`, signs the manifest with the `HQQ_RELEASE_SIGNING_KEY` secret, and publishes a GitHub Release from a `v*` tag. Supporting files: `scripts/release/` (fetch and verify SQLite, licenses, linkage report), `third_party/sqlite/` (pinned SQLite digests), and `docs/RELEASING.md`.
 
 ### Changed
@@ -41,6 +40,7 @@ The project follows [Semantic Versioning](https://semver.org/). While in `v0.x`,
 
 - The Zig binding (`bindings/zig`) and its CI job. It was never verified by CI.
 - The packages at `examples/sqlite/driver`, `examples/sqlite/wire`, `examples/sqlite/fakeserver`, and `examples/sqlite/e2e` (moved, see Changed and Migration).
+- **`hqqd` and package `supervisor`** (released in v0.6.0): the process manager `cmd/hqqd`, its configuration format, its admin protocol (`hqqd ctl`), and the `supervisor` package (`Supervisor`, `New`, `Config`, `ServiceSpec`, `ServeAdmin`, `DialAdmin`, `AdminClient`, and their related types). A process manager is outside the scope of an IPC library. Packages `lifeline` and `secureexec` stay.
 
 ### Migration (v0.6.0 → Unreleased)
 
@@ -57,6 +57,7 @@ The project follows [Semantic Versioning](https://semver.org/). While in `v0.x`,
 | `examples/sqlite/e2e` | `sqlite/e2e` |
 | `examples/sqlite/PROTOCOL.md` | `sqlite/PROTOCOL.md` |
 | `examples/sqlite/server` | unchanged |
+| `hqqd`, `hqqd ctl`, `import "gosuda.org/hqq/supervisor"` | removed; use the process manager of the host (systemd, launchd, a container runtime) to start and restart services, `sqlite/launcher` to start the SQLite server from Go, and `lifeline` and `secureexec` for parent-tied and verified starts |
 | `bindings/zig` | removed |
 
 ### Not verified

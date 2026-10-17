@@ -16,7 +16,7 @@ It delivers **sub-microsecond round-trip latency (~240 ns)** and **multi-GB/s th
 - **Crash and lifecycle detection (`HQQ_STL3` superblock)**: per-endpoint session tokens and heartbeats distinguish graceful peer shutdown (`io.EOF` from `Read`, `ErrPeerClosed` elsewhere) from abrupt termination (`ErrPeerGone`). Segments whose endpoints have all closed or died are re-initialized, a third endpoint is rejected (`ErrLinkBusy`), a dead initializer is taken over, and a foreign or other-version object is never modified.
 - **Formal verification and checks**: the MPMC ring (claim, completion CAS, FIFO order, progress) is model-checked with TLC ([`internal/mpmc/MPMC.tla`](internal/mpmc/MPMC.tla), bounded model, not a proof). CI runs `go vet ./...` (including `unsafeptr`), `go test ./...`, `go test -race ./...` (not on Windows), and fuzz smoke tests.
 - **Multi-client acceptor** (`NewAcceptor`, `Accept`, `Connect`): one listener name serves any number of clients. Each client has its own link segment, so a crashed client affects only its own link.
-- **Other languages and tools**: C, C++, and Rust implementations, a normative specification (`spec/`), golden conformance vectors and an interop harness, the `hqqd` process manager, a `database/sql` driver for a SQLite service (`sqlite`), and tools for verified executables and signed release manifests (`secureexec`, `cmd/hqq-manifest`). See [Other languages and interoperability](#other-languages-and-interoperability) and [Tools and examples](#tools-and-examples).
+- **Other languages and tools**: C, C++, and Rust implementations, a normative specification (`spec/`), golden conformance vectors and an interop harness, a `database/sql` driver for a SQLite service (`sqlite`), and tools for verified executables and signed release manifests (`secureexec`, `cmd/hqq-manifest`). See [Other languages and interoperability](#other-languages-and-interoperability) and [Tools and examples](#tools-and-examples).
 
 ---
 
@@ -261,40 +261,6 @@ The wait/wake handshake must use sequentially consistent accesses (or equivalent
 
 ## Tools and examples
 
-### hqqd: process manager
-
-`hqqd` runs services that serve HQQ listeners. It starts each service, decides readiness with HQQ health checks, restarts it with backoff, stops it gracefully, and answers commands over an HQQ admin listener. It is built on the [`supervisor`](supervisor) package. The configuration reference is in [`cmd/hqqd/README.md`](cmd/hqqd/README.md).
-
-```sh
-hqqd check -config /etc/hqqd/hqqd.json   # validate a configuration
-hqqd run -config /etc/hqqd/hqqd.json     # run the supervisor; SIGHUP reloads it
-hqqd ctl list                            # control the running supervisor
-hqqd ctl restart echo
-```
-
-A minimal configuration with one service:
-
-```json
-{"services":[{"name":"echo","command":"/usr/local/bin/hqq-echo"}]}
-```
-
-A service can also run a verified executable and be tied to the life of hqqd. The zero digest below is a placeholder: replace it with the SHA-256 of the binary, which `hqq-manifest hash FILE` prints.
-
-```json
-{"services":[
-  {"name":"app-db",
-   "command":"/opt/app/bin/hqq-sqlite-server",
-   "args":["app-db","--parent-stdin","--alias","main=/var/lib/app/app.sqlite"],
-   "listener":"app-db",
-   "sha256":"0000000000000000000000000000000000000000000000000000000000000000",
-   "parent_pipe":true}
-]}
-```
-
-- `sha256`, or `manifest` (a signed release manifest that gives the digest for this platform), makes hqqd verify the executable before every start and run the verified bytes. See [Verified executables](#verified-executables).
-- `parent_pipe: true` gives the service a standard input that hqqd holds open. When hqqd exits for any reason, including SIGKILL, the service reads end of file. The C server watches it with `--parent-stdin`, as in the example; a Go service calls `lifeline.Watch`. See [Parent lifeline](#parent-lifeline).
-- While a verified process runs, `hqqd ctl status` reports `verified` and `mechanism`.
-
 ### SQLite service (`sqlite`)
 
 The `sqlite` package is a `database/sql` driver, registered as `hqq-sqlite`, for a SQLite database that runs as a separate service reached through an HQQ listener. The client needs no cgo. Each `database/sql` connection is one HQQ stream of a shared link, and the server runs each stream as one session with its own SQLite connection, transaction state, and statements. The service is the C server in [`examples/sqlite/server`](examples/sqlite/server) (Linux, macOS and Windows with clang-cl), or the Go fake server used by the tests.
@@ -376,7 +342,7 @@ err = m.DB.QueryRowContext(ctx, "SELECT 1").Scan(&one)
 - `Start` hashes the binary with `secureexec` before it runs. The expected digest is `Config.SHA256`, or the entry for this platform of a signed manifest (`Config.Manifest`, whose signature is checked before the manifest is parsed). A mismatch starts nothing and returns an error that wraps `secureexec.ErrHashMismatch`.
 - The server is started with `--parent-stdin`. It shuts down gracefully, rolling back open transactions, when the process that started it exits, including by SIGKILL.
 - `Open` returns the `*sql.DB` and the `*Server` separately: close the DB first, then the server. `OpenManaged` returns both in one `Managed` value.
-- The launcher does not restart the server; hqqd does that. The details are in [`sqlite/launcher/README.md`](sqlite/launcher/README.md).
+- The launcher does not restart the server; the caller does. The details are in [`sqlite/launcher/README.md`](sqlite/launcher/README.md).
 
 ### Verified executables
 

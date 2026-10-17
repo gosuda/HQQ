@@ -244,7 +244,7 @@ configuration, and raw paths only when the policy allows them. It disables
 access control is the listener's permission. It does not authenticate requests.
 See PROTOCOL.md section 12.
 
-The C server with `--parent-stdin` also shuts down gracefully when the process that started it exits, including by SIGKILL (see the Parent lifeline section of `../examples/sqlite/server/README.md`). `sqlite/launcher` passes the flag itself; under hqqd, set `parent_pipe` and pass `--parent-stdin` in the service's `args`.
+The C server with `--parent-stdin` also shuts down gracefully when the process that started it exits, including by SIGKILL (see the Parent lifeline section of `../examples/sqlite/server/README.md`). `sqlite/launcher` passes the flag itself; a different parent must keep the write end of a pipe open on the server's standard input and pass `--parent-stdin`.
 
 ## Tests
 

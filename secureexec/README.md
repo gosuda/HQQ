@@ -9,7 +9,7 @@ Package documentation (threat model, API summary): `doc.go`, or `go doc gosuda.o
 
 ## Threat model
 
-- The verifier (supervisor, launcher) runs as an ordinary user.
+- The verifier (launcher) runs as an ordinary user.
 - The attacker is another local process or user who can write in the
   directories the executable is read from.
 - Attack 1, **path swap**: the directory entry is replaced (symlink, rename over,

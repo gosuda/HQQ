@@ -16,7 +16,7 @@
 //
 // # Threat model
 //
-// The verifier runs as an ordinary user: a supervisor or launcher. The
+// The verifier runs as an ordinary user: a launcher. The
 // attacker is another local process or user that can write in the directories
 // the binary is read from. Two attacks are stopped:
 //
