@@ -114,11 +114,14 @@ func runKillPeer(e *env) error {
 //
 // Step 1's opener, after the creator's death, must see ErrPeerGone within the
 // bound (the old endpoints' loss observed for real). Step 2 does not repeat it.
+//
+// Not on Windows: a name lives only while a handle to it is open, so once both
+// endpoints died the name is gone and the next creator starts a new object.
 func init() {
 	crash := map[string][]string{"creator": {"--crash-after", "exit"}, "opener": {"--crash-after", "exit"}}
 	register(&scenario{
 		ID: "X-09", Title: "reuse of a name after both endpoints died (epoch and creatorToken change)", Kind: "standard",
-		Platforms: []string{"any"}, TimeoutS: 60,
+		Platforms: []string{"linux", "darwin", "freebsd"}, TimeoutS: 60,
 		Variants: []variant{
 			{Name: "reuse", Params: params{BufferCount: 4, BufferSize: 256, HeartbeatMs: 50, PeerTimeoutMs: 300},
 				Steps: []step{

@@ -180,8 +180,20 @@ func ignoreNotExist(err error) error {
 	return err
 }
 
-// mapNamed opens (or creates) name and maps size bytes of it.
-func mapNamed(name string, size uintptr, flags int, mode os.FileMode) (*namedMapping, error) {
+// smallObjectError decides the error of an existing object that is shorter
+// than the segment the caller asks for (0 < cur < the requested size). It
+// must not modify the object, and must not close smem, which mapNamed closes.
+type smallObjectError func(smem *shm.SharedMemory, cur int64) error
+
+// linkSmallObject is the smallObjectError of links: an existing object that
+// is smaller than the requested segment is ErrInvalidSize, whatever it holds.
+func linkSmallObject(*shm.SharedMemory, int64) error {
+	return ErrInvalidSize
+}
+
+// mapNamed opens (or creates) name and maps size bytes of it. small decides
+// the error for an existing object that is shorter than size.
+func mapNamed(name string, size uintptr, flags int, mode os.FileMode, small smallObjectError) (*namedMapping, error) {
 	if size == 0 || uintptr(int(size)) != size {
 		return nil, ErrInvalidSize
 	}
@@ -203,8 +215,9 @@ func mapNamed(name string, size uintptr, flags int, mode os.FileMode) (*namedMap
 			_ = m.release()
 			return nil, errSegmentNotReady
 		case cur > 0 && cur < int64(size):
+			err = small(smem, cur)
 			_ = m.release()
-			return nil, ErrInvalidSize
+			return nil, err
 		}
 	}
 	mapped, err := mmap.Map(smem.FD(), 0, int(size), mmap.PROT_READ|mmap.PROT_WRITE, mmap.MAP_SHARED)
@@ -223,13 +236,13 @@ func mapNamed(name string, size uintptr, flags int, mode os.FileMode) (*namedMap
 // createNamed creates the object name exclusively. If the name exists it
 // opens the existing object instead, to be re-initialized by the caller if
 // its endpoints are gone (see claimSuperblock with roleCreator).
-func createNamed(name string, size uintptr, mode os.FileMode) (*namedMapping, error) {
+func createNamed(name string, size uintptr, mode os.FileMode, small smallObjectError) (*namedMapping, error) {
 	for attempt := 0; ; attempt++ {
-		m, err := mapNamed(name, size, createFlags, mode)
+		m, err := mapNamed(name, size, createFlags, mode, small)
 		if !errors.Is(err, os.ErrExist) {
 			return m, err
 		}
-		m, err = mapNamed(name, size, os.O_RDWR, 0)
+		m, err = mapNamed(name, size, os.O_RDWR, 0, small)
 		if errors.Is(err, os.ErrNotExist) && attempt < 3 {
 			continue // removed between the two opens: create it
 		}
@@ -282,9 +295,9 @@ func openNamedInstance[L any](ctx context.Context, name string, bufferCount, buf
 	if create {
 		attach.role = roleCreator
 		attach.creatorToken = newToken()
-		m, err = createNamed(name, size, mode)
+		m, err = createNamed(name, size, mode, linkSmallObject)
 	} else {
-		m, err = mapNamed(name, size, os.O_RDWR, 0)
+		m, err = mapNamed(name, size, os.O_RDWR, 0, linkSmallObject)
 	}
 	if err != nil {
 		return zero, nil, err

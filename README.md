@@ -11,9 +11,12 @@ It delivers **sub-microsecond round-trip latency (~240 ns)** and **multi-GB/s th
 - **Two composable protocol layers over one shared-memory layout**:
   - **Standard Protocol (`StandardLink`)**: fixed-capacity messages (`Read`, `Write`, `ReadZeroCopy`, `WriteZeroCopy`, `ReserveRead`, `ReserveWrite`, and `net.PacketConn` with datagram `ReadFrom`/`WriteTo` and deadlines) with zero heap allocations on the hot path.
   - **Advanced Protocol (`AdvancedLink`)**: negotiated overlay adding messages of up to `MaxMessageSize` bytes chunked over the ring (`Send`, `Recv`, pooled `Message`s), concurrent out-of-order RPC with a `net/http`-like server (`Call`, `Serve`, `Handler`, `Mux`), and logical streams (`Stream`, `ListenStreams`, `AcceptStream`, `OpenStream`).
+  - **Protocol 1.1 (negotiated)**: `FeatureCancel` cancels a handler when its caller gives up, `FeatureMetadata` carries the caller's remaining deadline and `CallOptions` caller and trace IDs, and `Shutdown` drains accepted requests. Peers that negotiate only 1.0 see 1.0 behavior.
 - **Adaptive cross-process parking (`WaitAdaptive`)**: re-checks the ring in a short tight loop, yields with `runtime.Gosched`, then parks in the OS kernel (`FUTEX_WAIT` on Linux, `UL_COMPARE_AND_WAIT_SHARED` on macOS, named semaphores for named segments on Windows). All goroutines of a process blocked on the same ring side share one kernel park (waiter aggregation), so N blocked goroutines pin one OS thread.
 - **Crash and lifecycle detection (`HQQ_STL3` superblock)**: per-endpoint session tokens and heartbeats distinguish graceful peer shutdown (`io.EOF` from `Read`, `ErrPeerClosed` elsewhere) from abrupt termination (`ErrPeerGone`). Segments whose endpoints have all closed or died are re-initialized, a third endpoint is rejected (`ErrLinkBusy`), a dead initializer is taken over, and a foreign or other-version object is never modified.
 - **Formal verification and checks**: the MPMC ring (claim, completion CAS, FIFO order, progress) is model-checked with TLC ([`internal/mpmc/MPMC.tla`](internal/mpmc/MPMC.tla), bounded model, not a proof). CI runs `go vet ./...` (including `unsafeptr`), `go test ./...`, `go test -race ./...` (not on Windows), and fuzz smoke tests.
+- **Multi-client acceptor** (`NewAcceptor`, `Accept`, `Connect`): one listener name serves any number of clients. Each client has its own link segment, so a crashed client affects only its own link.
+- **Other languages and tools**: C, C++, Rust, and Zig implementations, a normative specification (`spec/`), golden conformance vectors and an interop harness, the `hqqd` process manager, and a SQLite service example. See [Other languages and interoperability](#other-languages-and-interoperability) and [Tools and examples](#tools-and-examples).
 
 ---
 
@@ -181,6 +184,45 @@ defer secondary.Close()
 
 `hqq.NewAdvancedLink(mem, 128, 4096, hqq.AdvancedOptions{})` does the same for an `AdvancedLink`; call `Negotiate` on both endpoints before using Advanced APIs.
 
+### 5. Multi-client acceptor (`NewAcceptor` / `Accept` / `Connect`)
+
+One listener name serves any number of clients. Each client calls `Connect`, which creates its own link segment; the acceptor returns each negotiated link from `Accept`:
+
+```go
+// Server process
+acc, err := hqq.NewAcceptor("my-service", hqq.AcceptorConfig{})
+if err != nil {
+	log.Fatal(err)
+}
+defer acc.Close()
+
+mux := hqq.NewMux()
+mux.HandleFunc(MethodEcho, func(ctx context.Context, w *hqq.ResponseWriter, req *hqq.Request) {
+	w.Write(req.Payload())
+})
+for {
+	link, err := acc.Accept(ctx) // one link per client
+	if err != nil {
+		break // ctx ended, or the acceptor was closed (ErrAcceptorClosed)
+	}
+	go func() {
+		defer link.Close()
+		_ = link.Serve(ctx, mux)
+	}()
+}
+
+// Client process (any number of them)
+link, err := hqq.Connect(ctx, "my-service", hqq.Config{})
+if err != nil {
+	panic(err)
+}
+defer link.Close()
+
+m, err := link.Call(ctx, MethodEcho, []byte("hello"))
+```
+
+A client that crashes affects only its own link. See [Acceptor and `Connect` Behavior](#acceptor-and-connect-behavior) for the failure errors and the defaults.
+
 ---
 
 ## Architecture Overview
@@ -197,7 +239,67 @@ BUFFERS_1     fixed payload buffers for direction 1 (slot i owns BUFFERS_1[i])
 
 Each data-ring slot `i` owns the same-index payload buffer `BUFFERS[i]`. Senders claim a producer slot, fill `BUFFERS[slot]`, and publish a 64-byte `protocol.Packet`. Receivers claim the consumer slot, either copy the payload out (`Read`) or inspect it in place (`ReadZeroCopy` / `ReserveRead`), and release the slot when done. Because `BUFFERS[slot]` cannot be claimed by another producer until the consumer releases slot `i`, unread payloads can never be overwritten.
 
-See [PROTOCOL.md](PROTOCOL.md) for the full wire and memory layout specification.
+The normative specification is [`spec/SPEC.md`](spec/SPEC.md), with [`spec/MEMORY_MODEL.md`](spec/MEMORY_MODEL.md) for memory orders. [PROTOCOL.md](PROTOCOL.md) is an overview of the wire and memory layout that points to these documents.
+
+---
+
+## Other languages and interoperability
+
+The protocol is implemented outside Go. Each implementation is checked against this package with a two-process interop matrix and golden conformance vectors.
+
+| Component | Location | Status |
+| --- | --- | --- |
+| C library `libhqq` (C11): Standard, Advanced, acceptor, and listener layers | [`c/`](c/README.md), headers in [`c/include/hqq/`](c/include/hqq) | Tests and the Go/C interop pairings verified on the authoring host (macOS arm64). CI builds it on Linux, macOS, and Windows (clang-cl; MSVC is experimental). |
+| C++17 header-only wrapper (`hqq::`) | [`bindings/cpp/`](bindings/cpp) | Tests, examples, and interop verified on the authoring host (macOS arm64). CI in `bindings.yml`: Linux (gcc, clang with sanitizers), macOS, and Windows (clang-cl). |
+| Rust: `hqq-sys` (FFI), `hqq` (safe API), `hqq-interop` | [`bindings/rust/`](bindings/rust) | Tests, examples, and interop verified on the authoring host (macOS arm64). CI in `bindings.yml`: Linux, macOS, and Windows (MSVC). |
+| Zig binding | [`bindings/zig/`](bindings/zig) | Written for Zig 0.15.2 and not run on the authoring host. CI only (`bindings.yml`, Linux and macOS). |
+| Specification | [`spec/`](spec) | [`SPEC.md`](spec/SPEC.md) (Standard and Advanced Protocol 1.0, normative), [`MEMORY_MODEL.md`](spec/MEMORY_MODEL.md), [`PORTING.md`](spec/PORTING.md), [`ext/`](spec/ext) (Advanced Protocol 1.1 and the listener segment), [`constants.json`](spec/constants.json), [`litmus/`](spec/litmus) |
+| Conformance vectors | [`conformance/`](conformance) | Golden vectors generated by the Go implementation, checked by `go test ./conformance/...`, and run in CI by `interop.yml`. |
+| Interop harness | [`cmd/hqq-interop`](cmd/hqq-interop), [`interop/`](interop), [`conformance/INTEROP_CLI.md`](conformance/INTEROP_CLI.md) | Two-process matrix over the implementations listed in `HQQ_INTEROP_IMPLS` (for example `go=/path/to/hqq-interop-go,c=/path/to/hqq_interop`). Go, C, C++, and Rust pairings verified on the authoring host; run in CI by `interop.yml` and the binding workflows. |
+| Memory-model verification | [`c/verify/`](c/verify) | GenMC harnesses over the C ring, herd7 litmus tests, and stress litmus tests. CI only. |
+
+The wait/wake handshake must use sequentially consistent accesses (or equivalent fences) for `W1`, `W3`, `K1`, and `K2`; see [`spec/MEMORY_MODEL.md`](spec/MEMORY_MODEL.md) §4. Relaxed or acquire/release-only handshakes can lose wake-ups.
+
+## Tools and examples
+
+### hqqd: process manager
+
+`hqqd` runs services that serve HQQ listeners. It starts each service, decides readiness with HQQ health checks, restarts it with backoff, stops it gracefully, and answers commands over an HQQ admin listener. It is built on the [`supervisor`](supervisor) package. The configuration reference is in [`cmd/hqqd/README.md`](cmd/hqqd/README.md).
+
+```sh
+hqqd check -config /etc/hqqd/hqqd.json   # validate a configuration
+hqqd run -config /etc/hqqd/hqqd.json     # run the supervisor; SIGHUP reloads it
+hqqd ctl list                            # control the running supervisor
+hqqd ctl restart echo
+```
+
+A minimal configuration with one service:
+
+```json
+{"services":[{"name":"echo","command":"/usr/local/bin/hqq-echo"}]}
+```
+
+### SQLite service example
+
+[`examples/sqlite`](examples/sqlite) serves a SQLite database as an HQQ service. Each `database/sql` connection is one stream and one server session, and the client needs no cgo. The wire protocol is in [`examples/sqlite/PROTOCOL.md`](examples/sqlite/PROTOCOL.md). The directory holds the Go driver `hqq-sqlite`, a Go fake server for tests, a C server ([`examples/sqlite/server`](examples/sqlite/server), POSIX only), and end-to-end tests.
+
+```go
+import (
+	"database/sql"
+
+	_ "gosuda.org/hqq/examples/sqlite/driver" // registers "hqq-sqlite"
+)
+
+db, err := sql.Open("hqq-sqlite", "hqq://sqlite-svc?db=main&timeout=5s&fetch=256&busy=5s")
+```
+
+The DSN host is the listener name of the server. Build the C server and serve a database under the alias `main`:
+
+```sh
+cmake -S c -B build -DHQQ_BUILD_SQLITE_SERVER=ON -DHQQ_WERROR=ON
+cmake --build build --target hqq-sqlite-server
+build/sqlite-server/hqq-sqlite-server sqlite-svc --alias main=/path/to/app.db
+```
 
 ---
 
@@ -269,6 +371,24 @@ func (l *NamedAdvancedLink) Close() error
 
 `NewStandardLink` / `NewAdvancedLink` validate in this order: empty slice (`ErrMemorySmall`), page alignment (`ErrMemoryAlign`), configuration (`ErrInvalidSize`), slice length (`ErrMemorySmall`). A geometry that differs from an existing segment returns `*GeometryError` (matches `ErrInvalidSize`; use `errors.As` for `Want`/`Got`).
 
+### Acceptor and `Connect`
+
+```go
+// Server: one listener name, any number of clients (AcceptorConfig zero value = defaults)
+func NewAcceptor(name string, cfg AcceptorConfig) (*Acceptor, error)
+func NewAcceptorContext(ctx context.Context, name string, cfg AcceptorConfig) (*Acceptor, error)
+func (a *Acceptor) Accept(ctx context.Context) (*NamedAdvancedLink, error) // ErrAcceptorClosed after Close
+func (a *Acceptor) Close() error // idempotent; removes the listener name; links already accepted stay open
+func (a *Acceptor) Name() string
+func (a *Acceptor) Addr() net.Addr
+func (a *Acceptor) Stats() AcceptorStats
+
+// Client: one link per call, negotiated as Primary
+func Connect(ctx context.Context, listenerName string, cfg Config) (*NamedAdvancedLink, error)
+```
+
+`AcceptorConfig` fields: `Perm`, `QueueSize`, `Features`, `Advanced` (`AdvancedOptions` for every accepted link), `MaxBufferCount`, `MaxBufferSize`, `MaxLinkSize`, `Backlog`, `MaxHandshakes`, `HandshakeTimeout`, `StuckSlotTimeout`. Defaults are listed under [Acceptor and `Connect` Behavior](#acceptor-and-connect-behavior). `AcceptorStats` has the fields `Records`, `Accepted`, `Malformed`, `Unreachable`, `HandshakeFailed`, and `StuckSlots`.
+
 ### `StandardLink` Methods
 
 ```go
@@ -325,7 +445,9 @@ func (l *AdvancedLink) Stream() *Stream
 func (l *AdvancedLink) Send(ctx context.Context, p []byte) error
 func (l *AdvancedLink) Recv(ctx context.Context) (*Message, error) // data messages only; Release the result
 func (l *AdvancedLink) Call(ctx context.Context, method uint64, req []byte) (*Message, error) // Release the result
+func (l *AdvancedLink) CallWith(ctx context.Context, method uint64, req []byte, opts CallOptions) (*Message, error) // protocol 1.1 metadata
 func (l *AdvancedLink) Serve(ctx context.Context, h Handler) error
+func (l *AdvancedLink) Shutdown(ctx context.Context) error // refuse new requests, drain accepted ones; Serve then returns nil
 
 // Logical streams (Primary allocates even IDs 2, 4, ...; Secondary odd IDs 1, 3, ...; 0 is the link)
 func (l *AdvancedLink) ListenStreams(ctx context.Context) error
@@ -336,6 +458,7 @@ func (s *Stream) ID() uint64
 func (s *Stream) Send(ctx context.Context, p []byte) error
 func (s *Stream) Recv(ctx context.Context) (*Message, error)
 func (s *Stream) Call(ctx context.Context, method uint64, req []byte) (*Message, error)
+func (s *Stream) CallWith(ctx context.Context, method uint64, req []byte, opts CallOptions) (*Message, error) // protocol 1.1 metadata
 func (s *Stream) Close() error // no context; ErrInvalidOp on stream 0
 
 // Received messages (pooled)
@@ -353,6 +476,8 @@ type HandlerFunc func(ctx context.Context, w *ResponseWriter, req *Request)
 func (r *Request) Method() uint64
 func (r *Request) Payload() []byte // valid only during ServeHQQ
 func (r *Request) StreamID() uint64
+func (r *Request) Caller() uint64  // protocol 1.1: caller ID from CallOptions, or zero
+func (r *Request) Trace() [16]byte // protocol 1.1: trace ID from CallOptions, or zero
 func (w *ResponseWriter) Write(p []byte) (int, error)     // appends to the response body
 func (w *ResponseWriter) WriteError(status uint64, p []byte) // error response; Call returns ResponseError
 
@@ -363,6 +488,11 @@ func (m *Mux) HandleFunc(method uint64, f func(ctx context.Context, w *ResponseW
 type ResponseError struct { // returned by value from Call for an error response
 	Status  uint64
 	Payload []byte // a copy owned by the caller
+}
+
+type CallOptions struct { // request metadata, sent with FeatureMetadata
+	Caller uint64   // zero: not sent
+	Trace  [16]byte // all zero: not sent
 }
 
 // Link information and lifecycle
@@ -385,7 +515,7 @@ type Config struct {
 	BufferCount int          // default DefaultBufferCount (256)
 	BufferSize  int          // default DefaultBufferSize (4096)
 	Perm        os.FileMode  // permission of the created segment (Listen only), default 0o600
-	Features    uint64       // default FeatureMessages|FeatureRequestResponse
+	Features    uint64       // default: all supported features (FeatureMessages|FeatureRequestResponse|FeatureCancel|FeatureMetadata)
 	Advanced    AdvancedOptions
 }
 
@@ -401,28 +531,64 @@ type AdvancedOptions struct {
 	MaxReassemblyBytes uint64 // default 4 × MaxMessageSize
 	IncomingQueueSize  int    // default bufferCount
 	IncomingOverflow   OverflowPolicy
+	StreamListenGrace time.Duration // stream requests held before ListenStreams; default 2s, negative refuses at once
 	Link               LinkOptions
 }
 ```
 
-The errors, their `errors.Is` relationships and the packet formats are specified in [PROTOCOL.md](PROTOCOL.md#error-hierarchy).
+The errors and their `errors.Is` relationships are listed in [PROTOCOL.md](PROTOCOL.md#error-hierarchy); the packet formats are in [`spec/SPEC.md`](spec/SPEC.md) and [`spec/ext/PROTOCOL_1_1_DRAFT.md`](spec/ext/PROTOCOL_1_1_DRAFT.md).
 
 ### Streams, `Serve`, and routing
 
 **Streams.**
 
 - Stream 0 is the link itself: `l.Stream()` returns it (always the same pointer), it is always open, and `Close` on it returns `ErrInvalidOp`. `l.Send`, `l.Recv`, and `l.Call` are exactly `l.Stream().Send`, `Recv`, and `Call`.
-- Further streams: the acceptor calls `ListenStreams` and then `AcceptStream`; the peer's `OpenStream` waits for the accept. Without `ListenStreams` the peer's `OpenStream` fails with `ErrConnNotFound`. `ListenStreams` twice returns `ErrAlreadyListening`, and `AcceptStream` before `ListenStreams` returns `ErrNotListening`. The Primary allocates even IDs (2, 4, ...), the Secondary odd IDs (1, 3, ...), and IDs are never reused. An incoming stream is registered when its `OpConnCreate` arrives, so the messages the peer sends on it are queued before `AcceptStream` returns it.
+- Further streams: the acceptor calls `ListenStreams` and then `AcceptStream`; the peer's `OpenStream` waits for the accept. A stream request that arrives before `ListenStreams` is held for `AdvancedOptions.StreamListenGrace` (default 2 s) and accepted, in arrival order, when `ListenStreams` runs; one still held when the grace period ends is refused with `ErrConnNotFound`. `ListenStreams` twice returns `ErrAlreadyListening`, and `AcceptStream` before `ListenStreams` returns `ErrNotListening`. The Primary allocates even IDs (2, 4, ...), the Secondary odd IDs (1, 3, ...), and IDs are never reused. An incoming stream is registered when its `OpConnCreate` arrives, so the messages the peer sends on it are queued before `AcceptStream` returns it.
 - `Send` publishes `p` as one message of up to `MaxMessageSize` bytes (`ErrBufferOverflow` otherwise, nothing is sent), split into chunks of at most `BufferSize` bytes; the peer receives it as one message. `p` may be reused as soon as `Send` returns. `Send` needs `FeatureMessages`, `Call` and `Serve` need `FeatureRequestResponse` (`ErrNotNegotiated` otherwise).
 - **Ordering.** Messages sent one after the other on a stream arrive in that order. Concurrent `Send`s on a stream are not ordered relative to each other, and there is no ordering between streams. Responses to concurrent `Call`s may arrive in any order.
 
 **Serve.**
 
-- `Serve(ctx, h)` receives the requests of every stream of the link and answers each with `h`; `h.ServeHQQ` gets the `ctx` passed to `Serve`, a `*ResponseWriter`, and a `*Request` (`Method`, `Payload`, `StreamID`). When `ServeHQQ` returns, the response is sent on the stream the request arrived on. `Stream.Recv` never returns a request; `Serve` is the only consumer of requests.
+- `Serve(ctx, h)` receives the requests of every stream of the link and answers each with `h`. `h.ServeHQQ` gets its own context (see below), a `*ResponseWriter`, and a `*Request` (`Method`, `Payload`, `StreamID`, and, with `FeatureMetadata`, `Caller` and `Trace`). When `ServeHQQ` returns, the response is sent on the stream the request arrived on, unless the caller gave up in the meantime. `Stream.Recv` never returns a request; `Serve` is the only consumer of requests.
 - A handler that writes nothing answers with an empty success response. `w.Write` appends to the body (`ErrBufferOverflow` and nothing written if the body would exceed `MaxMessageSize`). `w.WriteError(status, p)` turns the response into an error response, replaces the body written so far, and makes the caller's `Call` return `ResponseError{Status, Payload}` (by value, `Payload` is a copy; test with `errors.As(err, &re)` for `var re hqq.ResponseError`). A later `Write` appends to the error body. A zero `status` is sent as `ErrCodeInvalidOp`; a `p` larger than `MaxMessageSize` becomes status `ErrCodeBufferOverflow` with an empty payload. A successful response always has status 0.
 - `Mux` dispatches by method; an unregistered method gets status `ErrCodeInvalidOp` with payload `hqq: unknown method`, unless `Mux.NotFound` is set. `Serve` with a nil handler returns `ErrInvalidOp`.
 - **Execution model.** One goroutine at a time, the receiver, takes requests from the request queue. While no handler is running, the receiver runs each request's handler itself (inline), which saves a goroutine hand-off per request. If an inline handler is still running after 200 µs, the receiver role passes to a new goroutine, so later requests are not stuck behind the slow handler (the slow handler finishes on its own goroutine). While any handler is running, the receiver hands requests to pooled worker goroutines, which are started on demand, up to `BufferCount`, and stay until `Serve` returns. As soon as a request arrives while no handler is running, it runs inline again, so a one-off slow handler affects one episode only. Concurrency is bounded by `BufferCount`; when all handlers are busy, `Serve` stops receiving requests until one finishes. A request that arrives behind a slow inline handler waits up to about 200 µs for the hand-over. `Serve` waits for running handlers before it returns.
-- `Serve` returns `ctx.Err()` when `ctx` ends, nil when the peer closed the link gracefully, and the receive error otherwise.
+- `Serve` returns `ctx.Err()` when `ctx` ends, nil when the peer closed the link gracefully or `Shutdown` completed, and the receive error otherwise.
+
+**Deadlines, metadata, cancellation, and shutdown (protocol 1.1).** These features are negotiated with `FeatureCancel` and `FeatureMetadata`, which the default `Config.Features` and `Negotiate(ctx, 0)` request. Against a peer that did not negotiate them, the calls behave as in 1.0.
+
+- **Deadline.** If the context of a `Call` has a deadline, the remaining time is sent with the request and becomes the deadline of the handler's context. A `Call` whose deadline has already passed returns `context.DeadlineExceeded` without sending anything.
+- **Cancellation.** If the context of a waiting `Call` ends, the peer is told to cancel the handler's context (`OpCancel`, best effort). The handler sees `ctx.Done()` closed, and no response is sent.
+- **Metadata.** `Stream.CallWith` and `AdvancedLink.CallWith` take a `CallOptions` with a caller ID and a 16-byte trace ID; the handler reads them with `req.Caller()` and `req.Trace()`. Zero values are not sent.
+- **Handler context.** Each handler gets its own context. It is canceled when the caller cancels, when the deadline expires, when the stream closes (on either side), when `Serve` ends, and when the link is closed. It is valid only during `ServeHQQ`.
+- **Shutdown.** `AdvancedLink.Shutdown(ctx)` refuses new requests (the caller's `Call` returns a `ResponseError` matching `ErrShuttingDown`), waits until the accepted requests are answered or `ctx` ends, and then makes `Serve` return nil. Other calls of the link keep working.
+
+```go
+// Caller: the remaining time and the caller and trace IDs travel with the request.
+ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+defer cancel()
+m, err := link.CallWith(ctx, MethodEcho, []byte("hello"), hqq.CallOptions{Caller: 42})
+if err != nil {
+	panic(err)
+}
+m.Release()
+
+// Handler: its context ends at the caller's deadline or on cancellation.
+mux.HandleFunc(MethodEcho, func(ctx context.Context, w *hqq.ResponseWriter, req *hqq.Request) {
+	select {
+	case <-time.After(100 * time.Millisecond):
+		w.Write(req.Payload())
+	case <-ctx.Done():
+		// The caller gave up or its deadline passed: no response is sent.
+	}
+})
+
+// Graceful stop: refuse new requests, drain the accepted ones, then close.
+if err := link.Shutdown(ctx); err != nil {
+	log.Printf("drain: %v", err)
+}
+link.Close()
+```
 
 **Routing.**
 
@@ -434,7 +600,7 @@ The errors, their `errors.Is` relationships and the packet formats are specified
 
 **Close and errors.**
 
-- After a local `Stream.Close`, `Send`, `Recv`, and `Call` on it return `ErrClosed`, as does a second `Close`; the queued messages are discarded and blocked `Recv`/`Call` calls wake. `Close` takes no context: it waits for room in the tx ring, returns the error of sending `OpConnClose`, and closes the stream locally even if that fails. Requests already in flight on the stream are not affected: `Serve` still answers them.
+- After a local `Stream.Close`, `Send`, `Recv`, and `Call` on it return `ErrClosed`, as does a second `Close`; the queued messages are discarded and blocked `Recv`/`Call` calls wake. `Close` takes no context: it waits for room in the tx ring, returns the error of sending `OpConnClose`, and closes the stream locally even if that fails. Requests already received on the stream are still answered by `Serve`, as far as the peer's stream exists, but the contexts of their handlers are canceled.
 - After the peer closes a stream, `Recv` returns the messages still queued and then `ErrPeerClosed`; `Send` and `Call` return `ErrPeerClosed` (a `Call` that is waiting wakes). The first `Close` after a peer close returns nil, later ones `ErrClosed`.
 - A closed link returns `ErrClosed` (the message of `ErrClosed` is `hqq: link closed` also for a stream), a dead peer `ErrPeerGone`, a graceful peer shutdown of the whole link `ErrPeerClosed`, and an ending context `ctx.Err()`. A closed stream gives `ErrClosed` (local close) or `ErrPeerClosed` (peer close), never `ErrConnNotFound`.
 
@@ -456,6 +622,7 @@ The errors, their `errors.Is` relationships and the packet formats are specified
 - **One receive path**: once `AdvancedLink` negotiation has started, the Advanced receive path owns the receive direction of the underlying rings. Use a `StandardLink` for raw `Read`/`Write`.
 - **Safe `Close()`**: closing a `StandardLink`, `AdvancedLink`, `NamedStandardLink`, or `NamedAdvancedLink` wakes all parked readers/writers (they return `ErrClosed`) and waits for in-flight calls, including running zero-copy callbacks, before returning or unmapping shared memory. `Close` and `Unlink` on named links may be called concurrently and repeatedly; only the first `Close` unmaps. `AdvancedLink.Close` also stops the dispatcher and the control sender (queued control replies are discarded) and fails pending calls and `OpenStream`s with `ErrClosed`; `Recv` calls blocked on the link or on one of its streams return `ErrClosed`.
 - **Not tracked by `Close`**: active reservations. A reservation's buffer is invalid once `Close` has run.
+- **Graceful stop**: `AdvancedLink.Shutdown(ctx)` refuses new requests, waits until the accepted ones are answered (or `ctx` ends), and then makes `Serve` return nil. `Close` does not drain: it cancels the contexts of running handlers at once, so call `Shutdown` first for a graceful stop.
 
 ### Crash Recovery & Liveness Semantics
 
@@ -484,6 +651,14 @@ How an endpoint treats an existing segment depends on how it reached it. **Opene
 - **`Dial` retries** with a backoff from 1 ms up to 100 ms only while the name does not exist yet (`os.ErrNotExist`), the creator has not claimed or sized the segment yet, the segment is still being initialized, or the segment has no live endpoint (transient errors that match `ErrFailedInit`; the last one lasts until a new `Listen` reuses the name). Every other error is permanent and returned immediately: for example `ErrLinkBusy`, `ErrIncompatibleLayout`, `ErrInvalidSize` (including `*GeometryError`), and `ErrInvalidName`.
 - **`ctx` bounds every wait**, also inside a single attempt (claiming the segment, watching an endpoint for liveness, attaching the rings, negotiation): `Dial` and `Listen` return `ctx.Err()` as soon as `ctx` is done, even if the initializer is stuck. `Dial` and `Listen` need the same `BufferCount`/`BufferSize` on both sides.
 - **Dial on a segment without live endpoints.** `Dial` never re-initializes a segment and never becomes Primary. If both endpoints are closed or dead (for example after the listener crashed and its heartbeat went stale), it keeps retrying until a new `Listen` reuses the name or `ctx` ends. Within `PeerTimeout` of a crash the dead endpoint still looks alive: `Listen` fails with `ErrLinkBusy`, and `Dial` fails with `ErrLinkBusy` or, if the dead listener never had a peer, attaches as Secondary and waits in negotiation until `ctx` ends. Start the side that should own the segment with `Listen`, and give both calls a context with a deadline.
+
+### Acceptor and `Connect` Behavior
+
+- `NewAcceptor` (or `NewAcceptorContext`, which bounds the wait for a listener segment that another process is still initializing) creates the listener name and accepts clients until `Close`. If the name exists, it is reused when its acceptor closed or died (clients still waiting in the old queue fail with `ErrListenerGone`); a live acceptor makes the call fail with `ErrListenerBusy`; an object that is not a listener segment of this layout version fails with `ErrIncompatibleLayout` and is not modified.
+- Each `Connect` creates the client's link segment, announces it in the listener's queue, and waits for the acceptor to attach to it as Secondary and negotiate. `Accept` returns the link when the handshake completes. A client that stalls or sends an invalid record delays neither other clients nor `Accept` callers.
+- `Connect` retries like `Dial` while the listener does not exist yet, is still being initialized, or has no live acceptor, until `ctx` ends. Once its request is queued, it fails with `ErrListenerClosed` (the acceptor closed the listener), `ErrListenerGone` (the acceptor stopped heartbeating or was replaced), or an error matching `ErrTimeout` (the acceptor did not attach within `Config.Advanced.Link.AttachTimeout`). In each failure case the client's segment is removed.
+- `Close` stops accepting, makes `Accept` return `ErrAcceptorClosed`, makes waiting clients fail with `ErrListenerClosed`, closes the links that completed their handshake but were not returned by `Accept`, and removes the listener name if it still refers to this acceptor. Links that `Accept` has returned stay open.
+- `AcceptorConfig` defaults: `QueueSize` 64 (a power of two from 2 to 65536), `Backlog` 16, `MaxHandshakes` 16, `HandshakeTimeout` 5 s, `StuckSlotTimeout` 2 s (negative disables the recovery of queue slots that a client claimed and never published), `MaxBufferCount` 4096, `MaxBufferSize` 1 MiB, `MaxLinkSize` 256 MiB. `Connect` fails at once for a geometry that the acceptor would drop. `AcceptorStats` counts every record as `Accepted`, `Malformed`, `Unreachable`, or `HandshakeFailed`, plus `StuckSlots`.
 
 ### Security Model (Trusted Peer Assumption)
 
@@ -525,6 +700,7 @@ On Windows, `ReleaseSemaphore` tokens persist, so a wake that runs between a wai
 - **`HeartbeatInterval` / `PeerTimeout`**: shorter values detect a crashed peer sooner (`PeerTimeout` is raised to at least four peer heartbeat intervals) at the cost of more superblock writes and a higher risk of false positives on a paused process.
 - **`AttachTimeout`**: how long an endpoint waits for another endpoint that is initializing the segment, and how long an opener (`Open*`, `Dial`) waits for a creator to claim a segment that is still empty; after that the call fails with a transient error matching `ErrFailedInit` (`Dial` retries). It also bounds each ring attach.
 - **`AdvancedOptions`**: `MaxMessageSize` and `MaxReassemblyBytes` bound memory held for incoming messages (a bound below `MaxMessageSize` refuses multi-chunk messages even when nothing else is in flight; single-chunk messages are not affected); `IncomingQueueSize` sets the capacity of every incoming queue (each stream, the request queue of `Serve`, the accept queue) and `IncomingOverflow` selects what happens when one is full.
+- **`StreamListenGrace`** (default 2 s): how long a stream request (`OpenStream` of the peer) that arrives before `ListenStreams` is held. Raise it when a peer may open streams before the acceptor starts listening; a negative value refuses such requests at once.
 
 ---
 
@@ -555,3 +731,4 @@ JAVA=/path/to/bin/java sh scripts/tlc.sh   # if `java` on PATH is not a working 
 - **`HQQ_PERF_TESTS=1`** enables the tests that compare CPU time or latency ratios (`TestIdleLinkDoesNotBurnCPU`, `TestMPMCIdleWaitDoesNotBurnCPU`, `TestMPMCWaitSpinBurnsCPU`). They are skipped otherwise because the ratios are only meaningful on a quiet machine; the benchmark workflow runs them.
 - **Fuzz targets**: `FuzzPacketRoundTrip` (`internal/protocol`), `FuzzConsumeAdvancedChunk` and `FuzzOpenOverCorruptSuperblock` (root package).
 - **TLC**: `scripts/tlc.sh` downloads `tla2tools.jar` if needed and checks `internal/mpmc/MPMC.tla` with `MPMC.cfg` (`BufferSize = 2`). It picks the Java runtime from `$JAVA`, then `$JAVA_HOME/bin/java`, then `java` on `PATH`; CI uses Temurin 21. The model covers the claim and completion protocol of the ring; it does not model parking, waiter counts or aggregation, `Format`, crashes, or stale copies of reservation handles.
+- **CI-only checks**: GenMC and herd7 (`c/verify`, `memory-model` job of `c.yml`), stress litmus tests (Linux arm64), the Zig binding, and the Windows jobs run in CI only. See [Other languages and interoperability](#other-languages-and-interoperability).

@@ -15,9 +15,8 @@
 #include <string_view>
 #include <thread>
 
-#include <unistd.h>
-
 #include "hqq/hqq.hpp"
+#include "../support/process_id.hpp"
 
 namespace {
 
@@ -149,7 +148,7 @@ int run_client(const std::string& name, std::chrono::seconds timeout) {
 }
 
 int run_selftest() {
-    const std::string name = "hqqcpp-rpc-" + std::to_string(static_cast<long>(::getpid()));
+    const std::string name = "hqqcpp-rpc-" + std::to_string(hqq_support::process_id());
     int service_rc = kOk;
     std::thread service([&] { service_rc = run_service(name, std::chrono::seconds(20)); });
     const int client_rc = run_client(name, std::chrono::seconds(20));

@@ -59,6 +59,7 @@ static void *waker(void *arg) {
     assert(ok && pos == 0);
     memcpy(hqq_ring_slot(&ring, pos)->packet, &v, sizeof v);
     hqq_ring_publish(&ring, pos);
+    HQV_PEER_DONE(); /* no further wake can come from this waker */
     return NULL;
 }
 

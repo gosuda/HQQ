@@ -648,9 +648,8 @@ type waiter struct {
 	nextCheck time.Time
 	sleep     time.Duration
 
-	group *parkGroup  // waiter aggregation state of word, nil until the first park
-	word  *uint32     // wait word group belongs to
-	timer *time.Timer // follower wake-up timer, reused across parks
+	group *parkGroup // waiter aggregation state of word, nil until the first park
+	word  *uint32    // wait word group belongs to
 }
 
 // finish ends the blocking operation. When it returns, the context wake-up
@@ -668,10 +667,6 @@ func (w *waiter) finish() {
 	if w.group != nil {
 		releaseParkGroup(w.word, w.group)
 		w.group = nil
-	}
-	if w.timer != nil {
-		w.timer.Stop()
-		w.timer = nil
 	}
 }
 

@@ -9,7 +9,7 @@ const hqq = @import("hqq");
 const method_upper: u64 = 1;
 
 const Upper = struct {
-    fn handle(_: *Upper, req: *hqq.Request, resp: *hqq.Response) void {
+    pub fn handle(_: *Upper, req: *hqq.Request, resp: *hqq.Response) void {
         if (req.method() != method_upper) {
             resp.writeError(hqq.c.HQQ_ERRCODE_INVALID_OP, &.{}) catch {};
             return;

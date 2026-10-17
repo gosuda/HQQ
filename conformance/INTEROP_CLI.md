@@ -173,7 +173,7 @@ Phase names are scenario-defined ASCII identifiers. Barriers are the only inter-
 ```
 
 * `kind`: `standard` (SPEC 9), `advanced` (SPEC 10 and `ext/PROTOCOL_1_1_DRAFT.md`), `acceptor` (`ext/LISTENER_DRAFT.md`).
-* `platforms`: `any`, or GOOS names (`windows`, `linux`, `darwin`). The helper exits 4 elsewhere; the driver does not start it.
+* `platforms`: `any`, or GOOS names (`windows`, `linux`, `darwin`). The helper exits 4 elsewhere; the driver does not start it. A name of a shared-memory segment lives only while a handle to it is open on Windows (on POSIX until it is unlinked), so a scenario that needs a dead segment's name to persist lists only the POSIX platforms.
 * `variants[].params`: the flags to pass (`buffer_count`, `buffer_size`, `size`, `messages`, `seed`, `heartbeat_ms`, `peer_timeout_ms`, `attach_timeout_ms`). Absent keys keep the helper defaults.
 * `steps`: executed in order. Each step starts one process per listed role, with the same `--name`, `--sync-dir`, and the params of the variant. `args` (optional, per role) adds flags such as `--crash-after`.
 * `expect` per role: `ok` (exit 0 and `ok=true`), `crash` (killed at a crash point, with `crashed=true` printed), `ok|crash` (either), `skip` (exit 4). A step passes when every role meets its expectation.
@@ -239,8 +239,8 @@ Condensed from the output of `hqq-interop list` (Go helper), which is authoritat
 | X-05 | standard | any | `ring2`: c,o (c:ok,o:ok) | X-05 | ring full / backpressure, deadline on a full ring |
 | X-06 | standard | any | `ring2`: c,o (c:ok,o:ok)<br>`ring256`: c,o (c:ok,o:ok) | X-06 | bidirectional stream, sequence and CRC, ring of 2 and 256 |
 | X-07 | standard | any | `creator-killed-running`: c,o (c:crash,o:ok)<br>`opener-killed-parked`: c,o (c:ok,o:crash)<br>`short-peer-timeout`: c,o (c:crash,o:ok) | X-07 | kill -9 of the peer (running and parked), default and short peer timeout |
-| X-08 | standard | any | `claim`: c (c:crash); c,o (c:ok,o:ok)<br>`format`: c (c:crash); c,o (c:ok,o:ok)<br>`publish`: c (c:crash); c,o (c:ok,o:ok)<br>`zeroing`: c (c:crash); c,o (c:ok,o:ok) | X-08 | kill -9 of the initializer between claim and publish |
-| X-09 | standard | any | `reuse`: c,o (c:crash,o:crash); c,o (c:crash,o:crash); o (o:ok) | X-09 | reuse of a name after both endpoints died (epoch and creatorToken change) |
+| X-08 | standard | linux, darwin, freebsd | `claim`: c (c:crash); c,o (c:ok,o:ok)<br>`format`: c (c:crash); c,o (c:ok,o:ok)<br>`publish`: c (c:crash); c,o (c:ok,o:ok)<br>`zeroing`: c (c:crash); c,o (c:ok,o:ok) | X-08 | kill -9 of the initializer between claim and publish |
+| X-09 | standard | linux, darwin, freebsd | `reuse`: c,o (c:crash,o:crash); c,o (c:crash,o:crash); o (o:ok) | X-09 | reuse of a name after both endpoints died (epoch and creatorToken change) |
 | X-10 | standard | linux,darwin | `default`: c (c:ok) | X-10 | safe unlink: replaced name survives the creator's close |
 | X-11 | standard | any | `default`: c (c:ok) | X-11 | invalid names per platform, long names on macOS |
 | X-12 | standard | any | `ring2`: c,o (c:ok,o:ok) | X-12 | parked consumer woken by a producer (ping-pong, ring of 2) |

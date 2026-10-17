@@ -143,6 +143,10 @@ func testOpts() hqq.LinkOptions {
 // createNamedObject creates the shared-memory object name with size bytes,
 // writes image at its start (the rest stays zero) and returns its mapping.
 // The name is unlinked when the test ends, after the links closed.
+//
+// On Windows a name exists only while a handle to it is open, so the handle
+// stays open until the test ends; the attach paths open the name by its
+// name afterwards. On the other platforms the handle is closed at once.
 func createNamedObject(t *testing.T, name string, image []byte, size int) []byte {
 	t.Helper()
 	smem, err := shm.OpenSharedMemory(name, size, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
@@ -150,10 +154,15 @@ func createNamedObject(t *testing.T, name string, image []byte, size int) []byte
 		t.Fatalf("create %s: %v", name, err)
 	}
 	view, err := mmap.Map(smem.FD(), 0, size, mmap.PROT_READ|mmap.PROT_WRITE, mmap.MAP_SHARED)
-	_ = smem.Close()
 	if err != nil {
+		_ = smem.Close()
 		_ = hqq.Unlink(name)
 		t.Fatalf("map %s: %v", name, err)
+	}
+	if shm.NamesPersist {
+		_ = smem.Close()
+	} else {
+		t.Cleanup(func() { _ = smem.Close() })
 	}
 	copy(view, image)
 	t.Cleanup(func() {

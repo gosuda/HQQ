@@ -690,7 +690,7 @@ const err_code_invalid_op: u64 = hqq.c.HQQ_ERRCODE_INVALID_OP;
 /// Handler of the scenarios: sleep-echo, error response, slow answer, echo;
 /// any other method is refused with status 6 (ErrCodeInvalidOp).
 const Mux = struct {
-    fn handle(_: *Mux, req: *hqq.Request, resp: *hqq.Response) void {
+    pub fn handle(_: *Mux, req: *hqq.Request, resp: *hqq.Response) void {
         switch (req.method()) {
             method_sleep_echo => {
                 // Inverse sleep: later ids finish first.

@@ -33,9 +33,14 @@ if(HQQ_SQLITE_AMALGAMATION_DIR)
   target_include_directories(hqqsqlite_amalgamation PUBLIC "${HQQ_SQLITE_AMALGAMATION_DIR}")
   target_compile_definitions(hqqsqlite_amalgamation PUBLIC SQLITE_THREADSAFE=1)
   set(HQQ_SQLITE_LIBRARY hqqsqlite_amalgamation)
+  set(HQQ_SQLITE_INCLUDE_DIRS "")
 else()
   find_package(SQLite3 3.24 REQUIRED)
-  set(HQQ_SQLITE_LIBRARY SQLite3::SQLite3)
+  # Use the variables, not an imported target: FindSQLite3 names its target
+  # SQLite3::SQLite3 only from CMake 4.3 on (SQLite::SQLite3 before), while the
+  # variables are the same in every version.
+  set(HQQ_SQLITE_LIBRARY ${SQLite3_LIBRARIES})
+  set(HQQ_SQLITE_INCLUDE_DIRS ${SQLite3_INCLUDE_DIRS})
 endif()
 
 set(HQQSQLITE_SERVER_CORE_SOURCES
@@ -45,7 +50,7 @@ set(HQQSQLITE_SERVER_CORE_SOURCES
   src/sqlsrv_link.c)
 
 add_library(hqqsqlite_server STATIC ${HQQSQLITE_SERVER_CORE_SOURCES})
-target_include_directories(hqqsqlite_server PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_include_directories(hqqsqlite_server PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src ${HQQ_SQLITE_INCLUDE_DIRS})
 target_link_libraries(hqqsqlite_server PUBLIC hqq::hqq ${HQQ_SQLITE_LIBRARY} Threads::Threads)
 hqq_apply_compile_options(hqqsqlite_server)
 

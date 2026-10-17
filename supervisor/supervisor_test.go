@@ -5,12 +5,23 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
 )
 
+// skipWithoutSignals skips tests that depend on POSIX stop signals: Windows
+// has no graceful signal, so services stop through stop_method or are killed.
+func skipWithoutSignals(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("stop signals are POSIX-only; on Windows services stop via stop_method or are killed")
+	}
+}
+
 func TestStartReadyAndStopBySignal(t *testing.T) {
+	skipWithoutSignals(t)
 	name := "svc"
 	cfg := Config{Services: []ServiceSpec{fakeSpec(name, shortName(), "serve", nil)}}
 	sv, rec := newTestSupervisor(t, cfg)
@@ -73,6 +84,7 @@ func TestGracefulStopByAdminMethod(t *testing.T) {
 }
 
 func TestStopKillsAfterStopTimeout(t *testing.T) {
+	skipWithoutSignals(t)
 	spec := fakeSpec("svc", shortName(), "ignore-term", nil)
 	spec.StopTimeout = Duration(200 * time.Millisecond)
 	sv, rec := newTestSupervisor(t, Config{Services: []ServiceSpec{spec}})

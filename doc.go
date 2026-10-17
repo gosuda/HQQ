@@ -12,8 +12,8 @@
 // is released only after the receiver finishes reading or releases its slot
 // reservation, producers cannot overwrite unread payloads without an extra
 // allocator or lock. Segments of another layout version (for example
-// "HQQ_STL2") are rejected with [ErrIncompatibleLayout]. The wire and memory
-// layout is specified in PROTOCOL.md.
+// "HQQ_STL2") are rejected with [ErrIncompatibleLayout]. The normative wire and
+// memory layout is spec/SPEC.md; PROTOCOL.md is an overview of it.
 //
 // Two protocol layers share the same memory layout:
 //
@@ -33,6 +33,13 @@
 //     [AdvancedLink.ListenStreams], [AdvancedLink.AcceptStream] and
 //     [AdvancedLink.OpenStream]). A failed negotiation is terminal: later
 //     attempts return [ErrNegotiationFailed].
+//
+// The Advanced Protocol is version 1.1. Its 1.1 features are negotiated like
+// all others: [FeatureCancel] (a call whose context ends tells the peer, which
+// cancels the handler's context) and [FeatureMetadata] (the remaining deadline
+// and the [CallOptions] caller and trace IDs travel with the request). A peer
+// that negotiates only the 1.0 features sees 1.0 behavior. The specification
+// of 1.1 is spec/ext/PROTOCOL_1_1_DRAFT.md.
 //
 // # Quick Start
 //
@@ -72,6 +79,57 @@
 // For named segments without negotiation use [CreateStandardLink] and
 // [OpenStandardLink] (or the Advanced variants).
 //
+// # Multi-client Acceptor
+//
+// One listener name can serve any number of clients. [NewAcceptor] (or
+// [NewAcceptorContext]) creates the listener segment. Each client calls
+// [Connect], which creates a link segment of its own and announces it in the
+// listener's queue; the acceptor attaches to that segment and negotiates. The
+// acceptor returns each finished link from [Acceptor.Accept]. A client that
+// crashes or stalls affects only its own link. [Acceptor.Close] stops accepting
+// and removes the listener name; links already returned by Accept stay open.
+// The listener segment (magic "HQQ_LSN1") is specified in
+// spec/ext/LISTENER_DRAFT.md.
+//
+//	// Server process
+//	acc, err := hqq.NewAcceptor("my-service", hqq.AcceptorConfig{})
+//	if err != nil {
+//	    log.Fatal(err)
+//	}
+//	defer acc.Close()
+//
+//	mux := hqq.NewMux()
+//	mux.HandleFunc(1, func(ctx context.Context, w *hqq.ResponseWriter, req *hqq.Request) {
+//	    w.Write(req.Payload())
+//	})
+//	for {
+//	    link, err := acc.Accept(ctx)
+//	    if err != nil {
+//	        break // ctx ended, or the acceptor was closed (ErrAcceptorClosed)
+//	    }
+//	    go func() {
+//	        defer link.Close()
+//	        _ = link.Serve(ctx, mux)
+//	    }()
+//	}
+//
+//	// Client process (one link per client)
+//	link, err := hqq.Connect(ctx, "my-service", hqq.Config{})
+//	if err != nil {
+//	    log.Fatal(err)
+//	}
+//	defer link.Close()
+//
+//	m, err := link.Call(ctx, 1, []byte("hello"))
+//
+// [Connect] retries while the listener does not exist yet, is still being
+// initialized, or has no live acceptor. Once its request is queued it fails
+// with [ErrListenerClosed] if the acceptor closes the listener, with
+// [ErrListenerGone] if the acceptor stops heartbeating or is replaced, and
+// with an error matching [ErrTimeout] if the acceptor does not attach in time.
+// [NewAcceptor] fails with [ErrListenerBusy] when a live acceptor already
+// serves the name.
+//
 // # Messages, Streams and Serve
 //
 // A [Stream] is a reliable, ordered, message-oriented channel. The link itself
@@ -85,6 +143,10 @@
 // Stream.Recv never returns a request or a response, and Serve is the only
 // consumer of requests.
 //
+// [Stream.CallWith] and [AdvancedLink.CallWith] attach a [CallOptions] caller
+// and trace ID, which the handler reads with [Request.Caller] and
+// [Request.Trace] when FeatureMetadata is negotiated.
+//
 // Each destination has its own bounded queue (IncomingQueueSize): every
 // stream, the request queue consumed by Serve, and the queue of accepted
 // streams. [AdvancedOptions].IncomingOverflow selects per queue what happens
@@ -97,16 +159,32 @@
 // [Stream.Close] sends OpConnClose. Afterwards the closing side gets
 // [ErrClosed] from every operation, and the peer's Recv returns the messages
 // still queued and then [ErrPeerClosed], while its Send and Call return
-// [ErrPeerClosed]. Blocked operations on the stream wake up.
+// [ErrPeerClosed]. Blocked operations on the stream wake up, and the contexts
+// of the handlers of requests received on the stream are canceled.
+//
+// A stream request (OpenStream) that arrives before the peer calls
+// ListenStreams is held for [AdvancedOptions].StreamListenGrace.
 //
 // [AdvancedLink.Serve] has one receiver goroutine at a time. While no handler
 // is running, the receiver runs each handler itself, which saves a goroutine
 // hand-off per request. If a handler is still running after 200 µs, the
 // receiver role passes to a new goroutine; while any handler is running,
-// requests go to pooled worker goroutines (at most BufferCount handlers run
-// at a time). When nothing is running any more, the next request runs inline
-// again. It returns ctx.Err() when ctx ends, nil when the peer closed the
-// link gracefully, and the receive error otherwise.
+// requests go to pooled worker goroutines (at most BufferCount handlers run at
+// a time). When nothing is running any more, the next request runs inline
+// again.
+//
+// Each handler gets its own context ([Handler]). It is canceled when the
+// caller cancels (FeatureCancel), when the deadline the caller sent expires
+// (FeatureMetadata), when the stream closes, and when Serve ends. No response
+// is sent for a request whose caller gave up or whose deadline passed while
+// the handler ran.
+//
+// [AdvancedLink.Shutdown] stops accepting requests (they are answered with
+// [ErrShuttingDown]), waits until the accepted ones are answered or its context
+// ends, and then makes Serve return nil.
+//
+// Serve returns ctx.Err() when ctx ends, nil when the peer closed the link
+// gracefully or Shutdown completed, and the receive error otherwise.
 //
 // # Buffer Ownership and Allocations
 //
@@ -131,15 +209,15 @@
 //     most one message; the unread tail of a partially read message is queued
 //     (first in, first out) and served, one tail per call, before newer
 //     messages.
-//   - All [AdvancedLink] and [Stream] methods are safe for concurrent use. After
-//     negotiation a single receive path owns the receive direction and routes
-//     every complete message: data to its stream's queue, requests to the
-//     request queue consumed by [AdvancedLink.Serve], responses to the waiting
-//     Call. The receive path never waits for the tx ring: stream accepts and
-//     refusals and refusal responses go through a bounded control-sender queue
-//     and are dropped (and counted in [AdvancedStats].DroppedMessages) when it
-//     is full, so always pass a context with a deadline to
-//     [AdvancedLink.OpenStream] and calls.
+//   - All [AdvancedLink], [Stream] and [Acceptor] methods are safe for
+//     concurrent use. After negotiation a single receive path owns the
+//     receive direction and routes every complete message: data to its stream's
+//     queue, requests to the request queue consumed by [AdvancedLink.Serve],
+//     responses to the waiting Call. The receive path never waits for the tx
+//     ring: stream accepts and refusals, refusal responses, and cancellation
+//     frames go through a bounded control-sender queue and are dropped (and
+//     counted in [AdvancedStats].DroppedMessages) when it is full, so always
+//     pass a context with a deadline to [AdvancedLink.OpenStream] and calls.
 //   - [StandardLink.Close] and [NamedStandardLink.Close] wake all blocked
 //     readers and writers and wait for in-flight ring operations, including
 //     running zero-copy callbacks, to drain before returning (and before
@@ -147,6 +225,8 @@
 //     zero-copy callback, and reservations must be finished before Close: it
 //     does not track them. Close and Unlink on named links may be called
 //     concurrently.
+//   - [AdvancedLink.Close] cancels the contexts of running handlers at once and
+//     does not drain. For a graceful stop call [AdvancedLink.Shutdown] first.
 //
 // # Crash Detection and Lifecycle
 //
@@ -188,12 +268,22 @@
 // the same physical pages with read-write permissions, a malicious peer with
 // write access to the segment can corrupt ring sequence numbers or superblock
 // metadata. Restrict segment permissions via the `perm` argument (for example
-// `0600`) when creating named links. On Linux, names are opened with
-// O_NOFOLLOW and must be regular files; anything else is [ErrInvalidName].
-// A first page that is not entirely zero is never overwritten
-// ([ErrIncompatibleLayout]). [AdvancedOptions].MaxMessageSize bounds one
-// reassembled message and [AdvancedOptions].MaxReassemblyBytes bounds the
-// memory held by all incomplete messages together.
+// `0600`) when creating named links, and via [AcceptorConfig].Perm for
+// listeners. On Linux, names are opened with O_NOFOLLOW and must be regular
+// files; anything else is [ErrInvalidName]. A first page that is not entirely
+// zero is never overwritten ([ErrIncompatibleLayout]).
+// [AdvancedOptions].MaxMessageSize bounds one reassembled message and
+// [AdvancedOptions].MaxReassemblyBytes bounds the memory held by all
+// incomplete messages together.
+//
+// # Other Implementations
+//
+// The same protocol is implemented outside Go: libhqq in C (c/, with the
+// Advanced layer and the acceptor), a header-only C++17 wrapper, Rust
+// (bindings/rust: hqq-sys and hqq), and a Zig binding. The language-neutral
+// specification is spec/SPEC.md, with spec/MEMORY_MODEL.md for memory orders
+// and spec/PORTING.md for porting. Golden vectors are in conformance/, and the
+// two-process interop harness is in interop/ (helper: cmd/hqq-interop).
 //
 // # Platform Notes
 //

@@ -12,8 +12,7 @@
 #include <thread>
 #include <vector>
 
-#include <unistd.h>
-
+#include "../support/process_id.hpp"
 #include "hqq/hqq.hpp"
 
 namespace {
@@ -35,7 +34,7 @@ int g_checks = 0;
 // A unique, short segment name (macOS allows 30 bytes).
 std::string unique_name(const char* tag) {
     static std::atomic<int> counter{0};
-    return std::string("hqqc-") + tag + "-" + std::to_string(static_cast<long>(::getpid())) + "-" +
+    return std::string("hqqc-") + tag + "-" + std::to_string(hqq_support::process_id()) + "-" +
            std::to_string(counter.fetch_add(1));
 }
 

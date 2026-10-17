@@ -138,12 +138,15 @@ acquire/release/relaxed accesses are not changed, and the harness code never use
 seq_cst. The LLVM IR of the ACQREL build was inspected on the host: the handshake
 accesses are acquire loads, release stores and acq_rel RMWs.
 
-**Hooks.** `hqq_ring_ops.wait` is a recording stub that returns at once, so a
-GenMC waiter never blocks and its continuation is explored. A kernel
+**Hooks.** In GenMC, `hqq_ring_ops.wait` stays asleep until the word differs from `v`
+or the waker has finished (`HQV_PEER_DONE()`, called after its last publish). A kernel
 `wait(word, v)` blocks forever only if the word still equals `v` when the waiter
-sleeps and nobody bumps it later. So `ring_wake.c` asserts, whenever the waiter
-went to sleep, that the word differs from `v` at the end. That is exactly "no
-lost wake-up". Producer and consumer retries use `__VERIFIER_assume` (`HQV_AWAIT`):
+sleeps and nobody bumps it later, and after the waker's last publish nobody can. So
+`ring_wake.c` asserts, whenever the waiter went to sleep, that the word differs from
+`v` at the end: exactly "no lost wake-up". An earlier stub returned at once, so the
+waiter left the park (decremented `waiters`) before the waker read the count, and
+the correct protocol was reported as a lost wake-up (CI run 38945948026, `wake (none)`).
+Producer and consumer retries use `__VERIFIER_assume` (`HQV_AWAIT`):
 an execution in which a retry still fails is discarded, not reported. run.sh
 requires at least one complete execution for every positive variant, so a
 vacuous pass fails.
@@ -163,14 +166,17 @@ for every variant under `-std=c11 -Wall -Wextra -Wpedantic -Werror`, with and
 without `-DHQQ_VERIFY_HOST`. Each of the four harnesses ran 10 000 iterations
 natively with exit status 0.
 
-**GenMC verdicts: not observed.** The expectations above are the design
-expectations. They are unverified until the CI job reports them. Risks to check
-in that first run: (1) GenMC's handling of the CAS retry loops in the header's
-claim functions. They iterate only after a failed CAS or a reload, which
-coherence bounds in these scenarios. If GenMC reports an unbounded loop, bound it
-with its loop-unrolling option, whose exact name must be checked against
-GenMC v0.19.0 (not assumed here). (2) Blocked executions (`assume` failures) are
-counted by GenMC, not reported as errors.
+**GenMC verdicts (CI run 38945948026, job `memory-model`).** The four PoC verdicts
+matched the table above. Three ring-harness verdicts did not: `mp (none)` and
+`mp -DHQQ_VERIFY_WEAKEN_RELAXED` failed without the expected output (no
+`Number of complete executions` and no `Error` line, so GenMC stopped abnormally;
+the cause is not known yet), and `wake (none)` was the stub defect fixed above.
+`reserve (none)` did not finish within the 60-minute job limit. `run.sh` now bounds
+each GenMC run with `GENMC_TIMEOUT` (300 s in CI; a hang reports `TIMEOUT`) and prints
+the last 40 lines of GenMC's output on every mismatch. The first suspect for the
+`mp` failure is the unbounded CAS retry loops of the claim functions (risk (1) above);
+a loop-bounding option must be checked against GenMC v0.19.0 before use. The herd7
+steps run regardless of GenMC (`if: always()`); neither tool has a passing CI verdict yet.
 
 ### 3.3 Status summary
 

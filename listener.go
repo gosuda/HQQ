@@ -245,10 +245,10 @@ func NewAcceptor(name string, cfg AcceptorConfig) (*Acceptor, error) {
 //     in the old queue are lost; their clients fail with ErrListenerGone.
 //   - If its acceptor is alive, the call fails with ErrListenerBusy.
 //   - If it is not a listener segment of this layout version, the call
-//     fails with ErrIncompatibleLayout and the object is not modified. An
-//     existing object smaller than the requested segment fails with
-//     ErrInvalidSize, and one that is not sized yet with a transient
-//     ErrFailedInit; both are left alone.
+//     fails with ErrIncompatibleLayout and the object is not modified, whatever
+//     its size. A listener of this layout version that is smaller than the
+//     requested segment fails with ErrInvalidSize, and an object that is not
+//     sized yet with a transient ErrFailedInit; both are left alone.
 //
 // ctx bounds the wait for a listener segment that another process is
 // initializing. Listener names are shared-memory names (see
@@ -268,7 +268,7 @@ func NewAcceptorContext(ctx context.Context, name string, cfg AcceptorConfig) (*
 	}
 
 	creatorToken := newToken()
-	m, err := createNamed(name, size, cfg.Perm)
+	m, err := createNamed(name, size, cfg.Perm, listenerSmallObject)
 	if err != nil {
 		return nil, err
 	}
@@ -641,6 +641,30 @@ func listenerHeaderZero(mem []byte) bool {
 		}
 	}
 	return true
+}
+
+// listenerSmallObject decides the error for an existing object shorter than
+// the listener segment an acceptor asks for (see smallObjectError). Only a
+// listener of this layout version is ErrInvalidSize; its header is inspected
+// through a mapping of its first listenerHeaderSize bytes. Anything else (a
+// link, foreign data, or an object too short to hold a header) is
+// ErrIncompatibleLayout, so the size of an object alone never decides
+// whether it is a listener.
+func listenerSmallObject(smem *shm.SharedMemory, cur int64) error {
+	if cur < listenerHeaderSize {
+		return ErrIncompatibleLayout
+	}
+	// Only the first listenerHeaderSize bytes are mapped and read, all of
+	// which lie inside the object, so no access reaches past its end.
+	page, err := mmap.Map(smem.FD(), 0, listenerHeaderSize, mmap.PROT_READ|mmap.PROT_WRITE, mmap.MAP_SHARED)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = mmap.UnMap(page) }()
+	if checkListenerCompat((*listenerHeader)(unsafe.Pointer(unsafe.SliceData(page))), false) != nil {
+		return ErrIncompatibleLayout
+	}
+	return ErrInvalidSize
 }
 
 // checkListenerCompat returns ErrIncompatibleLayout if the header was

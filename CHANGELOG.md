@@ -4,6 +4,60 @@ All notable changes to **HQQ** (`gosuda.org/hqq`) are documented in this file.
 
 The project follows [Semantic Versioning](https://semver.org/). While in `v0.x`, minor versions may introduce breaking wire-layout improvements accompanied by migration notes below.
 
+## v0.6.0 — 2026-10-17
+
+The multi-client acceptor (`NewAcceptor`, `Accept`, `Connect`) and Advanced Protocol 1.1 (negotiated cancellation, deadlines and request metadata, graceful shutdown) are added. The Go API changes are additive: no exported name of v0.5.0 was removed or changed. The shared-memory layout (`HQQ_STL3`, ring layout 2) and the 64-byte packet ABI are unchanged. Protocol 1.1 adds one opcode, one frame flag, a request metadata block, and the error status `0x08` (returned by `Shutdown`); the opcode, flag, and metadata block are used only when negotiated.
+
+### Added
+
+- **Multi-client acceptor.** `NewAcceptor`, `NewAcceptorContext`, `Acceptor` (`Accept`, `Close`, `Name`, `Addr`, `Stats`), `AcceptorConfig`, `AcceptorStats`, `Connect`, and `DefaultAcceptorQueueSize`. A listener is a named segment (layout `HQQ_LSN1`, see `spec/ext/LISTENER_DRAFT.md`); each client creates its own link segment and announces it in the listener's queue. New errors: `ErrListenerBusy`, `ErrListenerClosed`, `ErrListenerGone`, `ErrAcceptorClosed`.
+- **Advanced Protocol 1.1** (negotiated; a 1.0 peer negotiates 1.0): `FeatureCancel` (`OpCancel`, opcode `0x07`), `FeatureMetadata` (request metadata block, frame flag `AdvFlagMeta`), `CallOptions`, `Stream.CallWith`, `AdvancedLink.CallWith`, `Request.Caller`, `Request.Trace`, `AdvancedLink.Shutdown`, `ErrShuttingDown`, `ErrCodeShuttingDown` (`0x08`), `ResponseError.Is`, `AdvancedOptions.StreamListenGrace`, `AdvancedStats.CanceledRequests`, `AdvancedStats.RefusedRequests`. `CurrentProtocolVersion()` returns 1.1. With `FeatureMetadata`, a `Call` whose context has a deadline sends the remaining time with the request, and the handler's context gets that deadline.
+- **Specification** (`spec/`): `SPEC.md` (segment layout, superblock, roles, initialization, liveness, ring, wait/wake, Standard and Advanced Protocol 1.0, platform naming, error codes), `MEMORY_MODEL.md`, `PORTING.md`, `FINDINGS.md`, `constants.json`, litmus tests, and the extension documents `ext/PROTOCOL_1_1_DRAFT.md` and `ext/LISTENER_DRAFT.md`.
+- **C library** `libhqq` (`c/`): Standard and Advanced layers, acceptor and listener, public headers in `c/include/hqq/`.
+- **Bindings** (`bindings/`): header-only C++17 wrapper (`hqq::`), Rust workspace (`hqq-sys`, `hqq`, `hqq-interop`), Zig binding.
+- **Conformance and interop**: golden vectors in `conformance/`, the `cmd/hqq-interop` helper, and the two-process matrix in `interop/` (`HQQ_INTEROP_IMPLS` selects the implementations).
+- **Memory-model verification** (`c/verify/`): GenMC harnesses, herd7 litmus tests, and stress litmus tests. These run in CI only.
+- **hqqd** process manager (`cmd/hqqd`, `supervisor` package): starts and health-checks services, restarts them with backoff, and is controlled over an HQQ admin listener (`hqqd ctl`).
+- **SQLite service example** (`examples/sqlite`): wire protocol, `database/sql` driver `hqq-sqlite`, C server, Go fake server, and end-to-end tests.
+
+### Changed
+
+- **Held stream requests.** `OpenStream` to a peer that has not called `ListenStreams` yet is held for `AdvancedOptions.StreamListenGrace` (default 2 s) instead of failing at once. A held request is accepted when the peer calls `ListenStreams`, in arrival order, as if it had just arrived. It is refused with `ErrConnNotFound` when the grace period ends, when the link fails, or when `Shutdown` runs. A request is refused at once when the held requests and the accepted streams not yet returned by `AcceptStream` fill `IncomingQueueSize`, and every request is refused at once when the grace is negative.
+- **`ListenStreams` ordering.** The link is marked as listening before the dispatcher starts, so a stream request routed in between is no longer refused.
+- **Handler contexts are per request.** Each `ServeHQQ` gets its own context. It is canceled when the caller cancels (`FeatureCancel`), when the deadline the caller sent expires (`FeatureMetadata`), when the stream the request arrived on closes, and when `Serve` ends. The context is valid only during `ServeHQQ`.
+- **Canceled requests are not answered.** No response is sent when the caller gave up, or the deadline passed, while the handler ran. A request that is canceled before its handler starts is not passed to the handler.
+- **`Stream.Close` cancels handlers.** The contexts of handlers still running for requests received on the closed stream are canceled. `Serve` still answers them as far as the peer's stream exists.
+- **`Serve` after `Shutdown`.** After a successful `AdvancedLink.Shutdown`, `Serve` returns nil, also when called later.
+- **`Config.Features` default.** The default is now all supported features (`FeatureMessages|FeatureRequestResponse|FeatureCancel|FeatureMetadata`), so `Listen` and `Dial` negotiate the 1.1 features when the peer supports them.
+
+### Fixed
+
+- A stalled initializer could write into a segment after another endpoint took the initialization over. Ownership is now checked before each publish step, before each 256 KiB zeroing slice, and before each 1024-slot `Format` slice. A frozen initializer can still complete one slice after takeover; the residual window is documented in `spec/SPEC.md` §5.3 (`spec/FINDINGS.md` F-01, mitigated).
+- Windows named segments: a wake granted one semaphore token per parked process, so after a name was reused a stale count could release millions of tokens and cause a burst of spurious wake-ups. A wake now grants one token per published slot (F-02; compiled and vetted for Windows only).
+- A heartbeat timestamp more than 1 s in the future is no longer taken as fresh. A wall clock stepped backwards made a dead endpoint look alive: a creator got `ErrLinkBusy`, and an opener joined a dead primary until the clock passed the stale value (F-04).
+- When the set of refused message keys evicted an entry while that message's chunks were still arriving, the next chunk failed the whole receive path with `ErrProtocol`. Such chunks are now drained (F-07).
+- A multi-chunk message whose `End` chunk never arrives keeps its memory charge. Such a message is now reclaimed when a later message would be refused, after 2^16 received chunks without progress; a reclaimed response fails its call with `ErrReassemblyLimit` (F-09).
+- With heartbeats disabled (`HeartbeatInterval < 0`), each send checks the peer, so a closed or dead peer is noticed without a blocking call (F-10).
+- `ListenStreams`: a stream request routed while `ListenStreams` was starting was refused (see Changed).
+- Named links: once a segment is claimed or joined, a later empty object under the same name is no longer treated as this link's, so `Close` does not act on it (`spec/SPEC.md` §11.4).
+- Documentation: `OpProtoNegotiate` and `OpProtoAck` operand 2 is reserved (sent as zero, ignored on receipt). It was documented as capability flags; the wire behavior is unchanged (F-03).
+
+### Breaking notes
+
+- **Go API:** additive only. Every exported declaration of v0.5.0 exists with the same signature. Added: the declarations listed under Added, plus `AdvancedStats.CanceledRequests`, `AdvancedStats.RefusedRequests`, and `AdvancedOptions.StreamListenGrace`.
+- **Feature set:** `NegotiatedFeatures()` of a `Listen` or `Dial` link now includes `FeatureCancel` and `FeatureMetadata` when the peer supports them. Code that compares the value with `FeatureMessages|FeatureRequestResponse` must test the bits instead. Set `Config.Features` to `FeatureMessages|FeatureRequestResponse` to keep 1.0 features only.
+- **Stream open timing:** `OpenStream` can wait up to `StreamListenGrace` for a peer that has not called `ListenStreams` yet, instead of failing at once.
+- **Handler cancellation:** a handler that blocks on its context gets it canceled on peer cancel, deadline, stream close, or `Serve` end, and its response is then not sent.
+- **Wire and ABI:** the superblock (`HQQ_STL3`), the ring layout (2), and the 64-byte packet layout are unchanged. Protocol 1.1 adds opcode `OpCancel` (`0x07`) and frame flag `AdvFlagMeta` (`1 << 6`); both are used only when negotiated, so a 1.0 peer sees 1.0 frames. A v0.5.0 responder answers a 1.1 request with minor 0 and its own features, which the 1.1 initiator accepts (read from the negotiation code; see Not verified).
+
+### Not verified
+
+- Cross-version interop with v0.5.0 peers: the negotiation behavior above was read from the code, not run.
+- Windows: the Go library and the Windows semaphore path were compiled and vetted only; the Windows test jobs run in CI.
+- The Zig binding (`bindings/zig`) is written for Zig 0.15.2 and runs in CI only.
+- GenMC, herd7, and stress litmus checks (`c/verify`) run in CI only.
+- Not run for this release: the full test suite, `-race`, benchmarks, and the conformance and interop suites.
+
 ## v0.5.0 — 2026-10-16
 
 The Advanced API is redesigned around `Stream` and pooled `Message`s, with a `net/http`-like server (`Handler`, `ResponseWriter`, `Request`, `Mux`, `Serve`). Send, receive, and request-response allocate nothing in steady state. **The Go API of the Advanced layer changes incompatibly; the wire protocol (Advanced Protocol 1.0), the packet ABI, and the shared-memory layout (`HQQ_STL3`) are unchanged.** The `StandardLink` API is unchanged.

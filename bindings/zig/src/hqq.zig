@@ -222,7 +222,6 @@ pub const Stats = c.hqq_adv_stats;
 pub const ProtocolState = enum { none, negotiating, negotiated, failed };
 
 fn optPtr(comptime T: type, opts: ?*const T) ?*const c.hqq_options {
-    _ = T;
     return if (opts) |o| &o.raw else null;
 }
 
@@ -478,9 +477,9 @@ pub const AdvLink = struct {
 
     /// Like negotiate, with an explicit version word. `features` is used as
     /// given, so 0 requests the empty feature set.
-    pub fn negotiateProtocol(self: AdvLink, version: u16, features: u64, wait: Wait) Error!void {
+    pub fn negotiateProtocol(self: AdvLink, proto_version: u16, features: u64, wait: Wait) Error!void {
         const nw = wait.native();
-        try check(c.hqq_adv_negotiate_protocol(self.raw, version, features, &nw));
+        try check(c.hqq_adv_negotiate_protocol(self.raw, proto_version, features, &nw));
     }
 
     pub fn protocolState(self: AdvLink) ProtocolState {

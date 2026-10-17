@@ -311,7 +311,7 @@ jobs:
   memory-model:
     name: Memory model (GenMC, herd7)
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 90
 
     steps:
       - name: Checkout
@@ -349,9 +349,14 @@ jobs:
         run: c/verify/install-genmc.sh "$HOME/.local/genmc"
 
       - name: GenMC (ring core harnesses and handshake PoC; positive variants verify, negative variants fail)
+        env:
+          GENMC_TIMEOUT: '300'
         run: c/verify/genmc/run.sh --genmc "$HOME/.local/genmc/bin/genmc"
 
+      # herd7 does not depend on GenMC: it runs even when the GenMC step failed,
+      # so a failure of one tool does not hide the verdict of the other.
       - name: Cache herdtools7
+        if: always()
         id: herd-cache
         uses: actions/cache@v6.1.0
         with:
@@ -359,10 +364,11 @@ jobs:
           key: herdtools7-${{ runner.os }}-${{ runner.arch }}-${{ env.HERDTOOLS_VERSION }}-${{ hashFiles('c/verify/install-herd.sh') }}
 
       - name: Install herdtools7
-        if: steps.herd-cache.outputs.cache-hit != 'true'
+        if: always() && steps.herd-cache.outputs.cache-hit != 'true'
         run: c/verify/install-herd.sh
 
       - name: herd7 litmus tests (C11)
+        if: always()
         run: |
           eval "$(opam env --switch=herd)"
           c/verify/litmus/run-herd.sh "$(command -v herd7)"

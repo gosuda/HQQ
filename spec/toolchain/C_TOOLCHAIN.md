@@ -53,6 +53,13 @@ MSVC and clang-cl `/W4 [/WX]`. Sanitizers compile and link with
 `-fsanitize=...` (UBSan is configured fatal via `-fno-sanitize-recover`).
 `cl.exe` accepts only `HQQ_SANITIZE=address`.
 
+Every target is compiled with `-std=c11` (no GNU extensions). On POSIX targets
+`hqq_apply_compile_options` adds `-D_DEFAULT_SOURCE`, so glibc exposes the POSIX
+and BSD names the tools and tests use (`O_CLOEXEC`, `ftruncate`, `nanosleep`,
+`MAP_ANON`); Darwin ignores the macro. MSVC-family targets define
+`_CRT_SECURE_NO_WARNINGS` and `_CRT_NONSTDC_NO_WARNINGS`. The Windows `small`
+macro of `rpcndr.h` is avoided as an identifier.
+
 ## 3. Compiler and atomics support policy
 
 *Supported* = built and tested on every push, failure blocks the merge.

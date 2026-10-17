@@ -38,14 +38,28 @@ import (
 type parkGroup struct {
 	refs int // operations holding the group; guarded by parkGroups.mu
 
-	mu      sync.Mutex
-	leader  bool          // a goroutine is registered and parked for this word
-	release chan struct{} // closed when the current leader returns; nil if no follower has joined
+	mu     sync.Mutex
+	leader bool // a goroutine is registered and parked for this word
+
+	// wakes holds the wake-up channel of every follower blocked behind the
+	// current leader. The leader sends one value on each when it returns and
+	// empties the list. Channels are per follower and recycled through
+	// wakeChans, so parking allocates nothing in steady state.
+	wakes []chan struct{}
 
 	// followers is the number of goroutines currently blocked behind the
 	// leader. Only diagnostics and tests read it.
 	followers atomic.Int32
 }
+
+// wakeChans recycles the follower wake-up channels. Every channel in the pool
+// is empty: it holds no pending release.
+var wakeChans = sync.Pool{New: func() any { return make(chan struct{}, 1) }}
+
+// followerTimers recycles the timers of followers. Every timer in the pool is
+// stopped and its channel is drained; Reset is safe on it because timers have
+// synchronous channels (go.mod declares go 1.23 or later).
+var followerTimers sync.Pool
 
 // parkGroups indexes the live groups by wait word address. Groups only exist
 // while an operation that reached the parking phase holds a reference, and are
@@ -89,32 +103,58 @@ func releaseParkGroup(word *uint32, g *parkGroup) {
 
 // enter joins the group. The first caller while no leader is active becomes
 // the leader (and must call exitLeader when it returns from the kernel); every
-// other caller gets the channel that is closed when the current leader
-// returns.
-func (g *parkGroup) enter() (leader bool, release <-chan struct{}) {
+// other caller gets the channel on which the current leader releases it when
+// it returns. The caller must call leave with that channel afterwards.
+func (g *parkGroup) enter() (leader bool, wake chan struct{}) {
 	g.mu.Lock()
+	defer g.mu.Unlock()
 	if !g.leader {
 		g.leader = true
-		g.mu.Unlock()
 		return true, nil
 	}
-	if g.release == nil {
-		g.release = make(chan struct{})
-	}
-	ch := g.release
-	g.mu.Unlock()
-	return false, ch
+	wake = wakeChans.Get().(chan struct{})
+	g.wakes = append(g.wakes, wake)
+	return false, wake
 }
 
-// exitLeader ends the leader's tenure and releases all followers.
+// exitLeader ends the leader's tenure and releases all followers. The wake
+// channels are buffered and empty, so the sends never block.
 func (g *parkGroup) exitLeader() {
 	g.mu.Lock()
+	defer g.mu.Unlock()
 	g.leader = false
-	if g.release != nil {
-		close(g.release)
-		g.release = nil
+	for i, ch := range g.wakes {
+		ch <- struct{}{}
+		g.wakes[i] = nil
+	}
+	g.wakes = g.wakes[:0]
+}
+
+// leave ends a follower's wait on wake, whatever woke it. A follower that the
+// leader has not released yet withdraws its channel from the group; otherwise
+// the leader's release is consumed here if the follower did not receive it.
+// Either way the channel goes back to wakeChans empty.
+func (g *parkGroup) leave(wake chan struct{}) {
+	g.mu.Lock()
+	for i, ch := range g.wakes {
+		if ch == wake {
+			last := len(g.wakes) - 1
+			g.wakes[i] = g.wakes[last]
+			g.wakes[last] = nil
+			g.wakes = g.wakes[:last]
+			g.mu.Unlock()
+			wakeChans.Put(wake)
+			return
+		}
 	}
 	g.mu.Unlock()
+	// The leader released this follower under g.mu, so the value is in the
+	// channel unless the select above already took it.
+	select {
+	case <-wake:
+	default:
+	}
+	wakeChans.Put(wake)
 }
 
 // armContext registers the context wake-up callback once per operation. The
@@ -144,9 +184,9 @@ func (w *waiter) park(c *Cancel, site waitSite, seq *uint64, target uint64, time
 		w.group = acquireParkGroup(site.word)
 		w.word = site.word
 	}
-	leader, release := w.group.enter()
+	leader, wake := w.group.enter()
 	if !leader {
-		w.follow(c, release, timeout)
+		w.follow(c, wake, timeout)
 		return
 	}
 	defer w.group.exitLeader()
@@ -164,9 +204,9 @@ func (w *waiter) park(c *Cancel, site waitSite, seq *uint64, target uint64, time
 	}
 }
 
-// follow waits behind the leader until it returns, c is canceled or timeout
-// elapses, whichever comes first.
-func (w *waiter) follow(c *Cancel, release <-chan struct{}, timeout time.Duration) {
+// follow waits behind the leader until it releases wake, c is canceled or
+// timeout elapses, whichever comes first.
+func (w *waiter) follow(c *Cancel, wake chan struct{}, timeout time.Duration) {
 	var done, closed <-chan struct{}
 	if c != nil {
 		if c.Ctx != nil {
@@ -174,18 +214,25 @@ func (w *waiter) follow(c *Cancel, release <-chan struct{}, timeout time.Duratio
 		}
 		closed = c.Closed
 	}
-	if w.timer == nil {
-		w.timer = time.NewTimer(timeout)
-	} else {
-		w.timer.Reset(timeout)
-	}
+	timer := getFollowerTimer(timeout)
 	w.group.followers.Add(1)
 	select {
-	case <-release:
+	case <-wake:
 	case <-done:
 	case <-closed:
-	case <-w.timer.C:
+	case <-timer.C:
 	}
 	w.group.followers.Add(-1)
-	w.timer.Stop()
+	timer.Stop()
+	followerTimers.Put(timer)
+	w.group.leave(wake)
+}
+
+// getFollowerTimer returns a timer that fires after d, recycled if possible.
+func getFollowerTimer(d time.Duration) *time.Timer {
+	if t, ok := followerTimers.Get().(*time.Timer); ok {
+		t.Reset(d)
+		return t
+	}
+	return time.NewTimer(d)
 }

@@ -15,7 +15,8 @@
 # GenMC is not available outside CI in this repository: see
 # spec/toolchain/VERIFICATION_TOOLING.md.
 #
-# Environment: GENMC (binary, default genmc), CC (host compiler, default cc).
+# Environment: GENMC (binary, default genmc), CC (host compiler, default cc),
+#   GENMC_TIMEOUT (seconds per GenMC run, default 300; enforced when timeout(1) exists).
 # Weakened variants need clang (they rebind the __c11_atomic builtins).
 
 here="$(cd "$(dirname "$0")" && pwd)"
@@ -23,6 +24,7 @@ mode=genmc
 genmc="${GENMC:-genmc}"
 cc="${CC:-cc}"
 iters=2000
+genmc_timeout="${GENMC_TIMEOUT:-300}"
 targets=""
 
 while [ $# -gt 0 ]; do
@@ -71,18 +73,27 @@ cases=(
 rc=0
 
 run_genmc() {
-  local entry target src defs want needles out status got n
+  local entry target src defs want needles out status got n rest tmo=()
+  if command -v timeout >/dev/null 2>&1; then
+    tmo=(timeout "$genmc_timeout")
+  fi
   for entry in "${cases[@]}"; do
     IFS='|' read -r target src defs want needles <<<"$entry"
     selected "$target" || continue
-    out="$("$genmc" -rc11 -disable-mm-detector --disable-estimation -- ${defs:+"$defs"} "$here/$src" 2>&1)"
+    out="$("${tmo[@]}" "$genmc" -rc11 -disable-mm-detector --disable-estimation -- ${defs:+"$defs"} "$here/$src" 2>&1)"
     status=$?
     if [ "$status" -eq 0 ]; then got=pass; else got=fail; fi
-    printf '== %-8s %-30s expected=%-4s got=%-4s\n' "$target" "${defs:-(none)}" "$want" "$got"
+    printf '== %-8s %-30s expected=%-4s got=%-4s exit=%s\n' "$target" "${defs:-(none)}" "$want" "$got" "$status"
     printf '%s\n' "$out" | sed 's/^/   | /' | grep -E 'Number of|Error|race|violation|\((no_wake|would_park), 1\)' || true
+    if [ "$status" -eq 124 ]; then
+      echo "   TIMEOUT: GenMC did not finish within ${genmc_timeout}s" >&2
+      rc=1
+      continue
+    fi
     if [ "$want" = pass ]; then
       if [ "$got" != pass ]; then
         echo "   MISMATCH: expected a verified program (exit 0)" >&2
+        printf '%s\n' "$out" | tail -n 40 | sed 's/^/   > /' >&2
         rc=1
       elif ! printf '%s' "$out" | grep -Eiq 'complete executions[^0-9]*[1-9]'; then
         echo "   MISMATCH: no complete execution was explored (vacuous pass)" >&2
@@ -93,12 +104,13 @@ run_genmc() {
         echo "   MISMATCH: expected a counterexample (exit != 0)" >&2
         rc=1
       else
-        local rest="$needles" n
+        rest="$needles"
         while [ -n "$rest" ]; do
           n="${rest%%;*}"
           case "$rest" in *';'*) rest="${rest#*;}" ;; *) rest="" ;; esac
           if ! printf '%s' "$out" | grep -qF -- "$n"; then
             echo "   MISMATCH: failure output lacks '$n'" >&2
+            printf '%s\n' "$out" | tail -n 40 | sed 's/^/   > /' >&2
             rc=1
           fi
         done

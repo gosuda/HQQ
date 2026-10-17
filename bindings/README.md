@@ -10,8 +10,8 @@ Toolchain requirements, CI pins and the C API requests are in
 | Binding | Path | Interface | Status on the authoring host (macOS arm64) |
 | --- | --- | --- | --- |
 | C++17 | [`cpp/`](cpp) | header-only `include/hqq/hqq.hpp`, CMake target `hqq::cpp` | tests, examples and interop verified (Apple clang, CMake 4.3) |
-| Rust | [`rust/`](rust) | Cargo workspace: `hqq-sys` (raw FFI), `hqq` (safe API), `hqq-interop` | tests, examples and interop verified (cargo 1.96) |
-| Zig | [`zig/`](zig) | `build.zig`, module `hqq`, examples, `hqq-interop` | **unverified**: Zig is not installed on the host; written for Zig 0.15.2 |
+| Rust | [`rust/`](rust) | Cargo workspace: `hqq-sys` (raw FFI), `hqq` (safe API), `hqq-interop` | tests, examples and interop verified (cargo 1.96); Windows builds the C library with clang-cl |
+| Zig | [`zig/`](zig) | `build.zig`, module `hqq`, examples, `hqq-interop` | **unverified, non-blocking in CI**: Zig is not installed on the host; written for Zig 0.15.2. The first CI run failed (see Zig below) |
 
 None of the bindings needs network access to build: the C library is compiled from
 `c/` in each build (CMake `add_subdirectory`, Cargo `build.rs`, `build.zig`).
@@ -26,6 +26,7 @@ bindings/
     include/hqq/hqq.hpp     the wrapper (C++17, exceptions off by default)
     tests/test_hqq.cpp      unit and integration tests (Standard, Advanced, acceptor)
     examples/echo.cpp       echo over a Standard link (--create / --open / --selftest)
+    support/process_id.hpp  process id for unique segment names (POSIX and Windows)
     examples/rpc.cpp        request/response over an Advanced link
     interop/hqq_interop.cpp hqq-interop helper (contract)
   rust/
@@ -38,7 +39,7 @@ bindings/
     build.zig               builds libhqq from c/, module hqq, examples, hqq-interop
     src/hqq.zig             wrapper and unit tests
     examples/               echo.zig, rpc.zig
-    interop/hqq_interop.zig hqq-interop helper (contract, unverified)
+    interop/hqq_interop.zig hqq-interop helper (contract, unverified; CI run pending)
 ```
 
 ## Build and test
@@ -63,6 +64,11 @@ cargo run -p hqq --example echo -- --selftest
 cargo run -p hqq --example rpc -- --selftest
 cargo build --release -p hqq-interop      # target/release/hqq-interop
 ```
+
+Zig's CI job runs with `continue-on-error: true` (see `.github/workflows/bindings.yml`)
+until a CI run confirms it. On macOS the job selects the Command Line Tools SDK
+(`DEVELOPER_DIR`), because Zig 0.15.2 cannot link its build runner against the Xcode
+26.x SDK (ziglang/zig#31669).
 
 Zig 0.15.2 (unverified here):
 
@@ -174,7 +180,9 @@ writes (only the C helper has them) or a platform the helper does not run on.
   thread-safe and must not throw.
 - The Rust serve handler catches panics and answers with an error response
   (`HQQ_ERRCODE_INVALID_OP`, payload `handler panicked`).
-- Windows is covered by CI only (C++ with clang-cl, Rust with MSVC, Zig not in CI on Windows).
+- Windows is covered by CI only: C++ and Rust build the C library with clang-cl (the
+  Rust job sets `HQQ_CC=clang-cl`; cl.exe lacks always-lock-free C11 atomics on the runner);
+  Zig is not in CI on Windows.
 - `Acceptor::close` (Rust `close_shared`) and `AdvLink::close` (C++) may run while another
   thread is inside `accept`/`call`/`serve`; the C library waits for those calls.
 
@@ -183,7 +191,10 @@ writes (only the C helper has them) or a platform the helper does not run on.
 - C++: `hqq_cpp_test` passes with 105 checks in the default build and 106 with
   `HQQ_CPP_EXCEPTIONS=ON` (the exception path is checked only there); the default and
   ASan+UBSan CMake builds pass, plus the echo and rpc self-tests. macOS arm64 only.
+  LeakSanitizer is not supported on macOS, so the host ASan run omits `detect_leaks=1`
+  (CI on Linux keeps it).
 - Rust: `cargo test --workspace --locked` passes (3 unit, 9 integration, 1 doc test);
   `cargo clippy --workspace --all-targets` is clean; echo and rpc self-tests pass.
 - Interop: the three-helper matrix (go, cpp, rust) passes in both directions.
-- Not run here: Zig (not installed), Windows, Linux.
+- Not run here: Zig (not installed), Windows, Linux. The Zig job and the Windows jobs
+  are confirmed only by CI.

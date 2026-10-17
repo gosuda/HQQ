@@ -199,7 +199,7 @@ func TestCreateOverLiveSegmentIsBusy(t *testing.T) {
 func createForeignObject(t *testing.T, name string, size int, fill func(page []byte)) func() []byte {
 	t.Helper()
 	smem, mapped := mapNamedSharedMemory(t, name, size, os.O_RDWR|os.O_CREATE|os.O_EXCL)
-	fill(mapped[:pagesize])
+	fill(mapped[:min(size, int(pagesize))])
 	if err := mmap.UnMap(mapped); err != nil {
 		t.Fatal(err)
 	}
@@ -215,7 +215,7 @@ func createForeignObject(t *testing.T, name string, size int, fill func(page []b
 		smem, mapped := mapNamedSharedMemory(t, name, size, os.O_RDWR)
 		defer smem.Close()
 		defer mmap.UnMap(mapped)
-		return append([]byte(nil), mapped[:pagesize]...)
+		return append([]byte(nil), mapped[:min(size, int(pagesize))]...)
 	}
 }
 

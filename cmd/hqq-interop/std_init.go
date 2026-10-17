@@ -9,11 +9,16 @@ import (
 
 	"gosuda.org/hqq"
 	"gosuda.org/hqq/conformance"
+	"gosuda.org/hqq/internal/shm"
 )
 
 // X-04: opener before creator, opener on an initializing segment, opener on a
 // dead segment. Transient errors only; the opener writes nothing while it
 // fails (the first page is compared before and after through a read-only mapping).
+// On Windows a name lives only while a handle to it is open, so the segment of
+// a crashed initializer or of dead endpoints is gone there: the opener then
+// finds no name (the transient ErrNotExist) and the first-page comparison has
+// nothing to compare.
 //
 //	before-creator: the opener's first attempt (short attach timeout) finds no
 //	  segment or an unclaimed one; after the creator is up the open succeeds.
@@ -51,6 +56,9 @@ func runX04(e *env) error {
 	case "initializing":
 		if e.cfg.Role == "creator" {
 			return runRawInitVictim(e)
+		}
+		if !shm.NamesPersist {
+			return stdOpenVanished(e)
 		}
 		return stdOpenDuringInit(e)
 	case "dead":
@@ -107,7 +115,10 @@ func runX04Dead(e *env) error {
 		if link != nil {
 			_ = link.Close()
 		}
-		e.checkErr("opener on a dead segment fails with ErrFailedInit", err, hqq.ErrFailedInit)
+		// Windows: the dead segment's name is gone, which is ErrNotExist.
+		vanished := !shm.NamesPersist && errors.Is(err, os.ErrNotExist)
+		e.check("opener on a dead segment fails with ErrFailedInit (ErrNotExist on Windows)",
+			errors.Is(err, hqq.ErrFailedInit) || vanished, errText(err))
 		bound := stdStaleAfter(e.cfg) + 3*time.Second
 		e.check("failure is quick (errNoLiveEndpoint)", elapsed <= bound, fmt.Sprintf("%v, bound %v", elapsed, bound))
 		return nil
@@ -163,11 +174,28 @@ func stdOpenDuringInit(e *env) error {
 	return nil
 }
 
+// stdOpenVanished is the opener of the initializing variant on Windows: the
+// initializer died with its handle, so the name is gone and the open fails at
+// once with the transient missing-name error.
+func stdOpenVanished(e *env) error {
+	start := time.Now()
+	link, err := stdOpen(e)
+	elapsed := time.Since(start)
+	if link != nil {
+		_ = link.Close()
+	}
+	e.check("open of a segment whose initializer died fails with ErrNotExist (no name without a handle)",
+		errors.Is(err, os.ErrNotExist), errText(err))
+	e.check("failure is quick", elapsed <= hqq.DefaultAttachTimeout+stdSlack, fmt.Sprintf("%v", elapsed))
+	return nil
+}
+
 // X-08: kill -9 of the initializer between claim and publish. A raw initializer
 // (see runRawInitVictim) dies at the variant's point. The surviving creator takes
 // the initialization over after the stale window (max(peer timeout, 2 s)) and
 // completes it; an opener with a short attach timeout fails with ErrFailedInit
-// and writes nothing.
+// and writes nothing. Not on Windows: the name of a segment lives only while a
+// handle to it is open, so a dead initializer leaves no segment to take over.
 func init() {
 	steps := func(point string) []step {
 		return []step{
@@ -179,7 +207,7 @@ func init() {
 	}
 	register(&scenario{
 		ID: "X-08", Title: "kill -9 of the initializer between claim and publish", Kind: "standard",
-		Platforms: []string{"any"}, TimeoutS: 60,
+		Platforms: []string{"linux", "darwin", "freebsd"}, TimeoutS: 60,
 		Variants: []variant{
 			{Name: "claim", Params: params{BufferCount: 4, BufferSize: 256, PeerTimeoutMs: 2000}, Steps: steps("claim")},
 			{Name: "format", Params: params{BufferCount: 4, BufferSize: 256, PeerTimeoutMs: 2000}, Steps: steps("format")},

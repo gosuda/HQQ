@@ -108,7 +108,7 @@ Empty ───────────────► Initializing ────
 
 The acceptor sizes the object to the layout size and then claims it. Creation follows the creator rules of links (`PROTOCOL.md`, "Named Segments"):
 
-1. Create the object exclusively. If the name exists, open the existing object instead: an object smaller than the layout size is **not** reused and not modified (error `ErrInvalidSize`; the operator removes it with `Unlink`), a zero-size object is the transient `ErrFailedInit`, a larger object is used as it is, and on Linux a name that is not a regular file is `ErrInvalidName`.
+1. Create the object exclusively. If the name exists, open the existing object instead: an object smaller than the layout size is **not** reused and not modified: a listener of this layout version (magic `HQQ_LSN1`, major 1, no unknown required feature in its header) is `ErrInvalidSize` (the operator removes it with `Unlink`), and any other object (a link segment, foreign data, or an object shorter than the 4096-byte header) is `ErrIncompatibleLayout`. Whether a shorter object is a listener never depends on its size alone. A zero-size object is the transient `ErrFailedInit`, a larger object is used as it is, and on Linux a name that is not a regular file is `ErrInvalidName`.
 2. Claim loop (every iteration first checks the caller's context; waits between looks are 200 µs):
    - **Empty.** If the 4096 header bytes are not all zero (every word read atomically) and `state` is still Empty, the object is foreign: fail with `ErrIncompatibleLayout` **without writing anything**. If `state` changed, look again. Otherwise CAS `state: 0 → 1`, then `beginInit(expected = initToken just read, normally 0)`.
    - **Initializing.** Reject a conflicting layout: `magic` neither `0` nor `HQQ_LSN1`, `requiredFeatures` with an unknown bit, or `major` not `1` unless `major = 0` and `initToken = 0` (a claim that died before it stamped the layout). Then watch `initToken` and `initHeartbeat` on the **local monotonic clock**; once neither changed for `max(PeerTimeout, 2 s)` since the pair was first seen, take over with `beginInit(expected = the observed initToken)`; if the CAS fails somebody else moved first, start watching again. A stalled initializer is given its whole window even if that exceeds `AttachTimeout`; a creator that has waited longer than that for an initializer that keeps making progress fails with the transient `errInitContended`.
@@ -222,7 +222,7 @@ Connect records come from other processes on the same host. They are untrusted-b
 | --- | --- | --- |
 | `ErrListenerBusy` (matches `ErrLinkBusy`, `ErrFailedInit`) | acceptor creation | the name is served by a live acceptor |
 | `ErrIncompatibleLayout` | acceptor creation, client open | not a listener of this layout version; the object is never modified |
-| `ErrInvalidSize` | acceptor creation, client | existing object smaller than the layout size; geometry outside the acceptor's limits or invalid |
+| `ErrInvalidSize` | acceptor creation, client | existing listener of this layout smaller than the layout size (creation); geometry outside the acceptor's limits or invalid |
 | `ErrInvalidName` | both | invalid shared-memory name |
 | `errListenerNotReady`, `errSegmentNotReady`, `errListenerDead`, `ErrNotExist` | client open | transient: the listener is not (yet or any more) usable; retried |
 | `ErrListenerClosed` (matches `ErrPeerClosed`, `io.EOF`) | waiting client | the acceptor closed the listener |

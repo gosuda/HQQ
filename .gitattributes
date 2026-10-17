@@ -1,0 +1,4 @@
+# Golden vectors are compared byte for byte (conformance.TestCommittedVectorsCurrent,
+# and the interop workflow diffs them). Never let git convert their line endings
+# (core.autocrlf on Windows would check out CRLF), on any platform.
+conformance/vectors/** -text

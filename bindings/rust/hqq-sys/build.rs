@@ -8,8 +8,12 @@
 //!   chosen from the target OS (`hqq_platform_posix.c` or `hqq_platform_win32.c`).
 //! * Unix-like targets (GCC, Clang, MinGW): `$HQQ_CC` / `$CC` (default `cc`) and
 //!   `$HQQ_AR` / `$AR` (default `ar`).
-//! * `*-msvc` targets: `cl.exe` and `lib.exe` (C11 atomics need VS 17.5+ and
-//!   `/experimental:c11atomics`, as in c/CMakeLists.txt).
+//! * `*-msvc` targets: `$HQQ_CC` / `$CC` (default `cl`) and `lib.exe`
+//!   (`$HQQ_AR` / `$AR`). The compiler is clang-cl or cl.exe, told apart by the
+//!   file name. clang-cl gets `/std:c11` (always-lock-free C11 atomics); cl.exe
+//!   also gets `/experimental:c11atomics` and `HQQ_FORCE_C11_ATOMICS`, as in
+//!   c/CMakeLists.txt (VS 17.5+). CI sets `HQQ_CC=clang-cl` on Windows: the
+//!   always-lock-free check of c/CMakeLists.txt fails for cl.exe there.
 //! * `HQQ_C_SOURCE_DIR` overrides the location of the C tree (default
 //!   `../../../c` relative to this crate, i.e. the repository's `c/` directory).
 use std::env;
@@ -29,15 +33,16 @@ fn main() {
         Some(dir) => PathBuf::from(dir),
         None => manifest_dir.join("..").join("..").join("..").join("c"),
     };
-    let c_root = c_root
-        .canonicalize()
-        .unwrap_or_else(|e| panic!("hqq-sys: C source tree {}: {e}", c_root.display()));
+    let c_root = canonical_dir(&c_root);
 
     let out_dir = PathBuf::from(env_var("OUT_DIR"));
     let target_os = env_var("CARGO_CFG_TARGET_OS");
     let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
     let optimized = env::var("OPT_LEVEL").map(|v| v != "0").unwrap_or(true);
     let windows = target_os == "windows";
+    let msvc = target_env == "msvc";
+    let cc = tool("HQQ_CC", "CC", if msvc { "cl" } else { "cc" });
+    let clang_cl = msvc && is_clang_cl(&cc);
 
     let include_dir = c_root.join("include");
     let src_dir = c_root.join("src");
@@ -54,22 +59,22 @@ fn main() {
         .map(|rel| {
             let src = c_root.join(rel);
             let stem = Path::new(rel).file_stem().expect("source name");
-            let obj_name = if target_env == "msvc" {
+            let obj_name = if msvc {
                 format!("{}.obj", stem.to_string_lossy())
             } else {
                 format!("{}.o", stem.to_string_lossy())
             };
             let obj = out_dir.join(obj_name);
-            if target_env == "msvc" {
-                compile_msvc(&src, &include_dir, &src_dir, &obj, optimized);
+            if msvc {
+                compile_msvc(&cc, clang_cl, &src, &include_dir, &src_dir, &obj, optimized);
             } else {
-                compile_cc(&src, &include_dir, &src_dir, &obj, optimized);
+                compile_cc(&cc, &src, &include_dir, &src_dir, &obj, optimized);
             }
             obj
         })
         .collect();
 
-    if target_env == "msvc" {
+    if msvc {
         let lib = out_dir.join("hqq.lib");
         let mut cmd = Command::new(tool("HQQ_AR", "AR", "lib"));
         cmd.arg("/nologo").arg(format!("/OUT:{}", lib.display()));
@@ -109,6 +114,31 @@ fn tool(override_var: &str, fallback_var: &str, default: &str) -> String {
     env::var(override_var)
         .or_else(|_| env::var(fallback_var))
         .unwrap_or_else(|_| default.to_string())
+}
+
+/// True when the compiler is clang-cl (by file name, with or without `.exe`).
+fn is_clang_cl(cc: &str) -> bool {
+    Path::new(cc)
+        .file_stem()
+        .is_some_and(|s| s.to_string_lossy().eq_ignore_ascii_case("clang-cl"))
+}
+
+/// Canonical absolute form of an existing directory, without the `\\?\` verbatim
+/// prefix that `Path::canonicalize` returns on Windows. cl.exe and clang-cl do not
+/// accept verbatim paths: the source path became `\\hqq_util.c` and the build failed
+/// with `C1083: Cannot open source file` (Rust Windows job, 2026-10-16).
+fn canonical_dir(path: &Path) -> PathBuf {
+    let canon = path
+        .canonicalize()
+        .unwrap_or_else(|e| panic!("hqq-sys: C source tree {}: {e}", path.display()));
+    let text = canon.to_string_lossy().into_owned();
+    if let Some(unc) = text.strip_prefix(r"\\?\UNC\") {
+        PathBuf::from(format!(r"\\{unc}"))
+    } else if let Some(local) = text.strip_prefix(r"\\?\") {
+        PathBuf::from(local)
+    } else {
+        canon
+    }
 }
 
 fn run(mut cmd: Command, what: &str) {
@@ -169,8 +199,8 @@ fn library_sources(c_root: &Path, windows: bool) -> Vec<String> {
     sources
 }
 
-fn compile_cc(src: &Path, include: &Path, src_dir: &Path, obj: &Path, optimized: bool) {
-    let mut cmd = Command::new(tool("HQQ_CC", "CC", "cc"));
+fn compile_cc(cc: &str, src: &Path, include: &Path, src_dir: &Path, obj: &Path, optimized: bool) {
+    let mut cmd = Command::new(cc);
     cmd.arg("-std=c11")
         .arg("-fPIC")
         .arg("-Wall")
@@ -189,20 +219,31 @@ fn compile_cc(src: &Path, include: &Path, src_dir: &Path, obj: &Path, optimized:
     run(cmd, "C compiler");
 }
 
-fn compile_msvc(src: &Path, include: &Path, src_dir: &Path, obj: &Path, optimized: bool) {
-    let mut cmd = Command::new(tool("HQQ_CC", "CC", "cl"));
-    cmd.arg("/nologo")
-        .arg("/c")
-        .arg("/std:c11")
-        .arg("/experimental:c11atomics")
-        .arg("/DHQQ_FORCE_C11_ATOMICS=1")
-        .arg("/W4")
+/// One source with cl.exe or clang-cl (MSVC command line).
+fn compile_msvc(
+    cc: &str,
+    clang_cl: bool,
+    src: &Path,
+    include: &Path,
+    src_dir: &Path,
+    obj: &Path,
+    optimized: bool,
+) {
+    let mut cmd = Command::new(cc);
+    cmd.arg("/nologo").arg("/c").arg("/std:c11");
+    if !clang_cl {
+        // cl.exe keeps __STDC_NO_ATOMICS__ defined unless the experimental switch
+        // is given; the define is HQQ_C11_ATOMICS_FORCE_DEFINE of c/CMakeLists.txt.
+        cmd.arg("/experimental:c11atomics")
+            .arg("/DHQQ_FORCE_C11_ATOMICS=1");
+    }
+    cmd.arg("/W4")
         .arg(if optimized { "/O2" } else { "/Od" })
         .arg(format!("/I{}", include.display()))
         .arg(format!("/I{}", src_dir.display()))
         .arg(src)
         .arg(format!("/Fo{}", obj.display()));
-    run(cmd, "cl.exe");
+    run(cmd, if clang_cl { "clang-cl" } else { "cl.exe" });
 }
 
 /// Reruns the build script when any file below `dir` changes.

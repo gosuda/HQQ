@@ -637,7 +637,13 @@ public:
 
 private:
     static void touch(const std::filesystem::path& p) {
-        std::FILE* f = std::fopen(p.string().c_str(), "wb");
+        std::FILE* f = nullptr;
+#if defined(_WIN32)
+        // fopen is deprecated on Windows; with clang-cl and -Werror that is an error.
+        if (fopen_s(&f, p.string().c_str(), "wb") != 0) f = nullptr;
+#else
+        f = std::fopen(p.string().c_str(), "wb");
+#endif
         if (f == nullptr) {
             throw Failure{"Unknown", "barrier: cannot create " + p.string(), std::nullopt};
         }

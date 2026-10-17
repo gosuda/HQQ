@@ -887,7 +887,7 @@ static int run_a03(ihx_env *e) {
     hqq_stream *s;
     uint64_t limit = e->cfg.max_reassembly;
     uint64_t big;
-    uint64_t small;
+    uint64_t small_len;
     uint64_t seed = e->cfg.seed;
     int rc;
     memset(&sv, 0, sizeof sv);
@@ -895,7 +895,7 @@ static int run_a03(ihx_env *e) {
         return ihx_fail(e, "CheckFailed", "X-A03 needs max_reassembly (params)");
     }
     big = limit + limit / 2;
-    small = limit / 2;
+    small_len = limit / 2;
     rc = adv_establish(e, &link);
     if (rc != IHX_OK) {
         return rc;
@@ -920,7 +920,7 @@ static int run_a03(ihx_env *e) {
             goto out;
         }
         /* Accepted: it fits the limit on its own. */
-        rc = send_payload(e, s, seed, 3, small);
+        rc = send_payload(e, s, seed, 3, small_len);
         if (rc != IHX_OK) {
             goto out;
         }
@@ -970,7 +970,7 @@ static int run_a03(ihx_env *e) {
             goto out;
         }
         /* The three refused data messages never surface; the accepted one is first. */
-        rc = recv_check(e, s, seed, 3, small, 0);
+        rc = recv_check(e, s, seed, 3, small_len, 0);
         if (rc != IHX_OK) {
             goto out;
         }

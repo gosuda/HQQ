@@ -627,14 +627,75 @@ func TestAcceptorNeverTouchesForeignObject(t *testing.T) {
 			copy(page, "tiny")
 		})
 		before := snapshot()
-		if a, err := NewAcceptor(name, AcceptorConfig{}); !errors.Is(err, ErrInvalidSize) {
+		if a, err := NewAcceptor(name, AcceptorConfig{}); !errors.Is(err, ErrIncompatibleLayout) {
 			if a != nil {
 				_ = a.Close()
 			}
-			t.Fatalf("NewAcceptor over a small object = %v, want ErrInvalidSize", err)
+			t.Fatalf("NewAcceptor over a small foreign object = %v, want ErrIncompatibleLayout", err)
 		}
 		if !bytes.Equal(snapshot(), before) || !nameExists(t, name) {
 			t.Fatal("small foreign object was modified or removed")
+		}
+	})
+}
+
+// TestAcceptorSmallObjectSizes: whether an existing object shorter than the
+// listener segment is a listener does not depend on its size. Whether a
+// link segment (or any foreign data) is shorter or longer than the listener
+// depends on the page size of the host, so the sizes are constructed here
+// rather than derived from it. A foreign object is ErrIncompatibleLayout at
+// every size and is left alone; a shorter listener of this layout version
+// is ErrInvalidSize.
+func TestAcceptorSmallObjectSizes(t *testing.T) {
+	full := int(listenerLayoutSize(DefaultAcceptorQueueSize))
+	for _, tc := range []struct {
+		name string
+		size int
+	}{
+		{"below the header", listenerHeaderSize / 2},
+		{"header only", listenerHeaderSize},
+		{"two headers", 2 * listenerHeaderSize},
+		{"one short of the layout", full - 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			name := newPortableSharedMemoryName()
+			snapshot := createForeignObject(t, name, tc.size, func(page []byte) {
+				copy(page[100:], "a link or other data, not a listener")
+			})
+			before := snapshot()
+			if a, err := NewAcceptor(name, AcceptorConfig{}); !errors.Is(err, ErrIncompatibleLayout) {
+				if a != nil {
+					_ = a.Close()
+				}
+				t.Fatalf("NewAcceptor over a foreign %d-byte object = %v, want ErrIncompatibleLayout", tc.size, err)
+			}
+			if l, err := Connect(testContext(t, time.Second), name, listenerTestConfig()); !errors.Is(err, ErrIncompatibleLayout) {
+				if l != nil {
+					_ = l.Close()
+				}
+				t.Fatalf("Connect over a foreign %d-byte object = %v, want ErrIncompatibleLayout", tc.size, err)
+			}
+			if !bytes.Equal(snapshot(), before) || !nameExists(t, name) {
+				t.Fatal("foreign object was modified or removed")
+			}
+		})
+	}
+
+	t.Run("listener of this layout", func(t *testing.T) {
+		name := newPortableSharedMemoryName()
+		short, err := NewAcceptor(name, AcceptorConfig{QueueSize: 16, Advanced: listenerTestOptions()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer short.Close()
+		if a, err := NewAcceptor(name, AcceptorConfig{Advanced: listenerTestOptions()}); !errors.Is(err, ErrInvalidSize) {
+			if a != nil {
+				_ = a.Close()
+			}
+			t.Fatalf("NewAcceptor over a shorter listener = %v, want ErrInvalidSize", err)
+		}
+		if !nameExists(t, name) {
+			t.Fatal("the shorter listener's name was removed")
 		}
 	})
 }
@@ -646,7 +707,7 @@ func TestAcceptorTakesOverStalledInitializer(t *testing.T) {
 	size := listenerLayoutSize(DefaultAcceptorQueueSize)
 	craft := func(t *testing.T, name string) {
 		t.Helper()
-		m, err := createNamed(name, size, 0o600)
+		m, err := createNamed(name, size, 0o600, listenerSmallObject)
 		if err != nil {
 			t.Fatal(err)
 		}

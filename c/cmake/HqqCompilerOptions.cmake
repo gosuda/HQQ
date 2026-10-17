@@ -63,7 +63,16 @@ if(NOT HQQ_SANITIZE STREQUAL "none")
 endif()
 
 function(hqq_apply_compile_options target)
+  if(NOT WIN32)
+    # Feature-test macros for every POSIX target, once: glibc under -std=c11
+    # hides POSIX and BSD names (O_CLOEXEC, ftruncate, nanosleep, MAP_ANON, ...);
+    # Darwin ignores _DEFAULT_SOURCE, so macOS is unchanged.
+    target_compile_definitions(${target} PRIVATE _DEFAULT_SOURCE)
+  endif()
   if(MSVC)
+    # The tools and tests use portable CRT names (fopen, fscanf); MSVC-family
+    # compilers flag them as deprecated (C4996 / -Wdeprecated-declarations).
+    target_compile_definitions(${target} PRIVATE _CRT_SECURE_NO_WARNINGS _CRT_NONSTDC_NO_WARNINGS)
     target_compile_options(${target} PRIVATE /W4)
     if(HQQ_WERROR)
       target_compile_options(${target} PRIVATE /WX)

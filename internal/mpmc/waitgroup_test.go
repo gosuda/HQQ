@@ -381,3 +381,29 @@ func TestParkGroupFollowerBecomesLeader(t *testing.T) {
 		}
 	})
 }
+
+// TestParkGroupFollowerCycleAllocs: a steady state of leader tenures with a
+// follower behind them, each follower going through its wake-up channel and
+// its timer, allocates nothing. Parking is allocation-free wherever the
+// platform parks in process (Windows in particular has no other wait path).
+func TestParkGroupFollowerCycleAllocs(t *testing.T) {
+	if raceEnabled {
+		t.Skip("sync.Pool drops items at random under the race detector")
+	}
+	g := new(parkGroup)
+	w := &waiter{group: g}
+	cycle := func() {
+		if leader, _ := g.enter(); !leader {
+			t.Error("the first caller of a group is not its leader")
+		}
+		_, wake := g.enter()
+		g.exitLeader()
+		w.follow(nil, wake, time.Hour)
+	}
+	for range 100 {
+		cycle()
+	}
+	if n := testing.AllocsPerRun(1000, cycle); n != 0 {
+		t.Fatalf("follower cycle allocates %v per operation, want 0", n)
+	}
+}

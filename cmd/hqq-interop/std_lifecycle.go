@@ -85,7 +85,13 @@ func runX01(e *env) error {
 			if probe != nil {
 				_ = probe.Close()
 			}
-			e.checkErr("creator close removes the name", err, os.ErrNotExist)
+			// A Windows name lives while any handle to it is open, and the
+			// opener still holds its endpoint here: the name is there and busy.
+			if shm.NamesPersist {
+				e.checkErr("creator close removes the name", err, os.ErrNotExist)
+			} else {
+				e.checkErr("creator close keeps the name while the opener holds it (Windows)", err, hqq.ErrLinkBusy)
+			}
 		} else {
 			probe, err := hqq.OpenStandardLink(e.cfg.Name, e.cfg.BufferCount, e.cfg.BufferSize, stdOptions(e.cfg))
 			if probe != nil {

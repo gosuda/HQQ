@@ -4,11 +4,11 @@ name: Interop
 # that has a helper executable: the Go helper always, the C helper when present.
 # The helper contract is conformance/INTEROP_CLI.md.
 #
-# The C helper does not exist yet. The C steps below are guarded by
+# The C helper is c/tools/hqq_interop.c. The C steps below are guarded by
 #   if: hashFiles('c/tools/hqq_interop.c') != ''
-# and are skipped while that source file is absent. When it lands, the steps
-# build the CMake target named by HQQ_INTEROP_C_TARGET and the helper is added
-# to HQQ_INTEROP_IMPLS as c=<path>.
+# and are skipped while that source file is absent. They build the CMake target
+# named by HQQ_INTEROP_C_TARGET (clang-cl on Windows, as in c.yml) and add the
+# helper to HQQ_INTEROP_IMPLS as c=<path>.
 #
 # To add another implementation (Rust, Zig, C++, ...): add a build step that
 # produces an executable named hqq-interop (hqq-interop.exe on Windows), then
@@ -71,10 +71,23 @@ jobs:
       # C helper gate: every step below is skipped while the C helper source
       # is absent (see the header comment).
 
+      - name: Set up MSVC developer environment (C helper, Windows)
+        if: runner.os == 'Windows' && hashFiles('c/tools/hqq_interop.c') != ''
+        uses: ilammy/msvc-dev-cmd@v1.13.0
+        with:
+          arch: x64
+
       - name: Configure C helper
         if: hashFiles('c/tools/hqq_interop.c') != ''
         shell: bash
-        run: cmake -S c -B build-c -DCMAKE_BUILD_TYPE=Release -DHQQ_WERROR=ON
+        run: |
+          # Windows uses clang-cl, the supported Windows C compiler (see c.yml and
+          # spec/toolchain/C_TOOLCHAIN.md): default MSVC cl fails the C11 atomics probe.
+          args=(-S c -B build-c -DCMAKE_BUILD_TYPE=Release -DHQQ_WERROR=ON)
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            args+=(-G Ninja -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl)
+          fi
+          cmake "${args[@]}"
 
       - name: Build C helper
         if: hashFiles('c/tools/hqq_interop.c') != ''

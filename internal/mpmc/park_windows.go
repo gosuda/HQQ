@@ -9,6 +9,13 @@ import (
 	"unsafe"
 )
 
+// The two calls below go through syscall.SyscallN, not LazyProc.Call. Call
+// returns the error of the call as an interface, which allocates whenever it
+// is not zero (WaitOnAddress reports its timeouts through GetLastError), and
+// its variadic arguments escape, which moves the compare value to the heap.
+// Neither allocation is needed: callers re-check their condition after every
+// return, so the error is discarded.
+
 // parkingSupported is false: WaitOnAddress and WakeByAddressAll only match
 // waiters and wakers that live in the same process, so a waker in another
 // process never wakes a parked waiter. Cross-process parking needs a Parker
@@ -39,7 +46,7 @@ func futexWait(addr *uint32, val uint32, timeout time.Duration) {
 	case ms >= math.MaxUint32:
 		ms = math.MaxUint32 - 1 // INFINITE is 0xFFFFFFFF
 	}
-	_, _, _ = procWaitOnAddress.Call(
+	_, _, _ = syscall.SyscallN(procWaitOnAddress.Addr(),
 		uintptr(unsafe.Pointer(addr)),
 		uintptr(unsafe.Pointer(&val)),
 		unsafe.Sizeof(val),
@@ -49,5 +56,5 @@ func futexWait(addr *uint32, val uint32, timeout time.Duration) {
 
 // futexWake wakes every waiter of this process blocked on addr.
 func futexWake(addr *uint32) {
-	_, _, _ = procWakeByAddrAll.Call(uintptr(unsafe.Pointer(addr)))
+	_, _, _ = syscall.SyscallN(procWakeByAddrAll.Addr(), uintptr(unsafe.Pointer(addr)))
 }

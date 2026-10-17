@@ -6,11 +6,13 @@
  *
  *   GenMC (default). main() runs the scenario once and GenMC explores every
  *     RC11 execution. Blocking is __VERIFIER_assume() (HQV_AWAIT). The kernel
- *     hooks hqq_ring_ops are model stubs: a waiter that goes to sleep is
- *     recorded and returns at once; the harness then checks the recorded state.
- *     A kernel wait(word, expect) blocks forever iff the word still equals
- *     expect when the waiter gets to sleep and nobody changes it afterwards,
- *     so "word != expect at the end" is exactly "no lost wake-up".
+ *     hooks hqq_ring_ops are model stubs. A wait(word, expect) sleeps until the
+ *     word changes or the peer has finished (HQV_PEER_DONE). After the peer's
+ *     last publish no wake can come, so a waiter still asleep on an unchanged
+ *     word is a lost wake-up: "word != expect" after the join is exactly "no
+ *     lost wake-up". The stub must not return at once: the waiter would leave
+ *     the park (W4) before the waker reads the waiter count, and a wake that
+ *     was correctly ordered would be reported as lost.
  *
  *   Host (-DHQQ_VERIFY_HOST, POSIX threads). main() runs the scenario N times
  *     (argv[1], default 2000) with real threads. HQV_AWAIT spins with
@@ -113,6 +115,14 @@ static struct {
 } hqv_park;
 
 #ifdef HQQ_VERIFY_HOST
+#  define HQV_PEER_DONE() ((void)0)
+#else
+/* Set by the waker after its last publish; read by the GenMC wait stub. */
+static _Atomic int hqv_peer_done;
+#  define HQV_PEER_DONE() atomic_store_explicit(&hqv_peer_done, 1, memory_order_release)
+#endif
+
+#ifdef HQQ_VERIFY_HOST
 static pthread_mutex_t hqv_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t hqv_cv = PTHREAD_COND_INITIALIZER;
 #endif
@@ -137,6 +147,11 @@ static void hqv_wait(void *ctx, int side, _Atomic uint32_t *word, uint32_t expec
         }
     }
     pthread_mutex_unlock(&hqv_mu);
+#else
+    /* GenMC: sleep until the word changes, or until the peer is finished
+     * (then no wake can come). */
+    __VERIFIER_assume(atomic_load_explicit(word, memory_order_acquire) != expect ||
+                      atomic_load_explicit(&hqv_peer_done, memory_order_acquire) != 0);
 #endif
 }
 
