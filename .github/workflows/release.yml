@@ -239,6 +239,9 @@ jobs:
         id: sqlite
         shell: pwsh
         run: |
+          # A PowerShell script that runs no native command leaves $LASTEXITCODE
+          # null, and `$null -ne 0` is true: reset it so only an explicit exit counts.
+          $global:LASTEXITCODE = 0
           $dir = & scripts/release/fetch-sqlite.ps1 -Dest (Join-Path $env:RUNNER_TEMP 'sqlite-amalgamation')
           if ($LASTEXITCODE -ne 0) { throw 'fetch-sqlite.ps1 failed' }
           "dir=$dir" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8

@@ -175,6 +175,9 @@ func TestCancelReachesHandler(t *testing.T) {
 			t.Fatalf("second Call = %v, %v", m, err)
 		}
 		m.Release()
+		// The counter is bumped after the response is written, so the client
+		// can see "pong" a moment before it moves.
+		eventually(t, "second response counted", func() bool { return server.Stats().Responses >= 1 })
 		if got := server.Stats().Responses; got != 1 {
 			t.Fatalf("Responses = %d, want 1 (the canceled request is not answered)", got)
 		}
