@@ -856,6 +856,16 @@ static void test_rd_bytes_array(void) {
     HQQ_CHECK_EQ_INT(n, 0);
     HQQ_CHECK(p != NULL);
 
+    /* an empty array of 8-aligned elements is just its count: no alignment past the end (4.5) */
+    rtu_put32(b, 0);
+    rd_init(&r, b, 4);
+    HQQ_CHECK_EQ_INT(hqqrpc_rd_array(&r, 8, 8, 0, 4, &p, &n), HQQRPC_OK);
+    HQQ_CHECK_EQ_INT(n, 0);
+    HQQ_CHECK_EQ_INT(hqqrpc_rd_end(&r), HQQRPC_OK);
+    rd_init(&r, b, 4);
+    HQQ_CHECK_EQ_INT(hqqrpc_rd_array(&r, 8, 8, 1, 0, &p, &n), HQQRPC_OK); /* max 0 */
+    HQQ_CHECK_EQ_INT(hqqrpc_rd_end(&r), HQQRPC_OK);
+
     /* arrays of i64: count at 0, data aligned to 8 -> at 8 */
     rtu_put32(b, 2);
     rd_init(&r, b, 8 + 16);

@@ -807,16 +807,16 @@ This section fixes the order in which a server handles one request, who owns whi
 | 9 | If the function is the destroy function of a handle type: destroy the live descendants of the handle (5.1). The lock is already held; `hqqrpc_handle_destroy_children` does not take it. | |
 | 10 | Call the C function (or the shim) with zero-initialized `out` locals (4.6.1). `out` buffers are written directly into the response slot when the response is in place. | |
 | 11 | Evaluate the error convention (4.6.4). On failure: build the failure body (detail string, failed handle destroyed) and go to step 13. | |
-| 12 | On success: check produced lengths and `@offset_in` pointers; copy borrowed results into the response; call `@free` after the copy; write composite results through the writer. A check or writer failure is E_INTERNAL (4.6.6). | E_INTERNAL |
+| 12 | On success: check produced lengths and `@offset_in` pointers; copy borrowed results into the response; call `@free` after the copy; write composite results through the writer; **register the produced handles** (`hqqrpc_handle_put`), still under the lock, because a failed `hqqrpc_handle_put` destroys the object through the adapter, which calls the library. A check, registration or writer failure is E_INTERNAL (4.6.6). | E_INTERNAL |
 | 13 | `hqqrpc_exec_end`. | |
-| 14 | Register the produced handles (`hqqrpc_handle_put`); `hqqrpc_resp_commit` (it fails and converts the response if the writer is in error). | E_INTERNAL |
+| 14 | `hqqrpc_resp_commit` (it fails and converts the response if the writer is in error). | E_INTERNAL |
 | 15 | Release the request slot; release scratch. | |
 
 Rules that follow from the order:
 
 - Steps 1 to 5 execute nothing: a rejected request has **no side effect** and holds no response reservation.
 - **Error convention before length checks** (4.6.4, step 11 before 12): a failed result is not checked against the produced-length rules.
-- **Who frees what.** `@free` runs after the copy, inside the lock. Scratch obtained by `hqqrpc_scratch`, the private copies of step 5 and the assembly buffer live until step 15. Handle entries registered in step 14 are rolled back (destroyed and freed) if the call ends with a status other than OK after they were registered.
+- **Who frees what.** `@free` runs after the copy, inside the lock. Scratch obtained by `hqqrpc_scratch`, the private copies of step 5 and the assembly buffer live until step 15. Handle entries registered in step 12 are rolled back (destroyed and freed) if the call ends with a status other than OK after they were registered.
 - A destroy function's interceptor (step 8) runs **before** any descendant is destroyed, so a veto leaves the handle and its children untouched. A cascade (step 9) and a session teardown destroy children through the destroy adapters and do **not** run the interceptors of the child destroy functions; a policy that must apply to every destroy has to be enforced in the destroy adapter or in the library.
 - With `serialize(session)` the lock is taken once per call. With `serialize(none)` steps 7 and 13 do nothing.
 
@@ -843,6 +843,8 @@ The rule is one sentence: **a response whose bound fits one frame (`HDR + RESP_B
 Because a live link never sees a tombstone from this path, the slot accounting of 4.12 (`rf == 1` means exactly one slot) holds. An aborted reservation would cost two slots for one request (the tombstone and the error response) and could break the no-deadlock argument of 4.12; the in-place conversion exists for that reason.
 
 *In scratch (`rf > 1`).* No ring slot is held during the call. Step 6 only obtains `RESP_BOUND` bytes of scratch; after step 13 the runtime publishes `rf` frames in order (4.8). The cost is one `memcpy` of the body. Because every response size is bounded before the call (V26, V27, 4.6.3), no growth or spill mechanism exists.
+
+*In-place spans.* When the library writes a caller-supplied `out` buffer straight into the response, the glue takes one span from the writer for the whole variable item (`hqqrpc_wr_span`, 9.5). The rule for where the span starts: the writer first pads `G2` with zero bytes up to `G2pad` (inside the span, so `G2pad - size(G2)` zeroed bytes), then aligns to the element alignment (a buffer of 8-byte elements starts at `G2pad + 8` after its 4-byte count, and a count of 0 writes no element padding), then the glue advances by the produced length. A failure body does not take the span: it stays at `size(G2)` (4.6.4).
 
 #### 4.7.4 Client side
 
@@ -1288,7 +1290,7 @@ A session is one client, one Standard link, one server thread and one handle tab
 
 The server keeps one table per session. An entry holds: the C pointer, the handle type id, the generation (4.9), the parent index (0 if none), a creation sequence number (a `u64` counter of the session), and the live flag. Id encoding, allocation and reuse are in 4.9; this section adds ownership and the lifetime rules.
 
-**Creation.** A function that produces a handle of type `T` registers it after a successful call (4.7.1 step 14). If `T` has `owned_by P`, the parent is the `in` handle parameter of type `P` of that function (V16 guarantees there is exactly one), and its table entry is live (it was validated in step 4). A child created later than its parent has a larger creation sequence; destroying in descending creation sequence therefore destroys children before parents.
+**Creation.** A function that produces a handle of type `T` registers it after a successful call, in the same locked section as the call (4.7.1 step 12). If `T` has `owned_by P`, the parent is the `in` handle parameter of type `P` of that function (V16 guarantees there is exactly one), and its table entry is live (it was validated in step 4). A child created later than its parent has a larger creation sequence; destroying in descending creation sequence therefore destroys children before parents.
 
 **The destroy adapter.** The generator emits, for every handle type, an adapter `int destroy_T(void *ptr)` that calls the C destroy function and returns 0 if the object was released without error (void function, or status in `ok`) and nonzero otherwise. The adapter is what cascades and teardown call.
 
@@ -2609,7 +2611,7 @@ The C prototype of a shim is a function of its IDL signature: `in` parameters in
 #include "microlib_server.h"
 
 static int destroy_Counter(void *p) { ml_counter_free((ml_counter *)p); return 0; }
-static int destroy_Cursor(void *p) { return ml_cursor_free((ml_cursor *)p) != ML_OK; }
+static int destroy_Cursor(void *p) { return ml_cursor_free((ml_cursor *)p) != 0; /* ML_OK */ }
 
 /* op 1: ml_add. G1: a i32 @0, b i32 @4. G2: ret i32. RESP_BOUND 4. */
 static hqqrpc_status op_ml_add(hqqrpc_call *c) {
@@ -2709,7 +2711,7 @@ static hqqrpc_status op_ml_counter_add(hqqrpc_call *c) {
         return w.err;
     }
     memcpy(o + 0, &ret, 4);
-    if (ret == ML_OK)
+    if (ret == 0) /* ML_OK */
         memcpy(o + 8, &total, 8);
     else /* borrowed message: copied before the lock is released */
         flags = HQQRPC_F_FAIL | hqqrpc_wr_put_detail(&w, ml_counter_errmsg(a.c));
@@ -2806,12 +2808,13 @@ static hqqrpc_status op_ml_cursor_next(hqqrpc_call *c) {
     hqqrpc_exec_begin(s);
     ret = ml_cursor_next((ml_cursor *)p, &value);
     hqqrpc_exec_end(s);
-    if (ret != ML_OK && ret != ML_EMPTY)
+    if (ret != 0 && ret != 1) /* ML_OK, ML_EMPTY */
         flags = HQQRPC_F_FAIL;
     if ((o = hqqrpc_wr_fixed(&w, 8, 16)) == NULL)
         return w.err;
     memcpy(o + 0, &ret, 4);
-    memcpy(o + 8, &value, 8);
+    if (flags == 0) /* out values only on success (4.6.4) */
+        memcpy(o + 8, &value, 8);
     return hqqrpc_resp_commit(c, &w, flags);
 }
 
@@ -2839,7 +2842,7 @@ static hqqrpc_status op_ml_cursor_free(hqqrpc_call *c) {
     ret = ml_cursor_free((ml_cursor *)p);
     hqqrpc_handle_consume(s, h_cur); /* always: the object is gone whatever ret says (5.1) */
     hqqrpc_exec_end(s);
-    if (ret != ML_OK)
+    if (ret != 0) /* ML_OK */
         flags = HQQRPC_F_FAIL;
     if ((o = hqqrpc_wr_fixed(&w, 4, 4)) == NULL)
         return w.err;
@@ -2982,7 +2985,7 @@ static hqqrpc_status op_ml_counter_check(hqqrpc_call *c) {
         return w.err;
     }
     memcpy(o, &ret, 4);
-    if (ret != ML_OK) /* put_detail pads to 8 only when D is written */
+    if (ret != 0) /* ML_OK; put_detail pads to 8 only when D is written */
         flags = HQQRPC_F_FAIL | hqqrpc_wr_put_detail(&w, ml_counter_errmsg((ml_counter *)p));
     hqqrpc_exec_end(s);
     return hqqrpc_resp_commit(c, &w, flags);
@@ -3050,6 +3053,10 @@ The glue follows these rules, which the emitter implements once:
 5. Bound sums are computed in `uint64_t` (`(uint64_t)8 + HQQRPC_VAR_SLACK + cap`), never in `size_t`.
 6. Every `out` local is zero-initialized, and fixed groups are produced by `hqqrpc_wr_fixed`, which zero-fills.
 7. A destroy function calls `hqqrpc_handle_destroy_children` first (when the handle has children) and `hqqrpc_handle_consume` always after the C call, unless it has `@retain_on_fail` and failed (then the glue skips `consume`).
+8. **Constants.** IDL `const` names are not C macros (the model keeps only their values), so the glue writes the resolved numbers (`ret != 0`, `ret != 0 && ret != 1`) and may name the IDL constant in a comment, as the listing does.
+9. **Out values on failure.** The glue copies `out` and `inout` values into `G2` only when the call is not a failure (4.6.4: on failure every `G2` field except `ret` is zero, and the zero-filled `hqqrpc_wr_fixed` provides that).
+10. **Produced length without a length scalar.** The produced length of a caller-supplied `out` buffer that has no `out` or return length scalar is its capacity.
+11. **Borrowed results.** A borrowed pointer with `@free` is freed after the copy on the success path and on the failure path alike, inside the lock. A NULL `out str` is sent as the empty string; a NULL returned `str` is E_INTERNAL unless the function has `@error(null)` (then it is the failure of 4.6.4). The local that receives an `out char **` with `@free` is non-const (3.2).
 
 **`microlib_hooks.c`** (hand-written): the interceptor and the shim.
 

@@ -1,0 +1,229 @@
+// Package rt is a stand-in for gosuda.org/hqq/bindgen/rt in the behavior tests of the Go emitter: the
+// generated client is compiled against it instead of the real runtime, so the tests can script the
+// server side without a link. Conn.Serve receives the complete request frame (header and body) and
+// returns the complete response frame. codec.go is a verbatim copy of the real helpers.
+package rt
+
+import (
+	"context"
+	"encoding/binary"
+	"errors"
+	"fmt"
+)
+
+var le = binary.LittleEndian
+
+const (
+	HeaderSize    = 16
+	DetailMax     = 1024
+	DetailReserve = 1032
+	MsgMax        = 32
+	ErrBodyMax    = 37
+	VarSlack      = 11
+	NullLen       = 0xFFFFFFFF
+	Align16       = 16
+)
+
+var (
+	ErrInvalidArg    = errors.New("hqqbg: invalid argument")
+	ErrForeignHandle = errors.New("hqqbg: handle belongs to another session")
+	ErrFutureUsed    = errors.New("hqqbg: future already waited for or discarded")
+	ErrConcurrentUse = errors.New("hqqbg: re-entrant use of a Conn")
+)
+
+type Iface struct {
+	Service string
+	Digest  [32]byte
+	Ops     []string
+}
+
+type Options struct{}
+
+type StatusError struct {
+	Func   string
+	Status uint32
+	Msg    string
+}
+
+func (e *StatusError) Error() string { return fmt.Sprintf("%s: status %d: %s", e.Func, e.Status, e.Msg) }
+
+type LibError struct {
+	Func   string
+	Code   int64
+	Detail string
+}
+
+func (e *LibError) Error() string { return fmt.Sprintf("%s: library error %d: %s", e.Func, e.Code, e.Detail) }
+
+type ProtocolError struct{ Func string }
+
+func (e *ProtocolError) Error() string { return e.Func + ": malformed response body" }
+
+type Handle struct {
+	id uint32
+	c  *Conn
+}
+
+func (h Handle) ID() uint32  { return h.id }
+func (h Handle) IsNil() bool { return h.id == 0 }
+
+// Conn is a scripted session. Requests are recorded; a request is answered when it is submitted.
+type Conn struct {
+	Iface *Iface
+	Serve func(req []byte) []byte
+
+	// Observations for the tests.
+	Requests    [][]byte // every committed request frame
+	LastBodyLen int      // bodyLen argument of the last BeginRequest
+	LastRespMax int64    // respMax argument of the last BeginRequest
+	Broken      []string // functions whose response was reported malformed
+
+	nextID uint32
+	txOpen bool
+	rxOpen bool
+}
+
+func NewConn(iface *Iface, serve func(req []byte) []byte) *Conn { return &Conn{Iface: iface, Serve: serve} }
+
+func Dial(ctx context.Context, listener string, iface *Iface, opts Options) (*Conn, error) {
+	return nil, errors.New("fake rt cannot dial")
+}
+
+func (c *Conn) Close() error { return nil }
+func (c *Conn) Kill()        {}
+
+func (c *Conn) NewHandle(id uint32) Handle {
+	if id == 0 {
+		return Handle{}
+	}
+	return Handle{id, c}
+}
+
+func (c *Conn) CheckHandle(h Handle, nullable bool) error {
+	switch {
+	case h.id == 0 && nullable:
+		return nil
+	case h.id == 0:
+		return ErrInvalidArg
+	case h.c != c:
+		return ErrForeignHandle
+	}
+	return nil
+}
+
+type Enc struct {
+	op   uint16
+	body []byte
+}
+
+// Body returns a slice filled with 0xA5: a generated stub that does not write a byte, padding included,
+// leaves the pattern in the frame, as a recycled ring slot would.
+func (e *Enc) Body() []byte { return e.body }
+
+func (c *Conn) BeginRequest(op uint16, bodyLen int, respMax int64) (*Enc, error) {
+	if c.txOpen || c.rxOpen {
+		return nil, ErrConcurrentUse
+	}
+	if bodyLen < 0 || bodyLen > 1<<24 || respMax < 0 || respMax > 1<<30 {
+		return nil, ErrInvalidArg
+	}
+	c.LastBodyLen, c.LastRespMax = bodyLen, respMax
+	c.txOpen = true
+	body := make([]byte, bodyLen)
+	for i := range body {
+		body[i] = 0xA5
+	}
+	return &Enc{op, body}, nil
+}
+
+type Call struct {
+	id      uint32
+	pending bool
+	resp    []byte
+}
+
+func (c *Call) ID() uint32 { return c.id }
+
+func (c *Conn) Submit(e *Enc) (*Call, error) {
+	if !c.txOpen {
+		return nil, ErrConcurrentUse
+	}
+	c.txOpen = false
+	c.nextID++
+	frame := make([]byte, HeaderSize+len(e.body))
+	frame[0] = 1
+	le.PutUint16(frame[2:], e.op)
+	le.PutUint32(frame[4:], c.nextID)
+	le.PutUint32(frame[8:], uint32(len(e.body)))
+	copy(frame[HeaderSize:], e.body)
+	c.Requests = append(c.Requests, frame)
+	return &Call{id: c.nextID, pending: true, resp: c.Serve(frame)}, nil
+}
+
+func (c *Conn) Abort(e *Enc) { c.txOpen = false }
+
+type Dec struct {
+	Body   []byte
+	Detail bool
+	Fail   bool
+
+	c    *Conn
+	op   uint16
+	open bool
+}
+
+func (c *Conn) opName(op uint16) string {
+	if op >= 1 && int(op) <= len(c.Iface.Ops) {
+		return c.Iface.Ops[op-1]
+	}
+	return fmt.Sprintf("op%d", op)
+}
+
+func (c *Conn) Wait(call *Call, id uint32) (Dec, error) {
+	if call == nil || !call.pending || call.id != id {
+		return Dec{}, ErrFutureUsed
+	}
+	if c.rxOpen {
+		return Dec{}, ErrConcurrentUse
+	}
+	call.pending = false
+	r := call.resp
+	if len(r) < HeaderSize || r[0] != 2 || le.Uint32(r[4:]) != id || int(le.Uint32(r[8:])) != len(r)-HeaderSize {
+		return Dec{}, errors.New("fake rt: bad response frame")
+	}
+	op, flags, status := le.Uint16(r[2:]), r[1], le.Uint32(r[12:])
+	body := r[HeaderSize:]
+	if status != 0 {
+		msg, _, _ := GetStr(body, 0, MsgMax)
+		return Dec{}, &StatusError{Func: c.opName(op), Status: status, Msg: msg}
+	}
+	c.rxOpen = true
+	return Dec{Body: body, Detail: flags&1 != 0, Fail: flags&2 != 0, c: c, op: op, open: true}, nil
+}
+
+func (d *Dec) Release() {
+	if d.open {
+		d.open = false
+		d.c.rxOpen = false
+	}
+}
+
+func (d *Dec) Malformed() error {
+	fn := d.c.opName(d.op)
+	d.c.Broken = append(d.c.Broken, fn)
+	return &ProtocolError{Func: fn}
+}
+
+func (d *Dec) LibError(fn string, code int64, g2Size int) error {
+	var detail string
+	if d.Detail {
+		s, end, err := GetStr(d.Body, Align(g2Size, 8), DetailMax)
+		if err != nil || end != len(d.Body) {
+			return d.Malformed()
+		}
+		detail = s
+	} else if len(d.Body) != g2Size {
+		return d.Malformed()
+	}
+	return &LibError{Func: fn, Code: code, Detail: detail}
+}

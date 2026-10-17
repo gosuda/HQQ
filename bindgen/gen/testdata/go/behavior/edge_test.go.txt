@@ -1,0 +1,584 @@
+package PKG
+
+import (
+	"math"
+	"testing"
+
+	"fakemod/rt"
+)
+
+func db(s *srv) Db   { return Db{s.conn().NewHandle(0x10001)} }
+func stmt(s *srv) Stmt { return Stmt{s.conn().NewHandle(0x10002)} }
+
+func TestScalarsEncodeAtNaturalOffsets(t *testing.T) {
+	s := newSrv(t)
+	w := make([]byte, 56)
+	w[0], w[1], w[2] = 1, 0xfe, 3
+	le.PutUint16(w[4:], 0xfffc)
+	le.PutUint16(w[6:], 5)
+	le.PutUint32(w[8:], 0xfffffffa)
+	le.PutUint32(w[12:], 7)
+	le.PutUint64(w[16:], 0xfffffffffffffff8)
+	le.PutUint64(w[24:], 9)
+	le.PutUint64(w[32:], 10)
+	le.PutUint32(w[40:], math.Float32bits(1.5))
+	le.PutUint64(w[48:], math.Float64bits(2.5))
+	s.expect(hqqOpScalars, w, 0, new(bld).u64(math.Float64bits(3.25)).body())
+	v, err := s.cl.Scalars(true, -2, 3, -4, 5, -6, 7, -8, 9, 10, 1.5, 2.5)
+	if err != nil || v != 3.25 {
+		t.Fatalf("Scalars = %v, %v", v, err)
+	}
+	if s.conn().LastRespMax != 8 || s.conn().LastBodyLen != 56 {
+		t.Errorf("respMax %d bodyLen %d", s.conn().LastRespMax, s.conn().LastBodyLen)
+	}
+}
+
+func TestNoParamsHaveEmptyBody(t *testing.T) {
+	s := newSrv(t)
+	s.expect(hqqOpNop, nil, 0, nil)
+	if err := s.cl.Nop(); err != nil {
+		t.Fatal(err)
+	}
+	s.expect(hqqOpNopRet, nil, 0, new(bld).u32(5).body())
+	if v, err := s.cl.NopRet(); err != nil || v != 5 {
+		t.Fatal(v, err)
+	}
+	s.reply(0, new(bld).u32(5).body())
+	wantMalformed(t, "void with a body", s.cl.Nop())
+}
+
+func TestInoutScalars(t *testing.T) {
+	s := newSrv(t)
+	req := make([]byte, 20)
+	req[0] = 1
+	le.PutUint64(req[8:], math.Float64bits(1.0))
+	req[16] = 1
+	le.PutUint16(req[18:], 0x0102)
+	resp := make([]byte, 20)
+	resp[0], resp[4] = 7, 2
+	le.PutUint64(resp[8:], math.Float64bits(2.0))
+	resp[16] = 0
+	le.PutUint16(resp[18:], 3)
+	s.expect(hqqOpInc, req, 0, resp)
+	ret, x, f, flag, w, err := s.cl.Inc(1, 1.0, true, 0x0102)
+	if err != nil || ret != 7 || x != 2 || f != 2.0 || flag || w != 3 {
+		t.Fatalf("Inc = %d %d %v %v %d, %v", ret, x, f, flag, w, err)
+	}
+	resp[16] = 2
+	s.reply(0, resp)
+	_, _, _, _, _, err = s.cl.Inc(1, 1.0, true, 0)
+	wantMalformed(t, "bool 2", err)
+}
+
+func TestVariableGroupAlignment(t *testing.T) {
+	s := newSrv(t)
+	key := [16]uint8{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
+	m := [3]int16{1, -1, 2}
+	x := [2]Pt{{3, 4, 1}, {5, 6, 2}}
+	pts := []Pt{{1, 2, 0.5}}
+
+	w := new(bld)
+	w.raw(key[:]...)
+	for _, v := range m {
+		w.u16(uint16(v))
+	}
+	w.align(4) // pad 22..24
+	for _, p := range x {
+		w.u32(uint32(p.X)).u32(uint32(p.Y)).u32(math.Float32bits(p.W))
+	}
+	// V1 at 48: a, b, v, ns (NULL), nbytes (empty), pts, w (NULL), each aligned to 4.
+	w.str("hi").bytes([]byte{1, 2, 3})
+	w.u32(2).u32(7).u32(8)
+	w.u32(0xffffffff)
+	w.bytes([]byte{})
+	w.u32(1).u32(1).u32(2).u32(math.Float32bits(0.5))
+	w.u32(0xffffffff)
+	s.expect(hqqOpIns, w.body(), 0, new(bld).u32(77).body())
+	got, err := s.cl.Ins("hi", []byte{1, 2, 3}, []int32{7, 8}, nil, []byte{}, pts, nil, key, m, x)
+	if err != nil || got != 77 {
+		t.Fatalf("Ins = %d, %v", got, err)
+	}
+	if s.conn().LastBodyLen != len(w.body()) {
+		t.Errorf("bodyLen %d, want %d", s.conn().LastBodyLen, len(w.body()))
+	}
+
+	// Present optional values and an empty w: a present empty array is a count of 0, not NULL.
+	ns := "n"
+	w2 := new(bld)
+	w2.raw(key[:]...)
+	for _, v := range m {
+		w2.u16(uint16(v))
+	}
+	w2.align(4)
+	for _, p := range x {
+		w2.u32(uint32(p.X)).u32(uint32(p.Y)).u32(math.Float32bits(p.W))
+	}
+	w2.str("").bytes(nil).u32(0)
+	w2.str("n").bytes([]byte{9}).u32(0).u32(0)
+	s.expect(hqqOpIns, w2.body(), 0, new(bld).u32(1).body())
+	if _, err := s.cl.Ins("", nil, nil, &ns, []byte{9}, nil, []uint16{}, key, m, x); err != nil {
+		t.Fatal(err)
+	}
+
+	// Bounds and NUL are refused locally.
+	n := s.requests()
+	long := "01234567890"
+	for name, call := range map[string]func() error{
+		"a over bound":  func() error { _, e := s.cl.Ins(long, nil, nil, nil, nil, nil, nil, key, m, x); return e },
+		"a with NUL":    func() error { _, e := s.cl.Ins("a\x00", nil, nil, nil, nil, nil, nil, key, m, x); return e },
+		"ns over bound": func() error { l := "012345678"; _, e := s.cl.Ins("", nil, nil, &l, nil, nil, nil, key, m, x); return e },
+		"nbytes over":   func() error { _, e := s.cl.Ins("", nil, nil, nil, make([]byte, 10), nil, nil, key, m, x); return e },
+		"w over":        func() error { _, e := s.cl.Ins("", nil, nil, nil, nil, nil, make([]uint16, 4), key, m, x); return e },
+	} {
+		if err := call(); err != rt.ErrInvalidArg {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+	if s.requests() != n {
+		t.Error("a refused call committed a request")
+	}
+}
+
+func TestOneStrAndBytes(t *testing.T) {
+	s := newSrv(t)
+	s.expect(hqqOpOneStr, []byte{2, 0, 0, 0, 'a', 'b', 0}, 0, nil)
+	if err := s.cl.OneStr("ab"); err != nil {
+		t.Fatal(err)
+	}
+	s.expect(hqqOpOneBytes, []byte{3, 0, 0, 0, 1, 2, 3}, 0, nil)
+	if err := s.cl.OneBytes([]byte{1, 2, 3}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestOutBufferWithBoundReturn(t *testing.T) {
+	s := newSrv(t)
+	buf := make([]byte, 8)
+	req := []byte{5, 0, 0, 0, 8, 0, 0, 0}
+	s.expect(hqqOpOutBuf, req, 0, new(bld).u32(3).u32(0).bytes([]byte{1, 2, 3}).body())
+	got, err := s.cl.OutBuf(5, buf)
+	if err != nil || string(got) != "\x01\x02\x03" || &got[0] != &buf[0] || len(got) != 3 {
+		t.Fatalf("OutBuf = %x, %v", got, err)
+	}
+	if s.conn().LastRespMax != 8+rt.VarSlack+8 {
+		t.Errorf("respMax %d", s.conn().LastRespMax)
+	}
+	for name, resp := range map[string][]byte{
+		"ret differs":    new(bld).u32(4).u32(0).bytes([]byte{1, 2, 3}).body(),
+		"over capacity":  new(bld).u32(9).u32(0).bytes(make([]byte, 9)).body(),
+		"trailing":       append(new(bld).u32(3).u32(0).bytes([]byte{1, 2, 3}).body(), 0),
+		"short length":   new(bld).u32(3).u32(0).u32(4).raw(1, 2).body(),
+	} {
+		s.reply(0, resp)
+		_, err := s.cl.OutBuf(5, buf)
+		wantMalformed(t, name, err)
+	}
+	n := s.requests()
+	if _, err := s.cl.OutBuf(5, make([]byte, 101)); err != rt.ErrInvalidArg || s.requests() != n {
+		t.Errorf("capacity over the bound: %v", err)
+	}
+}
+
+func TestOutFixedValues(t *testing.T) {
+	s := newSrv(t)
+	b := make([]byte, 113)
+	b[0] = 9
+	for i := 0; i < 32; i++ {
+		b[1+i] = byte(i)
+	}
+	for i := 0; i < 3; i++ {
+		le.PutUint16(b[34+2*i:], uint16(0xfff0+i))
+	}
+	le.PutUint32(b[40:], 0xfffffffe) // p.x = -2
+	le.PutUint32(b[44:], 4)
+	le.PutUint32(b[48:], math.Float32bits(8.5))
+	le.PutUint16(b[56:], 1) // box.rows
+	le.PutUint32(b[64:], 11)
+	le.PutUint32(b[76+4:], 12) // box.pts[1].y
+	b[88] = 1                  // box.flag
+	le.PutUint64(b[96:], 0x0102030405060708)
+	copy(b[104:], []byte{4, 3, 2, 1})
+	b[112] = 1
+	s.expect(hqqOpOutFixed, nil, 0, b)
+	ret, key, m, p, box, ok, err := s.cl.OutFixed()
+	if err != nil || ret != 9 || key[31] != 31 || m != [3]int16{-16, -15, -14} || p != (Pt{-2, 4, 8.5}) || !ok {
+		t.Fatalf("OutFixed = %d %v %v %v %v, %v", ret, key, m, p, ok, err)
+	}
+	if box.Rows[0] != 1 || box.Pts[0].X != 11 || box.Pts[1].Y != 12 || !box.Flag || box.Tag != 0x0102030405060708 || box.Key != [4]uint8{4, 3, 2, 1} {
+		t.Errorf("box = %+v", box)
+	}
+	for name, off := range map[string]int{"outer bool": 112, "bool in a struct": 88} {
+		c := append([]byte(nil), b...)
+		c[off] = 2
+		s.reply(0, c)
+		_, _, _, _, _, _, err := s.cl.OutFixed()
+		wantMalformed(t, name, err)
+	}
+	s.reply(0, b[:112])
+	_, _, _, _, _, _, err = s.cl.OutFixed()
+	wantMalformed(t, "short", err)
+}
+
+func TestBorrowedOutputs(t *testing.T) {
+	s := newSrv(t)
+	good := new(bld).u32(5).align(8).str("hello").bytes([]byte{9, 8}).u32(3).u32(1).u32(2).u32(3).body()
+	s.expect(hqqOpOutBorrowed, nil, 0, good)
+	rc, msg, data, items, err := s.cl.OutBorrowed()
+	if err != nil || rc != 5 || msg != "hello" || string(data) != "\x09\x08" || len(items) != 3 || items[2] != 3 {
+		t.Fatalf("OutBorrowed = %d %q %x %v, %v", rc, msg, data, items, err)
+	}
+	// respMax: G2pad 8 + (11+64+1) + (11+256) + (11+16*4).
+	if got := s.conn().LastRespMax; got != 8+76+267+75 {
+		t.Errorf("respMax %d", got)
+	}
+	long := string(make([]byte, 65))
+	for name, body := range map[string][]byte{
+		"trailing":         append(append([]byte(nil), good...), 0),
+		"message too long": new(bld).u32(5).align(8).str(string(make([]byte, 0))+"x"+long).bytes(nil).u32(0).body(),
+		"NUL in message":   new(bld).u32(5).align(8).str("a\x00b").bytes(nil).u32(0).body(),
+		"items over bound": new(bld).u32(5).align(8).str("").bytes(nil).u32(17).body(),
+		"data over bound":  new(bld).u32(5).align(8).str("").u32(257).body(),
+		"truncated":        good[:len(good)-2],
+	} {
+		s.reply(0, body)
+		_, _, _, _, err := s.cl.OutBorrowed()
+		wantMalformed(t, name, err)
+	}
+}
+
+func TestStepWithDetailAndVariableOutput(t *testing.T) {
+	s := newSrv(t)
+	st := stmt(s)
+	// G2: ret@0, a@4, b@8 (size 9); V2 at 16.
+	ok := new(bld).u32(100).u32(7).raw(1).align(8).str("txt").body()
+	s.expect(hqqOpStep, new(bld).u32(0x10002).u32(0).u64(1<<40).body(), 0, ok)
+	rc, a, b, str, err := s.cl.Step(st, 1<<40)
+	if err != nil || rc != 100 || a != 7 || !b || str != "txt" {
+		t.Fatalf("Step = %d %d %v %q, %v", rc, a, b, str, err)
+	}
+	if s.conn().LastRespMax != 16+rt.DetailReserve {
+		t.Errorf("respMax %d", s.conn().LastRespMax)
+	}
+	// The failure body is G2 (9 bytes), padding to 16, then the detail string.
+	fail := new(bld).u32(1).u32(0).raw(0).align(8).str("boom").body()
+	s.reply(fFail|fDetail, fail)
+	_, _, _, _, err = s.cl.Step(st, 0)
+	var lerr *rt.LibError
+	if !asErr(err, &lerr) || lerr.Code != 1 || lerr.Detail != "boom" {
+		t.Errorf("failed Step = %v", err)
+	}
+	s.reply(fDetail, ok)
+	_, _, _, _, err = s.cl.Step(st, 0)
+	wantMalformed(t, "detail flag on success", err)
+	s.reply(0, append(append([]byte(nil), ok...), 0))
+	_, _, _, _, err = s.cl.Step(st, 0)
+	wantMalformed(t, "trailing byte", err)
+	bad := append([]byte(nil), ok...)
+	bad[8] = 2
+	s.reply(0, bad)
+	_, _, _, _, err = s.cl.Step(st, 0)
+	wantMalformed(t, "bool 2", err)
+}
+
+func TestPrepOffsetAndNilStatement(t *testing.T) {
+	s := newSrv(t)
+	s.expect(hqqOpPrep, new(bld).u32(0x10001).u32(0).str("x").body(), 0, new(bld).u32(0).u32(0).u32(1).body())
+	st, tail, err := s.cl.Prep(db(s), "x")
+	if err != nil || !st.IsNil() || tail != 1 {
+		t.Fatalf("Prep = %v %d, %v", st, tail, err)
+	}
+}
+
+func TestStatusConventions(t *testing.T) {
+	s := newSrv(t)
+	// ok(0, -7): the code is a result.
+	s.reply(0, new(bld).u32(0xfffffff9).body())
+	if rc, err := s.cl.Step2(stmt(s)); err != nil || rc != -7 {
+		t.Errorf("Step2 = %d, %v", rc, err)
+	}
+	// ok(3): the single ok value is not a result, the out value is.
+	s.reply(0, new(bld).u32(3).u32(0).u64(99).body())
+	if v, err := s.cl.SingleOk(stmt(s)); err != nil || v != 99 {
+		t.Errorf("SingleOk = %d, %v", v, err)
+	}
+	s.reply(fFail, new(bld).u32(4).u32(0).u64(0).body())
+	var lerr *rt.LibError
+	if _, err := s.cl.SingleOk(stmt(s)); !asErr(err, &lerr) || lerr.Code != 4 {
+		t.Errorf("SingleOk failure = %v", err)
+	}
+}
+
+func TestNullReturns(t *testing.T) {
+	s := newSrv(t)
+	d := db(s)
+	var lerr *rt.LibError
+
+	s.reply(0, new(bld).u32(0x10001).body())
+	if h, err := s.cl.Open(); err != nil || h.ID() != 0x10001 {
+		t.Errorf("Open = %v, %v", h, err)
+	}
+	s.reply(fFail, new(bld).u32(0).body())
+	if h, err := s.cl.Open(); !asErr(err, &lerr) || lerr.Code != 0 || !h.IsNil() {
+		t.Errorf("Open NULL = %v, %v", h, err)
+	}
+
+	// @error(null) on a str: failure is the flag alone, G2 is empty.
+	s.reply(0, new(bld).str("nm").body())
+	if v, err := s.cl.Name(d); err != nil || v != "nm" {
+		t.Errorf("Name = %q, %v", v, err)
+	}
+	s.reply(fFail, nil)
+	if v, err := s.cl.Name(d); !asErr(err, &lerr) || lerr.Code != 0 || v != "" {
+		t.Errorf("Name NULL = %q, %v", v, err)
+	}
+	// With detail the failure body is just the detail string at offset 0.
+	s.reply(fFail|fDetail, new(bld).str("why").body())
+	if _, err := s.cl.Name2(d); !asErr(err, &lerr) || lerr.Detail != "why" {
+		t.Errorf("Name2 NULL = %v", err)
+	}
+	s.reply(0, new(bld).bytes([]byte{1, 2}).body())
+	if v, err := s.cl.Name2(d); err != nil || len(v) != 2 {
+		t.Errorf("Name2 = %v, %v", v, err)
+	}
+}
+
+func TestNullableReturns(t *testing.T) {
+	s := newSrv(t)
+	d := db(s)
+	null := new(bld).u32(0xffffffff).body()
+
+	s.reply(0, null)
+	if v, err := s.cl.MaybeName(d); err != nil || v != nil {
+		t.Errorf("MaybeName NULL = %v, %v", v, err)
+	}
+	s.reply(0, new(bld).str("").body())
+	if v, err := s.cl.MaybeName(d); err != nil || v == nil || *v != "" {
+		t.Errorf("MaybeName empty = %v, %v", v, err)
+	}
+	s.reply(0, new(bld).str("ab").body())
+	if v, err := s.cl.MaybeName(d); err != nil || v == nil || *v != "ab" {
+		t.Errorf("MaybeName = %v, %v", v, err)
+	}
+	s.reply(0, new(bld).str(string(make([]byte, 33))).body())
+	_, err := s.cl.MaybeName(d)
+	wantMalformed(t, "MaybeName over bound", err)
+
+	s.reply(0, null)
+	if v, err := s.cl.MaybeBlob(d); err != nil || v != nil {
+		t.Errorf("MaybeBlob NULL = %v, %v", v, err)
+	}
+	s.reply(0, new(bld).bytes(nil).body())
+	if v, err := s.cl.MaybeBlob(d); err != nil || v == nil || len(v) != 0 {
+		t.Errorf("MaybeBlob empty = %#v, %v", v, err)
+	}
+	s.reply(0, new(bld).bytes([]byte{4, 5}).body())
+	if v, err := s.cl.MaybeBlob(d); err != nil || string(v) != "\x04\x05" {
+		t.Errorf("MaybeBlob = %v, %v", v, err)
+	}
+	s.reply(0, new(bld).bytes([]byte{4, 5}).raw(0).body())
+	_, err = s.cl.MaybeBlob(d)
+	wantMalformed(t, "MaybeBlob trailing", err)
+
+	s.reply(0, null)
+	if v, err := s.cl.MaybeArr(d); err != nil || v != nil {
+		t.Errorf("MaybeArr NULL = %v, %v", v, err)
+	}
+	s.reply(0, new(bld).u32(0).body())
+	if v, err := s.cl.MaybeArr(d); err != nil || v == nil || len(v) != 0 {
+		t.Errorf("MaybeArr empty = %#v, %v", v, err)
+	}
+	s.reply(0, new(bld).u32(2).u32(5).u32(6).body())
+	if v, err := s.cl.MaybeArr(d); err != nil || len(v) != 2 || v[1] != 6 {
+		t.Errorf("MaybeArr = %v, %v", v, err)
+	}
+
+	// A nullable handle return: id 0 is the nil handle and not an error.
+	s.reply(0, new(bld).u32(0).body())
+	if h, err := s.cl.GetHandle(1); err != nil || !h.IsNil() {
+		t.Errorf("GetHandle nil = %v, %v", h, err)
+	}
+	s.reply(0, new(bld).u32(0x10009).body())
+	if h, err := s.cl.GetHandle(1); err != nil || h.ID() != 0x10009 {
+		t.Errorf("GetHandle = %v, %v", h, err)
+	}
+}
+
+func TestNullableHandleParameter(t *testing.T) {
+	s := newSrv(t)
+	s.expect(hqqOpUseDb, []byte{0, 0, 0, 0}, 0, nil)
+	if err := s.cl.UseDb(Db{}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPredicateConventions(t *testing.T) {
+	s := newSrv(t)
+	var lerr *rt.LibError
+
+	// calc: failure with detail after G2 (size 4, padded to 8); success is exactly G2.
+	s.reply(fFail|fDetail, new(bld).u32(0xfffffffb).u32(0).str("bad").body())
+	if _, err := s.cl.Calc(1); !asErr(err, &lerr) || lerr.Code != -5 || lerr.Detail != "bad" {
+		t.Errorf("Calc failure = %v", err)
+	}
+	s.reply(0, new(bld).u32(42).body())
+	if v, err := s.cl.Calc(1); err != nil || v != 42 {
+		t.Errorf("Calc = %d, %v", v, err)
+	}
+	s.reply(0, new(bld).u32(42).u32(0).body())
+	_, err := s.cl.Calc(1)
+	wantMalformed(t, "Calc long success", err)
+	s.reply(fDetail, new(bld).u32(42).body())
+	_, err = s.cl.Calc(1)
+	wantMalformed(t, "Calc detail without failure", err)
+
+	// check_b: a bool return; the failure code is the raw byte.
+	s.reply(0, []byte{0})
+	if v, err := s.cl.CheckB(1); err != nil || v {
+		t.Errorf("CheckB = %v, %v", v, err)
+	}
+	s.reply(fFail, []byte{1})
+	if _, err := s.cl.CheckB(1); !asErr(err, &lerr) || lerr.Code != 1 {
+		t.Errorf("CheckB failure = %v", err)
+	}
+	s.reply(0, []byte{2})
+	_, err = s.cl.CheckB(1)
+	wantMalformed(t, "CheckB bool 2", err)
+
+	// open_h: a handle under a predicate; calc_f: a float, whose failure code is 0.
+	s.reply(fFail, new(bld).u32(0x10003).body())
+	if h, err := s.cl.OpenH(1); !asErr(err, &lerr) || lerr.Code != 0x10003 || !h.IsNil() {
+		t.Errorf("OpenH failure = %v, %v", h, err)
+	}
+	s.reply(fFail, new(bld).u64(math.Float64bits(1.5)).body())
+	if _, err := s.cl.CalcF(1); !asErr(err, &lerr) || lerr.Code != 0 {
+		t.Errorf("CalcF failure = %v", err)
+	}
+}
+
+func TestFixedStructReturn(t *testing.T) {
+	s := newSrv(t)
+	body := new(bld).u32(0xffffffff).u32(7).u32(math.Float32bits(2.5)).body()
+	s.expect(hqqOpPt2, []byte{3, 0, 0, 0}, 0, body)
+	p, err := s.cl.Pt2(3)
+	if err != nil || p != (Pt{-1, 7, 2.5}) {
+		t.Fatalf("Pt2 = %+v, %v", p, err)
+	}
+	s.reply(0, body[:11])
+	_, err = s.cl.Pt2(3)
+	wantMalformed(t, "short struct", err)
+}
+
+func TestOutHandlesWithStatus(t *testing.T) {
+	s := newSrv(t)
+	s.reply(0, new(bld).u32(5).u32(0x10007).body())
+	rc, st, err := s.cl.MkStmt(db(s))
+	if err != nil || rc != 5 || st.ID() != 0x10007 {
+		t.Errorf("MkStmt = %d %v, %v", rc, st, err)
+	}
+}
+
+func TestCompositeReturns(t *testing.T) {
+	s := newSrv(t)
+	d := db(s)
+
+	// Union Val, case R holding a Rec: id u64, name str, tags i32[], inner Pad (align 4, size 12).
+	rec := func(w *bld) *bld {
+		return w.u64(7).str("n").u32(2).u32(5).u32(6).align(4).raw(1, 0, 0, 0).u32(0x01020304).u16(0x0506).raw(1, 0)
+	}
+	s.reply(0, rec(new(bld).u32(6)).body())
+	v, err := s.cl.GetVal(d)
+	if err != nil || v.Tag != ValR || v.R.Id != 7 || v.R.Name != "n" || len(v.R.Tags) != 2 || v.R.Tags[1] != 6 ||
+		v.R.Inner != (Pad{1, 0x01020304, 0x0506, true}) {
+		t.Fatalf("GetVal = %+v, %v", v, err)
+	}
+	s.reply(0, new(bld).u32(1).u64(math.MaxInt64).body())
+	if v, err := s.cl.GetVal(d); err != nil || v.Tag != ValI || v.I != math.MaxInt64 {
+		t.Errorf("GetVal I = %+v, %v", v, err)
+	}
+	s.reply(0, new(bld).u32(5).body())
+	if v, err := s.cl.GetVal(d); err != nil || v.Tag != ValN {
+		t.Errorf("GetVal N = %+v, %v", v, err)
+	}
+	s.reply(0, new(bld).u32(8).raw(1).body())
+	if v, err := s.cl.GetVal(d); err != nil || v.Tag != ValFlag || !v.Flag {
+		t.Errorf("GetVal Flag = %+v, %v", v, err)
+	}
+	for name, body := range map[string][]byte{
+		"unknown tag":    new(bld).u32(99).body(),
+		"missing tag":    nil,
+		"bool 2":         new(bld).u32(8).raw(2).body(),
+		"bytes over max": new(bld).u32(4).u32(65).raw(make([]byte, 65)...).body(),
+		"trailing":       append(new(bld).u32(5).body(), 0),
+		"truncated Pad": rec(new(bld).u32(6)).body()[:47],
+	} {
+		s.reply(0, body)
+		_, err := s.cl.GetVal(d)
+		wantMalformed(t, "GetVal "+name, err)
+	}
+	bad := rec(new(bld).u32(6)).body()
+	bad[len(bad)-2] = 2 // Pad.ok
+	s.reply(0, bad)
+	_, err = s.cl.GetVal(d)
+	wantMalformed(t, "GetVal bool 2 inside a union", err)
+
+	// Rec[] appended to the caller's slice: elements are Rec values with their own slices.
+	s.reply(0, rec(new(bld).u32(1)).body())
+	dst := make([]Rec, 0, 2)
+	recs, err := s.cl.Recs(d, 1, dst)
+	if err != nil || len(recs) != 1 || recs[0].Name != "n" || &recs[0] != &dst[:1][0] {
+		t.Errorf("Recs = %+v, %v", recs, err)
+	}
+	s.reply(0, new(bld).u32(11).body())
+	_, err = s.cl.Recs(d, 1, nil)
+	wantMalformed(t, "Recs over bound", err)
+
+	// A fixed struct returned by a shim is part of G2.
+	s.reply(0, new(bld).u32(1).u32(2).u32(math.Float32bits(3)).body())
+	if p, err := s.cl.GetPt(d); err != nil || p != (Pt{1, 2, 3}) {
+		t.Errorf("GetPt = %+v, %v", p, err)
+	}
+}
+
+func TestOneBlobAndInts(t *testing.T) {
+	s := newSrv(t)
+	d := db(s)
+	s.reply(0, new(bld).bytes([]byte{1, 2, 3}).body())
+	if v, err := s.cl.Blob(d); err != nil || string(v) != "\x01\x02\x03" {
+		t.Errorf("Blob = %v, %v", v, err)
+	}
+	s.reply(0, new(bld).u32(2).u32(0xffffffff).u32(2).body())
+	if v, err := s.cl.Ints(d); err != nil || len(v) != 2 || v[0] != -1 {
+		t.Errorf("Ints = %v, %v", v, err)
+	}
+	s.reply(0, new(bld).u32(17).body())
+	_, err := s.cl.Ints(d)
+	wantMalformed(t, "Ints over bound", err)
+}
+
+func TestOutPtsDestination(t *testing.T) {
+	s := newSrv(t)
+	dst := make([]Pt, 2)
+	s.expect(hqqOpOutPts, []byte{2, 0, 0, 0, 1}, 0, new(bld).u32(1).u32(5).u32(6).u32(math.Float32bits(1)).body())
+	got, err := s.cl.OutPts(dst, true)
+	if err != nil || len(got) != 1 || got[0] != (Pt{5, 6, 1}) || &got[0] != &dst[0] {
+		t.Fatalf("OutPts = %+v, %v", got, err)
+	}
+	if s.conn().LastRespMax != rt.VarSlack+2*12 {
+		t.Errorf("respMax %d", s.conn().LastRespMax)
+	}
+	s.reply(0, new(bld).u32(3).body())
+	_, err = s.cl.OutPts(dst, false)
+	wantMalformed(t, "count over capacity", err)
+}
+
+func TestLocalsAndNames(t *testing.T) {
+	s := newSrv(t)
+	s.reply(0, new(bld).u32(1).body())
+	if v, err := s.cl.Locals(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20); err != nil || v != 1 {
+		t.Errorf("Locals = %d, %v", v, err)
+	}
+	body := s.conn().Requests[0][16:]
+	if len(body) != 80 || le.Uint32(body[76:]) != 20 {
+		t.Errorf("Locals request %x", body)
+	}
+}

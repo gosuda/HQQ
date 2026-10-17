@@ -1,0 +1,149 @@
+package PKG
+
+import (
+	"testing"
+
+	"fakemod/rt"
+)
+
+// The requests and responses below are written out by hand from 4.5 to 4.6 of the design document.
+
+func TestOpenPrepareStepClose(t *testing.T) {
+	s := newSrv(t)
+	cl := s.cl
+
+	// sqlite3_open_v2("a.db", 6, nil): G1 is flags@0 (size 4), V1 starts at 8; the nil zvfs is NULL_LEN.
+	s.expect(hqqOpSqlite3OpenV2, []byte{
+		6, 0, 0, 0, 0, 0, 0, 0,
+		4, 0, 0, 0, 'a', '.', 'd', 'b', 0, 0, 0, 0,
+		0xff, 0xff, 0xff, 0xff,
+	}, 0, new(bld).u32(0).u32(0x00010001).body())
+	db, err := cl.Sqlite3OpenV2("a.db", 6, nil)
+	if err != nil || db.ID() != 0x00010001 {
+		t.Fatalf("open = %#x, %v", db.ID(), err)
+	}
+	if got := s.conn().LastRespMax; got != 8+rt.DetailReserve {
+		t.Errorf("open respMax = %d, want %d", got, 8+rt.DetailReserve)
+	}
+
+	// A present zvfs follows the first string after padding to 4. A failed open has detail text and
+	// the nil handle.
+	vfs := "unix"
+	s.expect(hqqOpSqlite3OpenV2, []byte{
+		0, 0, 0, 0, 0, 0, 0, 0,
+		1, 0, 0, 0, 'x', 0, 0, 0,
+		4, 0, 0, 0, 'u', 'n', 'i', 'x', 0,
+	}, fFail|fDetail, new(bld).u32(14).u32(0).str("unable").body())
+	db2, err := cl.Sqlite3OpenV2("x", 0, &vfs)
+	var lerr *rt.LibError
+	if !asErr(err, &lerr) || lerr.Code != 14 || lerr.Detail != "unable" || lerr.Func != "sqlite3_open_v2" || !db2.IsNil() {
+		t.Fatalf("failed open = %#x, %v", db2.ID(), err)
+	}
+
+	// prepare: G1 db@0, V1 sql at 8. The response has the statement and the tail offset.
+	s.expect(hqqOpSqlite3PrepareV2, new(bld).u32(0x00010001).u32(0).str("select 1;").body(), 0,
+		new(bld).u32(0).u32(0x00010002).u32(9).body())
+	stmt, tail, err := cl.Sqlite3PrepareV2(db, "select 1;")
+	if err != nil || stmt.ID() != 0x00010002 || tail != 9 {
+		t.Fatalf("prepare = %#x, %d, %v", stmt.ID(), tail, err)
+	}
+	// SQL without a statement: success with id 0 is the nil handle and no error (4.6.5).
+	s.reply(0, new(bld).u32(0).u32(0).u32(3).body())
+	empty, tail, err := cl.Sqlite3PrepareV2(db, "-- x")
+	if err != nil || !empty.IsNil() || tail != 3 {
+		t.Fatalf("empty prepare = %#x, %d, %v", empty.ID(), tail, err)
+	}
+
+	// step: ok(100, 101) has two values, so the code is a result.
+	s.expect(hqqOpSqlite3Step, new(bld).u32(0x00010002).body(), 0, new(bld).u32(100).body())
+	if rc, err := cl.Sqlite3Step(stmt); err != nil || rc != 100 {
+		t.Fatalf("step = %d, %v", rc, err)
+	}
+	s.reply(fFail|fDetail, new(bld).u32(1).u32(0).str("bad").body())
+	if rc, err := cl.Sqlite3Step(stmt); !asErr(err, &lerr) || lerr.Code != 1 || lerr.Detail != "bad" || rc != 0 {
+		t.Fatalf("failed step = %d, %v", rc, err)
+	}
+	s.reply(fFail, new(bld).u32(100).body())
+	_, err = cl.Sqlite3Step(stmt)
+	wantMalformed(t, "step with an ok code and F_FAIL", err)
+	s.reply(0, new(bld).u32(1).body())
+	_, err = cl.Sqlite3Step(stmt)
+	wantMalformed(t, "step with an error code and no F_FAIL", err)
+	s.reply(0, new(bld).u32(100).u32(0).body())
+	_, err = cl.Sqlite3Step(stmt)
+	wantMalformed(t, "step with a long success body", err)
+
+	// bind_text: str after G1 (stmt, index), and a NUL in the text is refused before the request.
+	s.expect(hqqOpBindText, new(bld).u32(0x00010002).u32(3).str("hi").body(), 0, new(bld).u32(0).body())
+	if err := cl.BindText(stmt, 3, "hi"); err != nil {
+		t.Fatalf("bind_text: %v", err)
+	}
+	before := s.requests()
+	if err := cl.BindText(stmt, 3, "h\x00i"); err != rt.ErrInvalidArg || s.requests() != before {
+		t.Errorf("bind_text with NUL: %v, %d new requests", err, s.requests()-before)
+	}
+	if err := cl.BindText(Stmt{}, 3, "hi"); err != rt.ErrInvalidArg {
+		t.Errorf("bind_text with nil handle: %v", err)
+	}
+
+	// column_count has no error convention.
+	s.expect(hqqOpSqlite3ColumnCount, new(bld).u32(0x00010002).body(), 0, new(bld).u32(7).body())
+	if n, err := cl.Sqlite3ColumnCount(stmt); err != nil || n != 7 {
+		t.Errorf("column_count = %d, %v", n, err)
+	}
+
+	// close: the failure keeps its code, and a nullable-free destroy takes the handle.
+	s.reply(fFail, new(bld).u32(5).body())
+	if err := cl.Sqlite3Close(db); !asErr(err, &lerr) || lerr.Code != 5 || lerr.Detail != "" {
+		t.Errorf("close = %v", err)
+	}
+	if got := s.conn().Broken; len(got) != 3 {
+		t.Errorf("malformed responses: %v", got)
+	}
+}
+
+func TestFetchRows(t *testing.T) {
+	s := newSrv(t)
+	stmt := Stmt{s.conn().NewHandle(0x00010002)}
+
+	// ncols 2; three cells: Int 5 (i64 aligned to 8), Text "ab", Null.
+	rows := new(bld).u32(2).u32(3).
+		u32(1).u64(5).
+		u32(3).str("ab").
+		u32(5).body()
+	s.expect(hqqOpFetchRows, new(bld).u32(0x00010002).u32(10).body(), 0, rows)
+	got, err := s.cl.FetchRows(stmt, 10)
+	if err != nil || got.Ncols != 2 || len(got.Cells) != 3 {
+		t.Fatalf("FetchRows = %+v, %v", got, err)
+	}
+	if c := got.Cells; c[0].Tag != ValueInt || c[0].Int != 5 || c[1].Tag != ValueText || c[1].Text != "ab" || c[2].Tag != ValueNull {
+		t.Errorf("cells = %+v", c)
+	}
+	if s.conn().LastRespMax != 65536 {
+		t.Errorf("respMax %d, want 65536", s.conn().LastRespMax)
+	}
+
+	blob := new(bld).u32(1).u32(1).u32(4).bytes([]byte{9, 8, 7}).body()
+	s.reply(0, blob)
+	got, err = s.cl.FetchRows(stmt, 1)
+	if err != nil || string(got.Cells[0].Blob) != "\x09\x08\x07" {
+		t.Errorf("blob row = %+v, %v", got, err)
+	}
+
+	for name, body := range map[string][]byte{
+		"trailing byte":    append(append([]byte(nil), rows...), 0),
+		"truncated":        rows[:len(rows)-1],
+		"unknown tag":      new(bld).u32(1).u32(1).u32(9).body(),
+		"count over body":  new(bld).u32(1).u32(1 << 30).body(),
+		"missing count":    new(bld).u32(1).body(),
+		"text without NUL": new(bld).u32(1).u32(1).u32(3).u32(2).raw('a', 'b', 'c').body(),
+		"text with NUL":    new(bld).u32(1).u32(1).u32(3).u32(2).raw('a', 0, 0).body(),
+	} {
+		s.reply(0, body)
+		_, err := s.cl.FetchRows(stmt, 1)
+		wantMalformed(t, name, err)
+	}
+	s.reply(fFail, nil)
+	_, err = s.cl.FetchRows(stmt, 1)
+	wantMalformed(t, "F_FAIL without an error convention", err)
+}

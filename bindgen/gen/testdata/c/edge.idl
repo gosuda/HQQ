@@ -1,0 +1,118 @@
+// edge.idl: an interface of the C emitter tests (bindgen/gen/c_edge_test.go). It covers the shapes that the
+// microlib and sqlite excerpts do not: handles with parents and @retain_on_fail, out parameters of every kind,
+// the null and predicate conventions, shims with writers, an interceptor with a veto, nullable arguments,
+// arrays with 8-byte elements, borrowed results with @free, functions without parameters and void returns.
+idl 1;
+
+@serialize(session)
+service edge;
+
+include "edge.h";
+
+@c("edge_dir *")
+handle Dir destroy edge_dir_close;
+
+@c("edge_file *")
+handle File owned_by Dir destroy edge_file_close;
+
+@c("edge_tag *")
+handle Tag destroy edge_tag_free;
+
+// wire layout: x @0, ok @4, y @8, 16 bytes. The C struct has 3 bytes of padding after ok.
+@c("edge_pt")
+struct Pt {
+    x: i32;
+    ok: bool;
+    y: i64;
+}
+
+union Cell {
+    case 1 Int: i64;
+    case 2 Text: str<=4;
+    case 3 Nul;
+    case 4 At: Pt;
+    case 5 Arr: i32[];
+    case 6 Blob: bytes<=4;
+    case 7 Real: f64;
+    case 8 Byte: u8;
+    case 9 Flag: bool;
+    case 10 Words: Pt[]<=2;
+    case 11 Quad: u8[4];
+    case 12 Small: i32;
+    case 13 Wide: size;
+}
+
+fn edge_ping();
+fn edge_pings() -> i64;
+fn edge_reset();
+fn edge_log() -> str<=64;
+fn edge_frees() -> i32;
+
+fn edge_mix(a: i8, b: u16, c: f32, d: bool, e: u64) -> f64;
+fn edge_flip(b: bool) -> bool;
+fn edge_big(v: size) -> size;
+fn edge_key(k: u8[4]) -> u32;
+fn edge_sum(v: i64[], n: size @len_of(v)) -> i64;
+fn edge_count_true(v: bool[], n: size @len_of(v)) -> i32;
+fn edge_note(s: str<=32 @nullable) -> i32;
+
+@error(null)
+fn edge_dir_open(id: i32) -> Dir;
+
+// A locked directory answers 5 and stays alive.
+@retain_on_fail
+@error(status, ok(0))
+fn edge_dir_close(d: Dir) -> i32;
+
+fn edge_dir_lock(d: Dir, on: bool);
+fn edge_dir_peek(d: Dir @nullable) -> i32;
+
+@error(null)
+fn edge_file_open(d: Dir, name: str<=16) -> File;
+
+@error(status, ok(0))
+fn edge_file_close(f: File) -> i32;
+
+@error(null)
+fn edge_tag_new() -> Tag;
+fn edge_tag_free(t: Tag);
+
+// Directory 2 answers 3 but still returns both objects: the glue must destroy them and send id 0.
+@error(status, ok(0))
+fn edge_open_pair(d: Dir, out f: File, out t: Tag) -> i32;
+
+@error(status, ok(0), detail(edge_errmsg, d))
+fn edge_stat(d: Dir, out n: i32, out p: Pt, inout k: i32, out tag: u8[4]) -> i32;
+
+@error(null)
+fn edge_dir_name(d: Dir) -> str<=8;
+
+@error(predicate(edge_div_failed))
+fn edge_div(a: i32, b: i32) -> i32;
+
+@error(status, ok(0))
+fn edge_blob(d: Dir, out p: bytes<=16 @borrowed @free("edge_free"), out n: size @len_of(p)) -> i32;
+
+@error(status, ok(0))
+fn edge_label(d: Dir, out s: str<=8 @free("edge_free")) -> i32;
+
+// G2 is 4 bytes and V2 follows at 8: the library writes the buffer in place after 4 bytes of padding.
+@error(status, ok(0), detail(edge_errmsg, d))
+fn edge_read(d: Dir, out dst: bytes<=64, cap: size @len_of(dst), out n: size @len_of(dst)) -> i32;
+
+// G2 is 1 byte, V2 starts at 8 and the 8-byte elements start at 16.
+fn edge_iota(start: i64, out dst: i64[]<=8, cap: u32 @len_of(dst)) -> u8 @len_of(dst);
+
+// The first buffer is written in place, the second goes through scratch.
+fn edge_two(out a: u8[]<=8, ca: u32 @len_of(a), out b: u8[]<=8, cb: u32 @len_of(b),
+            out na: u32 @len_of(a), out nb: u32 @len_of(b));
+
+@intercept
+fn edge_guard(d: Dir, name: str<=16, n: i32 @len_of(name), mode: i32) -> i32;
+
+shim fn edge_cells(n: i32) -> Cell[]<=3 @max_out(64);
+shim fn edge_pt_shim(id: i32) -> Pt @max_out(24);
+shim fn edge_cell(sel: i32) -> Cell @max_out(256);
+
+@allow(server) fn edge_errmsg(d: Dir) -> str<=64;
+@allow(server) fn edge_div_failed(r: i32) -> i32;

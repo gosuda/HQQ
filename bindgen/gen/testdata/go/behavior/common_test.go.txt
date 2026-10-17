@@ -1,0 +1,138 @@
+package PKG
+
+import (
+	"bytes"
+	"encoding/binary"
+	"fmt"
+	"testing"
+
+	"fakemod/rt"
+)
+
+var le = binary.LittleEndian
+
+// bld builds a body the way 4.5 describes it, independently of the generated code under test.
+type bld struct{ b []byte }
+
+func (w *bld) align(n int) *bld {
+	for len(w.b)%n != 0 {
+		w.b = append(w.b, 0)
+	}
+	return w
+}
+
+func (w *bld) raw(p ...byte) *bld { w.b = append(w.b, p...); return w }
+
+func (w *bld) u16(v uint16) *bld { w.align(2); w.b = le.AppendUint16(w.b, v); return w }
+func (w *bld) u32(v uint32) *bld { w.align(4); w.b = le.AppendUint32(w.b, v); return w }
+func (w *bld) u64(v uint64) *bld { w.align(8); w.b = le.AppendUint64(w.b, v); return w }
+
+func (w *bld) str(s string) *bld {
+	w.u32(uint32(len(s)))
+	w.b = append(w.b, s...)
+	w.b = append(w.b, 0)
+	return w
+}
+
+func (w *bld) bytes(p []byte) *bld {
+	w.u32(uint32(len(p)))
+	w.b = append(w.b, p...)
+	return w
+}
+
+func (w *bld) body() []byte { return w.b }
+
+// srv answers the next request of a test.
+type srv struct {
+	t    *testing.T
+	next func(req []byte) []byte
+	cl   *Client
+}
+
+func newSrv(t *testing.T) *srv {
+	s := &srv{t: t}
+	s.cl = &Client{c: rt.NewConn(hqqIface, func(req []byte) []byte {
+		if s.next == nil {
+			t.Fatalf("unexpected request %x", req)
+		}
+		next := s.next
+		s.next = nil
+		return next(req)
+	})}
+	return s
+}
+
+func respFrame(req []byte, flags uint8, status uint32, body []byte) []byte {
+	f := make([]byte, 16+len(body))
+	f[0], f[1] = 2, flags
+	copy(f[2:4], req[2:4])
+	copy(f[4:8], req[4:8])
+	le.PutUint32(f[8:], uint32(len(body)))
+	le.PutUint32(f[12:], status)
+	copy(f[16:], body)
+	return f
+}
+
+const (
+	fDetail = 1
+	fFail   = 2
+)
+
+// expect checks the next request (opcode and body) and answers it with a response frame.
+func (s *srv) expect(op uint16, wantBody []byte, flags uint8, resp []byte) {
+	s.t.Helper()
+	s.next = func(req []byte) []byte {
+		s.t.Helper()
+		if got := le.Uint16(req[2:]); got != op {
+			s.t.Errorf("request op %d, want %d", got, op)
+		}
+		if got := req[16:]; !bytes.Equal(got, wantBody) {
+			s.t.Errorf("request body\n got %x\nwant %x", got, wantBody)
+		}
+		if got := le.Uint32(req[8:]); int(got) != len(wantBody) {
+			s.t.Errorf("request total %d, want %d", got, len(wantBody))
+		}
+		return respFrame(req, flags, 0, resp)
+	}
+}
+
+// status answers the next request with a call-level status.
+func (s *srv) status(status uint32, msg string) {
+	s.next = func(req []byte) []byte { return respFrame(req, 0, status, new(bld).str(msg).body()) }
+}
+
+// reply answers the next request without checking it.
+func (s *srv) reply(flags uint8, resp []byte) {
+	s.next = func(req []byte) []byte { return respFrame(req, flags, 0, resp) }
+}
+
+func (s *srv) conn() *rt.Conn { return s.cl.Conn() }
+
+func (s *srv) requests() int { return len(s.conn().Requests) }
+
+// wantMalformed fails unless err is the protocol error of a malformed response, and checks that the
+// next call is still possible (the decoder was released).
+func wantMalformed(t *testing.T, what string, err error) {
+	t.Helper()
+	var pe *rt.ProtocolError
+	if !asErr(err, &pe) {
+		t.Errorf("%s: error %v, want a malformed response", what, err)
+	}
+}
+
+func asErr[T error](err error, target *T) bool {
+	for err != nil {
+		if e, ok := err.(T); ok {
+			*target = e
+			return true
+		}
+		u, ok := err.(interface{ Unwrap() error })
+		if !ok {
+			return false
+		}
+		err = u.Unwrap()
+	}
+	return false
+}
+
+func hexs(b []byte) string { return fmt.Sprintf("%x", b) }

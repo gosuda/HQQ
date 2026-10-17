@@ -1,0 +1,178 @@
+// edge.idl exercises every parameter, return and error shape the Go emitter handles. It is not a
+// meaningful C library; it only has to be a valid IDL file.
+idl 1;
+
+@serialize(none)
+service edge;
+
+include "edge.h";
+
+const MAXN: u32 = 64;
+const BIG: u64 = 18446744073709551615;
+const NEG: i32 = -5;
+const SMALL: i8 = -128;
+const ERR_STEP: i32 = -7;
+
+@c("db_t *")
+handle Db destroy db_close;
+
+@c("stmt_t *")
+handle Stmt owned_by Db destroy stmt_finalize;
+
+// u8, u32, u16: padding between and after the fields.
+@c("pad_t")
+struct Pad {
+    a: u8;
+    b: u32;
+    c: u16;
+    ok: bool;
+}
+
+@c("pt_t")
+struct Pt {
+    x: i32;
+    y: i32;
+    w: f32;
+}
+
+@c("box_t")
+struct Box {
+    rows: i16[3];
+    pts: Pt[2];
+    flag: bool;
+    tag: u64;
+    key: u8[4];
+}
+
+struct Rec {
+    id: u64;
+    name: str<=32;
+    tags: i32[]<=8;
+    inner: Pad;
+}
+
+union Val {
+    case 1 I: i64;
+    case 2 F: f64;
+    case 3 S: str;
+    case 4 B: bytes<=64;
+    case 5 N;
+    case 6 R: Rec;
+    case 7 P: Pt;
+    case 8 Flag: bool;
+}
+
+fn nop();
+
+fn nop_ret() -> i32;
+
+fn scalars(a: bool, b: i8, c: u8, d: i16, e: u16, f: i32, g: u32, h: i64, i: u64, j: size, k: f32, l: f64) -> f64;
+
+// Go keywords and predeclared identifiers as parameter names, and names that equal the locals of generated code.
+fn names(func: i32, interface: i32, select: i32, defer: i32, go: i32, map: i32, chan: i32, package: i32,
+         fallthrough: i32, range: i32, type: i32, import: i32, var: i32, len: i32, cap: i32, clear: i32,
+         max: i32, min: i32, copy: i32, append: i32, make: i32, nil: i32, true: i32, error: i32, string: i32,
+         rt: i32, math: i32, binary: i32, context: i32) -> i32;
+
+fn locals(c: i32, f: i32, e: i32, d: i32, b: i32, err: i32, body: i32, call: i32, off: i32, end: i32, n: i32,
+          v: i32, i: i32, id: i32, rc: i32, cnt: i32, outv: i32, r: i32, s: i32, dst: i32) -> i32;
+
+fn inc(inout x: i32, inout f: f64, inout flag: bool, inout w: u16) -> i32;
+
+fn ins(a: str<=10, b: bytes, nb: u32 @len_of(b), v: i32[], nv: size @len_of(v), ns: str<=8 @nullable,
+       nbytes: bytes<=9 @nullable, nbn: u16 @len_of(nbytes), pts: Pt[], npts: u8 @len_of(pts),
+       w: u16[]<=3 @nullable, nw: u32 @len_of(w), key: u8[16], m: i16[3], x: Pt[2]) -> u32;
+
+fn one_str(s: str);
+
+fn one_bytes(b: bytes<=100, n: u8 @len_of(b));
+
+fn out_buf(key: u8, out buf: bytes<=100, cap: u32 @len_of(buf)) -> u32 @len_of(buf);
+
+fn out_arr(out items: i32[]<=10, cap: u16 @len_of(items), out n: u32 @len_of(items));
+
+fn out_pts(out pts: Pt[], cap: u32 @len_of(pts), out m: u32 @len_of(pts), flag: bool);
+
+fn two_bufs(out a: bytes, acap: u32 @len_of(a), out b: bytes<=8, bcap: u32 @len_of(b), s: str) -> i32;
+
+fn out_fixed(out key: u8[32], out m: i16[3], out p: Pt, out box: Box, out ok: bool) -> u8;
+
+fn out_borrowed(out msg: str<=64 @free("lib_free"), out data: bytes<=256 @borrowed, out dlen: size @len_of(data),
+                out items: i32[]<=16 @borrowed, out ilen: u32 @len_of(items)) -> i32;
+
+@error(status, ok(0), detail(db_errmsg, db))
+fn prep(db: Db, sql: str, nbyte: i32 @len_of(sql), out stmt: Stmt, out tail: u32 @offset_in(sql)) -> i32;
+
+@error(status, ok(0, 100, 101), detail(stmt_errmsg, stmt))
+fn step(stmt: Stmt, out a: i32, out b: bool, out s: str<=16 @free("lib_free"), x: i64) -> i32;
+
+@error(status, ok(0, -7))
+fn step2(stmt: Stmt) -> i32;
+
+@error(status, ok(3))
+fn single_ok(stmt: Stmt, out v: u64) -> u8;
+
+@error(null)
+fn open() -> Db;
+
+@error(null)
+fn name(db: Db) -> str<=32;
+
+@error(null, detail(db_errmsg, db))
+fn name2(db: Db, out n: u32 @len_of(ret)) -> bytes<=32 @free("lib_free");
+
+fn maybe_name(db: Db) -> str<=32 @nullable;
+
+fn maybe_blob(db: Db, out n: size @len_of(ret)) -> bytes<=1024 @nullable;
+
+fn maybe_arr(db: Db, out n: u32 @len_of(ret)) -> i32[]<=16 @nullable;
+
+fn blob(db: Db, out n: size @len_of(ret)) -> bytes<=1024;
+
+fn ints(db: Db, out n: u32 @len_of(ret)) -> i32[]<=16;
+
+@error(predicate(is_err), detail(errstr, ret))
+fn calc(x: i32) -> i32;
+
+@error(predicate(is_err_b))
+fn check_b(x: i32) -> bool;
+
+@error(predicate(is_err_h))
+fn open_h(x: i32) -> Db;
+
+@error(predicate(is_err_f))
+fn calc_f(x: i32) -> f64;
+
+fn use_db(db: Db @nullable);
+
+fn get_handle(x: i32) -> Db @nullable;
+
+fn is_ok(x: i32) -> bool;
+
+fn pt2(a: i32) -> Pt;
+
+fn mk_stmt(db: Db, out s: Stmt) -> i32;
+
+shim fn get_val(db: Db) -> Val @max_out(4096);
+
+shim fn get_rec(db: Db) -> Rec @max_out(1024);
+
+shim fn recs(db: Db, n: i32) -> Rec[]<=10 @max_out(8192);
+
+shim fn get_pt(db: Db) -> Pt @max_out(64);
+
+shim fn vals(db: Db, out cap: i32) -> Val[]<=4 @max_out(2048);
+
+@retain_on_fail
+@error(status, ok(0))
+fn db_close(db: Db) -> i32;
+
+fn stmt_finalize(s: Stmt);
+
+@allow(server) fn db_errmsg(db: Db) -> str<=100;
+@allow(server) shim fn stmt_errmsg(s: Stmt) -> str<=100;
+@allow(server) fn is_err(r: i32) -> i32;
+@allow(server) fn is_err_b(r: bool) -> i32;
+@allow(server) fn is_err_h(r: Db) -> i32;
+@allow(server) fn is_err_f(r: f64) -> i32;
+@allow(server) fn errstr(r: i32) -> str<=64;

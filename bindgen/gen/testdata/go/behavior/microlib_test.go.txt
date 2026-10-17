@@ -1,0 +1,271 @@
+package PKG
+
+import (
+	"bytes"
+	"encoding/hex"
+	"encoding/json"
+	"os"
+	"testing"
+
+	"fakemod/rt"
+)
+
+func loadVectors(t *testing.T) map[string][]byte {
+	t.Helper()
+	raw, err := os.ReadFile("vectors.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var f struct {
+		Microlib struct {
+			Frames []struct{ Name, Hex string } `json:"frames"`
+		} `json:"microlib"`
+	}
+	if err := json.Unmarshal(raw, &f); err != nil {
+		t.Fatal(err)
+	}
+	out := map[string][]byte{}
+	for _, fr := range f.Microlib.Frames {
+		b, err := hex.DecodeString(fr.Hex)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out[fr.Name] = b
+	}
+	return out
+}
+
+// TestVectorSession replays the session of 4.14 (requests 1 to 13) through the generated microlib client:
+// every request frame must be the vector byte for byte, and every response vector must decode as the
+// document says. The body slots start filled with 0xA5, so a missing padding byte fails the comparison.
+func TestVectorSession(t *testing.T) {
+	vec := loadVectors(t)
+	steps := [][2]string{
+		{"R1_REQ", "R1_RESP"}, {"R2_REQ", "R2_RESP"}, {"R3_REQ", "R3_RESP"}, {"R4_REQ", "R4_RESP"},
+		{"R5_REQ", "R5_RESP"}, {"R6_REQ", "R6_RESP"}, {"R7_REQ", "R7_RESP"}, {"R8_REQ", "R8_RESP"},
+		{"R9_REQ", "R9_RESP"}, {"R10_REQ", "R10_RESP"}, {"R11_REQ", "R11_RESP"}, {"R12_REQ", "R12_RESP"},
+		{"R13_REQ", "R13_RESP"},
+	}
+	next := 0
+	conn := rt.NewConn(hqqIface, func(req []byte) []byte {
+		if next >= len(steps) {
+			t.Fatalf("request %d: more requests than vectors", next+1)
+		}
+		step := steps[next]
+		next++
+		if want := vec[step[0]]; !bytes.Equal(req, want) {
+			t.Errorf("%s: client sent\n %x\nwant\n %x", step[0], req, want)
+		}
+		return vec[step[1]]
+	})
+	cl := &Client{c: conn}
+
+	counter, err := cl.CounterNew(9223372036854775800)
+	if err != nil || counter.ID() != 0x00010001 {
+		t.Fatalf("R1 CounterNew = %#x, %v; want handle 0x00010001", counter.ID(), err)
+	}
+
+	var lerr *rt.LibError
+	if _, err := cl.CounterAdd(counter, 100); !asErr(err, &lerr) || lerr.Code != -1 || lerr.Detail != "overflow" || lerr.Func != "ml_counter_add" {
+		t.Fatalf("R2 CounterAdd = %v; want LibError{-1, overflow}", err)
+	}
+	if conn.LastRespMax != 16+rt.DetailReserve {
+		t.Errorf("R2 respMax = %d, want %d", conn.LastRespMax, 16+rt.DetailReserve)
+	}
+
+	if v, err := cl.Add(7, 35); err != nil || v != 42 {
+		t.Fatalf("R3 Add = %d, %v; want 42", v, err)
+	}
+
+	dst := make([]byte, 8)
+	out, err := cl.Xor([]byte{1, 2, 3}, 0xff, dst)
+	if err != nil || !bytes.Equal(out, []byte{0xfe, 0xfd, 0xfc}) || &out[0] != &dst[0] {
+		t.Fatalf("R4 Xor = %x, %v; want fefdfc in dst", out, err)
+	}
+	if conn.LastRespMax != 8+rt.VarSlack+8 {
+		t.Errorf("R4 respMax = %d, want %d", conn.LastRespMax, 8+rt.VarSlack+8)
+	}
+	if _, err := cl.Xor([]byte{1, 2, 3}, 0xff, make([]byte, 2)); !asErr(err, &lerr) || lerr.Code != -1 || lerr.Detail != "" {
+		t.Fatalf("R5 Xor = %v; want LibError{SIZE_MAX}", err)
+	}
+
+	var se *rt.StatusError
+	if _, err := cl.CounterAdd(counter, -1); !asErr(err, &se) || se.Status != 5 || se.Msg != "denied" {
+		t.Fatalf("R6 CounterAdd = %v; want StatusError{5, denied}", err)
+	}
+	if _, err := cl.CounterAdd(Counter{conn.NewHandle(0x00010009)}, 1); !asErr(err, &se) || se.Status != 3 {
+		t.Fatalf("R7 CounterAdd = %v; want StatusError{3}", err)
+	}
+
+	cells, err := cl.Cells(counter, 3, nil)
+	want := []Cell{{Tag: CellInt, Int: -2}, {Tag: CellText, Text: "hi"}, {Tag: CellNull}}
+	if err != nil || len(cells) != 3 || cells[0] != want[0] || cells[1] != want[1] || cells[2] != want[2] {
+		t.Fatalf("R8 Cells = %+v, %v; want %+v", cells, err, want)
+	}
+	if conn.LastRespMax != 8192 {
+		t.Errorf("R8 respMax = %d, want 8192", conn.LastRespMax)
+	}
+
+	cursor, err := cl.CursorOpen(counter, 3)
+	if err != nil || cursor.ID() != 0x00010002 {
+		t.Fatalf("R9 CursorOpen = %#x, %v", cursor.ID(), err)
+	}
+	if err := cl.CursorFree(cursor); !asErr(err, &lerr) || lerr.Code != 2 || lerr.Detail != "" {
+		t.Fatalf("R10 CursorFree = %v; want LibError{2}", err)
+	}
+	if err := cl.CursorFree(cursor); !asErr(err, &se) || se.Status != 3 {
+		t.Fatalf("R11 CursorFree = %v; want StatusError{3}", err)
+	}
+	if err := cl.CounterCheck(counter, 5); !asErr(err, &lerr) || lerr.Code != -1 || lerr.Detail != "over limit" {
+		t.Fatalf("R12 CounterCheck = %v; want LibError{-1, over limit}", err)
+	}
+	if err := cl.CounterFree(counter); err != nil {
+		t.Fatalf("R13 CounterFree = %v", err)
+	}
+	if next != len(steps) {
+		t.Errorf("%d requests, want %d", next, len(steps))
+	}
+	if len(conn.Broken) != 0 {
+		t.Errorf("responses reported malformed: %v", conn.Broken)
+	}
+}
+
+// TestMicrolibClientErrors covers what the vectors do not: refused arguments, futures and responses that
+// contradict the interface.
+func TestMicrolibClientErrors(t *testing.T) {
+	s := newSrv(t)
+	cl := s.cl
+	h := Counter{s.conn().NewHandle(0x10001)}
+
+	// Refused before anything is committed.
+	if _, err := cl.CounterAdd(Counter{}, 1); err != rt.ErrInvalidArg {
+		t.Errorf("nil handle: %v", err)
+	}
+	other := rt.NewConn(hqqIface, nil)
+	if _, err := cl.CounterAdd(Counter{other.NewHandle(0x10001)}, 1); err != rt.ErrForeignHandle {
+		t.Errorf("foreign handle: %v", err)
+	}
+	if _, err := cl.Hash("a\x00b"); err != rt.ErrInvalidArg {
+		t.Errorf("NUL in str: %v", err)
+	}
+	if _, err := cl.Hash(string(make([]byte, 256))); err != rt.ErrInvalidArg {
+		t.Errorf("str over its bound: %v", err)
+	}
+	if _, err := cl.Xor(make([]byte, 65537), 0, nil); err != rt.ErrInvalidArg {
+		t.Errorf("bytes over its bound: %v", err)
+	}
+	if s.requests() != 0 {
+		t.Errorf("%d requests committed by refused calls", s.requests())
+	}
+
+	// Hash: str at 0 (G1 is empty), respMax 8.
+	s.expect(hqqOpHash, new(bld).str("abc").body(), 0, new(bld).u64(0xcbf29ce484222325).body())
+	if v, err := cl.Hash("abc"); err != nil || v != 0xcbf29ce484222325 {
+		t.Errorf("Hash = %#x, %v", v, err)
+	}
+	if s.conn().LastRespMax != 8 {
+		t.Errorf("Hash respMax %d", s.conn().LastRespMax)
+	}
+
+	// A future is single use and survives other calls in between.
+	s.expect(hqqOpAdd, new(bld).u32(1).u32(2).body(), 0, new(bld).u32(3).body())
+	f, err := cl.AddAsync(1, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v, err := f.Wait(); err != nil || v != 3 {
+		t.Errorf("Wait = %d, %v", v, err)
+	}
+	if _, err := f.Wait(); err != rt.ErrFutureUsed {
+		t.Errorf("second Wait: %v", err)
+	}
+	if _, err := (AddFuture{}).Wait(); err != rt.ErrFutureUsed {
+		t.Errorf("zero future: %v", err)
+	}
+
+	// Responses that contradict the interface are protocol errors, and the next call still works.
+	s.reply(0, new(bld).u32(1).u32(2).body())
+	_, err = cl.Add(1, 2)
+	wantMalformed(t, "Add with 8 bytes", err)
+	s.reply(fFail, new(bld).u32(1).body())
+	_, err = cl.Add(1, 2)
+	wantMalformed(t, "Add with F_FAIL but no error convention", err)
+	s.reply(0, new(bld).u32(0).body())
+	_, err = cl.CounterNew(1)
+	wantMalformed(t, "CounterNew NULL without F_FAIL", err)
+	s.reply(fFail, new(bld).u32(0x10001).body())
+	_, err = cl.CounterNew(1)
+	wantMalformed(t, "CounterNew F_FAIL with a handle", err)
+	s.reply(0, new(bld).u32(1).u32(0).body())
+	err = cl.CounterCheck(h, 1)
+	wantMalformed(t, "CounterCheck rc 1 without F_FAIL", err)
+	s.reply(fFail, new(bld).u32(0).body())
+	err = cl.CounterCheck(h, 1)
+	wantMalformed(t, "CounterCheck rc 0 with F_FAIL", err)
+	// F_FAIL with detail where the detail does not end the body.
+	s.reply(fFail|fDetail, new(bld).u32(0xffffffff).u32(0).str("x").raw(0).body())
+	err = cl.CounterCheck(h, 1)
+	wantMalformed(t, "CounterCheck detail with trailing byte", err)
+	s.reply(0, new(bld).u32(0).u32(0).body())
+	err = cl.CursorFree(Cursor{s.conn().NewHandle(0x10002)})
+	wantMalformed(t, "CursorFree success with trailing bytes", err)
+
+	// Cells: bad tag, bad text length, trailing bytes, count above the bound.
+	for name, body := range map[string][]byte{
+		"unknown tag":    new(bld).u32(1).u32(9).body(),
+		"text too long":  new(bld).u32(1).u32(2).str("0123456789abcdefg").body(),
+		"trailing byte":  append(new(bld).u32(1).u32(3).body(), 0),
+		"count over max": new(bld).u32(257).body(),
+		"count over body": new(bld).u32(200).u32(3).body(),
+		"truncated int":  new(bld).u32(1).u32(1).u32(0).body(),
+	} {
+		s.reply(0, body)
+		_, err := cl.Cells(h, 3, nil)
+		wantMalformed(t, "Cells "+name, err)
+	}
+	// The destination is reused when it is large enough.
+	s.reply(0, new(bld).u32(1).u32(1).u64(5).body())
+	dst := make([]Cell, 0, 4)
+	got, err := cl.Cells(h, 3, dst)
+	if err != nil || len(got) != 1 || got[0].Int != 5 || &got[0] != &dst[:1][0] {
+		t.Errorf("Cells into dst = %+v, %v", got, err)
+	}
+
+	// Xor: the produced length must be what ret says, and not exceed the capacity sent.
+	for name, c := range map[string]struct {
+		ret  uint64
+		data []byte
+	}{
+		"ret differs":    {2, []byte{1, 2, 3}},
+		"over capacity":  {9, make([]byte, 9)},
+	} {
+		s.reply(0, new(bld).u64(c.ret).bytes(c.data).body())
+		_, err := cl.Xor([]byte{1}, 0, make([]byte, 8))
+		wantMalformed(t, "Xor "+name, err)
+	}
+	if len(s.conn().Broken) == 0 {
+		t.Error("the fake runtime saw no Malformed call")
+	}
+}
+
+func TestMicrolibFlowOfFutures(t *testing.T) {
+	s := newSrv(t)
+	conn := s.conn()
+	conn.Serve = func(req []byte) []byte {
+		a, b := le.Uint32(req[16:]), le.Uint32(req[20:])
+		return respFrame(req, 0, 0, new(bld).u32(a+b).body())
+	}
+	var fs []AddFuture
+	for i := 0; i < 5; i++ {
+		f, err := s.cl.AddAsync(int32(i), 10)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fs = append(fs, f)
+	}
+	for i := len(fs) - 1; i >= 0; i-- {
+		if v, err := fs[i].Wait(); err != nil || v != int32(i)+10 {
+			t.Errorf("future %d = %d, %v", i, v, err)
+		}
+	}
+}

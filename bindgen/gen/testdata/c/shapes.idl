@@ -1,0 +1,103 @@
+// shapes.idl: argument shapes that the other tests do not run. bindgen/gen/c_compile_test.go compiles the glue
+// generated from it with -Wall -Wextra -Wpedantic -Werror against shapes.h, so every template of the emitter is
+// type-checked. Nothing here is executed.
+idl 1;
+
+service shapes;
+
+include "shapes.h";
+
+@c("sh_obj *")
+handle Obj destroy sh_obj_free;
+
+@c("sh_sub *")
+handle Sub owned_by Obj destroy sh_sub_free;
+
+@c("sh_pair")
+struct Pair {
+    a: u8;
+    b: u32;
+}
+
+@c("sh_wide")
+struct Wide {
+    p: Pair;
+    flags: bool[3];
+    q: u64;
+    f: f32;
+}
+
+union U {
+    case 1 W: Wide;
+    case 2 L: Pair[]<=4;
+    case 3 B: bool;
+    case 4 F: f32;
+    case 5 H: i16;
+}
+
+fn sh_scalars(a: i8, b: i16, c: u16, d: u32, e: i64, f: f32, g: f64, h: bool, k: size, m: i64 @c("long long")) -> u16;
+
+@error(status, ok(-1, 0, 7))
+fn sh_status_neg(a: i32) -> i32;
+
+fn sh_ret_bool(a: bool) -> bool;
+fn sh_ret_f32() -> f32;
+fn sh_ret_long() -> i64 @c("long");
+
+fn sh_in_fixed(a: bool[4], b: Pair[2], c: i16[3]) -> i32;
+
+fn sh_in_var(a: Pair[], na: u32 @len_of(a), b: bool[], nb: size @len_of(b), c: f64[], nc: i32 @len_of(c)) -> i32;
+
+@intercept
+fn sh_in_hooked(a: u8[4], b: bytes<=8, nb: i32 @len_of(b), c: f64[]<=4 @nullable, nc: i32 @len_of(c),
+                s: str<=4 @nullable, inout k: i32) -> i32;
+
+@intercept
+fn sh_no_args();
+
+fn sh_out_big(out a: u8[2000], out b: Pair, out c: bool, out d: f64, out e: Pair[2]) -> i32;
+
+fn sh_out_arr(out a: i32[]<=16, ca: i32 @len_of(a), out b: Pair[]<=3 @borrowed, out nb: u16 @len_of(b));
+
+@error(status, ok(0))
+fn sh_out_ret_arr(o: Obj, out buf: bytes<=32, cap: u32 @len_of(buf)) -> i32;
+
+@error(null)
+fn sh_ret_bytes(o: Obj, out n: u32 @len_of(ret)) -> bytes<=8;
+
+fn sh_ret_arr(o: Obj, out n: u32 @len_of(ret)) -> i32[]<=8 @nullable;
+
+@error(null)
+fn sh_ret_str_free() -> str<=8 @free("sh_free");
+
+@error(status, ok(0), detail(sh_msg, o, ret))
+fn sh_detail_ret(o: Obj) -> i32;
+
+@error(predicate(sh_bad), detail(sh_msg2, ret))
+fn sh_pred_obj(n: i32) -> Obj;
+
+fn sh_ret_struct(a: i32) -> Pair;
+fn sh_inout(inout a: i32, inout b: bool, inout c: f64);
+
+fn sh_off(s: str<=64, out t: u32 @offset_in(s), out u: u32 @offset_in(s)) -> i32;
+
+fn sh_off_n(s: str<=64, n: i32 @len_of(s), out t: u32 @offset_in(s)) -> i32;
+
+fn sh_obj_new() -> Obj;
+
+@error(null)
+fn sh_sub_new(a: Obj, b: i32) -> Sub;
+
+@error(status, ok(0))
+fn sh_obj_free(o: Obj) -> i32;
+
+fn sh_sub_free(o: Sub);
+fn sh_two(a: Obj @nullable, b: Obj) -> i32;
+
+shim fn sh_shim_u(a: i32) -> U[]<=2 @max_out(128);
+shim fn sh_shim_pair(a: i32, out n: i32) -> Pair @max_out(24);
+shim fn sh_shim_wide(a: i32) -> Wide @max_out(64);
+
+@allow(server) fn sh_msg(o: Obj, r: i32) -> str<=16;
+@allow(server) fn sh_msg2(r: Obj) -> str<=16;
+@allow(server) fn sh_bad(r: Obj) -> i32;

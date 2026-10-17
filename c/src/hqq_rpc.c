@@ -431,7 +431,7 @@ hqqrpc_status hqqrpc_rd_array(hqqrpc_rd *r, size_t elem_size, size_t elem_align,
         *count = 0;
         return HQQRPC_OK;
     }
-    if (n > max || !rd_align(r, elem_align)) {
+    if (n > max || (n != 0 && !rd_align(r, elem_align))) { /* an empty array has no element to align (4.5) */
         return HQQRPC_E_BAD_REQUEST;
     }
     remaining = r->len - r->off;
