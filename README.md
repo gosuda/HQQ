@@ -16,7 +16,7 @@ It delivers **sub-microsecond round-trip latency (~240 ns)** and **multi-GB/s th
 - **Crash and lifecycle detection (`HQQ_STL3` superblock)**: per-endpoint session tokens and heartbeats distinguish graceful peer shutdown (`io.EOF` from `Read`, `ErrPeerClosed` elsewhere) from abrupt termination (`ErrPeerGone`). Segments whose endpoints have all closed or died are re-initialized, a third endpoint is rejected (`ErrLinkBusy`), a dead initializer is taken over, and a foreign or other-version object is never modified.
 - **Formal verification and checks**: the MPMC ring (claim, completion CAS, FIFO order, progress) is model-checked with TLC ([`internal/mpmc/MPMC.tla`](internal/mpmc/MPMC.tla), bounded model, not a proof). CI runs `go vet ./...` (including `unsafeptr`), `go test ./...`, `go test -race ./...` (not on Windows), and fuzz smoke tests.
 - **Multi-client acceptor** (`NewAcceptor`, `Accept`, `Connect`): one listener name serves any number of clients. Each client has its own link segment, so a crashed client affects only its own link.
-- **Other languages and tools**: C, C++, and Rust implementations, a normative specification (`spec/`), golden conformance vectors and an interop harness, a `database/sql` driver for a SQLite service (`sqlite`), and tools for verified executables and signed release manifests (`secureexec`, `cmd/hqq-manifest`). See [Other languages and interoperability](#other-languages-and-interoperability) and [Tools and examples](#tools-and-examples).
+- **Other languages and tools**: C, C++, and Rust implementations, a normative specification (`spec/`), golden conformance vectors and an interop harness, `hqq-bindgen` (a generator that lets Go call a C library over shared memory without cgo), a `database/sql` driver for a SQLite service (`sqlite`), and tools for verified executables and signed release manifests (`secureexec`, `cmd/hqq-manifest`, `launch`). See [Other languages and interoperability](#other-languages-and-interoperability) and [Tools and examples](#tools-and-examples).
 
 ---
 
@@ -348,6 +348,19 @@ err = m.DB.QueryRowContext(ctx, "SELECT 1").Scan(&one)
 
 `launch` is the service-agnostic part of `sqlite/launcher`. `launch.Start(ctx, cfg, args...)` verifies the server binary (`Config.SHA256`, or a signed manifest in `Config.Manifest`), starts it with a parent lifeline (`--parent-stdin` by default), waits for the `ready <listener>` line, and returns a `*launch.Server` that stops gracefully and is killed after `StopTimeout`. It does not restart or supervise. See [`launch/README.md`](launch/README.md).
 
+### Calling C libraries from Go (`hqq-bindgen`)
+
+`hqq-bindgen` generates a Go client and a C server from an interface description (IDL). The C library runs in its own process behind the generated server; the Go client has no cgo and talks to it over HQQ shared memory. Only functions declared in the IDL can be called, handles are checked by the server, and client and server compare an interface digest when a session opens.
+
+```sh
+go run gosuda.org/hqq/cmd/hqq-bindgen -go-out client -go-strip ml_ -c-out server mylib.idl
+go run gosuda.org/hqq/cmd/hqq-bindgen -check -go-out client -go-strip ml_ -c-out server mylib.idl   # fails on stale output
+```
+
+What it is good at, measured on an Apple M1 (details and caveats in [`bindgen/README.md`](bindgen/README.md)): coarse calls. Compressing 64 KiB to 1 MiB with zstd through the generated client, with calls pipelined, is within 2% of cgo for one goroutine, and two sessions against two cgo threads are within 6% at 1 MiB. What it is not good at: tiny calls. A synchronous call with no work takes 310 ns against 25 ns for cgo, and a pipelined one 160–175 ns. The benefits it offers instead of speed are isolation (a crash in the C library ends the server process, not the Go program), no cgo in the Go build, and calls that overlap with Go work. There is no call cancellation, no callbacks, and the C server runs on POSIX systems only.
+
+The design is [`spec/toolchain/BINDGEN.md`](spec/toolchain/BINDGEN.md); examples are [`bindgen/examples/zstd`](bindgen/examples/zstd) and [`bindgen/examples/sqlite3`](bindgen/examples/sqlite3) (with the `hqq-sqlite-gen` driver in [`sqlite/gendriver`](sqlite/gendriver), which passes the same `database/sql` contract suite as `hqq-sqlite`). Generated servers are started with [`launch`](#starting-any-hqq-server-from-go-launch).
+
 ### Verified executables
 
 `secureexec` verifies the SHA-256 digest of a native executable and starts it without a time-of-check/time-of-use (TOCTOU) gap, so the bytes that are hashed are the bytes that run. It uses only the standard library.
@@ -481,29 +494,30 @@ sha256sum -c SHA256SUMS
 
 ## Benchmarks
 
-Measured on `darwin/arm64` (Go 1.27, `go test . -bench 'Benchmark(StandardLink|AdvancedLink|Compare)' -benchmem`, median of 6–9 runs); idle CPU from `HQQ_PERF_TESTS=1 go test -run 'TestIdleLinkDoesNotBurnCPU|TestMPMCWaitSpinBurnsCPU' ./...`.
+Measured on `darwin/arm64` (Apple M1, Go 1.27, quiet machine, median of 5–6 runs of `go test . -bench 'Benchmark(StandardLink|AdvancedLink|Compare)' -benchmem`); idle CPU from `HQQ_PERF_TESTS=1 go test -run 'TestIdleLinkDoesNotBurnCPU|TestMPMCWaitSpinBurnsCPU' ./...`. Both ends of every benchmark run in one process, on two goroutines; a Go client against a C server in two processes measured 186–187 ns average for the same 64-byte round trip.
 
 ### HQQ vs Unix Domain Socket (`SOCK_STREAM`) vs OS Pipe
 
 | Benchmark | HQQ (`WaitAdaptive`) | HQQ (`WaitSpin`) | Unix Domain Socket | OS Pipe | HQQ Speedup |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| **64 B Round-Trip Latency** | **239 ns/op** | 235 ns/op | 3,121 ns/op | 3,379 ns/op | **13.1×–14.1× faster** |
-| **4 KiB Unidirectional Throughput** | **24,180 MB/s** (169 ns/op) | 24,976 MB/s | 2,619 MB/s | 4,201 MB/s | **5.8×–9.2× higher** |
-| **64 KiB Unidirectional Throughput** | **28,420 MB/s** (2.31 µs/op) | 27,817 MB/s | 3,093 MB/s | 11,540 MB/s | **2.5×–9.2× higher** |
+| **64 B Round-Trip Latency** | **192 ns/op** | 193 ns/op | 3,121 ns/op | 3,341 ns/op | **16.2×–17.4× faster** |
+| **4 KiB Unidirectional Throughput** | **26,170 MB/s** (157 ns/op) | 24,690 MB/s | 2,700 MB/s | 4,357 MB/s | **6.0×–9.7× higher** |
+| **64 KiB Unidirectional Throughput** | **29,230 MB/s** (2.24 µs/op) | 29,010 MB/s | 3,110 MB/s | 11,770 MB/s | **2.5×–9.4× higher** |
 | **Idle Blocked Callers** | **~1% CPU** (2 blocked calls, incl. heartbeats) | >100% CPU (one core per blocked call) | blocks in the kernel | blocks in the kernel | kernel parking |
 
 ### StandardLink & AdvancedLink Microbenchmarks
 
 | Operation | Latency | Throughput | Allocs |
 | --- | ---: | ---: | ---: |
-| `StandardLink` Read/Write (`8 B`) | **61.1 ns/op** | **131 MB/s** | `0 B/op`, `0 allocs/op` |
-| `StandardLink` Zero-Copy (`4 KiB`) | **63.7 ns/op** | **64,342 MB/s** | `0 B/op`, `0 allocs/op` |
-| `StandardLink` Reserve/Commit (`4 KiB`) | **82.4 ns/op** | **49,690 MB/s** | `0 B/op`, `0 allocs/op` |
-| `StandardLink` Pipeline (`64 B`) | **52.8 ns/op** | **1,212 MB/s** | `0 B/op`, `0 allocs/op` |
-| `StandardLink` Pipeline (`4 KiB`) | **125.5 ns/op** | **32,637 MB/s** | `0 B/op`, `0 allocs/op` |
-| `AdvancedLink` Send/Recv + `Release` (`64 B`, one chunk) | **145.5 ns/op** | **440 MB/s** | `0 B/op`, `0 allocs/op` |
-| `AdvancedLink` Send/Recv + `Release` (`4 KiB` over `256 B` chunks) | **1.40 µs/op** | **2,928 MB/s** | `0 B/op`, `0 allocs/op` |
-| `AdvancedLink` Call + `Release` via `Serve` (`1 KiB` req + `1 KiB` resp, `256 B` chunks) | **1.29 µs/op** | **1,594 MB/s** | `0 B/op`, `0 allocs/op` |
+| `StandardLink` Read/Write (`8 B`) | **29.0 ns/op** | **276 MB/s** | `0 B/op`, `0 allocs/op` |
+| `StandardLink` Zero-Copy (`4 KiB`) | **41.1 ns/op** | **99,650 MB/s** | `0 B/op`, `0 allocs/op` |
+| `StandardLink` Reserve/Commit (`4 KiB`) | **68.4 ns/op** | **59,900 MB/s** | `0 B/op`, `0 allocs/op` |
+| `StandardLink` Pipeline (`64 B`) | **38.5 ns/op** | **1,662 MB/s** | `0 B/op`, `0 allocs/op` |
+| `StandardLink` Pipeline (`4 KiB`) | **121.8 ns/op** | **33,630 MB/s** | `0 B/op`, `0 allocs/op` |
+| `AdvancedLink` Send/Recv + `Release` (`64 B`, one chunk) | **151.8 ns/op** | **422 MB/s** | `0 B/op`, `0 allocs/op` |
+| `AdvancedLink` Send/Recv + `Release` (`4 KiB` over `256 B` chunks) | **1.46 µs/op** | **2,807 MB/s** | `0 B/op`, `0 allocs/op` |
+| `AdvancedLink` Call + `Release` via `Serve` (`64 B` req + `64 B` resp) | **555 ns/op** | **230 MB/s** | `0 B/op`, `0 allocs/op` |
+| `AdvancedLink` Call + `Release` via `Serve` (`1 KiB` req + `1 KiB` resp, `256 B` chunks) | **1.25 µs/op** | **1,642 MB/s** | `0 B/op`, `0 allocs/op` |
 
 ---
 
@@ -905,6 +919,10 @@ go test . -run '^$' -fuzz='^FuzzOpenOverCorruptSuperblock$' -fuzztime=10s
 go test -race -count=1 ./sqlite/... ./secureexec/...
 HQQ_SQLITE_SERVER=/path/to/hqq-sqlite-server go test -count=1 ./sqlite/e2e/...
 
+# hqq-bindgen: parser, emitters, runtime, end-to-end suite against the real C server
+go test -race -count=1 ./bindgen/... ./cmd/hqq-bindgen
+go test -tags zstdcgo ./bindgen/examples/zstd/...   # after: eval "$(bindgen/examples/zstd/build.sh)"
+
 # TLA+ model checking of the MPMC ring (requires a Java runtime)
 sh scripts/tlc.sh
 JAVA=/path/to/bin/java sh scripts/tlc.sh   # if `java` on PATH is not a working runtime
@@ -915,3 +933,4 @@ JAVA=/path/to/bin/java sh scripts/tlc.sh   # if `java` on PATH is not a working 
 - **TLC**: `scripts/tlc.sh` downloads `tla2tools.jar` if needed and checks `internal/mpmc/MPMC.tla` with `MPMC.cfg` (`BufferSize = 2`). It picks the Java runtime from `$JAVA`, then `$JAVA_HOME/bin/java`, then `java` on `PATH`; CI uses Temurin 21. The model covers the claim and completion protocol of the ring; it does not model parking, waiter counts or aggregation, `Format`, crashes, or stale copies of reservation handles.
 - **CI-only checks**: GenMC and herd7 (`c/verify`, `memory-model` job of `c.yml`), stress litmus tests (Linux arm64), and the Windows jobs run in CI only. See [Other languages and interoperability](#other-languages-and-interoperability).
 - **`HQQ_SQLITE_SERVER`** names a built `hqq-sqlite-server`. The end-to-end tests in `sqlite/e2e` and `sqlite/launcher` (the contract suite, the driver over a real server, the launcher, and the parent lifeline) skip without it. The other `sqlite` tests run against the Go fake server.
+- **`HQQ_BINDGEN_MICROLIB_SERVER`**, **`HQQ_SQLITE3GEN_SERVER`**, **`HQQ_ZSTD_SERVER`** name prebuilt servers of the `hqq-bindgen` end-to-end suites. Without them the microlib and sqlite3 suites build their server with CMake and Ninja on first use (and skip with a reason when those are missing); the zstd suite skips its server tests and needs `bindgen/examples/zstd/build.sh` to fetch and build the pinned zstd source. `HQQ_BINDGEN_MICROLIB_SANITIZE=address+undefined` runs the microlib suite against a sanitized server.

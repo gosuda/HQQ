@@ -132,6 +132,12 @@ received are discarded, so keepalives are allowed. Terminals are not watched unl
 
 Verified on POSIX by `test_lifeline`. The Windows backend is compiled and run only in CI.
 
+## RPC runtime for generated servers (`include/hqq/hqq_rpc.h`)
+
+`hqq_rpc.h` is the runtime of the C servers that `hqq-bindgen` generates (design: `spec/toolchain/BINDGEN.md`, overview: `bindgen/README.md`). It serves one session per Standard link: it validates every frame, decodes arguments in place from the request slot, keeps the handle table of the session (generations, creation order, children destroyed first on teardown), runs interceptors and the library call under the execution lock of the server, and encodes the response in place into the response slot. `hqqrpc_main` is the process entry of a generated server (command line, `ready <listener>` line, `--parent-stdin`, SIGTERM and SIGINT). Every ring wait uses a cancel token and a bound, so a stalled client cannot hold a session thread. The runtime uses `hqq_plat_mutex_*` and `hqq_plat_thread_detach` from `hqq_platform.h`; on Windows `hqqrpc_main` returns `HQQ_ERR_UNSUPPORTED`.
+
+Sources: `src/hqq_rpc.c` (readers, writers, scratch, handle table, execution lock), `src/hqq_rpc_session.c` (frame receive and validation, assembly, response reservation, teardown, the link-less test entry `hqqrpc_test_exchange`), `src/hqq_rpc_server.c` (bootstrap, session threads, shutdown, `hqqrpc_main`), `src/hqq_rpc_internal.h`. They are in the `HQQ_SOURCES` block, so the Rust build compiles them (portable C11, feature-test macros first).
+
 ## Platforms
 
 | Platform | Named segment | Parking |
@@ -175,6 +181,14 @@ and 32-bit MIPS/ARMv5-6 targets are rejected at compile time.
 | `lifeline` (POSIX) | parent lifeline: EOF fires once and the child exits, keepalives are drained, a pseudo-terminal is not watched unless forced, stop does not fire, a bad descriptor fires ERROR, start/stop safety, forced exit after the grace period and a stop in time, and SIGKILL of the supervisor (the service exits within about 1 s) |
 | `stress` | bounded threads on one link, rings of 2 and 256 slots, both directions, exactly-once and checksums |
 | `cxx17`, `smoke` | the public header compiles as C++17 and links; version and atomics self-test |
+| `platform_mutex` | the platform mutex: mutual exclusion under contention, destroy rules |
+| `rpc` | every vector of the design document byte for byte through a copy of the generated microlib glue, HELLO rules, every frame-rule violation, request ids and wrap, the reader and writer functions at their boundaries |
+| `rpc_calls` | in-place and scratch bodies at the frame boundary, response chunking, exactly one frame and no tombstone on every failure after the response was reserved, status filter, handle rollback |
+| `rpc_handles` | handle ids, generation wrap, limits, failed destroy, `@retain_on_fail`, cascade, teardown order, a randomized model comparison |
+| `rpc_fuzz`, `fuzz_rpc_frame_smoke`, `fuzz_rpc_writer_smoke` | deterministic mutation of the frame receiver and the body decoder: well-formed output, nothing rejected before the call reaches the library, every handle destroyed |
+| `rpc_live` (POSIX) | a real session over shared memory: bootstrap, pipelining, oversize bodies, violations, peer death by SIGKILL, write stall, idle timeout, control-link and geometry limits, shutdown with a stuck call |
+| `rpc_main` (POSIX) | `hqqrpc_main`: usage, exit codes, ready line, signals, `--parent-stdin` |
+| `adv_close_queued` | closing an Advanced link that holds queued, unserved requests releases each request once (regression test of a double release in `hqq_adv_close`) |
 
 ## Interoperability with the Go implementation
 
