@@ -10,8 +10,10 @@ The normative description is [`spec/SPEC.md`](../spec/SPEC.md) with
 [`spec/MEMORY_MODEL.md`](../spec/MEMORY_MODEL.md) (memory orders),
 [`spec/PORTING.md`](../spec/PORTING.md) and [`spec/FINDINGS.md`](../spec/FINDINGS.md).
 
-Scope: the Standard layer only. The Advanced layer (streams, request/response,
-negotiation) is not part of this library.
+Scope: the Standard layer (links, rings, superblock engine) and the Advanced layer
+(negotiation, streams, pooled messages, call/serve with cancel and deadlines,
+shutdown) plus the multi-client acceptor (`hqq_connect`, `hqq_acceptor_*`); see
+`include/hqq/hqq_advanced.h`.
 
 ## Build and test
 
@@ -172,7 +174,6 @@ Go API (`CreateStandardLink`, `OpenStandardLink`, `Read`, `Write`, `Close`):
 
 ## Known limits
 
-* Only the Standard layer. No Advanced (streams, negotiation, request/response) API.
 * The Windows layer is compiled in CI only (no local Windows toolchain); it was reviewed
   by reading, not executed.
 * ThreadSanitizer runs in CI; locally only ASan+UBSan were run.

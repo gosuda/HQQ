@@ -10,7 +10,7 @@ as one session with its own SQLite connection. No cgo is needed on the client.
 | `wire/` | Go encodings of the protocol, shared by the driver and the fake server. |
 | `driver/` | The `database/sql` driver, package `hqqsqlite`, registered as `hqq-sqlite`. |
 | `fakeserver/` | A Go stand-in for the C server: HQQ acceptor, sessions, and an in-memory engine with a small SQL subset. Used by the tests. |
-| `server/` | The C server (libhqq and the SQLite amalgamation). Not written yet; see `server/README.md`. |
+| `server/` | The C server (libhqq and SQLite: the system library by default, or an amalgamation via `HQQ_SQLITE_AMALGAMATION_DIR`); see `server/README.md`. |
 
 ## Using the driver
 
@@ -130,8 +130,6 @@ Two functions exist for tests: `hqq_sleep(ms)` (interruptible) and
 
 ## Open issues
 
-- The C server is not written. Its C Advanced layer is still a draft in
-  `c/include/hqq/`.
 - `Exec` accepts one statement. Migration scripts must be split by the caller.
 - `rows_affected` is SQLite's changes count for the last DML statement, so
   after a SELECT it still holds the previous value. This is SQLite's behavior.

@@ -27,7 +27,8 @@ type Config struct {
 	// Default: 0600.
 	Perm os.FileMode
 
-	// Features to negotiate. Default: FeatureMessages|FeatureRequestResponse.
+	// Features to negotiate. Default: every feature this version supports
+	// (FeatureMessages, FeatureRequestResponse, FeatureCancel, FeatureMetadata).
 	Features uint64
 
 	// Advanced configures the link.

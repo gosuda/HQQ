@@ -2,8 +2,8 @@
 
 This document is the contract between the Go client (`examples/sqlite/driver`,
 driver name `hqq-sqlite`), the Go fake server (`examples/sqlite/fakeserver`),
-and the C server (`examples/sqlite/server`, built on libhqq and the SQLite
-amalgamation). The Go encoder and decoder in `examples/sqlite/wire` implement
+and the C server (`examples/sqlite/server`, built on libhqq and SQLite, system
+library or amalgamation). The Go encoder and decoder in `examples/sqlite/wire` implement
 exactly the byte layouts below. A C implementer needs nothing else.
 
 Key words MUST, MUST NOT, SHOULD, and MAY are used as in RFC 2119.

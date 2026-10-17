@@ -40,7 +40,7 @@ Recommendation: `Release(1)` per wake per side suffices because the specified to
 6. `PROTOCOL.md`'s claim-loop text says a stalled initializer is "given its whole window even if that runs past `AttachTimeout`"; the precise rule (`limit = max(deadline, watch.since + initStale)` only if the watch began before `deadline`, `superblock.go:530-538`) is in SPEC 5.1.
 7. The Go code comments in `mpmc.go` state the waiter count "counts registered waiters ... with waiter aggregation at most one per process"; the protocol-level definition is "parked processes". SPEC 8.1 defines it as processes and allows a port to over-count.
 
-**Status:** item 1 fixed (the `OpProtoNegotiate`/`OpProtoAck` operand 2 comments now say reserved, sent as zero, ignored). Items 2–6 are documentation outside the Go sources (`PROTOCOL.md`, README), not changed here. Item 7: the `mpmc.go` comments already describe processes; no change beyond the wake-path comments.
+**Status:** item 1 fixed (the `OpProtoNegotiate`/`OpProtoAck` operand 2 comments now say reserved, sent as zero, ignored). Items 2–6 were documentation statements in `PROTOCOL.md`/README; `PROTOCOL.md` was rewritten as a non-normative overview that defers to `spec/SPEC.md` for these rules, so they no longer contradict the code. Item 7: the `mpmc.go` comments already describe processes; no change beyond the wake-path comments.
 
 ### F-04 (b) — A heartbeat timestamp in the future makes a dead endpoint look alive
 
