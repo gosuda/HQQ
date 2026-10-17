@@ -1,6 +1,6 @@
 //go:build windows
 
-package launcher
+package launch
 
 import (
 	"fmt"
@@ -32,7 +32,7 @@ func setProcessGroup(cmd *exec.Cmd) {
 func gracefulSignal(p *os.Process) error {
 	r, _, err := procGenerateConsoleCtrlEvent.Call(ctrlBreakEvent, uintptr(p.Pid))
 	if r == 0 {
-		return fmt.Errorf("launcher: CTRL_BREAK to process group %d: %w", p.Pid, err)
+		return fmt.Errorf("launch: CTRL_BREAK to process group %d: %w", p.Pid, err)
 	}
 	return nil
 }

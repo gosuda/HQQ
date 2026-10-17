@@ -5,6 +5,15 @@
 verifies the binary before it runs, ties the server's life to the process that
 started it, and returns a `database/sql` handle for its listener.
 
+The process mechanics (verification, the ready line, the lifeline, stop) are in
+[`gosuda.org/hqq/launch`](../../launch/README.md), which starts any HQQ server.
+This package adds what is specific to `hqq-sqlite-server`: its command line
+(listener, allow directory, aliases, `--max-sessions`, `--perm`), the embedded
+release key, and the `database/sql` handle. `Server`, `StartError` and
+`ReadyTimeoutError` are the types of `launch`, and `ErrConfig`, `ErrManifest`,
+`ErrNoArtifact`, `ErrReadyTimeout` and `ErrStopTimeout` are its values, so
+`errors.Is` matches either spelling.
+
 ```go
 m, err := launcher.OpenManaged(ctx, cfg,
     launcher.WithDatabase("main"),
@@ -154,6 +163,8 @@ compromised expected digest are out of scope.
 
 ## Lifecycle
 
+What follows is the behavior of `launch.Start` for this server.
+
 - `Start` returns when the server prints `ready <listener>` on stdout. The ready
   line is consumed. Everything else on stdout and stderr goes to `Config.Stdout`
   and `Config.Stderr`, which are optional; their errors are ignored. The last 2
@@ -197,10 +208,12 @@ compromised expected digest are out of scope.
 ## Tests
 
 - `go test ./sqlite/launcher/...` runs the unit tests against a stub server (the
-  test binary, re-executed): hash ok and mismatch, manifest accepted, bad
-  signature, tampered manifest, missing platform, placeholder key, ready
-  timeout, exit before ready, graceful and forced stop, crash status, output
-  capture, arguments, `DisableLifeline`, `Open` and `OpenManaged`.
+  test binary, re-executed): the SQLite command line, the generated listener,
+  invalid settings, the mapping of `Config` onto `launch.Config` (hash,
+  manifest, timeouts, output writers, `DisableLifeline`), the embedded
+  placeholder key, the shared error values, `Open` and `OpenManaged`. The
+  process mechanics (ready line, stop, lifeline, output tail) are tested in
+  `launch`.
 - The real server: set `HQQ_SQLITE_SERVER` to the built binary. The contract
   suite runs through the launcher, plus start/query/stop, the wrong-hash
   refusal, and the parent-kill check (a helper process holds the server and is

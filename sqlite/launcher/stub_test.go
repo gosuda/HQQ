@@ -1,110 +1,34 @@
 package launcher_test
 
-// The unit tests start this test binary as a stand-in server. LAUNCHER_STUB
-// selects the behaviour; TestMain runs it instead of the tests. The e2e tests
-// use LAUNCHER_E2E_PARENT for a helper process that starts a real server and
-// holds it until it is killed.
+// The unit tests start this test binary as a stand-in server
+// (internal/launchtest). The e2e tests use LAUNCHER_E2E_PARENT for a helper
+// process that starts a real server and holds it until it is killed.
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"io"
 	"os"
-	"os/signal"
-	"slices"
 	"syscall"
 	"testing"
 	"time"
 
+	"gosuda.org/hqq/internal/launchtest"
 	"gosuda.org/hqq/secureexec"
 	"gosuda.org/hqq/sqlite/launcher"
 )
 
 const (
-	envStub      = "LAUNCHER_STUB"       // stub mode, see runStub
-	envMark      = "LAUNCHER_MARK"       // the stub creates this file when it starts
-	envArgs      = "LAUNCHER_ARGS"       // the stub writes its arguments (JSON) here
 	envE2EParent = "LAUNCHER_E2E_PARENT" // helper: start the real server and hold it
 	envE2EBinary = "LAUNCHER_E2E_BINARY"
 	envE2EDir    = "LAUNCHER_E2E_DIR"
 )
 
 func TestMain(m *testing.M) {
-	if mode := os.Getenv(envStub); mode != "" {
-		runStub(mode)
-	}
+	launchtest.Serve()
 	if os.Getenv(envE2EParent) != "" {
 		runE2EParent()
 	}
 	os.Exit(m.Run())
-}
-
-// runStub behaves like hqq-sqlite-server for the launcher's needs. The listener
-// name is the first argument, as in the real server.
-func runStub(mode string) {
-	if p := os.Getenv(envMark); p != "" {
-		_ = os.WriteFile(p, []byte("started"), 0o600)
-	}
-	if p := os.Getenv(envArgs); p != "" {
-		b, _ := json.Marshal(os.Args[1:])
-		_ = os.WriteFile(p, b, 0o600)
-	}
-	listener := ""
-	if len(os.Args) > 1 {
-		listener = os.Args[1]
-	}
-	lifeline := slices.Contains(os.Args, "--parent-stdin")
-	ready := func() { fmt.Printf("ready %s\n", listener) }
-
-	switch mode {
-	case "ok":
-		wait := armStop(lifeline)
-		ready()
-		wait()
-	case "noisy":
-		// Output before the ready line is forwarded; the ready line itself is
-		// split across two writes, which the scanner must still recognise.
-		wait := armStop(lifeline)
-		fmt.Print("chatter\n")
-		fmt.Fprint(os.Stderr, "warn\n")
-		fmt.Print("rea")
-		time.Sleep(50 * time.Millisecond)
-		fmt.Printf("dy %s\n", listener)
-		fmt.Print("after\n")
-		wait()
-	case "ignore-eof":
-		// Never shuts down on its own: Stop must kill it.
-		signal.Ignore(syscall.SIGTERM)
-		ready()
-		time.Sleep(time.Hour)
-	case "no-ready":
-		fmt.Fprintln(os.Stderr, "booting")
-		time.Sleep(time.Hour)
-	case "exit-early":
-		fmt.Fprintln(os.Stderr, "boom")
-		syscall.Exit(3)
-	case "crash-after-ready":
-		ready()
-		time.Sleep(100 * time.Millisecond)
-		syscall.Exit(5)
-	default:
-		fmt.Fprintln(os.Stderr, "unknown stub mode", mode)
-		syscall.Exit(2)
-	}
-	syscall.Exit(0)
-}
-
-// armStop installs the SIGTERM handler (unless the lifeline is the stop
-// signal) and returns the wait function. It must run before the ready line is
-// printed: the launcher may send SIGTERM as soon as it sees that line.
-func armStop(lifeline bool) func() {
-	if lifeline {
-		return func() { _, _ = io.Copy(io.Discard, os.Stdin) }
-	}
-	ch := make(chan os.Signal, 1)
-	signal.Notify(ch, syscall.SIGTERM, os.Interrupt)
-	return func() { <-ch }
 }
 
 // runE2EParent starts the real server with a lifeline, prints its pid and

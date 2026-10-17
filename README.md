@@ -344,6 +344,10 @@ err = m.DB.QueryRowContext(ctx, "SELECT 1").Scan(&one)
 - `Open` returns the `*sql.DB` and the `*Server` separately: close the DB first, then the server. `OpenManaged` returns both in one `Managed` value.
 - The launcher does not restart the server; the caller does. The details are in [`sqlite/launcher/README.md`](sqlite/launcher/README.md).
 
+### Starting any HQQ server from Go (`launch`)
+
+`launch` is the service-agnostic part of `sqlite/launcher`. `launch.Start(ctx, cfg, args...)` verifies the server binary (`Config.SHA256`, or a signed manifest in `Config.Manifest`), starts it with a parent lifeline (`--parent-stdin` by default), waits for the `ready <listener>` line, and returns a `*launch.Server` that stops gracefully and is killed after `StopTimeout`. It does not restart or supervise. See [`launch/README.md`](launch/README.md).
+
 ### Verified executables
 
 `secureexec` verifies the SHA-256 digest of a native executable and starts it without a time-of-check/time-of-use (TOCTOU) gap, so the bytes that are hashed are the bytes that run. It uses only the standard library.

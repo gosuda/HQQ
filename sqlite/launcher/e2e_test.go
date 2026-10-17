@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"gosuda.org/hqq"
+	"gosuda.org/hqq/internal/launchtest"
 	"gosuda.org/hqq/secureexec"
 	"gosuda.org/hqq/sqlite"
 	"gosuda.org/hqq/sqlite/internal/contract"
@@ -232,7 +233,7 @@ func TestParentKilledServerExits(t *testing.T) {
 	if _, err := fmt.Sscanf(strings.TrimSpace(line), "pid %d listener %s", &pid, &listener); err != nil {
 		t.Fatalf("helper line %q: %v", line, err)
 	}
-	if err := probeProcess(pid); err != nil {
+	if err := launchtest.ProbeProcess(pid); err != nil {
 		t.Fatalf("server %d not running: %v", pid, err)
 	}
 
@@ -255,7 +256,7 @@ func TestParentKilledServerExits(t *testing.T) {
 	_ = helper.Wait()
 
 	deadline := time.Now().Add(10 * time.Second)
-	for probeProcess(pid) == nil {
+	for launchtest.ProbeProcess(pid) == nil {
 		if time.Now().After(deadline) {
 			t.Fatalf("server %d still running 10s after its parent was killed", pid)
 		}

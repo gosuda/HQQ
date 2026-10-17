@@ -1,6 +1,6 @@
 //go:build unix
 
-package launcher
+package launch
 
 import (
 	"os"

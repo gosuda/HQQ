@@ -2,32 +2,24 @@ package launcher
 
 import (
 	"crypto/ed25519"
-	"crypto/rand"
-	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
-	"runtime"
-	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
+	"gosuda.org/hqq/launch"
 	"gosuda.org/hqq/secureexec"
-	"gosuda.org/hqq/secureexec/manifest"
 )
 
-const (
-	defaultReadyTimeout = 10 * time.Second
-	defaultStopTimeout  = 10 * time.Second
-	// maxListenerName bounds the listener name: macOS shared memory names are
-	// limited to 31 bytes.
-	maxListenerName = 31
-	// maxSessionsLimit is the server's upper bound for --max-sessions.
-	maxSessionsLimit = 65536
-)
+// maxSessionsLimit is the server's upper bound for --max-sessions.
+const maxSessionsLimit = 65536
+
+// listenerPrefix starts the generated listener names.
+const listenerPrefix = "hqqsql"
 
 // Config describes the server to start. The zero value is not valid: a binary
 // and its expected digest, or a manifest, are required.
@@ -93,75 +85,9 @@ type ManifestSource struct {
 	Dir string
 }
 
-// resolve returns the path of the binary and the digest it must have.
-func (c Config) resolve() (string, secureexec.Hash, error) {
-	var zero secureexec.Hash
-	if c.Manifest == nil {
-		if c.Binary == "" {
-			return "", zero, fmt.Errorf("%w: Binary or Manifest is required", ErrConfig)
-		}
-		if c.SHA256 == zero {
-			return "", zero, fmt.Errorf("%w: SHA256 or Manifest is required: refusing to start an unverified binary", ErrConfig)
-		}
-		return c.Binary, c.SHA256, nil
-	}
-	if c.Binary != "" || c.SHA256 != zero {
-		return "", zero, fmt.Errorf("%w: Manifest is exclusive with Binary and SHA256", ErrConfig)
-	}
-	if c.Manifest.Dir == "" {
-		return "", zero, fmt.Errorf("%w: Manifest.Dir is required", ErrConfig)
-	}
-	pub := c.Manifest.PublicKey
-	if pub == nil {
-		var err error
-		if pub, err = ReleasePublicKey(); err != nil {
-			return "", zero, err
-		}
-	}
-	if len(pub) != ed25519.PublicKeySize {
-		return "", zero, fmt.Errorf("%w: Manifest.PublicKey has %d bytes, want %d", ErrConfig, len(pub), ed25519.PublicKeySize)
-	}
-	m, err := manifest.Verify(c.Manifest.Data, c.Manifest.Signature, pub)
-	if err != nil {
-		return "", zero, fmt.Errorf("%w: %w", ErrManifest, err)
-	}
-	f, ok := m.Find(runtime.GOOS, runtime.GOARCH)
-	if !ok {
-		return "", zero, fmt.Errorf("%w: %s/%s", ErrNoArtifact, runtime.GOOS, runtime.GOARCH)
-	}
-	return filepath.Join(c.Manifest.Dir, f.Name), f.SHA256, nil
-}
-
-// listenerName returns the configured listener name or a generated one.
-func (c Config) listenerName() (string, error) {
-	if c.Listener == "" {
-		var b [6]byte
-		if _, err := rand.Read(b[:]); err != nil {
-			return "", fmt.Errorf("launcher: listener name: %w", err)
-		}
-		return "hqqsql-" + hex.EncodeToString(b[:]), nil
-	}
-	n := c.Listener
-	if len(n) > maxListenerName {
-		return "", fmt.Errorf("%w: listener %q is longer than %d bytes", ErrConfig, n, maxListenerName)
-	}
-	if strings.HasPrefix(n, "-") {
-		return "", fmt.Errorf("%w: listener %q must not start with '-'", ErrConfig, n)
-	}
-	for _, r := range n {
-		ok := r == '-' || r == '_' || r == '.' || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9')
-		if !ok {
-			return "", fmt.Errorf("%w: listener %q may only contain letters, digits, '-', '_' and '.'", ErrConfig, n)
-		}
-	}
-	return n, nil
-}
-
-// validate checks the values that do not depend on the binary.
+// validate checks the SQLite-specific values. The generic ones (timeouts,
+// listener name, binary and digest) are checked by launch.Start.
 func (c Config) validate() error {
-	if c.ReadyTimeout < 0 || c.StopTimeout < 0 {
-		return fmt.Errorf("%w: timeouts must not be negative", ErrConfig)
-	}
 	if c.MaxSessions < 0 || c.MaxSessions > maxSessionsLimit {
 		return fmt.Errorf("%w: MaxSessions %d: want 0 or 1..%d", ErrConfig, c.MaxSessions, maxSessionsLimit)
 	}
@@ -179,7 +105,8 @@ func (c Config) validate() error {
 	return nil
 }
 
-// args returns the server's command line for listener.
+// args returns the server's command line up to the lifeline flag: the listener
+// and the database policy.
 func (c Config) args(listener string) ([]string, error) {
 	out := []string{listener}
 	if c.AllowDir != "" {
@@ -203,20 +130,50 @@ func (c Config) args(listener string) ([]string, error) {
 	if c.Perm != 0 {
 		out = append(out, "--perm", strconv.FormatUint(uint64(c.Perm), 8))
 	}
-	if !c.DisableLifeline {
-		out = append(out, "--parent-stdin")
-	}
-	return slices.Concat(out, c.ExtraArgs), nil
+	return out, nil
 }
 
-// timeouts returns the ready and stop timeouts with defaults applied.
-func (c Config) timeouts() (ready, stop time.Duration) {
-	ready, stop = c.ReadyTimeout, c.StopTimeout
-	if ready == 0 {
-		ready = defaultReadyTimeout
+// launchConfig maps c to the generic launcher's configuration. ExtraArgs are
+// not part of it: Start passes them as launch.Start's trailing arguments, which
+// follow the lifeline flag.
+func (c Config) launchConfig() (launch.Config, error) {
+	listener := c.Listener
+	if listener == "" {
+		var err error
+		if listener, err = launch.NewListenerName(listenerPrefix); err != nil {
+			return launch.Config{}, err
+		}
 	}
-	if stop == 0 {
-		stop = defaultStopTimeout
+	args, err := c.args(listener)
+	if err != nil {
+		return launch.Config{}, err
 	}
-	return ready, stop
+	lc := launch.Config{
+		Binary:          c.Binary,
+		SHA256:          c.SHA256,
+		Listener:        listener,
+		Args:            args,
+		Env:             c.Env,
+		Stdout:          c.Stdout,
+		Stderr:          c.Stderr,
+		ReadyTimeout:    c.ReadyTimeout,
+		StopTimeout:     c.StopTimeout,
+		VerifyOptions:   c.VerifyOptions,
+		DisableLifeline: c.DisableLifeline,
+	}
+	if c.Manifest != nil {
+		pub := c.Manifest.PublicKey
+		if pub == nil {
+			if pub, err = ReleasePublicKey(); err != nil {
+				return launch.Config{}, err
+			}
+		}
+		lc.Manifest = &launch.ManifestSource{
+			Data:      c.Manifest.Data,
+			Signature: c.Manifest.Signature,
+			PublicKey: pub,
+			Dir:       c.Manifest.Dir,
+		}
+	}
+	return lc, nil
 }

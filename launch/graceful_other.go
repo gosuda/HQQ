@@ -1,6 +1,6 @@
 //go:build !unix && !windows
 
-package launcher
+package launch
 
 import (
 	"errors"
@@ -8,7 +8,7 @@ import (
 	"os/exec"
 )
 
-var errNoGracefulSignal = errors.New("launcher: no graceful signal on this platform")
+var errNoGracefulSignal = errors.New("launch: no graceful signal on this platform")
 
 // gracefulSignal has no equivalent on this platform. Stop then kills the
 // server when there is no parent lifeline.

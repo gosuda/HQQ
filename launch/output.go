@@ -1,4 +1,4 @@
-package launcher
+package launch
 
 import (
 	"bytes"
@@ -31,7 +31,7 @@ type output struct {
 
 func newOutput(listener string, stdout, stderr io.Writer) *output {
 	return &output{
-		want:   []byte("ready " + listener + "\n"),
+		want:   []byte(ReadyPrefix + listener + "\n"),
 		ready:  make(chan struct{}),
 		stdout: stdout,
 		stderr: stderr,

@@ -1,15 +1,15 @@
 //go:build !windows
 
-package launcher_test
+package launchtest
 
 import (
 	"os"
 	"syscall"
 )
 
-// probeProcess returns nil while process pid runs. Signal 0 checks for the
+// ProbeProcess returns nil while process pid runs. Signal 0 checks for the
 // process without delivering anything.
-func probeProcess(pid int) error {
+func ProbeProcess(pid int) error {
 	p, err := os.FindProcess(pid)
 	if err != nil {
 		return err

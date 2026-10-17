@@ -1,6 +1,6 @@
 //go:build windows
 
-package launcher_test
+package launchtest
 
 import (
 	"fmt"
@@ -12,10 +12,10 @@ const (
 	stillActive                    = 259    // STILL_ACTIVE: the exit code of a process that has not exited
 )
 
-// probeProcess returns nil while process pid runs. os.Process.Signal is not
+// ProbeProcess returns nil while process pid runs. os.Process.Signal is not
 // implemented on Windows, so the probe reads the exit code of the process handle.
 // A process whose handle cannot be opened has been reaped and is not running.
-func probeProcess(pid int) error {
+func ProbeProcess(pid int) error {
 	h, err := syscall.OpenProcess(processQueryLimitedInformation, false, uint32(pid))
 	if err != nil {
 		return fmt.Errorf("process %d: %w", pid, err)
