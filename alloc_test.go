@@ -257,17 +257,20 @@ func TestStreamCallServeProtocol11ZeroAlloc(t *testing.T) {
 				}
 				request := patternedBytes(tc.size, 4)
 				var failure error
-				allocs := measureAllocs(t, func() {
-					m, err := stream.CallWith(callCtx, 7, request, v.opts)
-					if err != nil {
-						failure = err
-						return
-					}
-					if !bytes.Equal(m.Bytes(), response) {
-						failure = ErrProtocol
-					}
-					m.Release()
-				})
+				measure := func() float64 {
+					return measureAllocs(t, func() {
+						m, err := stream.CallWith(callCtx, 7, request, v.opts)
+						if err != nil {
+							failure = err
+							return
+						}
+						if !bytes.Equal(m.Bytes(), response) {
+							failure = ErrProtocol
+						}
+						m.Release()
+					})
+				}
+				allocs := measure()
 				if failure != nil {
 					t.Fatal(failure)
 				}
@@ -275,12 +278,20 @@ func TestStreamCallServeProtocol11ZeroAlloc(t *testing.T) {
 				// synchronous ring wait that has to park arms a context
 				// wake-up, which allocates (as in protocol 1.0, for every
 				// cancelable context). How often the wait parks depends on
-				// scheduling (on a loaded Linux runner up to ~0.4 per call was
-				// seen), so this case tolerates a fraction of calls parking; a
-				// per-call allocation would be 1.0 or more.
+				// scheduling, so this case takes the best of a few attempts: a
+				// per-call allocation shows in every attempt (1.0 or more),
+				// parking noise does not.
+				if v.deadline && !tc.dispatcher {
+					for range 4 {
+						allocs = min(allocs, measure())
+					}
+					if failure != nil {
+						t.Fatal(failure)
+					}
+				}
 				limit := 0.0
 				if v.deadline && !tc.dispatcher {
-					limit = 0.6
+					limit = 0.25
 				}
 				if allocs > limit {
 					t.Fatalf("CallWith+Release with Serve allocates %v per operation (both endpoints), want at most %v", allocs, limit)
