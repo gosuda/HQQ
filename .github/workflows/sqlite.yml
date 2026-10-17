@@ -200,8 +200,10 @@ jobs:
           export HQQ_SQLITE_SERVER="$GITHUB_WORKSPACE/build/sqlite-server/hqq-sqlite-server.exe"
           go test -count=1 -timeout 10m -v ./sqlite/... 2>&1 | tee e2e.log
           # The e2e packages skip without a usable binary. Fail on any skip except the
-          # TestHelper* re-exec helpers, which always skip.
-          if grep -- '--- SKIP' e2e.log | grep -qv -- 'SKIP: TestHelper'; then
+          # TestHelper* re-exec helpers (they always skip) and the Go fake server's
+          # own contract cases (TestContractFake/TestContractDSN .../fake/...), which
+          # skip SQL the fake does not implement and never involve the binary.
+          if grep -- '--- SKIP' e2e.log | grep -v -- 'SKIP: TestHelper' | grep -qv -- '/fake/'; then
             echo "::error::an end-to-end test was skipped; the binary was not exercised"
             exit 1
           fi

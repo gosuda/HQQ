@@ -59,18 +59,20 @@ func runStub(mode string) {
 
 	switch mode {
 	case "ok":
+		wait := armStop(lifeline)
 		ready()
-		waitStop(lifeline)
+		wait()
 	case "noisy":
 		// Output before the ready line is forwarded; the ready line itself is
 		// split across two writes, which the scanner must still recognise.
+		wait := armStop(lifeline)
 		fmt.Print("chatter\n")
 		fmt.Fprint(os.Stderr, "warn\n")
 		fmt.Print("rea")
 		time.Sleep(50 * time.Millisecond)
 		fmt.Printf("dy %s\n", listener)
 		fmt.Print("after\n")
-		waitStop(lifeline)
+		wait()
 	case "ignore-eof":
 		// Never shuts down on its own: Stop must kill it.
 		signal.Ignore(syscall.SIGTERM)
@@ -93,15 +95,16 @@ func runStub(mode string) {
 	syscall.Exit(0)
 }
 
-// waitStop returns when stdin reaches end of file (lifeline) or on SIGTERM.
-func waitStop(lifeline bool) {
+// armStop installs the SIGTERM handler (unless the lifeline is the stop
+// signal) and returns the wait function. It must run before the ready line is
+// printed: the launcher may send SIGTERM as soon as it sees that line.
+func armStop(lifeline bool) func() {
 	if lifeline {
-		_, _ = io.Copy(io.Discard, os.Stdin)
-		return
+		return func() { _, _ = io.Copy(io.Discard, os.Stdin) }
 	}
 	ch := make(chan os.Signal, 1)
 	signal.Notify(ch, syscall.SIGTERM, os.Interrupt)
-	<-ch
+	return func() { <-ch }
 }
 
 // runE2EParent starts the real server with a lifeline, prints its pid and
