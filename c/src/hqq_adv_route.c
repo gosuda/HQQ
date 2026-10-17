@@ -29,10 +29,16 @@ static hqq_req_ctx *reqctx_take_locked(hqq_adv *a) {
     hqq_req_ctx *c = a->reqctx_free;
     if (c != NULL) {
         a->reqctx_free = c->pool_next;
-        memset(c, 0, sizeof *c);
-        return c;
+    } else {
+        c = (hqq_req_ctx *)hqq_alloc(a->alloc_set ? &a->alloc : NULL, sizeof *c);
+        if (c == NULL) {
+            return NULL;
+        }
     }
-    return (hqq_req_ctx *)hqq_alloc(a->alloc_set ? &a->alloc : NULL, sizeof *c);
+    /* Pooled and fresh contexts alike start zeroed: a request without a budget
+     * relies on has_deadline being 0, and malloc does not clear memory. */
+    memset(c, 0, sizeof *c);
+    return c;
 }
 
 /* Refuses a request during shutdown or for a refused body: an error response
