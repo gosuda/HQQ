@@ -80,7 +80,12 @@ selected() { # target
   return 1
 }
 
-genmc_flags=(-rc11 -disable-mm-detector -disable-estimation -disable-ipr -unroll=128)
+# -disable-sr: no symmetry reduction. The reserve negative runs two identical
+# completer threads whose unguarded publishes write the same value; with SR on,
+# GenMC reports those "unordered writes" as an error before the intended
+# assertion (exactly one completion) can fail. GenMC's own message recommends
+# this flag (observed in CI run 38988205322).
+genmc_flags=(-rc11 -disable-mm-detector -disable-estimation -disable-ipr -disable-sr -unroll=128)
 
 # target|source|define (or empty)|expected pass|fail|needles (fail only)
 cases=(
