@@ -58,11 +58,11 @@ func (r *StandardWriteReservation) Commit(n int) error {
 		}
 		return ErrBufferOverflow
 	}
-	if err := r.link.enterTx(false); err != nil {
+	if err := r.link.enterTxOwner(false); err != nil {
 		return err
 	}
-	defer r.link.exitTx()
-	*r.slot.Value() = protocol.NewStandardLinkCopyPacket(r.copyID, r.slot.Slot(), uint64(n))
+	defer r.link.exitTxOwner()
+	storeCopyPacket(r.slot.Value(), r.copyID, r.slot.Slot(), uint64(n))
 	r.done = true
 	if !r.slot.Commit() {
 		return ErrInvalidOp
@@ -85,10 +85,10 @@ func (r *StandardWriteReservation) Abort(reason ErrorCode) error {
 }
 
 func (r *StandardWriteReservation) publishTombstone(reason ErrorCode) error {
-	if err := r.link.enterTx(false); err != nil {
+	if err := r.link.enterTxOwner(false); err != nil {
 		return err
 	}
-	defer r.link.exitTx()
+	defer r.link.exitTxOwner()
 	*r.slot.Value() = protocol.NewStandardLinkTombstonePacket(r.copyID, r.slot.Slot(), uint64(reason))
 	r.done = true
 	if !r.slot.Commit() {
@@ -147,10 +147,10 @@ func (r *StandardReadReservation) Release() error {
 	if !r.slot.Owned() {
 		return ErrInvalidOp
 	}
-	if err := r.link.enterRx(); err != nil {
+	if err := r.link.enterRxOwner(); err != nil {
 		return err
 	}
-	defer r.link.exitRx()
+	defer r.link.exitRxOwner()
 	r.done = true
 	if !r.slot.Release() {
 		return ErrInvalidOp
@@ -166,13 +166,12 @@ func (r *StandardReadReservation) Release() error {
 // Close must not be called while a reservation is active: finish it with
 // Commit or Abort first. Its buffer is invalid once Close has run.
 func (l *StandardLink) ReserveWrite() (StandardWriteReservation, error) {
-	if err := l.enterTx(true); err != nil {
+	if err := l.enterTxOwner(true); err != nil {
 		return StandardWriteReservation{}, err
 	}
-	defer l.exitTx()
+	defer l.exitTxOwner()
 
-	c := mpmc.Cancel{Closed: l.closeCh, DeadlineFunc: l.writeDeadlineFn, Check: l.checkFn}
-	slot, err := l.txRing.ReserveProducerCancel(&c)
+	slot, err := l.txRing.ReserveProducerCancel(&l.txCancel)
 	if err != nil {
 		return StandardWriteReservation{}, mapWaitErr(err)
 	}
@@ -180,7 +179,7 @@ func (l *StandardLink) ReserveWrite() (StandardWriteReservation, error) {
 		link:   l,
 		slot:   slot,
 		buffer: l.txBufs[slot.Slot()],
-		copyID: l.idGenerator.Add(1),
+		copyID: l.copyID(&slot),
 	}, nil
 }
 
@@ -195,13 +194,15 @@ func (l *StandardLink) ReserveWrite() (StandardWriteReservation, error) {
 // Close must not be called while a reservation is active: Release it first.
 // Its buffer is invalid once Close has run.
 func (l *StandardLink) ReserveRead() (StandardReadReservation, error) {
-	if err := l.enterRx(); err != nil {
+	if err := l.enterRxOwner(); err != nil {
 		return StandardReadReservation{}, err
 	}
-	defer l.exitRx()
+	defer l.exitRxOwner()
 
-	if view, backing, ok := l.recv.take(); ok {
-		return StandardReadReservation{link: l, buffer: view, backing: backing, local: true}, nil
+	if l.recv.pending.Load() {
+		if view, backing, ok := l.recv.take(); ok {
+			return StandardReadReservation{link: l, buffer: view, backing: backing, local: true}, nil
+		}
 	}
 	for {
 		slot, err := l.reserveRx()
@@ -210,11 +211,11 @@ func (l *StandardLink) ReserveRead() (StandardReadReservation, error) {
 		}
 		size, err := l.classify(slot.Value())
 		if err != nil {
-			slot.Release()
+			slot.ReleaseOwned()
 			return StandardReadReservation{}, err
 		}
 		if size == 0 {
-			slot.Release()
+			slot.ReleaseOwned()
 			continue
 		}
 		return StandardReadReservation{

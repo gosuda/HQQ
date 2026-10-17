@@ -228,20 +228,31 @@ func (l *AdvancedLink) Serve(ctx context.Context, h Handler) error {
 	if l.serveStopped.Load() {
 		return nil
 	}
-	ctx = orBackground(ctx)
+	return l.newServer(ctx, h, inlineLimit).serve()
+}
+
+// newServer prepares a Serve call whose inline handlers may run for limit
+// before the receiver role moves on.
+func (l *AdvancedLink) newServer(ctx context.Context, h Handler, limit time.Duration) *server {
 	n := max(l.BufferCount(), 1)
 	s := &server{
 		l:      l,
 		h:      h,
-		ctx:    ctx,
+		ctx:    orBackground(ctx),
 		max:    n,
+		limit:  limit,
 		slots:  make(chan struct{}, n),
 		work:   make(chan *Message),
 		result: make(chan error, 1),
+		base:   time.Now(),
 	}
-	s.timer = time.AfterFunc(time.Hour, s.escalate)
+	s.timer = time.AfterFunc(time.Hour, s.watch)
 	s.timer.Stop()
+	return s
+}
 
+// serve is the body of Serve.
+func (s *server) serve() error {
 	err, final := s.run()
 	if final {
 		s.stop()
@@ -275,6 +286,7 @@ type server struct {
 	h      Handler
 	ctx    context.Context
 	max    int
+	limit  time.Duration // inlineLimit; tests use others
 	slots  chan struct{} // one token per handler in flight that the receiver does not run inline
 	work   chan *Message // unbuffered: a send succeeds only if a worker is idle
 	result chan error    // Serve's result, sent by the final receiver if it is not Serve's goroutine
@@ -283,13 +295,17 @@ type server struct {
 	// reqCtx.begin).
 	stopped atomic.Bool
 
-	// Inline execution: timer fires escalate if a handler outlives
-	// inlineLimit; state holds the epoch and phase of the current inline run
-	// (epochs tell a stale outcome from the current one); fires counts the
-	// executions of escalate.
-	timer *time.Timer
-	state atomic.Uint64
-	fires atomic.Uint64
+	// Inline execution is watched by timer, which runs watch. state holds
+	// the epoch and phase of the current inline run (epochs tell a stale
+	// outcome from the current one) and startNs when it started, as time
+	// since base on the monotonic clock. armed is true while the timer is
+	// scheduled or watch runs; resets counts timer schedulings.
+	timer   *time.Timer
+	base    time.Time
+	state   atomic.Uint64
+	startNs atomic.Int64
+	armed   atomic.Bool
+	resets  atomic.Uint64
 
 	// Touched only by the current receiver (the role is handed over by a go
 	// statement after the receiver's atomic state update, which orders them).
@@ -303,6 +319,7 @@ type server struct {
 // and the ones handed to a worker but not yet started will not run.
 func (s *server) stop() {
 	s.stopped.Store(true)
+	s.stopWatch()
 	s.l.cancelServerRequests(s)
 }
 
@@ -339,20 +356,17 @@ func (s *server) run() (error, bool) {
 		}
 		// Nothing is running (only the receiver takes slots, so the
 		// check cannot become stale): run the handler inline, watched by
-		// the escalation timer.
+		// the escalation watchdog. The start time is stored before the
+		// state, so a watchdog that reads this state reads this start
+		// time or a later one (see watch).
 		s.epoch++
 		h := s.epoch<<2 | phaseHandling
-		armed := s.fires.Load()
+		s.startNs.Store(int64(time.Since(s.base)))
 		s.state.Store(h)
-		s.timer.Reset(inlineLimit)
-		req, w := s.handle(m)
-		if !s.timer.Stop() {
-			// The timer fired: wait until its callback is done, so that
-			// it cannot act on the next handler.
-			for s.fires.Load() == armed {
-				runtime.Gosched()
-			}
+		if !s.armed.Load() {
+			s.arm()
 		}
+		req, w := s.handle(m)
 		if !s.state.CompareAndSwap(h, h&^phaseMask|phaseDone) {
 			// Escalated while the handler ran: another goroutine receives
 			// the requests now. Release the slot escalate took for this
@@ -365,24 +379,98 @@ func (s *server) run() (error, bool) {
 	}
 }
 
-// escalate is the timer callback: if the inline handler is still running, it
-// is accounted as a running handler and a new goroutine takes over receiving.
-func (s *server) escalate() {
-	if st := s.state.Load(); st&phaseMask == phaseHandling {
-		select {
-		case s.slots <- struct{}{}:
-			if s.state.CompareAndSwap(st, st&^phaseMask|phaseEscalated) {
-				s.l.stats.serveEscalations.Add(1)
-				s.wg.Add(1)
-				s.fires.Add(1) // before the new receiver exists
-				go s.receiver()
+// arm schedules the watchdog for a full inlineLimit unless it is already
+// scheduled or running. Arming is what makes the watchdog lazy: handlers
+// that return in time never touch the timer, and one armed timer covers many
+// of them (see watch).
+func (s *server) arm() {
+	if s.armed.CompareAndSwap(false, true) {
+		s.reset(s.limit)
+	}
+}
+
+func (s *server) reset(d time.Duration) {
+	s.resets.Add(1)
+	s.timer.Reset(d)
+}
+
+// watch is the timer callback. It escalates the inline handler it finds
+// running if that handler has run for at least inlineLimit, re-arms the timer
+// for the remainder if the handler is younger (the timer was armed for an
+// earlier handler), and stops without re-arming if no handler is running (the
+// next inline handler arms it). armed is true from arm until the callback
+// stops, so at most one callback runs at a time.
+//
+// Races with the receiver, which keeps running while watch decides:
+//
+//   - watch loads state, then the start time; the receiver stores the start
+//     time, then state. If watch sees the state of epoch e it sees the start
+//     time of e or of a later epoch, never an earlier one, so the age it
+//     computes is at most the age of handler e: a stale start time can delay
+//     an escalation, never cause one. Epochs only grow.
+//   - escalate swaps exactly the state it saw, so a handler that returned
+//     (or was replaced by the next one) in the meantime rejects it, and the
+//     receiver's own CAS decides who sends the response.
+//   - before giving up, watch clears armed and looks at the state again; the
+//     receiver stores the state and then loads armed. One of the two sees
+//     the other's store, so a handler is never left without a watchdog.
+func (s *server) watch() {
+	for {
+		if s.stopped.Load() {
+			s.armed.Store(false)
+			return
+		}
+		if st := s.state.Load(); st&phaseMask == phaseHandling {
+			age := time.Since(s.base) - time.Duration(s.startNs.Load())
+			if wait := s.limit - age; wait > 0 {
+				s.reset(wait)
 				return
 			}
-			<-s.slots
-		default:
+			if !s.escalate(st) && s.state.Load() == st {
+				// No free slot (cannot happen while only the receiver
+				// and this callback take slots): try again later.
+				s.reset(s.limit)
+				return
+			}
+			continue
+		}
+		s.armed.Store(false)
+		if s.stopped.Load() || s.state.Load()&phaseMask != phaseHandling || !s.armed.CompareAndSwap(false, true) {
+			return
 		}
 	}
-	s.fires.Add(1)
+}
+
+// stopWatch ends the watchdog when receiving ended (stopped is set): when it
+// returns, no callback runs and none will, so none can touch the server
+// after Serve returned. A callback in flight sees stopped and ends without
+// re-arming; a pending timer is stopped.
+func (s *server) stopWatch() {
+	for s.armed.Load() {
+		if s.timer.Stop() {
+			return
+		}
+		runtime.Gosched()
+	}
+}
+
+// escalate accounts the inline handler whose state is st as a running
+// handler and starts a new goroutine that takes over receiving. It reports
+// whether it did; it does not if st is no longer current or no slot is free.
+func (s *server) escalate(st uint64) bool {
+	select {
+	case s.slots <- struct{}{}:
+	default:
+		return false
+	}
+	if !s.state.CompareAndSwap(st, st&^phaseMask|phaseEscalated) {
+		<-s.slots
+		return false
+	}
+	s.l.stats.serveEscalations.Add(1)
+	s.wg.Add(1)
+	go s.receiver()
+	return true
 }
 
 // receiver is a receiver goroutine started by escalate. If it is the one

@@ -516,7 +516,7 @@ Constraints (mandatory):
 3. The cursor store happens **before** the publish/release store of `seq` (it is the "claim" of the CAS protocol).
 4. Exactly one process acts as producer and one as consumer per ring: a second process on the same side is never admitted by the superblock protocol, so SPSC mode is sound **only because** of 5.5.
 
-CAS-based and store-based implementations interoperate on the same ring (the Go implementation is CAS-based).
+CAS-based and store-based implementations interoperate on the same ring (the Go implementation uses CAS by default and a store-based mode when `LinkOptions.Exclusive` is set).
 
 ## 8. Wait / wake protocol
 

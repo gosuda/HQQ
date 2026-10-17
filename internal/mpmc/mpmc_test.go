@@ -123,9 +123,12 @@ func TestMPMCZeroCopySlot(t *testing.T) {
 	}
 }
 
-func TestMPMCReserveCommitRelease(t *testing.T) {
+func TestMPMCReserveCommitRelease(t *testing.T) { eachMode(t, testMPMCReserveCommitRelease) }
+
+func testMPMCReserveCommitRelease(t *testing.T, exclusive bool) {
 	const size = 8
 	buffer, r := newRingOf[uintptr](t, size)
+	r.SetExclusive(exclusive)
 	defer runtime.KeepAlive(buffer)
 
 	for i := uintptr(0); i < size; i++ {
@@ -170,7 +173,12 @@ func TestMPMCReserveCommitRelease(t *testing.T) {
 // into the slot's sequence number again. A plain store would overwrite the
 // sequence the slot reached in a later lap and wedge the ring.
 func TestMPMCStaleProducerCopyCannotCorruptRing(t *testing.T) {
+	eachMode(t, testMPMCStaleProducerCopyCannotCorruptRing)
+}
+
+func testMPMCStaleProducerCopyCannotCorruptRing(t *testing.T, exclusive bool) {
 	buffer, r := newRingOf[uintptr](t, 2)
+	r.SetExclusive(exclusive)
 	defer runtime.KeepAlive(buffer)
 
 	slot := r.ReserveProducer()
@@ -213,7 +221,12 @@ func TestMPMCStaleProducerCopyCannotCorruptRing(t *testing.T) {
 // counterpart: releasing a copy must neither free a slot a producer already
 // refilled nor report success.
 func TestMPMCStaleConsumerCopyCannotCorruptRing(t *testing.T) {
+	eachMode(t, testMPMCStaleConsumerCopyCannotCorruptRing)
+}
+
+func testMPMCStaleConsumerCopyCannotCorruptRing(t *testing.T, exclusive bool) {
 	buffer, r := newRingOf[uintptr](t, 2)
+	r.SetExclusive(exclusive)
 	defer runtime.KeepAlive(buffer)
 
 	r.Enqueue(1)
@@ -543,4 +556,11 @@ func BenchmarkMPMCReservePayloadTypes(b *testing.B) {
 			}
 		})
 	})
+}
+
+// eachMode runs fn against a CAS handle and against an exclusive handle.
+func eachMode(t *testing.T, fn func(t *testing.T, exclusive bool)) {
+	t.Helper()
+	t.Run("cas", func(t *testing.T) { fn(t, false) })
+	t.Run("exclusive", func(t *testing.T) { fn(t, true) })
 }

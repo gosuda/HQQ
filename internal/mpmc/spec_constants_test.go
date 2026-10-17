@@ -304,12 +304,23 @@ func TestSpecAttachValidation(t *testing.T) {
 	}
 }
 
+// eachMode runs fn against a CAS handle and against an exclusive handle: the
+// slot protocol and the memory image it leaves are the same in both modes.
+func eachMode(t *testing.T, fn func(t *testing.T, exclusive bool)) {
+	t.Helper()
+	t.Run("cas", func(t *testing.T) { fn(t, false) })
+	t.Run("exclusive", func(t *testing.T) { fn(t, true) })
+}
+
 // TestSpecSlotProtocol walks the slot sequence protocol: claim, publish
 // (seq = pos+1), release (seq = pos+mask+1), full and empty detection.
-func TestSpecSlotProtocol(t *testing.T) {
+func TestSpecSlotProtocol(t *testing.T) { eachMode(t, testSpecSlotProtocol) }
+
+func testSpecSlotProtocol(t *testing.T, exclusive bool) {
 	c := loadSpecRing(t)
 	const slots = 4
 	r := newSpecRing(t, slots)
+	r.ring.SetExclusive(exclusive)
 	ring := r.ring
 	pk := func(i uint64) protocol.Packet { return protocol.NewPacket(protocol.OpStandardLinkCopy, i, i+1, i+2) }
 
@@ -350,10 +361,13 @@ func TestSpecSlotProtocol(t *testing.T) {
 
 // TestSpecPositionWraparound positions are 64-bit counters modulo 2^64; the
 // full/empty tests are signed differences (int64(seq - pos)).
-func TestSpecPositionWraparound(t *testing.T) {
+func TestSpecPositionWraparound(t *testing.T) { eachMode(t, testSpecPositionWraparound) }
+
+func testSpecPositionWraparound(t *testing.T, exclusive bool) {
 	c := loadSpecRing(t)
 	const slots = 4
 	r := newSpecRing(t, slots)
+	r.ring.SetExclusive(exclusive)
 	start := ^uint64(0) - 1 // 2^64 - 2: positions 2^64-2, 2^64-1, 0, 1 cross the wrap
 	r.put64(r.field(c, "r"), start)
 	r.put64(r.field(c, "w"), start)
@@ -384,9 +398,12 @@ func TestSpecPositionWraparound(t *testing.T) {
 // TestSpecWakeFields checks which words the waiting protocol touches: a
 // producer that publishes while consumers are registered bumps notEmpty, a
 // release bumps notFull only when fullWaiters != 0.
-func TestSpecWakeFields(t *testing.T) {
+func TestSpecWakeFields(t *testing.T) { eachMode(t, testSpecWakeFields) }
+
+func testSpecWakeFields(t *testing.T, exclusive bool) {
 	c := loadSpecRing(t)
 	r := newSpecRing(t, 4)
+	r.ring.SetExclusive(exclusive)
 	ne, ew, nf, fw := r.field(c, "notEmpty"), r.field(c, "emptyWaiters"), r.field(c, "notFull"), r.field(c, "fullWaiters")
 
 	r.ring.Enqueue(protocol.NewPacket(protocol.OpStandardLinkCopy, 1))

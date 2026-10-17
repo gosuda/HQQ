@@ -314,7 +314,8 @@ func (c *reqCtx) begin(s *server, m *Message) bool {
 			c.cancel(ctxDeadline)
 			return false
 		}
-		c.deadline, c.hasDeadline = time.Now().Add(remaining), true
+		// recvAt carries the monotonic reading, so no clock read is needed.
+		c.deadline, c.hasDeadline = m.meta.recvAt.Add(time.Duration(m.meta.budget)), true
 		if c.timer == nil {
 			c.timer = time.AfterFunc(time.Hour, c.onTimer)
 			c.timer.Stop()

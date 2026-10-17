@@ -435,6 +435,9 @@ func openNamedAdvanced(ctx context.Context, name string, bufferCount, bufferSize
 // openNamedAdvancedInstance is openNamedAdvanced with the instance check of
 // openNamedInstance.
 func openNamedAdvancedInstance(ctx context.Context, name string, bufferCount, bufferSize int, create bool, mode os.FileMode, expect uint64, opts AdvancedOptions) (*NamedAdvancedLink, error) {
+	if err := checkAdvancedLinkOptions(opts.Link); err != nil {
+		return nil, err
+	}
 	link, m, err := openNamedInstance(ctx, name, bufferCount, bufferSize, create, mode, expect, func(mem []byte, a namedAttach) (*AdvancedLink, error) {
 		opts.Link = a.apply(opts.Link)
 		return NewAdvancedLink(mem, bufferCount, bufferSize, opts)

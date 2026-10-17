@@ -2,6 +2,7 @@ package hqq
 
 import (
 	"context"
+	"encoding/binary"
 	"io"
 	"sync"
 	"sync/atomic"
@@ -26,7 +27,8 @@ type cacheLinePad struct{ _ [128]byte }
 // the queued tails, each in a call of its own, before they consume newer
 // messages. With concurrent readers, messages and tails may be received in
 // any order, but never mixed within one call. Deadlines may be changed while
-// calls are blocked.
+// calls are blocked. With LinkOptions.Exclusive the link is instead limited
+// to one writing and one reading goroutine at a time, see there.
 //
 // Lifetime: Close wakes every blocked call (they return ErrClosed), waits for
 // in-flight calls (including running zero-copy callbacks), stops the
@@ -54,8 +56,7 @@ type StandardLink struct {
 	txBufs, rxBufs     [][]byte
 
 	// State management
-	idGenerator atomic.Uint64 // Generates copy IDs
-	recv        recvRemainder // FIFO of unread tails of partially read messages
+	recv recvRemainder // FIFO of unread tails of partially read messages
 
 	readDeadline  atomic.Pointer[time.Time]
 	writeDeadline atomic.Pointer[time.Time]
@@ -69,15 +70,25 @@ type StandardLink struct {
 	peer      peerMonitor
 
 	_        cacheLinePad
-	rxActive atomic.Int64 // in-flight receive-side calls
+	rxActive atomic.Int64  // in-flight shared receive-side calls
+	rxOwner  atomic.Uint32 // 1 while the owner of an exclusive link is in a receive-side call
+	rxDepth  int           // nesting of those calls, touched by the owner only
 	_        cacheLinePad
-	txActive atomic.Int64 // in-flight send-side calls
+	txActive atomic.Int64  // in-flight shared send-side calls
+	txOwner  atomic.Uint32 // 1 while the owner of an exclusive link is in a send-side call
+	txDepth  int           // nesting of those calls, touched by the owner only
 	_        cacheLinePad
 
-	// Precomputed method values (avoid per-call allocations).
+	// Precomputed method values and cancellations (avoid per-call
+	// allocations). A Cancel is only read while waiting, so concurrent
+	// calls share these; each is the Cancel of one direction.
 	checkFn         func() error
 	readDeadlineFn  func() time.Time
 	writeDeadlineFn func() time.Time
+	rxCancel        mpmc.Cancel
+	txCancel        mpmc.Cancel
+	exclusive       bool   // opts.Exclusive, copied for the hot path
+	txBase          uint64 // producer cursor of txRing when this endpoint attached
 }
 
 // NewStandardLink creates or attaches to a standard link in caller-owned
@@ -229,6 +240,8 @@ func openStandardLink(base unsafe.Pointer, bufferCount int, bufferSize int, opts
 	}
 	ring0.SetWaitPolicy(opts.WaitPolicy.ring())
 	ring1.SetWaitPolicy(opts.WaitPolicy.ring())
+	ring0.SetExclusive(opts.Exclusive)
+	ring1.SetExclusive(opts.Exclusive)
 	if opts.parkers[0] != nil {
 		ring0.SetParker(opts.parkers[0])
 	}
@@ -251,6 +264,7 @@ func openStandardLink(base unsafe.Pointer, bufferCount int, bufferSize int, opts
 		buffers0:    splitBuffers(buffers0, bufferCount, bufferSize),
 		buffers1:    splitBuffers(buffers1, bufferCount, bufferSize),
 		closeCh:     make(chan struct{}),
+		exclusive:   opts.Exclusive,
 	}
 	if linkMode == LinkModeSecondary {
 		link.txRing, link.txBufs = ring1, link.buffers1
@@ -263,6 +277,9 @@ func openStandardLink(base unsafe.Pointer, bufferCount int, bufferSize int, opts
 	link.checkFn = link.checkPeer
 	link.readDeadlineFn = link.loadReadDeadline
 	link.writeDeadlineFn = link.loadWriteDeadline
+	link.rxCancel = mpmc.Cancel{Closed: link.closeCh, DeadlineFunc: link.readDeadlineFn, Check: link.checkFn}
+	link.txCancel = mpmc.Cancel{Closed: link.closeCh, DeadlineFunc: link.writeDeadlineFn, Check: link.checkFn}
+	link.txBase = link.txRing.ProducerCursor()
 
 	// The secondary attaches to a live primary: start monitoring it now.
 	if linkMode == LinkModeSecondary {
@@ -303,26 +320,95 @@ func (l *StandardLink) exitRx() { l.rxActive.Add(-1) }
 
 func (l *StandardLink) enterTx(checkPeer bool) error {
 	l.txActive.Add(1)
-	if l.closed.Load() {
+	if err := l.admitTx(checkPeer); err != nil {
 		l.txActive.Add(-1)
-		return ErrClosed
-	}
-	if checkPeer {
-		// Without the heartbeat goroutine nothing else refreshes the peer
-		// status between blocking calls, so a send would keep publishing
-		// into a ring after the peer closed or died (F-10).
-		if l.hbStop == nil {
-			_ = l.checkPeer()
-		}
-		if err := PeerState(l.peer.status.Load()).err(); err != nil {
-			l.txActive.Add(-1)
-			return err
-		}
+		return err
 	}
 	return nil
 }
 
 func (l *StandardLink) exitTx() { l.txActive.Add(-1) }
+
+// enterRxOwner, exitRxOwner, enterTxOwner and exitTxOwner are enterRx and
+// friends for the calls that move data: Read, ReadFrom, ReadZeroCopy,
+// ReserveRead and the Release of its reservations on the receive side, Write,
+// WriteZeroCopy, ReserveWrite and the Commit or Abort of its reservations on
+// the send side. On an exclusive link at most one goroutine at a time makes
+// calls of one side. The side's depth is then private to that goroutine, and
+// only the outermost call registers: a store of 1 into a counter of its own
+// instead of an atomic add, and a store of 0 when the last nested call (a
+// Release inside a ReadZeroCopy callback, say) returns. Close waits for these
+// counters as well. Calls that may overlap the owner, such as waking blocked
+// calls after a deadline changed, keep using enterRx and enterTx. The store
+// followed by the closed check is ordered like the add: sync/atomic
+// operations are sequentially consistent.
+func (l *StandardLink) enterRxOwner() error {
+	if !l.exclusive {
+		return l.enterRx()
+	}
+	if l.rxDepth == 0 {
+		l.rxOwner.Store(1)
+	}
+	l.rxDepth++
+	if l.closed.Load() {
+		l.exitRxOwner()
+		return ErrClosed
+	}
+	return nil
+}
+
+func (l *StandardLink) exitRxOwner() {
+	if !l.exclusive {
+		l.rxActive.Add(-1)
+		return
+	}
+	if l.rxDepth--; l.rxDepth == 0 {
+		l.rxOwner.Store(0)
+	}
+}
+
+func (l *StandardLink) enterTxOwner(checkPeer bool) error {
+	if !l.exclusive {
+		return l.enterTx(checkPeer)
+	}
+	if l.txDepth == 0 {
+		l.txOwner.Store(1)
+	}
+	l.txDepth++
+	if err := l.admitTx(checkPeer); err != nil {
+		l.exitTxOwner()
+		return err
+	}
+	return nil
+}
+
+func (l *StandardLink) exitTxOwner() {
+	if !l.exclusive {
+		l.txActive.Add(-1)
+		return
+	}
+	if l.txDepth--; l.txDepth == 0 {
+		l.txOwner.Store(0)
+	}
+}
+
+// admitTx reports why a send must not start: the link is closed or, with
+// checkPeer, the peer is known to be closed or dead.
+func (l *StandardLink) admitTx(checkPeer bool) error {
+	if l.closed.Load() {
+		return ErrClosed
+	}
+	if !checkPeer {
+		return nil
+	}
+	// Without the heartbeat goroutine nothing else refreshes the peer
+	// status between blocking calls, so a send would keep publishing
+	// into a ring after the peer closed or died (F-10).
+	if l.hbStop == nil {
+		_ = l.checkPeer()
+	}
+	return PeerState(l.peer.status.Load()).err()
+}
 
 func (l *StandardLink) loadReadDeadline() time.Time {
 	if d := l.readDeadline.Load(); d != nil {
@@ -357,7 +443,7 @@ func mapWaitErr(err error) error {
 // ring or peer error; callers map it with mapWaitErr.
 func dequeueDrained(ring *mpmc.MPMCRing[protocol.Packet], c *mpmc.Cancel, fn func(slot uint64, p *protocol.Packet)) error {
 	err := ring.DequeueZeroCopyCancel(c, fn)
-	if err != nil && peerLost(err) && ring.DequeueZeroCopyCancel(&mpmc.Cancel{NoWait: true}, fn) == nil {
+	if err != nil && peerLost(err) && ring.DequeueZeroCopyCancel(&drainCancel, fn) == nil {
 		return nil
 	}
 	return err
@@ -367,33 +453,35 @@ func dequeueDrained(ring *mpmc.MPMCRing[protocol.Packet], c *mpmc.Cancel, fn fun
 func reserveDrained(ring *mpmc.MPMCRing[protocol.Packet], c *mpmc.Cancel) (mpmc.ConsumerSlot[protocol.Packet], error) {
 	slot, err := ring.ReserveConsumerCancel(c)
 	if err != nil && peerLost(err) {
-		if s, retryErr := ring.ReserveConsumerCancel(&mpmc.Cancel{NoWait: true}); retryErr == nil {
-			return s, nil
-		}
+		return reserveRetry(ring, slot, err)
 	}
 	return slot, err
 }
 
+// reserveRetry makes the one non-blocking attempt of reserveDrained after the
+// peer was lost; slot and err are the failed first attempt.
+func reserveRetry(ring *mpmc.MPMCRing[protocol.Packet], slot mpmc.ConsumerSlot[protocol.Packet], err error) (mpmc.ConsumerSlot[protocol.Packet], error) {
+	if s, retryErr := ring.ReserveConsumerCancel(&drainCancel); retryErr == nil {
+		return s, nil
+	}
+	return slot, err
+}
+
+// drainCancel makes an operation fail instead of wait. It is never modified.
+var drainCancel = mpmc.Cancel{NoWait: true}
+
 // peerLost reports whether err says that the peer closed or died.
 func peerLost(err error) bool { return err == ErrPeerClosed || err == ErrPeerGone }
 
-// dequeue consumes one packet. fn runs while the slot is claimed.
-func (l *StandardLink) dequeue(fn func(slot uint64, p *protocol.Packet)) error {
-	c := mpmc.Cancel{Closed: l.closeCh, DeadlineFunc: l.readDeadlineFn, Check: l.checkFn}
-	return mapWaitErr(dequeueDrained(l.rxRing, &c, fn))
-}
-
-// enqueue publishes one packet. fn runs while the slot is claimed.
-func (l *StandardLink) enqueue(fn func(slot uint64, p *protocol.Packet)) error {
-	c := mpmc.Cancel{Closed: l.closeCh, DeadlineFunc: l.writeDeadlineFn, Check: l.checkFn}
-	return mapWaitErr(l.txRing.EnqueueZeroCopyCancel(&c, fn))
-}
-
-// reserveRx reserves the next readable packet slot.
+// reserveRx reserves the next readable packet slot. Like every receive-side
+// reservation it delivers the packets that are still published when the peer
+// is already gone before it reports the failure.
 func (l *StandardLink) reserveRx() (mpmc.ConsumerSlot[protocol.Packet], error) {
-	c := mpmc.Cancel{Closed: l.closeCh, DeadlineFunc: l.readDeadlineFn, Check: l.checkFn}
-	slot, err := reserveDrained(l.rxRing, &c)
-	return slot, mapWaitErr(err)
+	slot, err := reserveDrained(l.rxRing, &l.rxCancel)
+	if err != nil {
+		return slot, mapWaitErr(err)
+	}
+	return slot, nil
 }
 
 // classify interprets a packet taken from the receive ring. It returns the
@@ -417,27 +505,27 @@ func (l *StandardLink) classify(p *protocol.Packet) (size int, err error) {
 	}
 }
 
-// consume dequeues one packet and hands the payload of a copy packet to
-// deliver while the ring slot is claimed. skip reports a tombstone: nothing
-// was delivered and the caller should try the next packet. The slot is
-// released even if deliver panics.
-func (l *StandardLink) consume(deliver func(payload []byte) (int, error)) (n int, skip bool, err error) {
-	var pktErr error
-	err = l.dequeue(func(slot uint64, p *protocol.Packet) {
-		size, cerr := l.classify(p)
-		switch {
-		case cerr != nil:
-			pktErr = cerr
-		case size == 0:
-			skip = true
-		default:
-			n, pktErr = deliver(l.rxBufs[slot][:size:size])
-		}
-	})
-	if err != nil {
-		return 0, false, err
-	}
-	return n, skip, pktErr
+// copyID returns the CopyID of the packet for slot, the number of claims this
+// endpoint made on its send ring so far (the first packet carries 1). Every
+// claim moves the producer cursor of the ring this endpoint alone writes by
+// one, so the claimed position yields the counter without an atomic
+// operation of its own.
+func (l *StandardLink) copyID(slot *mpmc.ProducerSlot[protocol.Packet]) uint64 {
+	return slot.Position() - l.txBase + 1
+}
+
+// storeCopyPacket stores the copy packet in p. It is the content of
+// protocol.NewStandardLinkCopyPacket, but writes only the four words that
+// carry data. The remaining operand words, which SPEC 9.1 wants zero, are
+// zero already: a send ring starts zeroed, and an endpoint of a Standard
+// link publishes nothing but copy and tombstone packets, which never set
+// them. Building the whole packet instead and copying it over the slot costs
+// a few nanoseconds per message.
+func storeCopyPacket(p *protocol.Packet, copyID, slot, size uint64) {
+	binary.LittleEndian.PutUint64(p[0:8], uint64(protocol.OpStandardLinkCopy))
+	binary.LittleEndian.PutUint64(p[8:16], copyID)
+	binary.LittleEndian.PutUint64(p[16:24], slot)
+	binary.LittleEndian.PutUint64(p[24:32], size)
 }
 
 // Read implements io.Reader. One call returns bytes of at most one message
@@ -464,49 +552,39 @@ func (l *StandardLink) Read(b []byte) (int, error) {
 // message. In datagram mode the part of the message that does not fit into b
 // is discarded instead of queued, and an empty b still consumes one message.
 func (l *StandardLink) recvMessage(b []byte, datagram bool) (int, error) {
-	if err := l.enterRx(); err != nil {
+	if err := l.enterRxOwner(); err != nil {
 		return 0, err
 	}
-	defer l.exitRx()
+	defer l.exitRxOwner()
 
-	if n, ok := l.recv.read(b, datagram); ok {
-		return n, nil
-	}
-	// One callback per packet (no nested deliver closure): this is the
-	// hottest receive path.
-	for {
-		var (
-			n      int
-			skip   bool
-			pktErr error
-		)
-		err := l.dequeue(func(slot uint64, p *protocol.Packet) {
-			size, cerr := l.classify(p)
-			switch {
-			case cerr != nil:
-				pktErr = cerr
-			case size == 0:
-				skip = true
-			default:
-				payload := l.rxBufs[slot][:size:size]
-				n = copy(b, payload)
-				if n < size && !datagram {
-					l.recv.store(payload[n:])
-				}
-			}
-		})
-		if err == ErrPeerClosed {
-			return 0, io.EOF
-		}
-		if err != nil {
-			return 0, err
-		}
-		if pktErr != nil {
-			return 0, pktErr
-		}
-		if !skip {
+	if l.recv.pending.Load() {
+		if n, ok := l.recv.read(b, datagram); ok {
 			return n, nil
 		}
+	}
+	for {
+		slot, err := l.reserveRx()
+		if err != nil {
+			if err == ErrPeerClosed {
+				return 0, io.EOF
+			}
+			return 0, err
+		}
+		size, err := l.classify(slot.Value())
+		if err != nil || size == 0 {
+			slot.ReleaseOwned()
+			if err != nil {
+				return 0, err
+			}
+			continue
+		}
+		payload := l.rxBufs[slot.Slot()][:size:size]
+		n := copy(b, payload)
+		if n < size && !datagram {
+			l.recv.store(payload[n:])
+		}
+		slot.ReleaseOwned()
+		return n, nil
 	}
 }
 
@@ -525,19 +603,21 @@ func (l *StandardLink) Write(b []byte) (int, error) {
 	if bN > l.bufferSize {
 		return 0, ErrBufferOverflow
 	}
-	if err := l.enterTx(true); err != nil {
+	if err := l.enterTxOwner(true); err != nil {
 		return 0, err
 	}
-	defer l.exitTx()
-
-	copyID := l.idGenerator.Add(1)
-	err := l.enqueue(func(slot uint64, p *protocol.Packet) {
-		copy(l.txBufs[slot], b)
-		*p = protocol.NewStandardLinkCopyPacket(copyID, slot, uint64(bN))
-	})
+	// No callback runs between the claim and the publish, so the slot is
+	// completed inline instead of through a deferred call.
+	slot, err := l.txRing.ReserveProducerCancel(&l.txCancel)
 	if err != nil {
-		return 0, err
+		l.exitTxOwner()
+		return 0, mapWaitErr(err)
 	}
+	idx := slot.Slot()
+	copy(l.txBufs[idx], b)
+	storeCopyPacket(slot.Value(), l.copyID(&slot), idx, uint64(bN))
+	slot.CommitOwned()
+	l.exitTxOwner()
 	return bN, nil
 }
 
@@ -561,18 +641,16 @@ func (l *StandardLink) WriteZeroCopy(fn func(buffer []byte) (int, error)) (int, 
 	if fn == nil {
 		return 0, ErrInvalidOp
 	}
-	if err := l.enterTx(true); err != nil {
+	if err := l.enterTxOwner(true); err != nil {
 		return 0, err
 	}
-	defer l.exitTx()
+	defer l.exitTxOwner()
 
-	copyID := l.idGenerator.Add(1)
-	c := mpmc.Cancel{Closed: l.closeCh, DeadlineFunc: l.writeDeadlineFn, Check: l.checkFn}
-	slot, err := l.txRing.ReserveProducerCancel(&c)
+	slot, err := l.txRing.ReserveProducerCancel(&l.txCancel)
 	if err != nil {
 		return 0, mapWaitErr(err)
 	}
-	return l.fillSlot(slot, copyID, fn)
+	return l.fillSlot(slot, fn)
 }
 
 // fillSlot lets fn fill the payload buffer of the claimed producer slot and
@@ -580,16 +658,24 @@ func (l *StandardLink) WriteZeroCopy(fn func(buffer []byte) (int, error)) (int, 
 // calls runtime.Goexit: the packet is a tombstone until fn returned
 // successfully, so readers skip a slot whose writer failed and the panic
 // continues without wedging the ring.
-func (l *StandardLink) fillSlot(slot mpmc.ProducerSlot[protocol.Packet], copyID uint64, fn func(buffer []byte) (int, error)) (int, error) {
+func (l *StandardLink) fillSlot(slot mpmc.ProducerSlot[protocol.Packet], fn func(buffer []byte) (int, error)) (int, error) {
 	idx := slot.Slot()
 	p := slot.Value()
-	*p = protocol.NewStandardLinkTombstonePacket(copyID, idx, uint64(ErrCodeInvalidOp))
-	defer slot.Commit()
+	copyID := l.copyID(&slot)
+	filled := false
+	defer func() {
+		if !filled {
+			*p = protocol.NewStandardLinkTombstonePacket(copyID, idx, uint64(ErrCodeInvalidOp))
+		}
+		slot.CommitOwned()
+	}()
 
 	buffer := l.txBufs[idx]
 	n, err := fn(buffer)
+	filled = true
 	switch {
 	case err != nil:
+		*p = protocol.NewStandardLinkTombstonePacket(copyID, idx, uint64(ErrCodeInvalidOp))
 		return 0, err
 	case n <= 0:
 		*p = protocol.NewStandardLinkTombstonePacket(copyID, idx, uint64(ErrCodeInvalidSize))
@@ -598,7 +684,7 @@ func (l *StandardLink) fillSlot(slot mpmc.ProducerSlot[protocol.Packet], copyID 
 		*p = protocol.NewStandardLinkTombstonePacket(copyID, idx, uint64(ErrCodeBufferOverflow))
 		return 0, ErrBufferOverflow
 	}
-	*p = protocol.NewStandardLinkCopyPacket(copyID, idx, uint64(n))
+	storeCopyPacket(p, copyID, idx, uint64(n))
 	return n, nil
 }
 
@@ -625,34 +711,46 @@ func (l *StandardLink) ReadZeroCopy(fn func(buffer []byte) error) (int, error) {
 	}
 	// Register before touching the remainder so that Close waits for fn in
 	// every case.
-	if err := l.enterRx(); err != nil {
+	if err := l.enterRxOwner(); err != nil {
 		return 0, err
 	}
-	defer l.exitRx()
+	defer l.exitRxOwner()
 
-	if view, backing, ok := l.recv.take(); ok {
-		// Give the backing store back even if fn panics.
-		defer l.recv.giveBack(backing)
-		if err := fn(view); err != nil {
-			return 0, err
+	if l.recv.pending.Load() {
+		if view, backing, ok := l.recv.take(); ok {
+			// Give the backing store back even if fn panics.
+			defer l.recv.giveBack(backing)
+			if err := fn(view); err != nil {
+				return 0, err
+			}
+			return len(view), nil
 		}
-		return len(view), nil
-	}
-	deliver := func(payload []byte) (int, error) {
-		if err := fn(payload); err != nil {
-			return 0, err
-		}
-		return len(payload), nil
 	}
 	for {
-		n, skip, err := l.consume(deliver)
+		slot, err := l.reserveRx()
 		if err != nil {
 			return 0, err
 		}
-		if !skip {
-			return n, nil
+		size, err := l.classify(slot.Value())
+		if err != nil || size == 0 {
+			slot.ReleaseOwned()
+			if err != nil {
+				return 0, err
+			}
+			continue
 		}
+		return l.deliverZeroCopy(slot, size, fn)
 	}
+}
+
+// deliverZeroCopy passes the payload of the claimed slot to fn and releases
+// the slot afterwards, also if fn panics.
+func (l *StandardLink) deliverZeroCopy(slot mpmc.ConsumerSlot[protocol.Packet], size int, fn func(buffer []byte) error) (int, error) {
+	defer slot.ReleaseOwned()
+	if err := fn(l.rxBufs[slot.Slot()][:size:size]); err != nil {
+		return 0, err
+	}
+	return size, nil
 }
 
 // Mode returns the endpoint role (Primary or Secondary).
@@ -706,7 +804,7 @@ func (l *StandardLink) Close() error {
 		close(l.closeCh)
 		l.ring0.WakeAll()
 		l.ring1.WakeAll()
-		for l.rxActive.Load() != 0 || l.txActive.Load() != 0 {
+		for l.rxActive.Load() != 0 || l.txActive.Load() != 0 || l.rxOwner.Load() != 0 || l.txOwner.Load() != 0 {
 			time.Sleep(50 * time.Microsecond)
 		}
 		if l.hbStop != nil {

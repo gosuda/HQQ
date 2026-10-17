@@ -13,6 +13,11 @@
 // reservation that was already completed, which then neither touches the
 // ring nor wakes anyone.
 //
+// A handle can be switched to exclusive mode (SetExclusive) when its owner
+// serializes each side of the ring itself: claims then use plain stores on
+// the cursors instead of CAS, as spec/SPEC.md 7.6 describes, and the
+// completing CAS becomes a load check and a store.
+//
 // Blocking operations use an adaptive wait strategy (see WaitPolicy): a short
 // busy spin, then cooperative yielding, then parking on a 32-bit wait word in
 // the ring header. Parking uses futex(2) on Linux and __ulock_wait on macOS,
@@ -146,7 +151,9 @@ const (
 
 // Tuning knobs for WaitAdaptive.
 const (
-	spinIterations  = 64                     // tight re-check loop before yielding
+	spinIterations  = 64                     // spin steps before yielding
+	spinBatch       = 4                      // slot re-reads per spin step
+	pollEvery       = 8                      // spin steps between cancellation polls (power of two)
 	yieldIterations = 256                    // runtime.Gosched iterations before parking
 	maxPark         = 100 * time.Millisecond // upper bound for a single park
 	checkInterval   = 50 * time.Millisecond  // minimum spacing of Cancel.Check calls
@@ -216,6 +223,11 @@ type MPMCRing[T any] struct {
 	// parker, when set, replaces the in-memory wait words as the blocking
 	// primitive (see Parker).
 	parker Parker
+
+	// exclusive selects the store-based claim (see SetExclusive); guard
+	// checks its contract in race builds and is empty otherwise.
+	guard     exclusiveGuard
+	exclusive bool
 }
 
 // stride returns the slot stride for T.
@@ -390,6 +402,12 @@ func (m *MPMCRing[T]) Size() uint64 {
 	return m.size
 }
 
+// ProducerCursor returns the number of positions claimed on the producer
+// side so far.
+func (m *MPMCRing[T]) ProducerCursor() uint64 {
+	return atomic.LoadUint64(&m.head.w)
+}
+
 // WakeAll wakes every waiter parked on this ring, in every process. Waiters
 // re-check their condition and cancellation state and park again if needed.
 // Call it after closing a Cancel.Closed channel.
@@ -506,6 +524,9 @@ func (m *MPMCRing[T]) notifyProducers() {
 // claimProducer claims the next producer position. On success the caller owns
 // the returned slot until it publishes it.
 func (m *MPMCRing[T]) claimProducer(c *Cancel) (uint64, *_melem[T], error) {
+	if m.exclusive {
+		return m.claimProducerExclusive(c)
+	}
 	h := m.head
 	pos := atomic.LoadUint64(&h.w)
 	for {
@@ -556,6 +577,9 @@ func (m *MPMCRing[T]) claimProducerSlow(c *Cancel, pos uint64) (uint64, *_melem[
 // claimConsumer claims the next consumer position. On success the caller owns
 // the returned slot until it releases it.
 func (m *MPMCRing[T]) claimConsumer(c *Cancel) (uint64, *_melem[T], error) {
+	if m.exclusive {
+		return m.claimConsumerExclusive(c)
+	}
 	h := m.head
 	pos := atomic.LoadUint64(&h.r)
 	for {
@@ -621,6 +645,9 @@ func (m *MPMCRing[T]) release(pos uint64, e *_melem[T]) {
 // state (seq == pos), so a stale copy of an already committed slot fails the
 // swap and neither modifies the ring nor wakes anyone; it then returns false.
 func (m *MPMCRing[T]) publishSlot(pos uint64, e *_melem[T]) bool {
+	if m.exclusive {
+		return m.publishSlotExclusive(pos, e)
+	}
 	if !atomic.CompareAndSwapUint64(&e._seq, pos, pos+1) {
 		return false
 	}
@@ -632,6 +659,9 @@ func (m *MPMCRing[T]) publishSlot(pos uint64, e *_melem[T]) bool {
 // publishSlot it swaps from the claimed state (seq == pos+1) and reports
 // false, without side effects, when the slot was already released.
 func (m *MPMCRing[T]) releaseSlot(pos uint64, e *_melem[T]) bool {
+	if m.exclusive {
+		return m.releaseSlotExclusive(pos, e)
+	}
 	if !atomic.CompareAndSwapUint64(&e._seq, pos+1, pos+m.mask+1) {
 		return false
 	}
@@ -718,15 +748,32 @@ func stillBlocked(seq *uint64, target uint64) bool {
 
 // wait performs one backoff step while the slot at seq has not reached
 // target. It returns a non-nil error if the operation must be abandoned.
+//
+// Cancellation is checked on the first step and then on every
+// pollEvery-th spin step. The check is a channel operation that costs
+// several slot re-reads; running it between every two re-reads made a
+// message that arrives while waiting wait for the check as well. A spin step
+// therefore re-reads the slot spinBatch times first, which still bounds the
+// cancellation latency to well under a microsecond.
 func (w *waiter) wait(policy WaitPolicy, c *Cancel, site waitSite, seq *uint64, target uint64) error {
-	if err := poll(c); err != nil {
-		return err
-	}
-	if c != nil && c.NoWait {
-		return ErrTimeout
+	spinning := policy == WaitSpin || w.iter < spinIterations
+	if !spinning || w.iter&(pollEvery-1) == 0 {
+		if err := poll(c); err != nil {
+			return err
+		}
+		if c != nil && c.NoWait {
+			return ErrTimeout
+		}
 	}
 	w.iter++
 
+	if spinning {
+		for range spinBatch {
+			if !stillBlocked(seq, target) {
+				return nil
+			}
+		}
+	}
 	if policy == WaitSpin {
 		if w.iter&63 == 0 {
 			if err := w.slowChecks(c, time.Now()); err != nil {
@@ -738,7 +785,7 @@ func (w *waiter) wait(policy WaitPolicy, c *Cancel, site waitSite, seq *uint64, 
 	}
 
 	switch {
-	case w.iter <= spinIterations:
+	case spinning:
 		return nil
 	case w.iter <= spinIterations+yieldIterations:
 		if w.iter&15 == 0 {
@@ -837,13 +884,32 @@ func (s *ProducerSlot[T]) Value() *T {
 
 // Commit publishes the reserved producer slot. It returns false, and leaves
 // the ring and its waiters untouched, if the slot was already committed or is
-// invalid, including when another copy of this value committed it first.
+// invalid, including when another copy of this value committed it first. On an
+// exclusive ring the check is a load of the slot sequence instead of a
+// compare-and-swap: a copy committed earlier fails it just the same, but two
+// copies committed concurrently from different goroutines are not detected
+// (the side is single-goroutine by contract).
 func (s *ProducerSlot[T]) Commit() bool {
 	if !s.Valid() {
 		return false
 	}
 	s.done = true
 	return s.ring.publishSlot(s.pos, s.elem)
+}
+
+// Position returns the ring position this slot claimed. Positions count the
+// claims on the producer side of the ring, starting at the value
+// ProducerCursor returned before the first claim.
+func (s *ProducerSlot[T]) Position() uint64 {
+	return s.pos
+}
+
+// CommitOwned is Commit for a caller that holds the only copy of the slot
+// and has not committed it: a plain store instead of the compare-and-swap
+// that detects a stale copy. Committing a slot twice, or through two
+// copies, corrupts the ring.
+func (s *ProducerSlot[T]) CommitOwned() {
+	s.ring.publish(s.pos, s.elem)
 }
 
 // ConsumerSlot is a claimed consumer-side ring slot.
@@ -893,13 +959,24 @@ func (s *ConsumerSlot[T]) Value() *T {
 // Release returns the reserved consumer slot to producers. It returns false,
 // and leaves the ring and its waiters untouched, if the slot was already
 // released or is invalid, including when another copy of this value released
-// it first.
+// it first. On an exclusive ring the check is a load of the slot sequence
+// instead of a compare-and-swap: a copy released earlier fails it just the
+// same, but two copies released concurrently from different goroutines are
+// not detected (the side is single-goroutine by contract).
 func (s *ConsumerSlot[T]) Release() bool {
 	if !s.Valid() {
 		return false
 	}
 	s.done = true
 	return s.ring.releaseSlot(s.pos, s.elem)
+}
+
+// ReleaseOwned is Release for a caller that holds the only copy of the slot
+// and has not released it: a plain store instead of the compare-and-swap
+// that detects a stale copy. Releasing a slot twice, or through two copies,
+// corrupts the ring.
+func (s *ConsumerSlot[T]) ReleaseOwned() {
+	s.ring.release(s.pos, s.elem)
 }
 
 func ctxCancel(ctx context.Context) *Cancel {

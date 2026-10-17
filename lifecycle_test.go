@@ -25,8 +25,14 @@ var fastLiveness = LinkOptions{
 	AttachTimeout:     time.Second,
 }
 
+// forceExclusive makes newMemoryPair open its links with
+// LinkOptions.Exclusive; TestStandardLinkExclusiveSuite sets it to rerun the
+// single-goroutine-per-side tests of the Standard link in exclusive mode.
+var forceExclusive bool
+
 func newMemoryPair(t testing.TB, bufferCount, bufferSize int, opts LinkOptions) ([]byte, *StandardLink, *StandardLink) {
 	t.Helper()
+	opts.Exclusive = opts.Exclusive || forceExclusive
 	mem := AlignedBuffer(SizeStandardLink(bufferCount, bufferSize))
 	primary, err := NewStandardLink(mem, bufferCount, bufferSize, opts)
 	if err != nil {
