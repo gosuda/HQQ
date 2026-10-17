@@ -23,6 +23,9 @@ const exit_usage: u8 = 2;
 const exit_timeout: u8 = 3;
 const exit_skipped: u8 = 4;
 const exit_internal: u8 = 5;
+/// A shared-memory name outlives its last handle only on POSIX (Go shm.NamesPersist);
+/// on Windows it lives while any handle to it is open.
+const names_persist = @import("builtin").os.tag != .windows;
 
 // ---------------------------------------------------------------------------
 // Deterministic payloads (INTEROP_CLI section 5)
@@ -546,7 +549,16 @@ fn runX01(env: *Env) !void {
         // This side closes first.
         try link.close();
         if (is_creator) {
-            try probeName(env, "creator close removes the name", error.NotExist);
+            if (names_persist) {
+                try probeName(env, "creator close removes the name", error.NotExist);
+            } else {
+                // Windows: the opener still holds its endpoint, so the name is there and busy.
+                try probeName(
+                    env,
+                    "creator close keeps the name while the opener holds it (Windows)",
+                    error.LinkBusy,
+                );
+            }
         } else {
             try probeName(env, "opener close leaves the name in place", error.LinkBusy);
         }

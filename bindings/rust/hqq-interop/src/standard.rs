@@ -9,6 +9,10 @@ use hqq::{Error as HqqError, Link, Mode, Wait};
 use crate::env::{wait_until, Env, Fail};
 use crate::payload::{intact, payload};
 
+/// A shared-memory name outlives its last handle only on POSIX (Go shm.NamesPersist);
+/// on Windows it lives while any handle to it is open.
+const NAMES_PERSIST: bool = !cfg!(windows);
+
 type Res = Result<(), Fail>;
 
 fn create(env: &Env) -> hqq::Result<Link> {
@@ -102,11 +106,20 @@ pub fn x01(env: &mut Env) -> Res {
         link.close()?;
         let probe = probe_open(env);
         if creator {
-            env.check_err(
-                "creator close removes the name",
-                probe,
-                Some(HqqError::NotExist),
-            );
+            if NAMES_PERSIST {
+                env.check_err(
+                    "creator close removes the name",
+                    probe,
+                    Some(HqqError::NotExist),
+                );
+            } else {
+                // Windows: the opener still holds its endpoint, so the name is there and busy.
+                env.check_err(
+                    "creator close keeps the name while the opener holds it (Windows)",
+                    probe,
+                    Some(HqqError::LinkBusy),
+                );
+            }
         } else {
             env.check_err(
                 "opener close leaves the name in place",
@@ -246,10 +259,12 @@ pub fn x04_dead(env: &mut Env) -> Res {
         let elapsed = start.elapsed();
         let err = r.as_ref().err().copied();
         drop(r);
-        env.check_err(
-            "opener on a dead segment fails with ErrFailedInit",
-            err,
-            Some(HqqError::FailedInit),
+        // Windows: the dead segment's name is gone, which is ErrNotExist (as in the Go helper).
+        let vanished = !NAMES_PERSIST && err == Some(HqqError::NotExist);
+        env.check(
+            "opener on a dead segment fails with ErrFailedInit (ErrNotExist on Windows)",
+            err.is_some_and(|e| e.matches(HqqError::FailedInit)) || vanished,
+            &format!("{err:?}"),
         );
         let bound = env.stale_after() + Duration::from_secs(3);
         env.check(

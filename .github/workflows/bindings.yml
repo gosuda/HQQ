@@ -197,12 +197,16 @@ jobs:
         working-directory: bindings/rust
         run: cargo test --workspace --locked
 
-      - name: Examples
+      # Default shell (PowerShell on Windows). Git Bash (shell: bash) puts Git's usr/bin
+      # link.exe (GNU coreutils) before the MSVC linker, so the example link fails there.
+      # One command per step: each exit code fails its own step.
+      - name: Examples (echo)
         working-directory: bindings/rust
-        shell: bash
-        run: |
-          cargo run --release --locked -p hqq --example echo -- --selftest
-          cargo run --release --locked -p hqq --example rpc -- --selftest
+        run: cargo run --release --locked -p hqq --example echo -- --selftest
+
+      - name: Examples (rpc)
+        working-directory: bindings/rust
+        run: cargo run --release --locked -p hqq --example rpc -- --selftest
 
       - name: Build Go helper
         shell: bash
@@ -222,10 +226,13 @@ jobs:
   # ---- Zig -------------------------------------------------------------------
   # bindings/zig: build.zig compiles libhqq from c/ and the wrapper module, the
   # examples and the hqq-interop helper. Pinned Zig release via mlugg/setup-zig.
-  # NON-BLOCKING (continue-on-error): the Zig binding has not been compiled on any
-  # runner yet (Zig is not installed on the authoring host). Its first CI runs
-  # (2026-10-16) failed in the Zig source and on macOS in the build runner link.
-  # Remove continue-on-error once both jobs pass.
+  # NON-BLOCKING (continue-on-error): the Linux job has not passed in CI yet (its first
+  # run failed in the Zig test compile, fixed here but not yet CI-confirmed). Remove
+  # continue-on-error once it passes.
+  # Linux only. The macOS job was removed: Zig 0.15.2 links its own build runner against
+  # the Xcode 26.x SDK of macOS 26 and fails with undefined libSystem symbols (_abort,
+  # _dispatch_*, ...; ziglang/zig#31669). Pointing DEVELOPER_DIR at the Command Line
+  # Tools SDK did not fix it in CI. Restore the macOS job when the link is fixed upstream.
   zig:
     name: Zig ${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
@@ -238,8 +245,6 @@ jobs:
         include:
           - name: Linux
             runner: ubuntu-24.04
-          - name: macOS
-            runner: macos-latest
 
     steps:
       - name: Checkout
@@ -249,16 +254,6 @@ jobs:
         uses: mlugg/setup-zig@v2.2.1
         with:
           version: ${{ env.ZIG_VERSION }}
-
-      # Zig 0.15.2 links its build runner against the Xcode 26.x SDK on macOS 26,
-      # which lacks the arm64-macos libSystem symbols (undefined _abort, _malloc_size...,
-      # ziglang/zig#31669). The Command Line Tools SDK links, so point xcrun at it.
-      - name: Use the Command Line Tools SDK (macOS)
-        if: runner.os == 'macOS'
-        shell: bash
-        run: |
-          clt=/Library/Developer/CommandLineTools
-          if [ -d "$clt/SDKs" ]; then echo "DEVELOPER_DIR=$clt" >> "$GITHUB_ENV"; fi
 
       - name: Check formatting
         working-directory: bindings/zig

@@ -182,6 +182,11 @@ static hqq_status probe_open(ihx_env *e, const char *name) {
 
 static int64_t elapsed_since(uint64_t t0) { return (int64_t)((ihx_now_ns() - t0) / 1000000u); }
 
+/* shm.NamesPersist of the Go helper: false on Windows, where a name lives only while a
+ * handle to it is open (a dead segment's name is gone; the probe of a busy name fails
+ * with ErrLinkBusy instead of ErrNotExist). */
+static int names_persist(void) { return strcmp(ihx_goos(), "windows") != 0; }
+
 /* ---- X-01: create, open, exchange, close ------------------------------------------------ */
 
 static int x01_run(ihx_env *e) {
@@ -238,7 +243,13 @@ static int x01_run(ihx_env *e) {
             goto done;
         }
         if (creator) {
-            ihx_check_status(e, "creator close removes the name", probe_open(e, e->cfg.name), HQQ_ERR_NOT_EXIST);
+            if (names_persist()) {
+                ihx_check_status(e, "creator close removes the name", probe_open(e, e->cfg.name), HQQ_ERR_NOT_EXIST);
+            } else {
+                /* Windows: the opener still holds its endpoint, so the name is there and busy. */
+                ihx_check_status(e, "creator close keeps the name while the opener holds it (Windows)",
+                                 probe_open(e, e->cfg.name), HQQ_ERR_LINK_BUSY);
+            }
         } else {
             ihx_check_status(e, "opener close leaves the name in place", probe_open(e, e->cfg.name), HQQ_ERR_LINK_BUSY);
         }
@@ -380,6 +391,24 @@ static int open_during_init(ihx_env *e) {
     return IHX_OK;
 }
 
+/* The opener of the initializing variant on Windows (stdOpenVanished of the Go helper): the
+ * initializer died with its handle, so the name is gone and the open fails at once with
+ * ErrNotExist. Nothing is observed: there is no segment whose first page could be compared. */
+static int open_vanished(ihx_env *e) {
+    hqq_link *l = NULL;
+    hqq_status st;
+    uint64_t t0 = ihx_now_ns();
+    int64_t elapsed;
+    st = std_open(e, e->cfg.name, &l);
+    elapsed = elapsed_since(t0);
+    std_close(&l);
+    ihx_check_status(e, "open of a segment whose initializer died fails with ErrNotExist (no name without a handle)",
+                     st, HQQ_ERR_NOT_EXIST);
+    ihx_check(e, "failure is quick", elapsed <= (HQQ_DEFAULT_ATTACH_TIMEOUT_NS + STD_SLACK_NS) / NS_PER_MS,
+              "%lld ms", (long long)elapsed);
+    return IHX_OK;
+}
+
 static int x04_before_creator_opener(ihx_env *e) {
     hqq_link *l = NULL;
     hqq_status st;
@@ -439,7 +468,10 @@ static int x04_dead(ihx_env *e) {
         st = std_open(e, e->cfg.name, &l);
         elapsed = (int64_t)(ihx_now_ns() - t0);
         std_close(&l);
-        ihx_check_status(e, "opener on a dead segment fails with ErrFailedInit", st, HQQ_ERR_FAILED_INIT);
+        /* Windows: the dead segment's name is gone, which is ErrNotExist. */
+        ihx_check(e, "opener on a dead segment fails with ErrFailedInit (ErrNotExist on Windows)",
+                  hqq_error_is(st, HQQ_ERR_FAILED_INIT) || (!names_persist() && hqq_error_is(st, HQQ_ERR_NOT_EXIST)),
+                  "%s", hqq_strerror(st));
         ihx_check(e, "failure is quick (errNoLiveEndpoint)", elapsed <= bound, "%lld ms, bound %lld ms",
                   (long long)(elapsed / NS_PER_MS), (long long)(bound / NS_PER_MS));
         return IHX_OK;
@@ -470,7 +502,7 @@ static int x04_run(ihx_env *e) {
         if (e->cfg.role == 0) {
             return ihx_raw_init_victim(e);
         }
-        return open_during_init(e);
+        return names_persist() ? open_during_init(e) : open_vanished(e);
     }
     if (strcmp(e->cfg.variant, "dead") == 0) {
         return x04_dead(e);
@@ -1453,10 +1485,10 @@ const ihx_scenario ihx_std_scenarios[] = {
      NELEM(x06_variants), x06_variants, x06_run},
     {"X-07", "kill -9 of the peer (running and parked), default and short peer timeout", "standard", "any", 60,
      NELEM(x07_variants), x07_variants, kill_peer_run},
-    {"X-08", "kill -9 of the initializer between claim and publish", "standard", "any", 60, NELEM(x08_variants),
-     x08_variants, x08_run},
-    {"X-09", "reuse of a name after both endpoints died (epoch and creatorToken change)", "standard", "any", 60,
-     NELEM(x09_variants), x09_variants, x09_run},
+    {"X-08", "kill -9 of the initializer between claim and publish", "standard", "linux,darwin,freebsd", 60,
+     NELEM(x08_variants), x08_variants, x08_run},
+    {"X-09", "reuse of a name after both endpoints died (epoch and creatorToken change)", "standard",
+     "linux,darwin,freebsd", 60, NELEM(x09_variants), x09_variants, x09_run},
     {"X-10", "safe unlink: replaced name survives the creator's close", "standard", "linux,darwin", 30,
      NELEM(x10_variants), x10_variants, x10_run},
     {"X-11", "invalid names per platform, long names on macOS", "standard", "any", 30, NELEM(x11_variants),

@@ -11,7 +11,7 @@ Toolchain requirements, CI pins and the C API requests are in
 | --- | --- | --- | --- |
 | C++17 | [`cpp/`](cpp) | header-only `include/hqq/hqq.hpp`, CMake target `hqq::cpp` | tests, examples and interop verified (Apple clang, CMake 4.3) |
 | Rust | [`rust/`](rust) | Cargo workspace: `hqq-sys` (raw FFI), `hqq` (safe API), `hqq-interop` | tests, examples and interop verified (cargo 1.96); Windows builds the C library with clang-cl |
-| Zig | [`zig/`](zig) | `build.zig`, module `hqq`, examples, `hqq-interop` | **unverified, non-blocking in CI**: Zig is not installed on the host; written for Zig 0.15.2. The first CI run failed (see Zig below) |
+| Zig | [`zig/`](zig) | `build.zig`, module `hqq`, examples, `hqq-interop` | **unverified, non-blocking in CI**: Zig is not installed on the host; written for Zig 0.15.2; CI runs Linux only. The first CI run failed (see Zig below) |
 
 None of the bindings needs network access to build: the C library is compiled from
 `c/` in each build (CMake `add_subdirectory`, Cargo `build.rs`, `build.zig`).
@@ -65,10 +65,10 @@ cargo run -p hqq --example rpc -- --selftest
 cargo build --release -p hqq-interop      # target/release/hqq-interop
 ```
 
-Zig's CI job runs with `continue-on-error: true` (see `.github/workflows/bindings.yml`)
-until a CI run confirms it. On macOS the job selects the Command Line Tools SDK
-(`DEVELOPER_DIR`), because Zig 0.15.2 cannot link its build runner against the Xcode
-26.x SDK (ziglang/zig#31669).
+Zig's CI job runs on Linux only, with `continue-on-error: true` (see `.github/workflows/bindings.yml`)
+until a CI run confirms it. The macOS job was removed: Zig 0.15.2 cannot link its build runner
+against the Xcode 26.x SDK of macOS 26 (ziglang/zig#31669), and pointing `DEVELOPER_DIR` at the
+Command Line Tools SDK did not fix it in CI.
 
 Zig 0.15.2 (unverified here):
 
@@ -183,6 +183,10 @@ writes (only the C helper has them) or a platform the helper does not run on.
 - Windows is covered by CI only: C++ and Rust build the C library with clang-cl (the
   Rust job sets `HQQ_CC=clang-cl`; cl.exe lacks always-lock-free C11 atomics on the runner);
   Zig is not in CI on Windows.
+- Windows shared-memory names live only while a handle to them is open. The C++, Rust and
+  Zig helpers follow the Go helper: X-01 creator-closes-first expects `ErrLinkBusy` from the
+  creator's probe (the opener still holds the segment), not `ErrNotExist`. The Rust examples run
+  in PowerShell, because Git Bash puts Git's `usr/bin/link.exe` before the MSVC linker.
 - `Acceptor::close` (Rust `close_shared`) and `AdvLink::close` (C++) may run while another
   thread is inside `accept`/`call`/`serve`; the C library waits for those calls.
 

@@ -623,7 +623,10 @@ fn uniqueName(buf: *[32]u8) ![:0]const u8 {
 
 test "error mapping is 1:1 and errorIs follows the Go hierarchy" {
     try std.testing.expectEqual(error.Closed, toError(c.HQQ_ERR_CLOSED));
-    try std.testing.expectEqual(c.HQQ_ERR_LISTENER_NOT_READY, statusOf(error.ListenerNotReady));
+    try std.testing.expectEqual(
+        @as(c.hqq_status, c.HQQ_ERR_LISTENER_NOT_READY),
+        statusOf(error.ListenerNotReady),
+    );
     try check(c.HQQ_OK);
     try std.testing.expectError(error.PeerGone, check(c.HQQ_ERR_PEER_GONE));
     try std.testing.expect(errorIs(error.LinkBusy, error.FailedInit));

@@ -830,6 +830,14 @@ hqq::Link std_open_after(Env& e) {
     return take(open_link(e.cfg), "open");
 }
 
+// A shared-memory name outlives its last handle only on POSIX (Go shm.NamesPersist).
+// On Windows the name lives while any handle to it is open.
+#if defined(_WIN32)
+constexpr bool kNamesPersist = false;
+#else
+constexpr bool kNamesPersist = true;
+#endif
+
 // Probes the name: NotExist once removed, LinkBusy while attached.
 hqq::Status probe_name(const Config& c) {
     hqq::Result<hqq::Link> probe = open_link(c);
@@ -981,7 +989,13 @@ void run_x01(Env& e) {
         must("close", link.close());
         const hqq::Status probe = probe_name(e.cfg);
         if (creator) {
-            e.check_status("creator close removes the name", probe, HQQ_ERR_NOT_EXIST);
+            if (kNamesPersist) {
+                e.check_status("creator close removes the name", probe, HQQ_ERR_NOT_EXIST);
+            } else {
+                // Windows: the opener still holds its endpoint, so the name is there and busy.
+                e.check_status("creator close keeps the name while the opener holds it (Windows)", probe,
+                               HQQ_ERR_LINK_BUSY);
+            }
         } else {
             e.check_status("opener close leaves the name in place", probe, HQQ_ERR_LINK_BUSY);
         }
@@ -1068,7 +1082,10 @@ void run_x04_dead(Env& e) {
         const auto start = Clock::now();
         hqq::Result<hqq::Link> r = open_link(e.cfg);
         const Nanos elapsed = std::chrono::duration_cast<Nanos>(Clock::now() - start);
-        e.check_status("opener on a dead segment fails with ErrFailedInit", r.status(), HQQ_ERR_FAILED_INIT);
+        // Windows: the dead segment's name is gone, which is ErrNotExist (as in the Go helper).
+        const bool vanished = !kNamesPersist && r.status().matches(HQQ_ERR_NOT_EXIST);
+        e.check("opener on a dead segment fails with ErrFailedInit (ErrNotExist on Windows)",
+                r.status().matches(HQQ_ERR_FAILED_INIT) || vanished, std::string(r.status().message()));
         const Nanos bound = stale_after(e.cfg) + 3s;
         e.check("failure is quick (errNoLiveEndpoint)", elapsed <= bound,
                 std::to_string(elapsed.count() / 1'000'000) + "ms, bound " +
