@@ -3,6 +3,11 @@ add_executable(hqq_echo hqq_echo.c)
 target_link_libraries(hqq_echo PRIVATE hqq::hqq)
 hqq_apply_compile_options(hqq_echo)
 
+# Advanced-link echo server for measuring hqq_adv_serve (interop BenchmarkAdvancedCallCServer).
+add_executable(hqq_adv_echo hqq_adv_echo.c)
+target_link_libraries(hqq_adv_echo PRIVATE hqq::hqq)
+hqq_apply_compile_options(hqq_adv_echo)
+
 # The interop helper (conformance/INTEROP_CLI.md). Its executable is named
 # hqq-interop (hqq-interop.exe on Windows); the CMake target is hqq_interop, the
 # name .github/workflows/interop.yml builds. It links the internal library to

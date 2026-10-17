@@ -214,7 +214,13 @@ func TestStreamCallServeProtocol11ZeroAlloc(t *testing.T) {
 	for _, v := range variants {
 		for _, tc := range zeroAllocCases() {
 			t.Run(v.name+"/"+tc.name, func(t *testing.T) {
-				client, server := newNegotiatedPair(t, 1024, 256, AdvancedOptions{}, AdvancedOptions{})
+				// WaitSpin: a ring wait that parks with a cancelable context
+				// (the caller's deadline context) arms a context wake-up,
+				// which allocates; how often a wait parks depends on
+				// scheduling, and the protocol 1.1 costs checked here are
+				// not about parking.
+				spin := AdvancedOptions{Link: LinkOptions{WaitPolicy: WaitSpin}}
+				client, server := newNegotiatedPair(t, 1024, 256, spin, spin)
 				if tc.dispatcher {
 					if err := client.startDispatcher(); err != nil {
 						t.Fatal(err)
@@ -274,27 +280,8 @@ func TestStreamCallServeProtocol11ZeroAlloc(t *testing.T) {
 				if failure != nil {
 					t.Fatal(failure)
 				}
-				// A caller context with a deadline has a Done channel, so a
-				// synchronous ring wait that has to park arms a context
-				// wake-up, which allocates (as in protocol 1.0, for every
-				// cancelable context). How often the wait parks depends on
-				// scheduling, so this case takes the best of a few attempts: a
-				// per-call allocation shows in every attempt (1.0 or more),
-				// parking noise does not.
-				if v.deadline && !tc.dispatcher {
-					for range 4 {
-						allocs = min(allocs, measure())
-					}
-					if failure != nil {
-						t.Fatal(failure)
-					}
-				}
-				limit := 0.0
-				if v.deadline && !tc.dispatcher {
-					limit = 0.25
-				}
-				if allocs > limit {
-					t.Fatalf("CallWith+Release with Serve allocates %v per operation (both endpoints), want at most %v", allocs, limit)
+				if allocs != 0 {
+					t.Fatalf("CallWith+Release with Serve allocates %v per operation (both endpoints), want 0", allocs)
 				}
 			})
 		}

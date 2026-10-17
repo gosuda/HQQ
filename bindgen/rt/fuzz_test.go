@@ -106,7 +106,6 @@ func FuzzDecodeResponse(f *testing.F) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		quiet.Exclusive = true
 		client, err := hqq.NewStandardLink(mem, fuzzCount, fuzzSize, quiet)
 		if err != nil {
 			t.Fatal(err)

@@ -197,8 +197,17 @@ func (cn *conn) guard(ctx context.Context, timeout time.Duration) (stop func() b
 
 // arm kills the session when ctx ends. cancel is called when the guard is
 // disarmed.
+//
+// The kill runs on another goroutine than the owner of the session. Kill is the
+// one call of the session that is safe from there (bindgen/rt Conn.Kill), and
+// the fields the kill sets are atomics or are published by killed. stop does not
+// return while a kill that has started is still running, so that when it reports
+// that the guard fired, killed and killCause are set and no kill is left that
+// could overlap a later call of the owner.
 func (cn *conn) arm(ctx context.Context, cancel context.CancelFunc) (stop func() bool) {
+	finished := make(chan struct{})
 	disarm := context.AfterFunc(ctx, func() {
+		defer close(finished)
 		cn.killCause = context.Cause(ctx)
 		cn.killed.Store(true)
 		cn.bad.Store(true)
@@ -207,6 +216,9 @@ func (cn *conn) arm(ctx context.Context, cancel context.CancelFunc) (stop func()
 	return func() bool {
 		fired := !disarm()
 		cancel()
+		if fired {
+			<-finished
+		}
 		return fired
 	}
 }

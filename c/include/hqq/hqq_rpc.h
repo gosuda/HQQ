@@ -216,13 +216,12 @@ typedef struct hqqrpc_server_options {
     uint32_t scratch_keep;               /* 0: 1 MiB */
     int copy_request;                    /* 0: zero-copy request bodies; 1: copy first (7.2) */
     hqq_options link;                    /* options of session links; hqqrpc_server_options_init sets
-                                          * peer_timeout_ns = 2 s explicitly (0 would mean 5 s). The C library
-                                          * has no exclusive flag: sessions use the CAS ring. */
+                                          * peer_timeout_ns = 2 s explicitly (0 would mean 5 s). */
     hqq_acceptor_options acceptor;       /* the control listener */
     void *user;                          /* passed to the callbacks below */
     void *(*on_session_start)(void *user, hqqrpc_session *s);              /* may be NULL */
     void (*on_session_end)(void *user, void *session_user, hqqrpc_session *s); /* may be NULL */
-    void (*on_log)(void *user, int level, const char *msg);                 /* may be NULL; level 0 error, 1 warning, 2 info */
+    void (*on_log)(void *user, int level, const char *msg);                 /* may be NULL */
 } hqqrpc_server_options;
 
 HQQ_API void hqqrpc_server_options_init(hqqrpc_server_options *opts);

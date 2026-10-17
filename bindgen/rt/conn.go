@@ -4,10 +4,15 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	hqq "gosuda.org/hqq"
 )
+
+// killedBit is set in Conn.gate by Kill. The bits below it count the spans in
+// which the owner can touch link memory.
+const killedBit = 1 << 62
 
 const (
 	// keepBuf is the largest response buffer a recycled Call keeps.
@@ -51,8 +56,15 @@ type Conn struct {
 	callTimeout  time.Duration
 	closeTimeout time.Duration
 
-	// One goroutine at a time owns everything below until Kill, which only
-	// touches closeOnce.
+	// gate guards link memory against Kill, the only method that runs on
+	// another goroutine. The owner holds one count while it can read or write a
+	// ring slot: from the start of BeginRequest to Submit or Abort, and from the
+	// start of Wait to Release (also across Sync and Close). Kill sets killedBit
+	// and wakes blocked ring waits; the link is closed, and its segment
+	// unmapped, only when no count is held, by whoever brings the counts to zero
+	// with killedBit set. Everything below is owned by one goroutine at a time.
+	gate atomic.Uint64
+
 	txOpen bool
 	rxOpen bool
 	enc    Enc
@@ -150,7 +162,47 @@ func newConn(link *hqq.StandardLink, closeFn func() error, iface *Iface, cfg con
 }
 
 // Err is the sticky failure of a broken session, or nil.
-func (c *Conn) Err() error { return c.broken }
+func (c *Conn) Err() error {
+	if c.broken == nil && c.killed() {
+		c.markKilled()
+	}
+	return c.broken
+}
+
+// enter opens a span in which the owner may touch link memory. It fails if the
+// session was killed; the caller then calls markKilled.
+func (c *Conn) enter() bool {
+	if c.gate.Add(1)&killedBit != 0 {
+		c.leave()
+		return false
+	}
+	return true
+}
+
+// leave closes a span. The last span of a killed session closes the link.
+func (c *Conn) leave() {
+	if c.gate.Add(^uint64(0)) == killedBit {
+		_ = c.closeLink()
+	}
+}
+
+func (c *Conn) killed() bool { return c.gate.Load()&killedBit != 0 }
+
+// markKilled records Kill as the failure of the session. Owner only.
+func (c *Conn) markKilled() {
+	c.failRx(&TransportError{Err: hqq.ErrClosed, Unknown: true, svc: c.iface.Service})
+}
+
+// txFailed records the failure of a send and returns the error to report: a
+// wake-up caused by Kill is hqq.ErrClosed, as if the link had been closed.
+func (c *Conn) txFailed(err error) error {
+	if c.killed() {
+		c.markKilled()
+		return hqq.ErrClosed
+	}
+	c.failTx(err)
+	return err
+}
 
 // Limits returns the values granted by the server.
 func (c *Conn) Limits() Limits { return c.lim }
@@ -185,9 +237,14 @@ func (c *Conn) BeginRequest(op uint16, bodyLen int, respMax int64) (*Enc, error)
 	if c.broken != nil {
 		return nil, c.brokenErr(op)
 	}
+	if !c.enter() {
+		c.markKilled()
+		return nil, c.brokenErr(op)
+	}
 	rf := c.rfOf(op, respMax)
 	if !c.fits(rf) {
 		if err := c.makeRoom(op, rf); err != nil {
+			c.leave()
 			return nil, err
 		}
 	}
@@ -195,7 +252,8 @@ func (c *Conn) BeginRequest(op uint16, bodyLen int, respMax int64) (*Enc, error)
 	if HeaderSize+bodyLen <= c.lim.BufferSize {
 		res, err := c.link.ReserveWrite()
 		if err != nil {
-			c.failTx(err)
+			err = c.txFailed(err)
+			c.leave()
 			return nil, &TransportError{Func: c.opName(op), Err: err, svc: c.iface.Service}
 		}
 		e.res = res
@@ -303,8 +361,9 @@ func (c *Conn) Submit(e *Enc) (*Call, error) {
 	c.txOpen = false
 	e.body, e.buf = nil, nil
 	if err != nil {
-		c.failTx(err)
+		err = c.txFailed(err)
 		c.afterOp()
+		c.leave()
 		return nil, &TransportError{Func: c.opName(op), Err: err, Unknown: committed, svc: c.iface.Service}
 	}
 	c.nextID = id
@@ -320,6 +379,7 @@ func (c *Conn) Submit(e *Enc) (*Call, error) {
 		c.scratch = nil
 	}
 	c.afterOp()
+	c.leave()
 	return call, nil
 }
 
@@ -366,6 +426,7 @@ func (c *Conn) Abort(e *Enc) {
 	}
 	e.body, e.buf = nil, nil
 	c.afterOp()
+	c.leave()
 }
 
 func (c *Conn) newCall() *Call {
@@ -421,13 +482,23 @@ func (c *Conn) unansHead() *Call {
 // CallTimeout from now, or none. A deadline left over from an earlier run is
 // cleared first.
 func (c *Conn) armRead() error {
-	if c.callTimeout > 0 {
+	switch {
+	case c.callTimeout > 0:
 		c.rdArmed = true
-		return c.link.SetReadDeadline(time.Now().Add(c.callTimeout))
-	}
-	if c.rdArmed {
+		if err := c.link.SetReadDeadline(time.Now().Add(c.callTimeout)); err != nil {
+			return err
+		}
+	case c.rdArmed:
 		c.rdArmed = false
-		return c.link.SetReadDeadline(time.Time{})
+		if err := c.link.SetReadDeadline(time.Time{}); err != nil {
+			return err
+		}
+	default:
+		return nil
+	}
+	// The deadline just set may have replaced the one Kill set to wake us.
+	if c.killed() {
+		return hqq.ErrClosed
 	}
 	return nil
 }
@@ -463,6 +534,9 @@ func (c *Conn) readResponse(mode rxMode) error {
 }
 
 func (c *Conn) readError(err error) error {
+	if c.killed() {
+		return c.failRx(&TransportError{Err: hqq.ErrClosed, Unknown: true, svc: c.iface.Service})
+	}
 	if errors.Is(err, hqq.ErrTimeout) {
 		return err
 	}
@@ -719,16 +793,21 @@ func (c *Conn) Wait(call *Call, id uint32) (Dec, error) {
 	if c.rxOpen {
 		return Dec{}, ErrConcurrentUse
 	}
+	if !c.enter() {
+		c.markKilled()
+		return Dec{}, c.abandonCall(call)
+	}
 	c.rxOpen = true
 	if !call.done {
 		if err := c.await(call); err != nil {
 			c.rxOpen = false
 			if !c.rxDead {
+				c.leave()
 				return Dec{}, &TransportError{Func: c.opName(call.op), Err: err, Unknown: true, svc: c.iface.Service}
 			}
-			e := c.errForCall(call.op)
-			c.dropCall(call)
+			e := c.abandonCall(call)
 			c.afterOp()
+			c.leave()
 			return Dec{}, e
 		}
 	}
@@ -737,6 +816,7 @@ func (c *Conn) Wait(call *Call, id uint32) (Dec, error) {
 		c.recycle(call)
 		c.rxOpen = false
 		c.afterOp()
+		c.leave()
 		return Dec{}, e
 	}
 	c.rxGen++
@@ -750,6 +830,17 @@ func (c *Conn) Wait(call *Call, id uint32) (Dec, error) {
 	}
 	c.recycle(call)
 	return d, nil
+}
+
+// abandonCall ends call because the session failed and returns its error.
+func (c *Conn) abandonCall(call *Call) error {
+	e := c.errForCall(call.op)
+	if call.done {
+		c.recycle(call)
+	} else {
+		c.dropCall(call)
+	}
+	return e
 }
 
 // await reads responses until call is answered. The response of call itself is
@@ -799,6 +890,7 @@ func (c *Conn) endRx() {
 	}
 	c.rxOpen = false
 	c.afterOp()
+	c.leave()
 }
 
 // Malformed marks the session broken, because the response body is not what
@@ -840,6 +932,12 @@ func (c *Conn) Sync() error {
 	if c.txOpen || c.rxOpen {
 		return ErrConcurrentUse
 	}
+	if !c.enter() {
+		c.markKilled()
+		c.abandon()
+		c.afterOp()
+		return c.broken
+	}
 	var rerr error
 	armed := false
 	for c.unansN > 0 && !c.rxDead {
@@ -857,8 +955,10 @@ func (c *Conn) Sync() error {
 	if c.rxDead {
 		c.abandon()
 		c.afterOp()
+		c.leave()
 		return c.broken
 	}
+	c.leave()
 	if rerr != nil {
 		c.discardAnswered()
 		return &TransportError{Err: rerr, Unknown: true, svc: c.iface.Service}
@@ -910,14 +1010,24 @@ func (c *Conn) Close() error {
 	c.abandon()
 	var err error
 	if c.broken == nil {
-		err = c.closeSession()
+		if c.enter() {
+			err = c.closeSession()
+			c.leave()
+		} else {
+			c.markKilled()
+		}
 	}
 	err = errors.Join(err, c.closeLink())
 	c.closeRes = err
 	return err
 }
 
+// transportErr is the error of the CLOSE exchange. A wake-up caused by Kill
+// reads as the closed link it stands for.
 func (c *Conn) transportErr(err error) error {
+	if c.killed() {
+		err = hqq.ErrClosed
+	}
 	return &TransportError{Err: err, svc: c.iface.Service}
 }
 
@@ -925,6 +1035,9 @@ func (c *Conn) closeSession() error {
 	deadline := time.Now().Add(c.closeTimeout)
 	if err := c.link.SetWriteDeadline(deadline); err != nil {
 		return c.transportErr(err)
+	}
+	if c.killed() { // the deadline may have replaced the one Kill set
+		return c.transportErr(hqq.ErrClosed)
 	}
 	w, err := c.link.ReserveWrite()
 	if err != nil {
@@ -938,6 +1051,9 @@ func (c *Conn) closeSession() error {
 		return c.transportErr(err)
 	}
 	c.rdArmed = true
+	if c.killed() {
+		return c.transportErr(hqq.ErrClosed)
+	}
 	for {
 		r, err := c.link.ReserveRead()
 		if err != nil {
@@ -968,10 +1084,25 @@ func (c *Conn) closeSession() error {
 	}
 }
 
-// Kill closes the link without the CLOSE exchange; the one call that is safe
-// from any goroutine. Calls in flight have an unknown outcome (8.2). It must
-// not run while the owner holds an open Enc or Dec: the buffers they point
-// into are unmapped.
+// Kill ends the session from any goroutine, at any time, without waiting for
+// the owner: every blocked and later call fails with hqq.ErrClosed (calls in
+// flight have an unknown outcome) and the server sees the link close.
+//
+// Kill never invalidates memory the owner is using. It marks the Conn killed
+// and wakes blocked ring waits with expired deadlines; the link is closed, and
+// its segment unmapped, when the owner holds no Enc or Dec: at once if it holds
+// none now, otherwise by the owner's call that ends the last one (Submit,
+// Abort, Release). An owner that keeps an Enc or Dec open for ever keeps the
+// link open. Kill is idempotent and may be called concurrently with Close.
 func (c *Conn) Kill() {
-	_ = c.closeLink()
+	old := c.gate.Or(killedBit)
+	if old&^killedBit == 0 {
+		_ = c.closeLink()
+		return
+	}
+	// The wake-up must follow the flag: an owner that re-arms its deadline
+	// checks the flag afterwards.
+	now := time.Now()
+	_ = c.link.SetReadDeadline(now)
+	_ = c.link.SetWriteDeadline(now)
 }

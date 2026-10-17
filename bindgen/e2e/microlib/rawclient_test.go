@@ -151,7 +151,6 @@ func rawOpen(t testing.TB, s *server, count, size uint32, link hqq.LinkOptions) 
 	if r.code != 0 {
 		t.Fatalf("OPEN refused with code %d: %s", r.code, r.msg)
 	}
-	link.Exclusive = true
 	nl, err := hqq.OpenStandardLink(r.name, int(r.count), int(r.size), link)
 	if err != nil {
 		t.Fatalf("attaching the session link %s: %v", r.name, err)

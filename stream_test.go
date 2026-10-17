@@ -1082,7 +1082,13 @@ func TestServeSlowHandlerDoesNotBlockLaterRequests(t *testing.T) {
 // a permanent mode switch: once the slow handler is done, Serve runs requests
 // inline again, and allocates nothing.
 func TestServeReturnsToInlineAfterEscalation(t *testing.T) {
-	client, server := newNegotiatedPair(t, 16, 64, AdvancedOptions{}, AdvancedOptions{})
+	// WaitSpin: an adaptive receiver that finds no request within its spin
+	// budget parks, and a park with the cancelable Serve context allocates
+	// (context.AfterFunc in the ring waiter). On a loaded machine that
+	// happens now and then, whatever Serve does, so it would make the
+	// zero-allocation check below depend on scheduling.
+	spin := AdvancedOptions{Link: LinkOptions{WaitPolicy: WaitSpin}}
+	client, server := newNegotiatedPair(t, 16, 64, spin, spin)
 	ctx, cancel := context.WithCancel(context.Background())
 	serveDone := make(chan error, 1)
 

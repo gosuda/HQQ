@@ -35,7 +35,7 @@ func Dial(ctx context.Context, listener string, iface *Iface, opts Options) (_ *
 		BufferCount: 4,
 		BufferSize:  4096,
 		Features:    hqq.FeatureRequestResponse,
-		Advanced:    hqq.AdvancedOptions{Link: controlLinkOptions(cfg.link)},
+		Advanced:    hqq.AdvancedOptions{Link: cfg.link},
 	})
 	if err != nil {
 		return nil, dialError(parent, ctx, iface, err)
@@ -66,14 +66,6 @@ func Dial(ctx context.Context, listener string, iface *Iface, opts Options) (_ *
 		return nil, err
 	}
 	return newConn(nl.StandardLink, nl.Close, iface, cfg, lim), nil
-}
-
-// controlLinkOptions are the options of the Advanced control link: the same
-// timing as the session link, without Exclusive, which an Advanced link
-// rejects.
-func controlLinkOptions(o hqq.LinkOptions) hqq.LinkOptions {
-	o.Exclusive = false
-	return o
 }
 
 // dialError reports a connect failure. Errors that carry their own meaning

@@ -516,7 +516,7 @@ Constraints (mandatory):
 3. The cursor store happens **before** the publish/release store of `seq` (it is the "claim" of the CAS protocol).
 4. Exactly one process acts as producer and one as consumer per ring: a second process on the same side is never admitted by the superblock protocol, so SPSC mode is sound **only because** of 5.5.
 
-CAS-based and store-based implementations interoperate on the same ring (the Go implementation uses CAS by default and a store-based mode when `LinkOptions.Exclusive` is set).
+CAS-based and store-based implementations interoperate on the same ring (the Go implementation is CAS-based).
 
 ## 8. Wait / wake protocol
 
@@ -572,7 +572,7 @@ K3  if n != 0:  fetch_add(word, 1)  then  wake_all(word)        # with a Parker:
 
 A blocked operation escalates through three phases, re-checking the slot sequence each iteration:
 
-1. spin: 64 iterations (no syscall);
+1. spin: 256 iterations (no syscall). A Go iteration re-reads the slot 4 times, about 24 ns, so the window is about 6 µs; an implementation with a cheaper step uses proportionally more iterations (the C library: 1024 single-read steps, about 4 µs). The window must cover the reply of a peer that spends a few microseconds per request; a window of about 1.5 µs measurably slowed such calls (the Go yield phase wakes another thread per `runtime.Gosched`);
 2. yield: 256 iterations of `sched_yield`/`runtime.Gosched` (deadline and liveness checks every 16th iteration);
 3. park for `min(100 ms, time to deadline, time to next liveness check)`; liveness (`Check`) runs once when leaving the spin phase and then at most every 50 ms.
 
@@ -600,7 +600,7 @@ A packet is **64 bytes: eight little-endian `u64` words**.
 | 0 | 0 | opcode in the low byte; bits 8..63 reserved |
 | 1..7 | 8, 16, …, 56 | operands 0..6 |
 
-**[IOP]** Senders MUST write the reserved bits of word 0 as zero, and all unused operand words as zero. **[IOP]** Receivers MUST read the opcode as `word0 & 0xFF` and MUST ignore bits 8..63 of word 0 (forward compatibility). Operand words not defined for an opcode are ignored by receivers.
+**[IOP]** The reserved bits of word 0 and every operand word that the opcode does not define MUST be zero in a published packet. A sender MAY skip the store of a word that is already zero: operands 3..6 (words 4..7) of a Standard ring are defined by no Standard opcode and are zeroed by `Format` (7.2), so a Standard sender that never writes them satisfies the rule, and an implementation relies on this only for rings it formatted or attached under the rules of 7.2 and 7.3. A sender that writes into a slot that held a packet of another layer MUST clear the words itself. **[IOP]** Receivers MUST read the opcode as `word0 & 0xFF` and MUST ignore bits 8..63 of word 0 (forward compatibility). Operand words not defined for an opcode are ignored by receivers.
 
 ### 9.2 Opcodes and operands **[IOP]**
 

@@ -98,28 +98,6 @@ type LinkOptions struct {
 	// retries it). Zero selects DefaultAttachTimeout.
 	AttachTimeout time.Duration
 
-	// Exclusive selects the store-based single-producer single-consumer ring
-	// protocol (SPEC 7.6) for this endpoint instead of the compare-and-swap
-	// protocol. It removes the CAS from every claim, which lowers the cost
-	// of a round trip, and interoperates with CAS endpoints and with the C,
-	// C++ and Rust implementations on the same segment.
-	//
-	// The caller promises that at most one goroutine at a time performs
-	// write-side operations on the link (Write, WriteZeroCopy, ReserveWrite
-	// and the Commit or Abort of its reservations) and at most one
-	// goroutine at a time performs read-side operations (Read, ReadFrom,
-	// ReadZeroCopy, ReserveRead and the Release of its reservations). The
-	// write side and the read side may run concurrently with each other.
-	// Violating this corrupts the link: two goroutines can claim the same
-	// ring slot. Builds with the race detector panic when two goroutines
-	// claim on one side at the same time. Close, deadlines, PeerState and
-	// the heartbeat may be used from any goroutine.
-	//
-	// Only a StandardLink supports it: the Advanced constructors reject it
-	// with ErrExclusiveUnsupported, because an AdvancedLink sends from many
-	// goroutines. Default: false.
-	Exclusive bool
-
 	// parkers, set by the named-segment constructors on platforms whose
 	// waiters cannot park on words inside the shared memory (Windows), are
 	// the cross-process wake objects of ring 0 and ring 1. Nil entries keep

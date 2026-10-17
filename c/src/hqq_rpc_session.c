@@ -2,7 +2,7 @@
  * hqq_rpc_session.c - one session of the hqq-bindgen C runtime: frame receive and validation
  * (BINDGEN.md 4.4), assembly of CONT frames (4.8), request ids (4.12), the server order of 4.7.1,
  * the response reservation held in place (4.7.3), error and status encoding (4.10), teardown (5.2),
- * and the link-less test entry points (12.1, item 6).
+ * and the link-less test entry points (12.1, item 4).
  *
  * A session is used by one thread at a time: the session thread of the server, or the test.
  * Portable C11: no POSIX headers, no threads.
@@ -710,7 +710,7 @@ void hqqrpc_session_destroy(hqqrpc_session *s) {
     hqq_free(ap, s, sizeof *s);
 }
 
-/* ---- Test entry points (12.1, item 6) --------------------------------------------------------- */
+/* ---- Test entry points (12.1, item 4) --------------------------------------------------------- */
 
 hqqrpc_session *hqqrpc_test_session_new(const hqqrpc_iface *iface, const hqqrpc_server_options *opts) {
     hqqrpc_server_options def;

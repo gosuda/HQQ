@@ -193,7 +193,22 @@ void adv_wake_locked(hqq_adv *a) {
     a->wq = NULL;
 }
 
-void adv_park_locked(hqq_adv *a, uint64_t ns) {
+void adv_wake_events_locked(hqq_adv *a, unsigned events) {
+    adv_waiter **pp = &a->wq;
+    while (*pp != NULL) {
+        adv_waiter *w = *pp;
+        if ((w->events & events) != 0) {
+            *pp = w->next;
+            hqq_plat_event_signal(w->ev);
+        } else {
+            pp = &w->next;
+        }
+    }
+}
+
+void adv_park_locked(hqq_adv *a, uint64_t ns) { adv_park_events_locked(a, ns, 0); }
+
+void adv_park_events_locked(hqq_adv *a, uint64_t ns, unsigned events) {
     adv_waiter *w = a->waiter_free;
     if (ns > ADV_POLL_NS) {
         ns = ADV_POLL_NS;
@@ -218,6 +233,7 @@ void adv_park_locked(hqq_adv *a, uint64_t ns) {
         return;
     }
     hqq_plat_event_reset(w->ev);
+    w->events = events;
     w->next = a->wq;
     a->wq = w;
     hqq_spin_unlock(&a->lock);

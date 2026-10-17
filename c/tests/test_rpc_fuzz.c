@@ -311,6 +311,9 @@ static void check_output(outcheck *c, const uint8_t *out, size_t n) {
     uint32_t chunk = c->S - RTU_HDR;
 
     c->messages = 0;
+    c->first_aux = 0;
+    c->first_id = 0;
+    c->first_kind = 0;
     c->ok = 1;
     while (off < n) {
         const uint8_t *f = out + off;
@@ -404,7 +407,7 @@ static unsigned long g_stat_handshake_fail;
 static void run_one(int script) {
     hqqrpc_server_options o;
     hqqrpc_session *s;
-    outcheck oc;
+    outcheck oc = {0, 0, 0, 0, 0, 0, 0};
     uint8_t viol[64];
     unsigned i;
     uint32_t S = script_S(script);

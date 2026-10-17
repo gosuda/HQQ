@@ -102,6 +102,7 @@ hqq_status adv_wrap_base(hqq_link *base, const hqq_adv_options *opts, hqq_adv **
     a->overflow = opts != NULL ? opts->overflow : HQQ_OVERFLOW_BLOCK;
     a->control_cap = bc > ADV_CONTROL_MIN ? bc : ADV_CONTROL_MIN;
     a->listen_grace_ns = ADV_LISTEN_GRACE_NS;
+    a->inline_limit_ns = ADV_INLINE_NS;
     if (opts != NULL && opts->stream_listen_grace_ns < 0) {
         a->listen_grace_ns = 0;
     } else if (opts != NULL && opts->stream_listen_grace_ns > 0) {
@@ -657,7 +658,7 @@ hqq_status adv_check_negotiated(hqq_adv *a, uint64_t feature) {
 
 /* ---- Receive dispatcher ------------------------------------------------------------------ */
 
-static hqq_status dispatch_one(hqq_adv *a, hqq_packet *pkt, uint64_t pos) {
+static hqq_status dispatch_one(hqq_adv *a, hqq_packet *pkt, uint64_t pos, adv_inline *inl) {
     unsigned op = hqq_packet_op(pkt);
 
     if (op == HQQ_OP_CONN_COPY) {
@@ -691,7 +692,7 @@ static hqq_status dispatch_one(hqq_adv *a, hqq_packet *pkt, uint64_t pos) {
             hqq_spin_unlock(&a->lock);
         }
         if (out.complete != NULL) {
-            return adv_route(a, out.complete);
+            return adv_route(a, out.complete, inl);
         }
         return HQQ_OK;
     }
@@ -716,14 +717,19 @@ static hqq_status dispatch_one(hqq_adv *a, hqq_packet *pkt, uint64_t pos) {
 void adv_dispatch_main(void *arg) {
     hqq_adv *a = (hqq_adv *)arg;
     adv_wait w;
+    adv_inline inl;
 
     adv_wait_init(&w, NULL);
+    inl.msg = NULL;
     for (;;) {
         hqq_packet pkt;
         uint64_t pos;
         hqq_status st = adv_rx(a, &w, &pkt, &pos);
         if (st == HQQ_OK) {
-            st = dispatch_one(a, &pkt, pos);
+            st = dispatch_one(a, &pkt, pos, &inl);
+        }
+        if (st == HQQ_OK && inl.msg != NULL && adv_run_inline(a, &inl)) {
+            return; /* another dispatcher thread owns the receive path now */
         }
         if (st != HQQ_OK) {
             hqq_spin_lock(&a->lock);

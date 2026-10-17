@@ -1,7 +1,7 @@
 /*
  * hqq_adv_msg.c - the messaging API of the Advanced layer: sending chunked
  * messages (SPEC 10.4), receiving them, calls (SPEC 10.6, 1.1 sections 2, 3, 5),
- * Serve with its request workers and deadline timer (1.1 section 4), responses,
+ * Serve with inline handlers, request workers and the timer thread (1.1 section 4), responses,
  * cancellation and graceful shutdown (1.1 sections 2, 6).
  */
 #include "hqq_adv_internal.h"
@@ -138,7 +138,7 @@ static void finish_request_locked(hqq_adv *a, hqq_req_ctx *c) {
     c->req = NULL;
     c->pool_next = a->reqctx_free;
     a->reqctx_free = c;
-    adv_wake_locked(a);
+    adv_wake_events_locked(a, ADV_EV_DONE);
 }
 
 /* ---- Data messages ------------------------------------------------------------------- */
@@ -550,7 +550,7 @@ hqq_status hqq_req_ctx_wait_done(hqq_req_ctx *c, int64_t timeout_ns) {
             st = HQQ_ERR_TIMEOUT;
             break;
         }
-        adv_park_locked(a, adv_slice_ns(&w));
+        adv_park_events_locked(a, adv_slice_ns(&w), ADV_EV_DONE);
     }
     hqq_spin_unlock(&a->lock);
     return st;
@@ -568,24 +568,42 @@ int hqq_req_ctx_deadline(const hqq_req_ctx *c, uint64_t *mono_ns) {
     return has;
 }
 
-/* ---- Serve, workers, deadline timer -------------------------------------------------- */
+/* ---- Serve: inline handlers, workers, the watchdog and deadline timer ------------------ */
 
-/* Runs the handler of one request and sends its response (lock not held). */
-static void run_request(hqq_adv *a, hqq_msg *m, hqq_req_ctx *c, hqq_handler_fn fn, void *user) {
+/* Runs the handler of one request and sends its response (lock not held). A worker passes
+ * inl == NULL. The dispatcher thread passes its adv_inline: the handler holds the receive path,
+ * so the timer thread may move the receive role to a new thread (escalate_locked) while it runs.
+ * Then the node that now owns this thread is returned; the caller must end the thread after
+ * marking the node done. */
+static adv_worker *run_request(hqq_adv *a, hqq_msg *m, hqq_req_ctx *c, hqq_handler_fn fn, void *user,
+                               adv_inline *inl) {
     hqq_request req;
     hqq_response w;
     int skip;
+    int dead = 0;
+    adv_worker *retired = NULL;
     adv_wait nowait_wait;
 
     req.msg = m;
     memset(&w, 0, sizeof w);
     w.a = a;
     w.ctx = c;
-    fn(user, c, &w, &req);
+    if (inl != NULL) {
+        /* A worker checked the context when it took the request; the dispatcher claimed it a
+         * moment ago, and a deadline, the end of Serve or a close may have ended it since. */
+        hqq_spin_lock(&a->lock);
+        dead = c->end != ADV_REQ_LIVE;
+        hqq_spin_unlock(&a->lock);
+    }
+    if (!dead) {
+        fn(user, c, &w, &req);
+    }
 
     hqq_spin_lock(&a->lock);
-    a->workers_busy--; /* idle again before the response can reach the requester */
-    skip = c->end == ADV_REQ_CANCELED || c->end == ADV_REQ_DEADLINE;
+    if (inl == NULL) {
+        a->workers_busy--; /* idle again before the response can reach the requester */
+    }
+    skip = dead || c->end == ADV_REQ_CANCELED || c->end == ADV_REQ_DEADLINE;
     if (c->end == ADV_REQ_LIVE) {
         c->end = ADV_REQ_HANDLED;
     }
@@ -603,9 +621,34 @@ static void run_request(hqq_adv *a, hqq_msg *m, hqq_req_ctx *c, hqq_handler_fn f
     }
     hqq_spin_lock(&a->lock);
     m->rc = NULL;
+    if (inl != NULL) {
+        /* The response is part of the inline run: a send that blocks on a full ring is escalated
+         * like a handler, and Serve's drain waits for it. */
+        if (inl->escalated) {
+            retired = inl->retired;
+            a->esc_busy--;
+        } else {
+            a->inl = NULL;
+            a->inline_active = 0;
+        }
+    }
     finish_request_locked(a, c);
     hqq_spin_unlock(&a->lock);
     adv_msg_put(m);
+    return retired;
+}
+
+int adv_run_inline(hqq_adv *a, adv_inline *inl) {
+    hqq_msg *m = inl->msg;
+    adv_worker *retired;
+
+    inl->msg = NULL;
+    retired = run_request(a, m, inl->ctx, inl->fn, inl->user, inl);
+    if (retired == NULL) {
+        return 0;
+    }
+    atomic_store_explicit(&retired->done, 1, memory_order_release); /* last access: it may be joined now */
+    return 1;
 }
 
 void adv_worker_main(void *arg) {
@@ -619,7 +662,7 @@ void adv_worker_main(void *arg) {
 
         while (adv_queue_empty(&a->reqq) && !a->serve_stop &&
                !atomic_load_explicit(&a->closing, memory_order_seq_cst)) {
-            adv_park_locked(a, ADV_POLL_NS);
+            adv_park_events_locked(a, ADV_POLL_NS, ADV_EV_WORK);
         }
         if (a->serve_stop || atomic_load_explicit(&a->closing, memory_order_seq_cst)) {
             break;
@@ -639,19 +682,94 @@ void adv_worker_main(void *arg) {
         user = a->serve_user;
         a->workers_busy++;
         hqq_spin_unlock(&a->lock);
-        run_request(a, m, c, fn, user);
+        (void)run_request(a, m, c, fn, user, NULL);
         hqq_spin_lock(&a->lock);
     }
     hqq_spin_unlock(&a->lock);
 }
 
+/* Joins the retired dispatcher threads that ended (all of them with `all`) and frees their
+ * nodes. Lock held; released while joining. */
+static void reap_retired_locked(hqq_adv *a, int all) {
+    const hqq_allocator *ap = adv_alloc_ptr(a);
+    adv_worker *ended = NULL;
+    adv_worker **pp = &a->retired;
+
+    while (*pp != NULL) {
+        adv_worker *n = *pp;
+        if (all || atomic_load_explicit(&n->done, memory_order_acquire)) {
+            *pp = n->next;
+            n->next = ended;
+            ended = n;
+        } else {
+            pp = &n->next;
+        }
+    }
+    if (ended == NULL) {
+        return;
+    }
+    hqq_spin_unlock(&a->lock);
+    while (ended != NULL) {
+        adv_worker *next = ended->next;
+        hqq_plat_thread_join(ap, ended->th);
+        hqq_free(ap, ended, sizeof *ended);
+        ended = next;
+    }
+    hqq_spin_lock(&a->lock);
+}
+
+/* The inline handler outlived ADV_INLINE_NS (lock held): a new thread takes over the receive path
+ * so that cancels, responses and further requests are processed while the handler runs. The
+ * handler's thread becomes a retired dispatcher and ends after the handler and its response. */
+static void escalate_locked(hqq_adv *a) {
+    const hqq_allocator *ap = adv_alloc_ptr(a);
+    adv_inline *inl = a->inl;
+    adv_worker *rt;
+    hqq_plat_thread *t;
+    int os_err = 0;
+
+    if (inl == NULL || inl->escalated || a->esc_busy >= ADV_MAX_WORKERS) {
+        return;
+    }
+    rt = (adv_worker *)hqq_alloc(ap, sizeof *rt);
+    if (rt == NULL) {
+        return;
+    }
+    t = hqq_plat_thread_start(ap, adv_dispatch_main, a, &os_err);
+    if (t == NULL) {
+        hqq_free(ap, rt, sizeof *rt);
+        return; /* tried again at the next tick */
+    }
+    atomic_store_explicit(&rt->done, 0, memory_order_relaxed);
+    rt->th = a->rx_thread;
+    a->rx_thread = t;
+    rt->next = a->retired;
+    a->retired = rt;
+    inl->escalated = 1;
+    inl->retired = rt;
+    a->inl = NULL;
+    a->inline_active = 0;
+    a->esc_busy++;
+    a->sv_escalated++;
+}
+
+/* Deadlines of requests and the escalation watchdog. While inline handlers keep arriving it ticks
+ * every inline_limit_ns, so a handler is escalated between one and two limits after it started;
+ * after ADV_WATCH_IDLE_TICKS quiet ticks it sleeps ADV_TIMER_NS and adv_route wakes it for the
+ * next inline handler. While the timer ticks, the request path only reads timer_slow. */
 void adv_timer_main(void *arg) {
     hqq_adv *a = (hqq_adv *)arg;
+    uint64_t seen = 0;
+    unsigned quiet = 0;
+
     hqq_spin_lock(&a->lock);
+    seen = a->inl_seq;
     while (!a->serve_stop && !atomic_load_explicit(&a->closing, memory_order_seq_cst)) {
         hqq_req_ctx *c;
         uint64_t now = hqq_plat_mono_ns();
+        uint64_t ns = ADV_TIMER_NS;
         int changed = 0;
+
         for (c = a->reqs; c != NULL; c = c->next) {
             if (c->has_deadline && c->end == ADV_REQ_LIVE && now >= c->deadline_mono) {
                 c->end = ADV_REQ_DEADLINE;
@@ -661,7 +779,26 @@ void adv_timer_main(void *arg) {
         if (changed) {
             adv_wake_locked(a);
         }
-        adv_park_locked(a, ADV_TIMER_NS);
+        if (a->inline_active || a->inl_seq != seen) {
+            seen = a->inl_seq;
+            quiet = 0;
+        } else if (quiet < ADV_WATCH_IDLE_TICKS) {
+            quiet++;
+        }
+        a->timer_slow = quiet >= ADV_WATCH_IDLE_TICKS;
+        if (!a->timer_slow && a->inline_limit_ns < ns) {
+            ns = a->inline_limit_ns;
+        }
+        if (a->inl != NULL && !a->inl->escalated) {
+            uint64_t age = now - a->inl_start;
+            if (age >= a->inline_limit_ns) {
+                escalate_locked(a);
+            } else if (a->inline_limit_ns - age < ns) {
+                ns = a->inline_limit_ns - age;
+            }
+        }
+        reap_retired_locked(a, 0);
+        adv_park_events_locked(a, ns, ADV_EV_TIMER);
     }
     hqq_spin_unlock(&a->lock);
 }
@@ -674,6 +811,7 @@ static hqq_status spawn_worker_locked(hqq_adv *a) {
     if (wk == NULL) {
         return HQQ_ERR_NO_MEMORY;
     }
+    atomic_store_explicit(&wk->done, 0, memory_order_relaxed);
     wk->th = hqq_plat_thread_start(ap, adv_worker_main, a, &os_err);
     if (wk->th == NULL) {
         hqq_free(ap, wk, sizeof *wk);
@@ -716,23 +854,13 @@ hqq_status hqq_adv_serve(hqq_adv *a, hqq_handler_fn fn, void *user, const hqq_wa
     a->serve_stop = 0;
     a->serve_fn = fn;
     a->serve_user = user;
+    a->timer_slow = 0;
     a->timer_thread = hqq_plat_thread_start(ap, adv_timer_main, a, &os_err);
     if (a->timer_thread == NULL) {
         a->serving = 0;
         hqq_spin_unlock(&a->lock);
         adv_leave(a);
         return HQQ_ERR_SYSTEM;
-    }
-    st = spawn_worker_locked(a);
-    if (st != HQQ_OK) {
-        a->serve_stop = 1;
-        a->serving = 0;
-        adv_wake_locked(a);
-        hqq_spin_unlock(&a->lock);
-        hqq_plat_thread_join(ap, a->timer_thread);
-        a->timer_thread = NULL;
-        adv_leave(a);
-        return st;
     }
     for (;;) {
         if (a->rx_failed) {
@@ -751,14 +879,19 @@ hqq_status hqq_adv_serve(hqq_adv *a, hqq_handler_fn fn, void *user, const hqq_wa
             st = HQQ_ERR_TIMEOUT;
             break;
         }
-        if (!adv_queue_empty(&a->reqq) && a->workers_busy >= a->workers_total && a->workers_total < ADV_MAX_WORKERS) {
+        while (a->reqq.count > adv_idle_workers_locked(a) && a->workers_total < ADV_MAX_WORKERS) {
             hqq_status sp = spawn_worker_locked(a);
             if (sp != HQQ_OK) {
                 st = sp;
                 break;
             }
         }
-        adv_park_locked(a, adv_slice_ns(&w));
+        if (st != HQQ_OK) {
+            break;
+        }
+        /* The request path wakes this thread when the workers fall behind; completions only
+         * matter to it once a shutdown waits for the last one. */
+        adv_park_events_locked(a, adv_slice_ns(&w), a->shutting ? ADV_EV_SPAWN | ADV_EV_DONE : ADV_EV_SPAWN);
     }
 
     /* Serve ends: every request context ends, the workers and the timer stop. */
@@ -774,15 +907,24 @@ hqq_status hqq_adv_serve(hqq_adv *a, hqq_handler_fn fn, void *user, const hqq_wa
     a->serving = 0;
     adv_wake_locked(a);
     {
-        adv_worker *wk = a->workers;
         hqq_plat_thread *tt = a->timer_thread;
-        a->workers = NULL;
-        a->workers_total = 0;
+        adv_worker *wk;
+
         a->timer_thread = NULL;
         hqq_spin_unlock(&a->lock);
         if (tt != NULL) {
             hqq_plat_thread_join(ap, tt);
         }
+        hqq_spin_lock(&a->lock);
+        /* The watchdog is gone, so no handler can be escalated any more: wait for the one the
+         * dispatcher runs and for those on retired dispatcher threads. */
+        while (a->inline_active || a->esc_busy != 0) {
+            adv_park_events_locked(a, ADV_POLL_NS, ADV_EV_DONE);
+        }
+        wk = a->workers;
+        a->workers = NULL;
+        a->workers_total = 0;
+        hqq_spin_unlock(&a->lock);
         while (wk != NULL) {
             adv_worker *next = wk->next;
             if (wk->th != NULL) {
@@ -791,6 +933,9 @@ hqq_status hqq_adv_serve(hqq_adv *a, hqq_handler_fn fn, void *user, const hqq_wa
             hqq_free(ap, wk, sizeof *wk);
             wk = next;
         }
+        hqq_spin_lock(&a->lock);
+        reap_retired_locked(a, 1);
+        hqq_spin_unlock(&a->lock);
     }
     adv_leave(a);
     return st;
@@ -826,7 +971,7 @@ hqq_status hqq_adv_shutdown(hqq_adv *a, const hqq_wait *in) {
             st = HQQ_ERR_TIMEOUT;
             break;
         }
-        adv_park_locked(a, adv_slice_ns(&w));
+        adv_park_events_locked(a, adv_slice_ns(&w), ADV_EV_DONE);
     }
     hqq_spin_unlock(&a->lock);
     adv_leave(a);

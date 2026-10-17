@@ -1044,11 +1044,11 @@ func TestMalformedBreaksAndCloses(t *testing.T) {
 // ring that the client reads as Standard frames (5.4).
 func TestUnexpectedPacketBreaksTheSession(t *testing.T) {
 	mem := hqq.AlignedBuffer(hqq.SizeStandardLink(8, 4096))
-	adv, err := hqq.NewAdvancedLink(mem, 8, 4096, hqq.AdvancedOptions{Link: testLinkOpts(false)})
+	adv, err := hqq.NewAdvancedLink(mem, 8, 4096, hqq.AdvancedOptions{Link: testLinkOpts()})
 	if err != nil {
 		t.Fatal(err)
 	}
-	client, err := hqq.NewStandardLink(mem, 8, 4096, testLinkOpts(true))
+	client, err := hqq.NewStandardLink(mem, 8, 4096, testLinkOpts())
 	if err != nil {
 		t.Fatal(err)
 	}

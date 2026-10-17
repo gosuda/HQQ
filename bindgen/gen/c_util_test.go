@@ -100,9 +100,13 @@ func needCC(t testing.TB) string {
 	if runtime.GOOS == "windows" {
 		t.Skip("skipped: the C server targets POSIX (BINDGEN.md 1.2)")
 	}
-	cc, err := exec.LookPath("cc")
+	name := "cc"
+	if env := strings.Fields(os.Getenv("CC")); len(env) == 1 {
+		name = env[0] // CMake honors CC too, so the library and the glue use one compiler
+	}
+	cc, err := exec.LookPath(name)
 	if err != nil {
-		t.Skip("skipped: no C compiler (cc) on PATH")
+		t.Skipf("skipped: no C compiler (%s) on PATH", name)
 	}
 	return cc
 }

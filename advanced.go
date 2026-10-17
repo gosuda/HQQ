@@ -192,8 +192,7 @@ type AdvancedOptions struct {
 	// so is every request when the grace is negative. Zero uses 2 seconds.
 	StreamListenGrace time.Duration
 
-	// Link configures the underlying StandardLink. Link.Exclusive is not
-	// supported and is rejected with ErrExclusiveUnsupported.
+	// Link configures the underlying StandardLink.
 	Link LinkOptions
 }
 
@@ -361,31 +360,11 @@ type AdvancedLink struct {
 	closeErr  error
 }
 
-// ErrExclusiveUnsupported is returned by the Advanced constructors, Listen,
-// Dial, Connect and NewAcceptor when LinkOptions.Exclusive is set. An
-// AdvancedLink sends from many goroutines (replies, control frames, streams),
-// which the single-writer contract of an exclusive link forbids. It matches
-// ErrInvalidOp.
-var ErrExclusiveUnsupported = &hqqError{msg: "hqq: LinkOptions.Exclusive is not supported by Advanced links", base: ErrInvalidOp}
-
-// checkAdvancedLinkOptions rejects the LinkOptions that an Advanced link
-// cannot honor. It runs before a segment is touched.
-func checkAdvancedLinkOptions(o LinkOptions) error {
-	if o.Exclusive {
-		return ErrExclusiveUnsupported
-	}
-	return nil
-}
-
 // NewAdvancedLink creates or attaches to an Advanced link in mem. mem must be
 // page-aligned and at least SizeStandardLink(bufferCount, bufferSize) bytes
 // long; it is typically a shared mapping, or AlignedBuffer for links between
 // goroutines of one process. See NewStandardLink for the endpoint roles.
-// opts.Link.Exclusive is rejected with ErrExclusiveUnsupported.
 func NewAdvancedLink(mem []byte, bufferCount int, bufferSize int, opts AdvancedOptions) (*AdvancedLink, error) {
-	if err := checkAdvancedLinkOptions(opts.Link); err != nil {
-		return nil, err
-	}
 	slink, err := NewStandardLink(mem, bufferCount, bufferSize, opts.Link)
 	if err != nil {
 		return nil, err

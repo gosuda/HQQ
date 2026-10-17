@@ -55,7 +55,7 @@ void adv_refuse_request_locked(hqq_adv *a, uint64_t conn, uint64_t msg_id, uint6
 
 /* Delivers a completed message to its destination; takes ownership of m.
  * Returns the error that fails the receive path, or HQQ_OK. */
-hqq_status adv_route(hqq_adv *a, hqq_msg *m) {
+hqq_status adv_route(hqq_adv *a, hqq_msg *m, adv_inline *inl) {
     uint32_t kind = m->flags & ADV_KIND_MASK;
 
     hqq_spin_lock(&a->lock);
@@ -109,7 +109,7 @@ hqq_status adv_route(hqq_adv *a, hqq_msg *m) {
                 adv_msg_put(m);
                 return HQQ_ERR_CLOSED;
             }
-            adv_park_locked(a, ADV_POLL_NS);
+            adv_park_events_locked(a, ADV_POLL_NS, ADV_EV_DONE);
         }
         c = reqctx_take_locked(a);
         if (c == NULL) {
@@ -137,8 +137,32 @@ hqq_status adv_route(hqq_adv *a, hqq_msg *m) {
         c->next = a->reqs;
         a->reqs = c;
         a->inflight++;
+        if (c->end == ADV_REQ_LIVE && a->serving && !a->serve_stop && a->workers_busy == 0 &&
+            a->esc_busy == 0 && adv_queue_empty(&a->reqq)) {
+            /* Nothing runs and nothing waits: the dispatcher runs the handler itself. */
+            inl->msg = m;
+            inl->ctx = c;
+            inl->fn = a->serve_fn;
+            inl->user = a->serve_user;
+            inl->escalated = 0;
+            inl->retired = NULL;
+            a->inl = inl;
+            a->inline_active = 1;
+            a->inl_start = adv_mono();
+            a->inl_seq++;
+            a->sv_inline++;
+            if (a->timer_slow) {
+                adv_wake_events_locked(a, ADV_EV_TIMER);
+            }
+            hqq_spin_unlock(&a->lock);
+            return HQQ_OK;
+        }
         adv_queue_push(&a->reqq, m);
-        adv_wake_locked(a);
+        a->sv_pooled++;
+        adv_wake_events_locked(a, ADV_EV_WORK);
+        if (a->reqq.count > adv_idle_workers_locked(a)) {
+            adv_wake_events_locked(a, ADV_EV_SPAWN);
+        }
         hqq_spin_unlock(&a->lock);
         return HQQ_OK;
     }

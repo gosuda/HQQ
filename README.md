@@ -2,7 +2,7 @@
 
 **HQQ** (`gosuda.org/hqq`) is a Go inter-process communication (IPC) library built on shared memory, lock-free Vyukov-style MPMC rings, and slot-owned payload buffers.
 
-It delivers **sub-microsecond round-trip latency (~240 ns)** and **multi-GB/s throughput (24–64 GB/s)** while keeping idle blocked callers parked in the kernel instead of spinning (`futex` on Linux, `__ulock_wait` on macOS, named kernel semaphores on Windows).
+It delivers **sub-microsecond round-trip latency (~190 ns)** and **multi-GB/s throughput (24–100 GB/s)** while keeping idle blocked callers parked in the kernel instead of spinning (`futex` on Linux, `__ulock_wait` on macOS, named kernel semaphores on Windows).
 
 ---
 
@@ -714,7 +714,6 @@ type LinkOptions struct {
 	HeartbeatInterval time.Duration // default 250ms; negative disables heartbeats
 	PeerTimeout       time.Duration // default 5s, raised to at least 4 peer heartbeat intervals
 	AttachTimeout     time.Duration // default 5s
-	Exclusive         bool          // Standard links only: one writer and one reader goroutine; plain stores instead of CAS
 }
 
 type AdvancedOptions struct {
@@ -886,9 +885,8 @@ On Windows, `ReleaseSemaphore` tokens persist, so a wake that runs between a wai
 - **`BufferSize`**: match your 95th-percentile message size so most messages travel as a single slot without chunking (for example `4096` for control/RPC messages, `65536` for media/tensor frames). Must be a multiple of 8. Both endpoints must use the same value.
 - **`BufferCount`**: how many messages or chunks can be in flight per direction before backpressure stalls the writer. Power of two (`>= 2`). `128` to `1024` works well for most workloads. A segment occupies about `2 × bufferCount × bufferSize` bytes plus the rings; the Primary zeroes all payload buffers when it initializes a segment.
 - **`WaitPolicy`**:
-  - `WaitAdaptive` (default): re-checks the ring in a short tight loop (64 iterations), then yields with `runtime.Gosched` (256 iterations), then parks in the OS kernel for at most 100 ms per park. Best for almost all production deployments.
+  - `WaitAdaptive` (default): re-checks the ring in a short tight loop (256 iterations, about 6 µs), then yields with `runtime.Gosched` (256 iterations), then parks in the OS kernel for at most 100 ms per park. Best for almost all production deployments.
   - `WaitSpin`: pure user-space busy-spin with zero kernel transitions; every blocked call keeps one core busy. Use only when pinning dedicated cores for ultra-low tail latency.
-- **`Exclusive`** (`LinkOptions`, Standard links): selects the store-based single-producer single-consumer ring protocol of SPEC 7.6. The caller promises that at most one goroutine at a time writes (`Write`, `WriteZeroCopy`, `ReserveWrite` and the commit of its reservations) and at most one reads (`Read`, `ReadFrom`, `ReadZeroCopy`, `ReserveRead` and the release of its reservations) on the link; the two sides may run concurrently. Violating the contract corrupts the link; builds with the race detector panic when two goroutines claim on the same side at once. The wire format is unchanged and an exclusive endpoint interoperates with CAS endpoints and with the C, C++, and Rust implementations. It cuts the cost of pipelined messages (about 43 to 38 ns per 64-byte message in-process) and the cost of a round trip by a few nanoseconds. `AdvancedLink`, `Listen`, `Dial`, `Connect`, and `NewAcceptor` reject it with `ErrExclusiveUnsupported`.
 - **`HeartbeatInterval` / `PeerTimeout`**: shorter values detect a crashed peer sooner (`PeerTimeout` is raised to at least four peer heartbeat intervals) at the cost of more superblock writes and a higher risk of false positives on a paused process.
 - **`AttachTimeout`**: how long an endpoint waits for another endpoint that is initializing the segment, and how long an opener (`Open*`, `Dial`) waits for a creator to claim a segment that is still empty; after that the call fails with a transient error matching `ErrFailedInit` (`Dial` retries). It also bounds each ring attach.
 - **`AdvancedOptions`**: `MaxMessageSize` and `MaxReassemblyBytes` bound memory held for incoming messages (a bound below `MaxMessageSize` refuses multi-chunk messages even when nothing else is in flight; single-chunk messages are not affected); `IncomingQueueSize` sets the capacity of every incoming queue (each stream, the request queue of `Serve`, the accept queue) and `IncomingOverflow` selects what happens when one is full.

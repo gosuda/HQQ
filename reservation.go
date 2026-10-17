@@ -58,10 +58,10 @@ func (r *StandardWriteReservation) Commit(n int) error {
 		}
 		return ErrBufferOverflow
 	}
-	if err := r.link.enterTxOwner(false); err != nil {
+	if err := r.link.enterTx(false); err != nil {
 		return err
 	}
-	defer r.link.exitTxOwner()
+	defer r.link.exitTx()
 	storeCopyPacket(r.slot.Value(), r.copyID, r.slot.Slot(), uint64(n))
 	r.done = true
 	if !r.slot.Commit() {
@@ -85,10 +85,10 @@ func (r *StandardWriteReservation) Abort(reason ErrorCode) error {
 }
 
 func (r *StandardWriteReservation) publishTombstone(reason ErrorCode) error {
-	if err := r.link.enterTxOwner(false); err != nil {
+	if err := r.link.enterTx(false); err != nil {
 		return err
 	}
-	defer r.link.exitTxOwner()
+	defer r.link.exitTx()
 	*r.slot.Value() = protocol.NewStandardLinkTombstonePacket(r.copyID, r.slot.Slot(), uint64(reason))
 	r.done = true
 	if !r.slot.Commit() {
@@ -147,10 +147,10 @@ func (r *StandardReadReservation) Release() error {
 	if !r.slot.Owned() {
 		return ErrInvalidOp
 	}
-	if err := r.link.enterRxOwner(); err != nil {
+	if err := r.link.enterRx(); err != nil {
 		return err
 	}
-	defer r.link.exitRxOwner()
+	defer r.link.exitRx()
 	r.done = true
 	if !r.slot.Release() {
 		return ErrInvalidOp
@@ -166,10 +166,10 @@ func (r *StandardReadReservation) Release() error {
 // Close must not be called while a reservation is active: finish it with
 // Commit or Abort first. Its buffer is invalid once Close has run.
 func (l *StandardLink) ReserveWrite() (StandardWriteReservation, error) {
-	if err := l.enterTxOwner(true); err != nil {
+	if err := l.enterTx(true); err != nil {
 		return StandardWriteReservation{}, err
 	}
-	defer l.exitTxOwner()
+	defer l.exitTx()
 
 	slot, err := l.txRing.ReserveProducerCancel(&l.txCancel)
 	if err != nil {
@@ -194,10 +194,10 @@ func (l *StandardLink) ReserveWrite() (StandardWriteReservation, error) {
 // Close must not be called while a reservation is active: Release it first.
 // Its buffer is invalid once Close has run.
 func (l *StandardLink) ReserveRead() (StandardReadReservation, error) {
-	if err := l.enterRxOwner(); err != nil {
+	if err := l.enterRx(); err != nil {
 		return StandardReadReservation{}, err
 	}
-	defer l.exitRxOwner()
+	defer l.exitRx()
 
 	if l.recv.pending.Load() {
 		if view, backing, ok := l.recv.take(); ok {

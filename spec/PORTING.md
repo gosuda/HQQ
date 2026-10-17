@@ -22,7 +22,7 @@ You can stop at any level; each level interoperates with the Go implementation a
 
 Simple mode = **spin, then sleep with exponential backoff, never park**. It is a conforming implementation of section 8 because parking is optional for correctness:
 
-* A **simple-mode waiter** never touches `emptyWaiters`/`fullWaiters`/`notEmpty`/`notFull` and re-checks the slot sequence in a loop: spin ~64 iterations, then `sched_yield` ~256 iterations, then `nanosleep` doubling from 20 µs up to 2 ms (the Go fallback uses exactly this).
+* A **simple-mode waiter** never touches `emptyWaiters`/`fullWaiters`/`notEmpty`/`notFull` and re-checks the slot sequence in a loop: spin for about 4 to 6 µs (256 steps of 4 slot reads, or 1024 single reads), then `sched_yield` ~256 iterations, then `nanosleep` doubling from 20 µs up to 2 ms (the Go fallback uses exactly this).
 * A **simple-mode waker** that does nothing after publish/release is still *correct*: a Go peer that is parked on that ring wakes at the end of its bounded park (at most 100 ms) and then finds the data. This costs up to 100 ms of latency, never a hang. RECOMMENDED: still do the two-access waker duty K1/K2 (and K3 if `n != 0`): it costs one `seq_cst` store and one load and gives the Go peer instant wake-ups.
 * **Never park without a timeout.** The park timeout is what makes every lost wake-up a latency event.
 * Simple mode is also the right first milestone for Windows, where parking needs the four named semaphores (SPEC 11.5).

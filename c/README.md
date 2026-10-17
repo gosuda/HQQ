@@ -92,7 +92,7 @@ ABI). Its receive direction is owned by a dispatcher thread after negotiation.
 * Streams: `hqq_adv_listen_streams`, `hqq_adv_open_stream`, `hqq_adv_accept_stream`,
   `hqq_stream_send`, `hqq_stream_recv`, `hqq_stream_close`; stream 0 is `hqq_adv_stream0`.
 * Calls: `hqq_stream_call` / `hqq_stream_call_with` (caller and trace metadata);
-  `hqq_adv_serve` runs a handler callback `(ctx, response, request)` on worker threads;
+  `hqq_adv_serve` runs a handler callback `(ctx, response, request)`: on the link's receive thread while no handler runs (no thread hand-off), on worker threads while handlers overlap, and a handler that holds the receive thread for 200 µs is escalated to a new receive thread (the model of the Go `Serve`);
   `hqq_adv_shutdown` refuses new requests with status 8 and waits for in-flight ones.
 * Messages are pooled: `hqq_msg_data`, `hqq_msg_len`, `hqq_msg_release`. An error
   response returns `HQQ_ERR_RESPONSE` with the message; `hqq_msg_status` gives its status.
@@ -165,6 +165,7 @@ and 32-bit MIPS/ARMv5-6 targets are rejected at compile time.
 | `src/hqq_lifeline.c` | parent lifeline: a helper thread that watches stdin (or a descriptor or handle) and fires once on EOF or a read error (`include/hqq/hqq_lifeline.h`); POSIX poll/self-pipe, Windows ReadFile/CancelSynchronousIo |
 | `tests/` | dependency-free tests (`test_*.c`), golden vectors from `spec/constants.json` |
 | `tools/hqq_echo.c` | interop CLI (create or open a named link, echo or client mode) |
+| `tools/hqq_adv_echo.c` | Advanced-link echo server (creates the link as Primary, negotiates every feature, runs `hqq_adv_serve` with an echo handler); `BenchmarkAdvancedCallCServer` in `interop` measures a Go client against it (`HQQ_ADV_ECHO=<path>`) |
 | `verify/` | memory-model tooling (litmus, GenMC); not built by the library |
 
 ## Tests
@@ -189,6 +190,7 @@ and 32-bit MIPS/ARMv5-6 targets are rejected at compile time.
 | `rpc_live` (POSIX) | a real session over shared memory: bootstrap, pipelining, oversize bodies, violations, peer death by SIGKILL, write stall, idle timeout, control-link and geometry limits, shutdown with a stuck call |
 | `rpc_main` (POSIX) | `hqqrpc_main`: usage, exit codes, ready line, signals, `--parent-stdin` |
 | `adv_close_queued` | closing an Advanced link that holds queued, unserved requests releases each request once (regression test of a double release in `hqq_adv_close`) |
+| `adv_serve` | `hqq_adv_serve`: sequential requests run inline without a thread hand-off, a handler that waits for a later request escalates and does not deadlock, a handler that calls the peer on the same link completes, cancel and deadline reach an inline handler, `Serve` end, shutdown and close wait for running handlers, concurrent handlers, `Serve` restart |
 
 ## Interoperability with the Go implementation
 

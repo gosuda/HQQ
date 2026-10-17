@@ -8,8 +8,15 @@
 
 #include "hqq/hqq.h"
 
-static _Atomic int hqq_test_failures;
-static _Atomic int hqq_test_checks;
+/* A translation unit may include this header without using the counters (a libFuzzer harness). */
+#if defined(__GNUC__) || defined(__clang__)
+#  define HQQ_TEST_UNUSED __attribute__((unused))
+#else
+#  define HQQ_TEST_UNUSED
+#endif
+
+static HQQ_TEST_UNUSED _Atomic int hqq_test_failures;
+static HQQ_TEST_UNUSED _Atomic int hqq_test_checks;
 
 #define HQQ_CHECK(cond)                                                      \
     do {                                                                     \

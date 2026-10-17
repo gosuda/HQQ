@@ -239,7 +239,7 @@ func syncAfter(tb testing.TB, c *microbench.Client) {
 }
 
 // echoLink starts hqq_echo as a server on a fresh named Standard link and returns the client end
-// of that link, opened the way rt opens a session link: Exclusive, with the benchmark wait policy.
+// of that link, opened the way rt opens a session link: with the benchmark wait policy and a 2 s PeerTimeout.
 // The echo process ends, and the segment goes, when tb is done.
 func echoLink(tb testing.TB) *hqq.NamedStandardLink {
 	tb.Helper()
@@ -267,7 +267,7 @@ func echoLink(tb testing.TB) *hqq.NamedStandardLink {
 	deadline := time.Now().Add(10 * time.Second)
 	for {
 		link, err = hqq.OpenStandardLink(name, defaultBufferCount, defaultBufferSize,
-			hqq.LinkOptions{WaitPolicy: waitPolicy, Exclusive: true, PeerTimeout: 2 * time.Second})
+			hqq.LinkOptions{WaitPolicy: waitPolicy, PeerTimeout: 2 * time.Second})
 		if err == nil {
 			break
 		}

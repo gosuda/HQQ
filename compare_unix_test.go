@@ -83,14 +83,12 @@ func comparePairs(b *testing.B, size int) map[string]func() duplexPair {
 	return map[string]func() duplexPair{
 		"hqq-adaptive": func() duplexPair { return hqqPair(b, LinkOptions{WaitPolicy: WaitAdaptive}, size) },
 		"hqq-spin":     func() duplexPair { return hqqPair(b, LinkOptions{WaitPolicy: WaitSpin}, size) },
-		// Store-based ring claims; each end below uses one goroutine per direction.
-		"hqq-exclusive": func() duplexPair { return hqqPair(b, LinkOptions{WaitPolicy: WaitSpin, Exclusive: true}, size) },
-		"unix-socket":   func() duplexPair { return unixSocketPair(b) },
-		"pipe":          func() duplexPair { return pipePair(b) },
+		"unix-socket":  func() duplexPair { return unixSocketPair(b) },
+		"pipe":         func() duplexPair { return pipePair(b) },
 	}
 }
 
-var compareOrder = []string{"hqq-adaptive", "hqq-spin", "hqq-exclusive", "unix-socket", "pipe"}
+var compareOrder = []string{"hqq-adaptive", "hqq-spin", "unix-socket", "pipe"}
 
 // BenchmarkCompareRoundTrip measures request/response latency (ns/op is one
 // round trip) for small messages.
@@ -142,71 +140,62 @@ func BenchmarkCompareRoundTrip(b *testing.B) {
 // the request while it writes the response.
 func BenchmarkCompareRoundTripZeroCopy(b *testing.B) {
 	const size = 64
-	variants := []struct {
-		name string
-		opts LinkOptions
-	}{
-		{"hqq-spin", LinkOptions{WaitPolicy: WaitSpin}},
-		{"hqq-exclusive", LinkOptions{WaitPolicy: WaitSpin, Exclusive: true}},
-	}
-	for _, v := range variants {
-		b.Run(v.name+"/64B", func(b *testing.B) {
-			p := hqqPair(b, v.opts, size)
-			defer p.close()
-			client, server := p.a.(*StandardLink), p.b.(*StandardLink)
-			done := make(chan error, 1)
-			go func() {
-				for range b.N {
-					req, err := server.ReserveRead()
-					if err != nil {
-						done <- err
-						return
-					}
-					resp, err := server.ReserveWrite()
-					if err != nil {
-						done <- err
-						return
-					}
-					n := copy(resp.Buffer(), req.Buffer())
-					if err := resp.Commit(n); err != nil {
-						done <- err
-						return
-					}
-					if err := req.Release(); err != nil {
-						done <- err
-						return
-					}
-				}
-				done <- nil
-			}()
-			msg := make([]byte, size)
-			b.ReportAllocs()
-			b.ResetTimer()
+	b.Run("hqq-spin/64B", func(b *testing.B) {
+		p := hqqPair(b, LinkOptions{WaitPolicy: WaitSpin}, size)
+		defer p.close()
+		client, server := p.a.(*StandardLink), p.b.(*StandardLink)
+		done := make(chan error, 1)
+		go func() {
 			for range b.N {
-				w, err := client.ReserveWrite()
+				req, err := server.ReserveRead()
 				if err != nil {
-					b.Fatal(err)
+					done <- err
+					return
 				}
-				copy(w.Buffer(), msg)
-				if err := w.Commit(size); err != nil {
-					b.Fatal(err)
-				}
-				r, err := client.ReserveRead()
+				resp, err := server.ReserveWrite()
 				if err != nil {
-					b.Fatal(err)
+					done <- err
+					return
 				}
-				if len(r.Buffer()) != size {
-					b.Fatalf("response of %d bytes, want %d", len(r.Buffer()), size)
+				n := copy(resp.Buffer(), req.Buffer())
+				if err := resp.Commit(n); err != nil {
+					done <- err
+					return
 				}
-				if err := r.Release(); err != nil {
-					b.Fatal(err)
+				if err := req.Release(); err != nil {
+					done <- err
+					return
 				}
 			}
-			if err := <-done; err != nil {
+			done <- nil
+		}()
+		msg := make([]byte, size)
+		b.ReportAllocs()
+		b.ResetTimer()
+		for range b.N {
+			w, err := client.ReserveWrite()
+			if err != nil {
 				b.Fatal(err)
 			}
-		})
-	}
+			copy(w.Buffer(), msg)
+			if err := w.Commit(size); err != nil {
+				b.Fatal(err)
+			}
+			r, err := client.ReserveRead()
+			if err != nil {
+				b.Fatal(err)
+			}
+			if len(r.Buffer()) != size {
+				b.Fatalf("response of %d bytes, want %d", len(r.Buffer()), size)
+			}
+			if err := r.Release(); err != nil {
+				b.Fatal(err)
+			}
+		}
+		if err := <-done; err != nil {
+			b.Fatal(err)
+		}
+	})
 }
 
 // BenchmarkCompareThroughput measures one-way streaming throughput.

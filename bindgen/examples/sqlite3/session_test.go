@@ -179,10 +179,12 @@ func TestCloseTearsDownBeforeTheAck(t *testing.T) {
 	if err := c.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if got := srv.Log.Count(sqlite3srv.LineSessionEnded); got != 1 {
-		t.Fatalf("%d sessions ended at Close, want 1: the ack came before the teardown", got)
+	observer(t, srv, "close.db", 1) // the proof that the teardown came first: the write lock is free as Close returns
+	// The log line is only a second witness, and stderr reaches the test through a pipe, so it may arrive
+	// a moment after Close returned: wait for it.
+	if !srv.Log.WaitCount(sqlite3srv.LineSessionEnded, 1, sqlite3srv.FailBound) {
+		t.Fatalf("the session end was not logged:\n%s", srv.Log.String())
 	}
-	observer(t, srv, "close.db", 1)
 }
 
 // TestCloseConnectionWithLiveStatements closes a connection that has statements: the server finalizes them first
@@ -298,12 +300,19 @@ func TestSessionLimit(t *testing.T) {
 	if err := c1.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if !srv.Log.WaitCount(sqlite3srv.LineSessionEnded, 1, sqlite3srv.FailBound) {
-		t.Fatal("the server did not end the closed session")
-	}
-	c4, err := dial()
-	if err != nil {
-		t.Fatalf("a session after a slot was freed: %v", err)
+	// The slot is released after the CLOSE_ACK and after the link is closed (BINDGEN.md 5.2, steps 4 to 6),
+	// so a dial right after Close may still see BUSY: retry while the refusal is the session limit.
+	var c4 *sqlite3.Client
+	deadline := time.Now().Add(sqlite3srv.FailBound)
+	for {
+		c4, err = dial()
+		if err == nil {
+			break
+		}
+		if !errors.As(err, &oe) || oe.Code != 3 || time.Now().After(deadline) {
+			t.Fatalf("a session after a slot was freed: %v (the slot was not released within %v)", err, sqlite3srv.FailBound)
+		}
+		time.Sleep(2 * time.Millisecond) // the slot is released by another process
 	}
 	t.Cleanup(func() { _ = c4.Close() })
 	if n, err := c4.Sqlite3LibversionNumber(); err != nil || n == 0 {

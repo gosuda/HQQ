@@ -27,8 +27,7 @@ type cacheLinePad struct{ _ [128]byte }
 // the queued tails, each in a call of its own, before they consume newer
 // messages. With concurrent readers, messages and tails may be received in
 // any order, but never mixed within one call. Deadlines may be changed while
-// calls are blocked. With LinkOptions.Exclusive the link is instead limited
-// to one writing and one reading goroutine at a time, see there.
+// calls are blocked.
 //
 // Lifetime: Close wakes every blocked call (they return ErrClosed), waits for
 // in-flight calls (including running zero-copy callbacks), stops the
@@ -70,13 +69,9 @@ type StandardLink struct {
 	peer      peerMonitor
 
 	_        cacheLinePad
-	rxActive atomic.Int64  // in-flight shared receive-side calls
-	rxOwner  atomic.Uint32 // 1 while the owner of an exclusive link is in a receive-side call
-	rxDepth  int           // nesting of those calls, touched by the owner only
+	rxActive atomic.Int64 // in-flight receive-side calls
 	_        cacheLinePad
-	txActive atomic.Int64  // in-flight shared send-side calls
-	txOwner  atomic.Uint32 // 1 while the owner of an exclusive link is in a send-side call
-	txDepth  int           // nesting of those calls, touched by the owner only
+	txActive atomic.Int64 // in-flight send-side calls
 	_        cacheLinePad
 
 	// Precomputed method values and cancellations (avoid per-call
@@ -87,7 +82,6 @@ type StandardLink struct {
 	writeDeadlineFn func() time.Time
 	rxCancel        mpmc.Cancel
 	txCancel        mpmc.Cancel
-	exclusive       bool   // opts.Exclusive, copied for the hot path
 	txBase          uint64 // producer cursor of txRing when this endpoint attached
 }
 
@@ -240,8 +234,6 @@ func openStandardLink(base unsafe.Pointer, bufferCount int, bufferSize int, opts
 	}
 	ring0.SetWaitPolicy(opts.WaitPolicy.ring())
 	ring1.SetWaitPolicy(opts.WaitPolicy.ring())
-	ring0.SetExclusive(opts.Exclusive)
-	ring1.SetExclusive(opts.Exclusive)
 	if opts.parkers[0] != nil {
 		ring0.SetParker(opts.parkers[0])
 	}
@@ -264,7 +256,6 @@ func openStandardLink(base unsafe.Pointer, bufferCount int, bufferSize int, opts
 		buffers0:    splitBuffers(buffers0, bufferCount, bufferSize),
 		buffers1:    splitBuffers(buffers1, bufferCount, bufferSize),
 		closeCh:     make(chan struct{}),
-		exclusive:   opts.Exclusive,
 	}
 	if linkMode == LinkModeSecondary {
 		link.txRing, link.txBufs = ring1, link.buffers1
@@ -328,69 +319,6 @@ func (l *StandardLink) enterTx(checkPeer bool) error {
 }
 
 func (l *StandardLink) exitTx() { l.txActive.Add(-1) }
-
-// enterRxOwner, exitRxOwner, enterTxOwner and exitTxOwner are enterRx and
-// friends for the calls that move data: Read, ReadFrom, ReadZeroCopy,
-// ReserveRead and the Release of its reservations on the receive side, Write,
-// WriteZeroCopy, ReserveWrite and the Commit or Abort of its reservations on
-// the send side. On an exclusive link at most one goroutine at a time makes
-// calls of one side. The side's depth is then private to that goroutine, and
-// only the outermost call registers: a store of 1 into a counter of its own
-// instead of an atomic add, and a store of 0 when the last nested call (a
-// Release inside a ReadZeroCopy callback, say) returns. Close waits for these
-// counters as well. Calls that may overlap the owner, such as waking blocked
-// calls after a deadline changed, keep using enterRx and enterTx. The store
-// followed by the closed check is ordered like the add: sync/atomic
-// operations are sequentially consistent.
-func (l *StandardLink) enterRxOwner() error {
-	if !l.exclusive {
-		return l.enterRx()
-	}
-	if l.rxDepth == 0 {
-		l.rxOwner.Store(1)
-	}
-	l.rxDepth++
-	if l.closed.Load() {
-		l.exitRxOwner()
-		return ErrClosed
-	}
-	return nil
-}
-
-func (l *StandardLink) exitRxOwner() {
-	if !l.exclusive {
-		l.rxActive.Add(-1)
-		return
-	}
-	if l.rxDepth--; l.rxDepth == 0 {
-		l.rxOwner.Store(0)
-	}
-}
-
-func (l *StandardLink) enterTxOwner(checkPeer bool) error {
-	if !l.exclusive {
-		return l.enterTx(checkPeer)
-	}
-	if l.txDepth == 0 {
-		l.txOwner.Store(1)
-	}
-	l.txDepth++
-	if err := l.admitTx(checkPeer); err != nil {
-		l.exitTxOwner()
-		return err
-	}
-	return nil
-}
-
-func (l *StandardLink) exitTxOwner() {
-	if !l.exclusive {
-		l.txActive.Add(-1)
-		return
-	}
-	if l.txDepth--; l.txDepth == 0 {
-		l.txOwner.Store(0)
-	}
-}
 
 // admitTx reports why a send must not start: the link is closed or, with
 // checkPeer, the peer is known to be closed or dead.
@@ -552,10 +480,10 @@ func (l *StandardLink) Read(b []byte) (int, error) {
 // message. In datagram mode the part of the message that does not fit into b
 // is discarded instead of queued, and an empty b still consumes one message.
 func (l *StandardLink) recvMessage(b []byte, datagram bool) (int, error) {
-	if err := l.enterRxOwner(); err != nil {
+	if err := l.enterRx(); err != nil {
 		return 0, err
 	}
-	defer l.exitRxOwner()
+	defer l.exitRx()
 
 	if l.recv.pending.Load() {
 		if n, ok := l.recv.read(b, datagram); ok {
@@ -603,21 +531,21 @@ func (l *StandardLink) Write(b []byte) (int, error) {
 	if bN > l.bufferSize {
 		return 0, ErrBufferOverflow
 	}
-	if err := l.enterTxOwner(true); err != nil {
+	if err := l.enterTx(true); err != nil {
 		return 0, err
 	}
 	// No callback runs between the claim and the publish, so the slot is
 	// completed inline instead of through a deferred call.
 	slot, err := l.txRing.ReserveProducerCancel(&l.txCancel)
 	if err != nil {
-		l.exitTxOwner()
+		l.exitTx()
 		return 0, mapWaitErr(err)
 	}
 	idx := slot.Slot()
 	copy(l.txBufs[idx], b)
 	storeCopyPacket(slot.Value(), l.copyID(&slot), idx, uint64(bN))
 	slot.CommitOwned()
-	l.exitTxOwner()
+	l.exitTx()
 	return bN, nil
 }
 
@@ -641,10 +569,10 @@ func (l *StandardLink) WriteZeroCopy(fn func(buffer []byte) (int, error)) (int, 
 	if fn == nil {
 		return 0, ErrInvalidOp
 	}
-	if err := l.enterTxOwner(true); err != nil {
+	if err := l.enterTx(true); err != nil {
 		return 0, err
 	}
-	defer l.exitTxOwner()
+	defer l.exitTx()
 
 	slot, err := l.txRing.ReserveProducerCancel(&l.txCancel)
 	if err != nil {
@@ -711,10 +639,10 @@ func (l *StandardLink) ReadZeroCopy(fn func(buffer []byte) error) (int, error) {
 	}
 	// Register before touching the remainder so that Close waits for fn in
 	// every case.
-	if err := l.enterRxOwner(); err != nil {
+	if err := l.enterRx(); err != nil {
 		return 0, err
 	}
-	defer l.exitRxOwner()
+	defer l.exitRx()
 
 	if l.recv.pending.Load() {
 		if view, backing, ok := l.recv.take(); ok {
@@ -804,7 +732,7 @@ func (l *StandardLink) Close() error {
 		close(l.closeCh)
 		l.ring0.WakeAll()
 		l.ring1.WakeAll()
-		for l.rxActive.Load() != 0 || l.txActive.Load() != 0 || l.rxOwner.Load() != 0 || l.txOwner.Load() != 0 {
+		for l.rxActive.Load() != 0 || l.txActive.Load() != 0 {
 			time.Sleep(50 * time.Microsecond)
 		}
 		if l.hbStop != nil {

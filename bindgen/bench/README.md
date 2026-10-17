@@ -40,7 +40,7 @@ cmake --build build/c --target hqq_echo        # build/c/tools/hqq_echo, for Ben
 | --- | --- |
 | `HQQ_BENCH_SERVER` | path of `microbench_server`. Unset: every test and benchmark that needs the server skips with a message; the cgo-only tests and the cgo leaves still run. |
 | `HQQ_BENCH_WAIT` | `spin` (default) or `adaptive`. It sets `Link.WaitPolicy` of the client and the `--spin` flag of the server together. 10.5 pins the pipelining numbers to `spin`; an `adaptive` run is a separate, labeled run. |
-| `HQQ_BENCH_ECHO` | path of `hqq_echo` (`c/tools/hqq_echo.c`). Unset: `BenchmarkRoundTrip/echo` and `TestEchoRoundTrip` skip. The harness starts it with `--create NAME --server --count 64 --size 16384 --wait <mode>` and opens the link as `rt` does (`Exclusive`, same wait policy). |
+| `HQQ_BENCH_ECHO` | path of `hqq_echo` (`c/tools/hqq_echo.c`). Unset: `BenchmarkRoundTrip/echo` and `TestEchoRoundTrip` skip. The harness starts it with `--create NAME --server --count 64 --size 16384 --wait <mode>` and opens the link as `rt` does (same wait policy, `PeerTimeout` of 2 s). |
 | `HQQ_BENCH_SERVER_CPU` | Linux only: pin the server to this CPU with `taskset -a -p -c`. macOS has no affinity API, so on Apple silicon the "server on another core" of 10.5 is up to the scheduler; setting the variable there is an error. Pin the client by running the whole command under `taskset -c N`. |
 
 `ML_TRACE` is removed from the environment of the benchmark binary and of the server: with it set the library appends a line to a file on every call.

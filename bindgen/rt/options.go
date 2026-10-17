@@ -22,7 +22,7 @@ type Options struct {
 	ConnectTimeout time.Duration   // 0: 5s; bootstrap and handshake
 	CloseTimeout   time.Duration   // 0: 5s; wait for CLOSE_ACK
 	CallTimeout    time.Duration   // 0: none; bound on one Wait
-	Link           hqq.LinkOptions // session link options; Dial forces Exclusive to true and, if PeerTimeout is 0, sets it to 2s (0 would mean 5s)
+	Link           hqq.LinkOptions // session link options; if PeerTimeout is 0, Dial sets it to 2s (0 would mean 5s)
 }
 
 // Limits are the values granted by the server in HELLO_REPLY.
@@ -100,10 +100,9 @@ func validBufferSize(n int) bool {
 }
 
 // sessionLinkOptions applies the rules of 4.11 to the caller's link options:
-// the session end is Exclusive and PeerTimeout is explicit, because 0 would
-// mean 5 s in hqq and the C server sets 2 s.
+// PeerTimeout is explicit, because 0 would mean 5 s in hqq and the C server
+// sets 2 s.
 func sessionLinkOptions(o hqq.LinkOptions) hqq.LinkOptions {
-	o.Exclusive = true
 	if o.PeerTimeout == 0 {
 		o.PeerTimeout = defaultPeerTimeout
 	}

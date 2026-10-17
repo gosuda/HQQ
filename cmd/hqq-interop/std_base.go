@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -17,19 +16,10 @@ import (
 // stdSlack is the timing slack added to every bound the scenarios assert.
 const stdSlack = 1500 * time.Millisecond
 
-// envExclusive, set to "1" in the environment of the helper, opens every
-// Standard endpoint with LinkOptions.Exclusive (the store-based ring
-// protocol of SPEC 7.6), so the matrix covers an exclusive Go endpoint
-// against CAS and store-based peers. Every Standard scenario uses at most one
-// writing and one reading goroutine per link (stdBidirectional runs exactly
-// one of each), which is what Exclusive requires. Advanced scenarios ignore
-// it: AdvancedLink rejects the option.
-const envExclusive = "HQQ_INTEROP_EXCLUSIVE"
-
 // stdOptions maps the configuration to the LinkOptions of a Standard endpoint
 // (INTEROP_CLI.md, section 2). A zero field keeps the library default.
 func stdOptions(c config) hqq.LinkOptions {
-	o := hqq.LinkOptions{AttachTimeout: c.AttachTimeout, Exclusive: os.Getenv(envExclusive) == "1"}
+	o := hqq.LinkOptions{AttachTimeout: c.AttachTimeout}
 	if c.HeartbeatMs != 0 {
 		o.HeartbeatInterval = time.Duration(c.HeartbeatMs) * time.Millisecond
 	}

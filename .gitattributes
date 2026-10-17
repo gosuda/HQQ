@@ -2,3 +2,14 @@
 # and the interop workflow diffs them). Never let git convert their line endings
 # (core.autocrlf on Windows would check out CRLF), on any platform.
 conformance/vectors/** -text
+
+# Inputs and outputs of hqq-bindgen are compared byte for byte (generated
+# files against their committed copies, the design document against the
+# vectors extracted from it, pinned digests against their files), and shell
+# scripts must run on Windows runners. Always check them out with LF.
+bindgen/** text eol=lf
+spec/** text eol=lf
+third_party/** text eol=lf
+scripts/** text eol=lf
+c/tests/generated/** text eol=lf
+*.sh text eol=lf

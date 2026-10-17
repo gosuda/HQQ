@@ -176,8 +176,12 @@ int32_t edge_blob(edge_dir *d, void **p, size_t *n) {
 
 int32_t edge_label(edge_dir *d, char **s) {
     char buf[32];
+    char *m;
+
     snprintf(buf, sizeof buf, "label-%d", d->id);
-    *s = strdup(buf);
+    m = (char *)malloc(strlen(buf) + 1);
+    memcpy(m, buf, strlen(buf) + 1);
+    *s = m;
     return d->id == 4 ? 1 : 0;
 }
 

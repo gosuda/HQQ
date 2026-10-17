@@ -69,7 +69,7 @@ func startService(tb tbLike, o serviceOpts) *fakeService {
 		o.handle = microHandler
 	}
 	s := &fakeService{tb: tb, name: listenerName(), opts: o, hello: make(chan []byte, 8)}
-	acc, err := hqq.NewAcceptor(s.name, hqq.AcceptorConfig{Advanced: hqq.AdvancedOptions{Link: testLinkOpts(false)}})
+	acc, err := hqq.NewAcceptor(s.name, hqq.AcceptorConfig{Advanced: hqq.AdvancedOptions{Link: testLinkOpts()}})
 	if err != nil {
 		tb.Fatalf("NewAcceptor: %v", err)
 	}
@@ -168,7 +168,7 @@ func (s *fakeService) open(_ context.Context, w *hqq.ResponseWriter, req *hqq.Re
 	s.mu.Unlock()
 
 	mkSession := func() *fakeSession {
-		ss, err := hqq.CreateStandardLink(name, count, size, 0o600, testLinkOpts(false))
+		ss, err := hqq.CreateStandardLink(name, count, size, 0o600, testLinkOpts())
 		if err != nil {
 			s.tb.Errorf("create session segment: %v", err)
 			return nil
@@ -283,7 +283,7 @@ func dialOpts() Options {
 	return Options{
 		ConnectTimeout: 5 * time.Second,
 		CloseTimeout:   2 * time.Second,
-		Link:           testLinkOpts(false),
+		Link:           testLinkOpts(),
 	}
 }
 
@@ -320,15 +320,8 @@ func TestDialAndCall(t *testing.T) {
 	svc.mu.Lock()
 	name := svc.names[0]
 	svc.mu.Unlock()
-	if l, err := hqq.OpenStandardLink(name, 64, 16384, testLinkOpts(false)); !isNotExist(err) {
-		if l != nil {
-			_ = l.Close()
-		}
-		t.Errorf("session name still exists after the handshake: %v", err)
-	}
+	requireNameGone(t, name)
 }
-
-func isNotExist(err error) bool { return err != nil && errors.Is(err, os.ErrNotExist) }
 
 func TestDialDigestMismatch(t *testing.T) {
 	svc := startService(t, serviceOpts{digest: microIface.Digest})
@@ -348,12 +341,7 @@ func TestDialDigestMismatch(t *testing.T) {
 	svc.mu.Lock()
 	name := svc.names[0]
 	svc.mu.Unlock()
-	if l, err := hqq.OpenStandardLink(name, 64, 16384, testLinkOpts(false)); !isNotExist(err) {
-		if l != nil {
-			_ = l.Close()
-		}
-		t.Errorf("name still exists: %v", err)
-	}
+	requireNameGone(t, name)
 }
 
 func TestDialOpenErrors(t *testing.T) {
@@ -455,12 +443,7 @@ func TestDialCleansUpWhenHelloIsNotAnswered(t *testing.T) {
 	svc.mu.Unlock()
 	// The creator is still alive and holds the segment; only the name is
 	// gone.
-	if l, err := hqq.OpenStandardLink(name, 64, 16384, testLinkOpts(false)); !isNotExist(err) {
-		if l != nil {
-			_ = l.Close()
-		}
-		t.Fatalf("session name survived the failed dial: %v", err)
-	}
+	requireNameGone(t, name)
 }
 
 func TestDialContextCancel(t *testing.T) {
@@ -535,11 +518,11 @@ func TestDialInvalidOptions(t *testing.T) {
 
 func TestSessionLinkOptions(t *testing.T) {
 	o := sessionLinkOptions(hqq.LinkOptions{})
-	if !o.Exclusive || o.PeerTimeout != 2*time.Second {
+	if o.PeerTimeout != 2*time.Second {
 		t.Errorf("zero options become %+v", o)
 	}
 	o = sessionLinkOptions(hqq.LinkOptions{PeerTimeout: 7 * time.Second, WaitPolicy: hqq.WaitSpin})
-	if !o.Exclusive || o.PeerTimeout != 7*time.Second || o.WaitPolicy != hqq.WaitSpin {
+	if o.PeerTimeout != 7*time.Second || o.WaitPolicy != hqq.WaitSpin {
 		t.Errorf("explicit options changed: %+v", o)
 	}
 	cfg, err := Options{}.resolve()
@@ -549,13 +532,10 @@ func TestSessionLinkOptions(t *testing.T) {
 	want := config{
 		bufferCount: 64, bufferSize: 16384, maxInFlight: 64, maxMessage: 16 << 20,
 		connectTimeout: 5 * time.Second, closeTimeout: 5 * time.Second,
-		link: hqq.LinkOptions{Exclusive: true, PeerTimeout: 2 * time.Second},
+		link: hqq.LinkOptions{PeerTimeout: 2 * time.Second},
 	}
 	if cfg != want {
 		t.Errorf("defaults: %+v, want %+v", cfg, want)
-	}
-	if o := controlLinkOptions(cfg.link); o.Exclusive || o.PeerTimeout != 2*time.Second {
-		t.Errorf("control link options: %+v", o)
 	}
 }
 

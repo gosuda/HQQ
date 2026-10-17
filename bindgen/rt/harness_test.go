@@ -147,12 +147,11 @@ func errBody(msg string) []byte {
 
 // testOpts are link options with fast heartbeats, so that closing and dying
 // peers are noticed in milliseconds.
-func testLinkOpts(exclusive bool) hqq.LinkOptions {
+func testLinkOpts() hqq.LinkOptions {
 	return hqq.LinkOptions{
 		HeartbeatInterval: 10 * time.Millisecond,
 		PeerTimeout:       300 * time.Millisecond,
 		AttachTimeout:     3 * time.Second,
-		Exclusive:         exclusive,
 	}
 }
 
@@ -166,11 +165,11 @@ type pair struct {
 func newPair(tb testing.TB, count, size int) *pair {
 	tb.Helper()
 	mem := hqq.AlignedBuffer(hqq.SizeStandardLink(count, size))
-	server, err := hqq.NewStandardLink(mem, count, size, testLinkOpts(false))
+	server, err := hqq.NewStandardLink(mem, count, size, testLinkOpts())
 	if err != nil {
 		tb.Fatalf("server link: %v", err)
 	}
-	client, err := hqq.NewStandardLink(mem, count, size, testLinkOpts(true))
+	client, err := hqq.NewStandardLink(mem, count, size, testLinkOpts())
 	if err != nil {
 		_ = server.Close()
 		tb.Fatalf("client link: %v", err)

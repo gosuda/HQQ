@@ -3,7 +3,7 @@
  *
  * hqq_rpc.c         readers, writers, scratch, handle table, execution lock, status helpers
  * hqq_rpc_session.c frame receive and validation, response building, request execution, teardown,
- *                   the link-less test entry points (BINDGEN.md 12.1, item 6)
+ *                   the link-less test entry points (BINDGEN.md 12.1, item 4)
  * hqq_rpc_server.c  server, bootstrap over the listener, session threads, hqqrpc_main
  *
  * Section numbers refer to spec/toolchain/BINDGEN.md.
@@ -273,7 +273,7 @@ hqq_status hqqrpc_tx_reserve(hqqrpc_session *s, int final, uint8_t **frame, hqq_
 hqq_status hqqrpc_tx_commit(hqqrpc_session *s, hqq_write_reservation *res, size_t n);
 void hqqrpc_tx_abort(hqqrpc_session *s, hqq_write_reservation *res);
 
-/* ---- Test entry points (12.1, item 6) -------------------------------------------------------- */
+/* ---- Test entry points (12.1, item 4) -------------------------------------------------------- */
 
 /* Creates a session without a link. The geometry is opts->default_buffer_size and
  * opts->default_buffer_count; opts == NULL selects the defaults. The session starts in the state

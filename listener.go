@@ -112,9 +112,6 @@ const (
 )
 
 func (c AcceptorConfig) normalized() (AcceptorConfig, error) {
-	if err := checkAdvancedLinkOptions(c.Advanced.Link); err != nil {
-		return c, err
-	}
 	if c.Perm == 0 {
 		c.Perm = 0o600
 	}
@@ -1076,9 +1073,6 @@ func (lc *listenerClient) admits(cfg Config) error {
 func Connect(ctx context.Context, listenerName string, cfg Config) (*NamedAdvancedLink, error) {
 	ctx = orBackground(ctx)
 	cfg = cfg.normalized()
-	if err := checkAdvancedLinkOptions(cfg.Advanced.Link); err != nil {
-		return nil, err
-	}
 	if !validConfig(cfg.BufferCount, cfg.BufferSize) {
 		return nil, ErrInvalidSize
 	}

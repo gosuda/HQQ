@@ -606,7 +606,7 @@
     "zero_chunk_bytes": 8388608
   },
   "wait": {
-    "spin_iterations": 64,
+    "spin_iterations": 256,
     "yield_iterations": 256,
     "max_park_ns": 100000000,
     "check_interval_ns": 50000000,

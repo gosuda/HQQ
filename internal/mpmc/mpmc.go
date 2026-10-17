@@ -13,11 +13,6 @@
 // reservation that was already completed, which then neither touches the
 // ring nor wakes anyone.
 //
-// A handle can be switched to exclusive mode (SetExclusive) when its owner
-// serializes each side of the ring itself: claims then use plain stores on
-// the cursors instead of CAS, as spec/SPEC.md 7.6 describes, and the
-// completing CAS becomes a load check and a store.
-//
 // Blocking operations use an adaptive wait strategy (see WaitPolicy): a short
 // busy spin, then cooperative yielding, then parking on a 32-bit wait word in
 // the ring header. Parking uses futex(2) on Linux and __ulock_wait on macOS,
@@ -150,8 +145,17 @@ const (
 )
 
 // Tuning knobs for WaitAdaptive.
+//
+// A spin step re-reads the slot spinBatch times and costs about 24 ns on
+// Apple M1, so spinIterations steps are a window of about 6 us. The window
+// must cover the reply of a peer that works for a few microseconds per
+// request: with 64 steps (about 1.5 us) such a reply arrived just after the
+// window, every wait entered the Gosched phase, and with idle Ps each Gosched
+// wakes another thread (wakep), which stretched a 3 us wait to 5 to 9 us. A
+// synchronous call to a C server that spends 1 to 3 us in the handler took
+// 6.7 to 9 us with 64 steps and 3.3 us with 256.
 const (
-	spinIterations  = 64                     // spin steps before yielding
+	spinIterations  = 256                    // spin steps before yielding
 	spinBatch       = 4                      // slot re-reads per spin step
 	pollEvery       = 8                      // spin steps between cancellation polls (power of two)
 	yieldIterations = 256                    // runtime.Gosched iterations before parking
@@ -223,11 +227,6 @@ type MPMCRing[T any] struct {
 	// parker, when set, replaces the in-memory wait words as the blocking
 	// primitive (see Parker).
 	parker Parker
-
-	// exclusive selects the store-based claim (see SetExclusive); guard
-	// checks its contract in race builds and is empty otherwise.
-	guard     exclusiveGuard
-	exclusive bool
 }
 
 // stride returns the slot stride for T.
@@ -524,9 +523,6 @@ func (m *MPMCRing[T]) notifyProducers() {
 // claimProducer claims the next producer position. On success the caller owns
 // the returned slot until it publishes it.
 func (m *MPMCRing[T]) claimProducer(c *Cancel) (uint64, *_melem[T], error) {
-	if m.exclusive {
-		return m.claimProducerExclusive(c)
-	}
 	h := m.head
 	pos := atomic.LoadUint64(&h.w)
 	for {
@@ -577,9 +573,6 @@ func (m *MPMCRing[T]) claimProducerSlow(c *Cancel, pos uint64) (uint64, *_melem[
 // claimConsumer claims the next consumer position. On success the caller owns
 // the returned slot until it releases it.
 func (m *MPMCRing[T]) claimConsumer(c *Cancel) (uint64, *_melem[T], error) {
-	if m.exclusive {
-		return m.claimConsumerExclusive(c)
-	}
 	h := m.head
 	pos := atomic.LoadUint64(&h.r)
 	for {
@@ -645,9 +638,6 @@ func (m *MPMCRing[T]) release(pos uint64, e *_melem[T]) {
 // state (seq == pos), so a stale copy of an already committed slot fails the
 // swap and neither modifies the ring nor wakes anyone; it then returns false.
 func (m *MPMCRing[T]) publishSlot(pos uint64, e *_melem[T]) bool {
-	if m.exclusive {
-		return m.publishSlotExclusive(pos, e)
-	}
 	if !atomic.CompareAndSwapUint64(&e._seq, pos, pos+1) {
 		return false
 	}
@@ -659,9 +649,6 @@ func (m *MPMCRing[T]) publishSlot(pos uint64, e *_melem[T]) bool {
 // publishSlot it swaps from the claimed state (seq == pos+1) and reports
 // false, without side effects, when the slot was already released.
 func (m *MPMCRing[T]) releaseSlot(pos uint64, e *_melem[T]) bool {
-	if m.exclusive {
-		return m.releaseSlotExclusive(pos, e)
-	}
 	if !atomic.CompareAndSwapUint64(&e._seq, pos+1, pos+m.mask+1) {
 		return false
 	}
@@ -884,11 +871,7 @@ func (s *ProducerSlot[T]) Value() *T {
 
 // Commit publishes the reserved producer slot. It returns false, and leaves
 // the ring and its waiters untouched, if the slot was already committed or is
-// invalid, including when another copy of this value committed it first. On an
-// exclusive ring the check is a load of the slot sequence instead of a
-// compare-and-swap: a copy committed earlier fails it just the same, but two
-// copies committed concurrently from different goroutines are not detected
-// (the side is single-goroutine by contract).
+// invalid, including when another copy of this value committed it first.
 func (s *ProducerSlot[T]) Commit() bool {
 	if !s.Valid() {
 		return false
@@ -959,10 +942,7 @@ func (s *ConsumerSlot[T]) Value() *T {
 // Release returns the reserved consumer slot to producers. It returns false,
 // and leaves the ring and its waiters untouched, if the slot was already
 // released or is invalid, including when another copy of this value released
-// it first. On an exclusive ring the check is a load of the slot sequence
-// instead of a compare-and-swap: a copy released earlier fails it just the
-// same, but two copies released concurrently from different goroutines are
-// not detected (the side is single-goroutine by contract).
+// it first.
 func (s *ConsumerSlot[T]) Release() bool {
 	if !s.Valid() {
 		return false

@@ -8,8 +8,16 @@
 
 #include <stdint.h>
 
-/* Wait tuning (SPEC 8.4, constants.json "wait"). */
-#define HQQ_SPIN_ITERATIONS 64u
+/*
+ * Wait tuning (SPEC 8.4, constants.json "wait"). One spin step here re-reads
+ * the slot once (a few ns), where a Go step re-reads it four times, so the
+ * same window of about 4 us takes 1024 steps instead of the spec's 256. A
+ * window shorter than the reply time of a peer that works 1 to 3 us per
+ * request lands the reply in the yield phase: measured against a Go server
+ * on macOS arm64, 64 steps gave 4.9 us (1.5 us of work) and 5.2 us (3 us),
+ * 1024 steps 3.3 us and 4.5 us.
+ */
+#define HQQ_SPIN_ITERATIONS 1024u
 #define HQQ_YIELD_ITERATIONS 256u
 #define HQQ_MAX_PARK_NS (100 * HQQ_NS_PER_MS)
 #define HQQ_CHECK_INTERVAL_NS (50 * HQQ_NS_PER_MS)

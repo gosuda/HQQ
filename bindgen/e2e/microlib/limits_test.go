@@ -135,7 +135,7 @@ func TestSessionSegmentNameIsUnlinkedAtHello(t *testing.T) {
 	if !nameExists(t, r.name) {
 		t.Fatalf("session segment %q does not exist between OPEN and HELLO", r.name)
 	}
-	link, err := hqq.OpenStandardLink(r.name, int(r.count), int(r.size), hqq.LinkOptions{Exclusive: true})
+	link, err := hqq.OpenStandardLink(r.name, int(r.count), int(r.size), hqq.LinkOptions{})
 	wantNoErr(t, "attaching the session link", err)
 	defer link.Close()
 	c := &rawConn{t: t, nl: link, link: link.StandardLink}

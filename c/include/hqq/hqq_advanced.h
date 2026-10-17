@@ -250,16 +250,28 @@ HQQ_API hqq_status hqq_stream_call_with(hqq_stream *s, uint64_t method, const vo
                                         const hqq_call_options *opts, hqq_msg **resp,
                                         const hqq_wait *wait);
 
-/* Handler of one request. It runs on a worker thread of Serve, may block, and
- * must not keep `req`, `w` or `ctx` after it returns. If it writes no response,
- * an empty response is sent (unless the request was canceled first). */
+/* Handler of one request. It runs on a thread of the link (see hqq_adv_serve), may
+ * block, and must not keep `req`, `w` or `ctx` after it returns. If it writes no
+ * response, an empty response is sent (unless the request was canceled first). */
 typedef void (*hqq_handler_fn)(void *user, hqq_req_ctx *ctx, hqq_response *w, const hqq_request *req);
 
 /*
  * Serves requests of the link until `wait` ends, the link is closed or shut
  * down (then HQQ_OK after the in-flight requests completed), or the receive
- * path fails (its error). Handlers run concurrently on worker threads. Only
- * one Serve may run per link (HQQ_ERR_INVALID_OP otherwise).
+ * path fails (its error). Only one Serve may run per link (HQQ_ERR_INVALID_OP
+ * otherwise). Serve returns after every handler has returned.
+ *
+ * Where a handler runs follows the Go Serve. While no handler is running, the
+ * thread that receives the link's frames runs the next request itself, so a
+ * call costs no thread hand-off. A handler that keeps that thread for about
+ * 200 us is escalated: a new thread takes over receiving, so cancels, the
+ * responses to the link's own calls and further requests are processed while
+ * the handler runs, and the old thread ends with the handler. While any handler
+ * runs, further requests go to worker threads (started on demand, at most 64)
+ * and handlers run concurrently; the next request runs inline again as soon as
+ * none runs. A handler that waits for a later request, for a cancel, or for the
+ * response of a call it makes on this link therefore completes, after the
+ * escalation delay (200 to 400 us); it does not deadlock Serve.
  */
 HQQ_API hqq_status hqq_adv_serve(hqq_adv *link, hqq_handler_fn fn, void *user, const hqq_wait *wait);
 
