@@ -554,6 +554,11 @@ func claimSuperblock(sb *standardSuperblock, bufferCount, bufferSize int, layout
 			limit = later(deadline, watch.since.Add(staleInit))
 		}
 		if !emptyWait && time.Now().After(limit) {
+			if stalling && watch.active && time.Since(watch.since) >= staleInit {
+				// The window ended between the takeover check above and
+				// this one: take over now instead of giving up.
+				continue
+			}
 			return 0, false, errInitContended
 		}
 		if err := sleepCtx(ctx, claimPollInterval); err != nil {

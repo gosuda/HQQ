@@ -809,6 +809,11 @@ func claimListener(ctx context.Context, h *listenerHeader, mem []byte, token, cr
 			limit = later(deadline, watch.since.Add(staleInit))
 		}
 		if time.Now().After(limit) {
+			if stalling && watch.active && time.Since(watch.since) >= staleInit {
+				// The window ended between the takeover check above and
+				// this one: take over now instead of giving up.
+				continue
+			}
 			return errInitContended
 		}
 		if err := sleepCtx(ctx, claimPollInterval); err != nil {

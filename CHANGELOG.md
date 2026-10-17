@@ -31,6 +31,11 @@ The project follows [Semantic Versioning](https://semver.org/). While in `v0.x`,
 - **Time columns**: TEXT in a `DATE`, `DATETIME`, or `TIMESTAMP` column is returned as `time.Time` when it parses (it was `string`).
 - **Argument conversion** is the driver's `CheckNamedValue`, not the default converter of `database/sql`.
 
+### Fixed
+
+- Creating or listening on a segment whose initializer had stalled could fail with the transient initialization error at the very end of the takeover window: the give-up check read the clock after the takeover check had. The claim loops (`claimSuperblock`, `claimListener`) now retry the takeover once the window has elapsed.
+- CI: the SQLite e2e and launcher packages run serially (`go test -p 1`), and the launcher contract harness kills a server that stops answering after 60 s and logs its output, so a stuck call fails the run with a diagnosis instead of waiting for the `go test` timeout.
+
 ### Removed
 
 - The Zig binding (`bindings/zig`) and its CI job. It was never verified by CI.
