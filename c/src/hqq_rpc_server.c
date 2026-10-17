@@ -70,6 +70,7 @@ typedef struct hqqrpc_ctl {
     uint64_t id;
     hqq_cancel cancel;
     _Atomic int opened;
+    int released;                 /* no longer counted against max_control_links (guarded by srv->mu) */
 } hqqrpc_ctl;
 
 enum {
@@ -227,6 +228,12 @@ void hqqrpc_server_session_started(hqqrpc_server *srv, uint64_t ctl_id) {
     for (c = srv->ctls; c != NULL; c = c->next) {
         if (c->id == ctl_id) {
             hqq_cancel_signal(&c->cancel);
+            /* Its job is done: stop counting it now; the serve loop notices the cancel at its next
+             * park slice, and the thread ends later. */
+            if (!c->released) {
+                c->released = 1;
+                srv->ctl_count--;
+            }
             break;
         }
     }
@@ -457,7 +464,10 @@ static void ctl_main(void *arg) {
             break;
         }
     }
-    srv->ctl_count--;
+    if (!ctl->released) {
+        ctl->released = 1;
+        srv->ctl_count--;
+    }
     hqq_plat_mutex_unlock(srv->mu);
     (void)hqq_adv_close(ctl->adv);
     hqq_free(srv->alloc, ctl, sizeof *ctl);
@@ -481,6 +491,20 @@ static void on_accepted(hqqrpc_server *srv, hqq_adv *adv) {
     hqq_cancel_init(&ctl->cancel);
     atomic_init(&ctl->opened, 0);
     hqq_plat_mutex_lock(srv->mu);
+    if (srv->ctl_count >= srv->cfg.max_control_links) {
+        hqqrpc_ctl *c;
+
+        /* A link whose client has closed it (a refused OPEN, a client that left) is not served any
+         * more, but its thread only notices at the next park slice of hqq_adv_serve. Count only the
+         * links whose peer is still there. The adv handle stays valid while the link is listed:
+         * ctl_main closes it after removing it from the list, under this lock. */
+        for (c = srv->ctls; c != NULL; c = c->next) {
+            if (!c->released && hqq_adv_peer_state(c->adv) != HQQ_PEER_CONNECTED) {
+                c->released = 1;
+                srv->ctl_count--;
+            }
+        }
+    }
     if (srv->ctl_count >= srv->cfg.max_control_links) {
         hqq_plat_mutex_unlock(srv->mu);
         hqq_free(srv->alloc, ctl, sizeof *ctl);

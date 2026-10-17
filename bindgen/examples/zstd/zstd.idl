@@ -1,0 +1,141 @@
+// zstd.idl: a subset of Zstandard 1.5.x (lib/zstd.h) for hqq-bindgen. See README.md for the
+// functions that are deliberately not declared and for the geometry the server runs with.
+//
+// Error convention: ZSTD_* functions that return size_t encode failure in the result.
+// @error(predicate(ZSTD_isError)) turns that into a library failure, and detail(ZSTD_getErrorName, ret)
+// carries the library's error text. The Go error is a *rt.LibError whose Code is int64(ret), that is
+// minus the ZSTD_ErrorCode (zstd_errors.h).
+idl 1;
+
+// Distinct contexts are independent in zstd and the one-shot functions are re-entrant, so sessions
+// may enter the library at the same time.
+@serialize(none)
+service zstd;
+
+include "zstd.h";
+
+// Largest uncompressed buffer of the compress and decompress calls: 512 MiB.
+const ZSTD_MAX_SRC: u32 = 536870912;
+// Largest destination buffer: 768 MiB, which covers ZSTD_compressBound(ZSTD_MAX_SRC).
+const ZSTD_MAX_DST: u32 = 805306368;
+// ZSTD_FRAMEHEADERSIZE_MAX: the bytes of a frame that ZSTD_getFrameContentSize reads.
+const ZSTD_FRAMEHEADER_MAX: u32 = 18;
+
+const ZSTD_CONTENTSIZE_UNKNOWN: u64 = 18446744073709551615;
+const ZSTD_CONTENTSIZE_ERROR: u64 = 18446744073709551614;
+
+// ZSTD_EndDirective.
+const ZSTD_e_continue: u32 = 0;
+const ZSTD_e_flush: u32 = 1;
+const ZSTD_e_end: u32 = 2;
+
+// ZSTD_ResetDirective.
+const ZSTD_reset_session_only: u32 = 1;
+const ZSTD_reset_parameters: u32 = 2;
+const ZSTD_reset_session_and_parameters: u32 = 3;
+
+// ZSTD_cParameter values that the server lets a client set; the interceptor of
+// ZSTD_CCtx_setParameter refuses every other one. The tuning parameters (hashLog, chainLog,
+// searchLog, minMatch, targetLength, long-distance matching) are not exposed: hashLog and chainLog
+// accept values up to 30 and would let a client ask for multi-GiB tables.
+const ZSTD_c_compressionLevel: i32 = 100;
+const ZSTD_c_windowLog: i32 = 101;
+const ZSTD_c_strategy: i32 = 107;
+const ZSTD_c_contentSizeFlag: i32 = 200;
+const ZSTD_c_checksumFlag: i32 = 201;
+const ZSTD_c_dictIDFlag: i32 = 202;
+// Refused by the interceptor: a worker pool needs a multithreaded build and threads inside the server.
+const ZSTD_c_nbWorkers: i32 = 400;
+
+@c("ZSTD_CCtx *")
+handle CCtx destroy ZSTD_freeCCtx;
+
+@c("ZSTD_DCtx *")
+handle DCtx destroy ZSTD_freeDCtx;
+
+fn ZSTD_versionNumber() -> u32;
+fn ZSTD_versionString() -> str<=32;
+fn ZSTD_minCLevel() -> i32;
+fn ZSTD_maxCLevel() -> i32;
+
+@error(predicate(ZSTD_isError), detail(ZSTD_getErrorName, ret))
+fn ZSTD_compressBound(srcSize: size) -> size;
+
+// Reads at most ZSTD_FRAMEHEADER_MAX bytes of a frame. Returns the content size, or
+// ZSTD_CONTENTSIZE_UNKNOWN or ZSTD_CONTENTSIZE_ERROR; those two are results, not failures.
+fn ZSTD_getFrameContentSize(src: bytes<=ZSTD_FRAMEHEADER_MAX, srcSize: size @len_of(src)) -> u64;
+
+// One-shot compression and decompression. dst is caller-supplied storage: the client passes a
+// slice whose length is the capacity, and gets back the prefix that was produced. The server
+// writes into the response frame in place when the response fits one frame.
+@error(predicate(ZSTD_isError), detail(ZSTD_getErrorName, ret))
+fn ZSTD_compress(out dst: bytes<=ZSTD_MAX_DST, dstCapacity: size @len_of(dst),
+                 src: bytes<=ZSTD_MAX_SRC, srcSize: size @len_of(src),
+                 compressionLevel: i32) -> size @len_of(dst);
+
+@error(predicate(ZSTD_isError), detail(ZSTD_getErrorName, ret))
+fn ZSTD_decompress(out dst: bytes<=ZSTD_MAX_SRC, dstCapacity: size @len_of(dst),
+                   src: bytes<=ZSTD_MAX_DST, compressedSize: size @len_of(src)) -> size @len_of(dst);
+
+// Contexts are per-session objects: the server destroys the ones a client leaves behind.
+@error(null)
+fn ZSTD_createCCtx() -> CCtx;
+
+@error(status, ok(0), detail(ZSTD_getErrorName, ret))
+fn ZSTD_freeCCtx(cctx: CCtx) -> size;
+
+@error(null)
+fn ZSTD_createDCtx() -> DCtx;
+
+@error(status, ok(0), detail(ZSTD_getErrorName, ret))
+fn ZSTD_freeDCtx(dctx: DCtx) -> size;
+
+@error(predicate(ZSTD_isError), detail(ZSTD_getErrorName, ret))
+fn ZSTD_compressCCtx(cctx: CCtx,
+                     out dst: bytes<=ZSTD_MAX_DST, dstCapacity: size @len_of(dst),
+                     src: bytes<=ZSTD_MAX_SRC, srcSize: size @len_of(src),
+                     compressionLevel: i32) -> size @len_of(dst);
+
+@error(predicate(ZSTD_isError), detail(ZSTD_getErrorName, ret))
+fn ZSTD_decompressDCtx(dctx: DCtx,
+                       out dst: bytes<=ZSTD_MAX_SRC, dstCapacity: size @len_of(dst),
+                       src: bytes<=ZSTD_MAX_DST, compressedSize: size @len_of(src)) -> size @len_of(dst);
+
+// The interceptor (server/zstd_hooks.c) allows compressionLevel, windowLog, strategy and the three
+// flags, refuses every other parameter with E_DENIED, and refuses a windowLog above 27, the largest
+// window the decompressor accepts by default.
+@intercept
+@error(predicate(ZSTD_isError), detail(ZSTD_getErrorName, ret))
+fn ZSTD_CCtx_setParameter(cctx: CCtx, param: i32, value: i32) -> size;
+
+@error(predicate(ZSTD_isError), detail(ZSTD_getErrorName, ret))
+fn ZSTD_CCtx_setPledgedSrcSize(cctx: CCtx, pledgedSrcSize: u64) -> size;
+
+@error(predicate(ZSTD_isError), detail(ZSTD_getErrorName, ret))
+fn ZSTD_CCtx_reset(cctx: CCtx, reset: u32) -> size;
+
+@error(predicate(ZSTD_isError), detail(ZSTD_getErrorName, ret))
+fn ZSTD_DCtx_reset(dctx: DCtx, reset: u32) -> size;
+
+// Streaming. ZSTD_compressStream2 and ZSTD_decompressStream take ZSTD_inBuffer and ZSTD_outBuffer
+// structs that hold pointers, which have no wire form, so these two shims flatten them: the input
+// buffer is src and srcSize with the consumed count returned in srcPos, the output buffer is dst
+// with the capacity dstCapacity and the produced count returned in dstPos (the length of dst).
+// The result is the function's own return value: the hint of ZSTD_compressStream2 (bytes still to
+// flush, 0 when an ZSTD_e_end frame is complete) and of ZSTD_decompressStream (0 at a frame end).
+// The shims are in server/zstd_hooks.c.
+@error(predicate(ZSTD_isError), detail(ZSTD_getErrorName, ret))
+shim fn ZSTD_compressStream2_flat(cctx: CCtx,
+                                  out dst: bytes<=ZSTD_MAX_DST, dstCapacity: size @len_of(dst),
+                                  src: bytes<=ZSTD_MAX_SRC, srcSize: size @len_of(src),
+                                  endOp: u32,
+                                  out dstPos: size @len_of(dst), out srcPos: size) -> size;
+
+@error(predicate(ZSTD_isError), detail(ZSTD_getErrorName, ret))
+shim fn ZSTD_decompressStream_flat(dctx: DCtx,
+                                   out dst: bytes<=ZSTD_MAX_SRC, dstCapacity: size @len_of(dst),
+                                   src: bytes<=ZSTD_MAX_DST, srcSize: size @len_of(src),
+                                   out dstPos: size @len_of(dst), out srcPos: size) -> size;
+
+@allow(server) fn ZSTD_isError(code: size) -> u32;
+@allow(server) fn ZSTD_getErrorName(code: size) -> str<=128;

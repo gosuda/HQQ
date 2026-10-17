@@ -660,6 +660,51 @@ static void test_bootstrap_bounds(void) {
     HQQ_CHECK_STATUS(srv_stop(&sc), HQQ_OK);
 }
 
+/* A client that opens sessions one after the other never has more than one control link alive:
+ * the slot is free as soon as the session's HELLO was read, not when the control thread has
+ * noticed the close. With max_control_links 1 every OPEN of the loop must succeed at once. */
+static void test_sequential_opens(void) {
+    srv_ctx sc;
+    hqqrpc_server_options o;
+    client c;
+    int i;
+
+    hqqrpc_server_options_init(&o);
+    o.max_control_links = 1;
+    srv_start(&sc, &microlib_iface, &o, "seq");
+    for (i = 0; i < 40; i++) {
+        cli_open(&c, sc.name, 0, 0); /* requires every connect and OPEN to succeed */
+        HQQ_CHECK_EQ_U64(cli_hello(&c, &microlib_iface, NULL, NULL), 0);
+        cli_free(&c);
+    }
+    HQQ_CHECK_STATUS(srv_stop(&sc), HQQ_OK);
+}
+
+/* A client whose OPEN is refused closes its control link: the server counts that link no more, so
+ * with max_control_links 1 a long run of refused OPENs, each on a link of its own, never starves
+ * the next connect. */
+static void test_refused_opens_free_slots(void) {
+    srv_ctx sc;
+    hqqrpc_server_options o;
+    client c;
+    int i;
+
+    hqqrpc_server_options_init(&o);
+    o.max_control_links = 1;
+    srv_start(&sc, &microlib_iface, &o, "ref");
+    for (i = 0; i < 40; i++) {
+        hqq_adv *ctl = NULL;
+
+        HQQ_REQUIRE(ctl_connect(sc.name, &ctl) == HQQ_OK);
+        expect_open_error(ctl, 3, 128, 1, "HQBO", HQQRPC_OPEN_E_GEOMETRY, "B not a power of two");
+        HQQ_CHECK_STATUS(hqq_adv_close(ctl), HQQ_OK);
+    }
+    cli_open(&c, sc.name, 0, 0); /* and a good OPEN still gets a link */
+    HQQ_CHECK_EQ_U64(cli_hello(&c, &microlib_iface, NULL, NULL), 0);
+    cli_free(&c);
+    HQQ_CHECK_STATUS(srv_stop(&sc), HQQ_OK);
+}
+
 /* ---- Stop and shutdown ---------------------------------------------------------------------------- */
 
 /* A stop ends idle sessions with E_SHUTTING_DOWN and run returns HQQ_OK; destroy is refused while
@@ -948,6 +993,8 @@ int main(int argc, char **argv) {
     test_idle_timeout();
     test_open_without_hello();
     test_bootstrap_bounds();
+    test_sequential_opens();
+    test_refused_opens_free_slots();
     test_stop_with_sessions();
     test_create_errors();
     test_serialize();

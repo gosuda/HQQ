@@ -1,6 +1,6 @@
-// microbench.idl: the functions of the benchmarks of BINDGEN.md 10.5 that microlib.idl does not declare.
-// ml_work is a C loop of known cost (microlib.h); ml_add is repeated here so that the trivial-call and the
-// fixed-cost benchmarks run against one server.
+// microbench.idl: the functions of the benchmarks of BINDGEN.md 10.5, in one service so that one server
+// covers every benchmark. The declarations are copied from microlib.idl; ml_work is a C loop of known
+// cost (microlib.h). ml_xor accepts 64 KiB, so BenchmarkXor also measures the chunked path.
 idl 1;
 
 @serialize(session)
@@ -8,6 +8,27 @@ service microbench;
 
 include "microlib.h";
 
+const ML_OK: i32 = 0;
+
+@c("ml_counter *")
+handle Counter destroy ml_counter_free;
+
 fn ml_add(a: i32, b: i32) -> i32;
 
 fn ml_work(iters: u32) -> u64;
+
+@error(null)
+fn ml_counter_new(start: i64) -> Counter;
+
+@intercept
+@error(status, ok(ML_OK), detail(ml_counter_errmsg, c))
+fn ml_counter_add(c: Counter, delta: i64, out total: i64) -> i32;
+
+fn ml_counter_free(c: Counter);
+
+@error(predicate(ml_xor_failed))
+fn ml_xor(src: bytes<=65536, n: size @len_of(src), key: u8,
+          out dst: bytes, cap: size @len_of(dst)) -> size @len_of(dst);
+
+@allow(server) fn ml_counter_errmsg(c: Counter) -> str<=1024;
+@allow(server) fn ml_xor_failed(r: size) -> i32;

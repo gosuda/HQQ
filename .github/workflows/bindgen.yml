@@ -1,0 +1,303 @@
+name: Bindgen
+
+# hqq-bindgen (spec/toolchain/BINDGEN.md, 10.6): the generated files are fresh, the golden vectors match
+# the document, the Go packages pass with the race detector, the C runtime passes under the sanitizers,
+# and the generated Go client talks to the generated C server (bindgen/e2e/microlib) over real shared
+# memory, with and without ASan and UBSan in the server. A workflow_dispatch job runs the benchmarks
+# against cgo (bindgen/bench); they do not gate anything. The Go CI (ci.yml) and the C CI (c.yml) are
+# independent of this workflow: they already run go vet, go test and ctest over the same trees.
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'bindgen/**'
+      - 'cmd/hqq-bindgen/**'
+      - 'c/**'
+      - 'launch/**'
+      - 'spec/toolchain/BINDGEN.md'
+      - 'go.mod'
+      - 'go.sum'
+      - '.github/workflows/bindgen.yml'
+  pull_request:
+    paths:
+      - 'bindgen/**'
+      - 'cmd/hqq-bindgen/**'
+      - 'c/**'
+      - 'launch/**'
+      - 'spec/toolchain/BINDGEN.md'
+      - 'go.mod'
+      - 'go.sum'
+      - '.github/workflows/bindgen.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bindgen-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # The generated files are functions of the IDL files: regenerate with -check, like
+  # c/tools/gen_constants.py --check, and compare the golden vectors with the document.
+  generated:
+    name: Generated files and vectors
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.2
+
+      - name: Set up Go
+        uses: actions/setup-go@v6.4.0
+        with:
+          go-version-file: go.mod
+          check-latest: true
+          cache: true
+
+      - name: Generated microlib client and server glue are fresh
+        run: >
+          go run ./cmd/hqq-bindgen -check
+          -go-out bindgen/e2e/microlib -go-strip ml_ -c-out bindgen/e2e/microlib/server
+          bindgen/testdata/microlib/microlib.idl
+
+      - name: Generated v2 client (digest mismatch test) is fresh
+        run: >
+          go run ./cmd/hqq-bindgen -check
+          -go-out bindgen/e2e/microlib/v2 -go-package microlibv2 -go-strip ml_
+          bindgen/testdata/microlib/microlib_v2.idl
+
+      - name: Generated benchmark client and server glue are fresh
+        run: >
+          go run ./cmd/hqq-bindgen -check
+          -go-out bindgen/bench/microbench -go-strip ml_ -c-out bindgen/bench/server
+          bindgen/testdata/microlib/microbench.idl
+
+      - name: Golden vectors match the document
+        run: |
+          go test ./bindgen -run TestDocVectors -count=1
+          go run ./bindgen/internal/vectors -check -c c/tests/generated/rpc_vectors.h
+
+      - name: Go builds and vets without cgo
+        env:
+          CGO_ENABLED: '0'
+        run: |
+          go build ./...
+          go vet ./...
+
+  go:
+    name: Go ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-24.04
+          - macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.2
+
+      - name: Set up Go
+        uses: actions/setup-go@v6.4.0
+        with:
+          go-version-file: go.mod
+          check-latest: true
+          cache: true
+
+      # The end-to-end package builds and starts the C server: its own job runs it.
+      - name: Run vet
+        run: go vet ./bindgen/... ./cmd/hqq-bindgen/... ./launch/...
+
+      - name: Run race tests
+        run: |
+          pkgs=$(go list ./bindgen/... ./cmd/hqq-bindgen/... ./launch/... | grep -v '/bindgen/e2e/')
+          go test -race -count=1 -timeout=10m $pkgs
+
+      - name: Run fuzz smoke tests
+        if: runner.os == 'Linux'
+        run: |
+          go test ./bindgen/idl -run '^$' -fuzz='^FuzzParse$' -fuzztime=5s
+          go test ./bindgen/rt -run '^$' -fuzz='^FuzzDecodeResponse$' -fuzztime=5s
+          go test ./bindgen/rt -run '^$' -fuzz='^FuzzDecodeValues$' -fuzztime=5s
+
+  # The C runtime and its generated-glue tests under the sanitizers. The plain build and the other
+  # platforms are c.yml's.
+  c-runtime:
+    name: C runtime ${{ matrix.sanitizer }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [address+undefined, thread]
+
+    env:
+      CC: clang-18
+      CXX: clang++-18
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.2
+
+      - name: Install compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang-18 libclang-rt-18-dev cmake ninja-build
+          # TSan cannot map its shadow memory with the default 32 bits of ASLR
+          # entropy on recent kernels.
+          sudo sysctl -w vm.mmap_rnd_bits=28 || true
+
+      - name: Configure
+        run: >
+          cmake -S c -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DHQQ_WERROR=ON
+          -DHQQ_BUILD_STRESS=OFF -DHQQ_BUILD_CXX_CHECK=OFF
+          -DHQQ_SANITIZE=${{ matrix.sanitizer }}
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Test the C runtime
+        env:
+          ASAN_OPTIONS: detect_leaks=1:strict_string_checks=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+          TSAN_OPTIONS: halt_on_error=1:second_deadlock_stack=1
+        run: ctest --test-dir build -R 'rpc|platform_mutex' --output-on-failure --timeout 300
+
+  # The generated Go client against the generated C server over shared memory (BINDGEN.md 10.4). The
+  # server is built here and handed to the tests (HQQ_BINDGEN_MICROLIB_SERVER); the sanitizer variants
+  # also tell the tests which runtime options to give it (HQQ_BINDGEN_MICROLIB_SANITIZE). LeakSanitizer
+  # does not exist on macOS: the tests turn detect_leaks on only on Linux.
+  e2e:
+    name: E2E ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    continue-on-error: ${{ matrix.experimental }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux
+            runner: ubuntu-24.04
+            sanitize: none
+            test_sanitize: ''
+            build_type: Release
+            experimental: false
+          - name: Linux ASan+UBSan
+            runner: ubuntu-24.04
+            sanitize: address+undefined
+            test_sanitize: address+undefined
+            build_type: Debug
+            experimental: false
+          - name: macOS
+            runner: macos-latest
+            sanitize: none
+            test_sanitize: ''
+            build_type: Release
+            experimental: false
+          # Sanitizer support on hosted macOS images depends on the OS release, as in c.yml.
+          - name: macOS ASan+UBSan (best effort)
+            runner: macos-latest
+            sanitize: address+undefined
+            test_sanitize: address+undefined
+            build_type: Debug
+            experimental: true
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.2
+
+      - name: Install tools (Linux)
+        if: runner.os == 'Linux'
+        env:
+          SANITIZE: ${{ matrix.sanitize }}
+        run: |
+          packages="cmake ninja-build"
+          if [ "$SANITIZE" != none ]; then
+            packages="$packages clang-18 libclang-rt-18-dev"
+            echo "CC=clang-18" >> "$GITHUB_ENV"
+          fi
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends $packages
+
+      - name: Install tools (macOS)
+        if: runner.os == 'macOS'
+        run: command -v ninja >/dev/null || brew install ninja
+
+      - name: Set up Go
+        uses: actions/setup-go@v6.4.0
+        with:
+          go-version-file: go.mod
+          check-latest: true
+          cache: true
+
+      - name: Build the microlib server
+        run: >
+          cmake -S bindgen/e2e/microlib/server -B build-ml -G Ninja
+          -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+          -DHQQ_WERROR=ON -DHQQ_SANITIZE=${{ matrix.sanitize }}
+
+      - name: Build
+        run: cmake --build build-ml --target microlib_server
+
+      - name: End-to-end tests
+        env:
+          HQQ_BINDGEN_MICROLIB_SERVER: ${{ github.workspace }}/build-ml/microlib_server
+          HQQ_BINDGEN_MICROLIB_SANITIZE: ${{ matrix.test_sanitize }}
+        run: go test -race -count=1 -timeout 10m -v ./bindgen/e2e/...
+
+  # Benchmarks against cgo (BINDGEN.md 10.5): manual runs only, and never a gate. The numbers of a
+  # shared runner are not the numbers of a quiet machine; the artifacts are for a pull request
+  # description, not for a threshold.
+  benchmarks:
+    name: Benchmarks
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.2
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake ninja-build gcc
+
+      - name: Set up Go
+        uses: actions/setup-go@v6.4.0
+        with:
+          go-version-file: go.mod
+          check-latest: true
+          cache: true
+
+      - name: Build the benchmark server and hqq_echo
+        run: |
+          cmake -S bindgen/bench/server -B build/bench -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build/bench
+          cmake -S c -B build/c -G Ninja -DCMAKE_BUILD_TYPE=Release -DHQQ_BUILD_CXX_CHECK=OFF
+          cmake --build build/c --target hqq_echo
+
+      - name: Run the benchmarks (pinned spin, then adaptive)
+        env:
+          HQQ_BENCH_SERVER: ${{ github.workspace }}/build/bench/microbench_server
+          HQQ_BENCH_ECHO: ${{ github.workspace }}/build/c/tools/hqq_echo
+        run: |
+          mkdir -p bench-results
+          go test -run '^$' -bench . -benchtime 2s -count 5 -timeout 60m ./bindgen/bench | tee bench-results/spin.txt
+          HQQ_BENCH_WAIT=adaptive go test -run '^$' -bench . -benchtime 2s -count 5 -timeout 60m ./bindgen/bench | tee bench-results/adaptive.txt
+
+      - name: Upload the results
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: bindgen-benchmarks
+          path: bench-results/
+          if-no-files-found: error

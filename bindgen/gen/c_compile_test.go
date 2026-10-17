@@ -1,7 +1,6 @@
 package gen
 
 import (
-	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -37,15 +36,24 @@ func TestCCompilesMicrolib(t *testing.T) {
 		filepath.Join(dir, "microlib_server.c"), cTestdata(t, "microlib_hooks.c"), filepath.Join(micro, "microlib.c"))
 }
 
-// TestCCompilesMicrobench compiles the glue of the benchmark interface, which has no handles and no hooks.
+// TestCCompilesMicrobench compiles the glue of the benchmark interface with its interceptor hook.
 func TestCCompilesMicrobench(t *testing.T) {
 	dir := t.TempDir()
 	writeFiles(t, dir, genC(t, parseSpec(t, "bindgen/testdata/microlib/microbench.idl"), "microbench.idl"))
 	micro := filepath.Join(repoRoot(t), "bindgen", "testdata", "microlib")
-	compileObjects(t, dir, []string{micro}, filepath.Join(dir, "microbench_server.c"), filepath.Join(micro, "microlib.c"))
-	src, _ := os.ReadFile(filepath.Join(dir, "microbench_server.c"))
-	if !strings.Contains(string(src), "    0, NULL,\n") {
-		t.Errorf("a service without handle types needs a NULL table:\n%s", src)
+	compileObjects(t, dir, []string{micro, cTestdata(t)},
+		filepath.Join(dir, "microbench_server.c"), cTestdata(t, "microbench_hooks.c"), filepath.Join(micro, "microlib.c"))
+}
+
+// TestCNoHandleTypes: a service without handle types has NULL tables and still compiles.
+func TestCNoHandleTypes(t *testing.T) {
+	dir := t.TempDir()
+	files := genC(t, parseText(t, "idl 1;\nservice plain;\ninclude \"plain.h\";\nfn pl_add(a: i32, b: i32) -> i32;\n"), "plain.idl")
+	writeFiles(t, dir, files)
+	writeFiles(t, dir, map[string][]byte{"plain.h": []byte("#include <stdint.h>\nint32_t pl_add(int32_t a, int32_t b);\n")})
+	compileObjects(t, dir, nil, filepath.Join(dir, "plain_server.c"))
+	if !strings.Contains(string(files["plain_server.c"]), "    0, NULL,\n") {
+		t.Errorf("a service without handle types needs a NULL table:\n%s", files["plain_server.c"])
 	}
 }
 
