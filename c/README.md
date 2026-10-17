@@ -108,6 +108,7 @@ pools. After warm-up it makes no allocator calls; `test_adv` checks this with a 
 allocator hook.
 
 Verified: `test_adv` (negotiation, chunking, streams, calls, steady-state allocation),
+`test_adv_uninit` (concurrent budget-less calls on an allocator that poisons every block),
 `test_listener` (round trips, busy listener, bad records, closed acceptor), and the
 interop matrix (`interop/`, scenarios X-A01..X-A10, all four Go/C pairings).
 

@@ -33,6 +33,7 @@ The project follows [Semantic Versioning](https://semver.org/). While in `v0.x`,
 
 ### Fixed
 
+- **libhqq (C): requests could be dropped without a response.** A request context allocated while the context pool was empty (many concurrent requests) was not zeroed. For a request without a time budget its `has_deadline` and `deadline_mono` held whatever the allocator returned, so the deadline timer could end the request as expired, the worker skipped it, and the caller waited for a response that never came. Every context is now zeroed. Found through intermittent hangs of the SQLite end-to-end tests on Windows, where the C server serves 32 concurrent sessions. The Go library is not affected (Go zeroes allocations). Regression test: `c/tests/test_adv_uninit.c` (an allocator that poisons every block).
 - Creating or listening on a segment whose initializer had stalled could fail with the transient initialization error at the very end of the takeover window: the give-up check read the clock after the takeover check had. The claim loops (`claimSuperblock`, `claimListener`) now retry the takeover once the window has elapsed.
 - CI: the SQLite e2e and launcher packages run serially (`go test -p 1`), and the launcher contract harness kills a server that stops answering after 60 s and logs its output, so a stuck call fails the run with a diagnosis instead of waiting for the `go test` timeout.
 
