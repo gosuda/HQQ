@@ -357,7 +357,7 @@ go run gosuda.org/hqq/cmd/hqq-bindgen -go-out client -go-strip ml_ -c-out server
 go run gosuda.org/hqq/cmd/hqq-bindgen -check -go-out client -go-strip ml_ -c-out server mylib.idl   # fails on stale output
 ```
 
-What it is good at, measured on an Apple M1 (details and caveats in [`bindgen/README.md`](bindgen/README.md)): coarse calls. Compressing 64 KiB to 1 MiB with zstd through the generated client, with calls pipelined, is within 2% of cgo for one goroutine, and two sessions against two cgo threads are within 6% at 1 MiB. What it is not good at: tiny calls. A synchronous call with no work takes 310 ns against 25 ns for cgo, and a pipelined one 160–175 ns. The benefits it offers instead of speed are isolation (a crash in the C library ends the server process, not the Go program), no cgo in the Go build, and calls that overlap with Go work. There is no call cancellation, no callbacks, and the C server runs on POSIX systems only.
+What it is good at, measured on an Apple M1 (details and caveats in [`bindgen/README.md`](bindgen/README.md)): coarse calls. Compressing 64 KiB to 1 MiB with zstd through the generated client, with calls pipelined, is within 2% of cgo for one goroutine, and two sessions against two cgo threads are within 2% at 1 MiB. What it is not good at: tiny calls. A synchronous call with no work takes about 335 ns against 25 ns for cgo, and a pipelined one 164–178 ns. The benefits it offers instead of speed are isolation (a crash in the C library ends the server process, not the Go program), no cgo in the Go build, and calls that overlap with Go work. There is no call cancellation, no callbacks, and the C server runs on POSIX systems only.
 
 The design is [`spec/toolchain/BINDGEN.md`](spec/toolchain/BINDGEN.md); examples are [`bindgen/examples/zstd`](bindgen/examples/zstd) and [`bindgen/examples/sqlite3`](bindgen/examples/sqlite3) (with the `hqq-sqlite-gen` driver in [`sqlite/gendriver`](sqlite/gendriver), which passes the same `database/sql` contract suite as `hqq-sqlite`). Generated servers are started with [`launch`](#starting-any-hqq-server-from-go-launch).
 
@@ -494,30 +494,30 @@ sha256sum -c SHA256SUMS
 
 ## Benchmarks
 
-Measured on `darwin/arm64` (Apple M1, Go 1.27, quiet machine, median of 5–6 runs of `go test . -bench 'Benchmark(StandardLink|AdvancedLink|Compare)' -benchmem`); idle CPU from `HQQ_PERF_TESTS=1 go test -run 'TestIdleLinkDoesNotBurnCPU|TestMPMCWaitSpinBurnsCPU' ./...`. Both ends of every benchmark run in one process, on two goroutines; a Go client against a C server in two processes measured 186–187 ns average for the same 64-byte round trip.
+Measured on `darwin/arm64` (Apple M1, Go 1.27, quiet machine, median of 6 runs of `go test . -bench 'Benchmark(StandardLink|AdvancedLink|Compare)' -benchmem`); idle CPU from `HQQ_PERF_TESTS=1 go test -run 'TestIdleLinkDoesNotBurnCPU|TestMPMCWaitSpinBurnsCPU' ./...`. Both ends of every benchmark run in one process, on two goroutines; a Go client against a C server in two processes measured 186–187 ns average for the same 64-byte round trip.
 
 ### HQQ vs Unix Domain Socket (`SOCK_STREAM`) vs OS Pipe
 
 | Benchmark | HQQ (`WaitAdaptive`) | HQQ (`WaitSpin`) | Unix Domain Socket | OS Pipe | HQQ Speedup |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| **64 B Round-Trip Latency** | **192 ns/op** | 193 ns/op | 3,121 ns/op | 3,341 ns/op | **16.2×–17.4× faster** |
-| **4 KiB Unidirectional Throughput** | **26,170 MB/s** (157 ns/op) | 24,690 MB/s | 2,700 MB/s | 4,357 MB/s | **6.0×–9.7× higher** |
-| **64 KiB Unidirectional Throughput** | **29,230 MB/s** (2.24 µs/op) | 29,010 MB/s | 3,110 MB/s | 11,770 MB/s | **2.5×–9.4× higher** |
+| **64 B Round-Trip Latency** | **192.7 ns/op** | 193.1 ns/op | 3,136 ns/op | 3,396 ns/op | **16.3×–17.6× faster** |
+| **4 KiB Unidirectional Throughput** | **25,250 MB/s** (162.2 ns/op) | 25,200 MB/s (162.6 ns/op) | 2,643 MB/s | 4,359 MB/s | **5.8×–9.6× higher** |
+| **64 KiB Unidirectional Throughput** | **27,070 MB/s** (2,421 ns/op) | 27,800 MB/s (2,358 ns/op) | 3,088 MB/s | 11,733 MB/s | **2.3×–8.8× higher** |
 | **Idle Blocked Callers** | **~1% CPU** (2 blocked calls, incl. heartbeats) | >100% CPU (one core per blocked call) | blocks in the kernel | blocks in the kernel | kernel parking |
 
 ### StandardLink & AdvancedLink Microbenchmarks
 
 | Operation | Latency | Throughput | Allocs |
 | --- | ---: | ---: | ---: |
-| `StandardLink` Read/Write (`8 B`) | **29.0 ns/op** | **276 MB/s** | `0 B/op`, `0 allocs/op` |
-| `StandardLink` Zero-Copy (`4 KiB`) | **41.1 ns/op** | **99,650 MB/s** | `0 B/op`, `0 allocs/op` |
-| `StandardLink` Reserve/Commit (`4 KiB`) | **68.4 ns/op** | **59,900 MB/s** | `0 B/op`, `0 allocs/op` |
-| `StandardLink` Pipeline (`64 B`) | **38.5 ns/op** | **1,662 MB/s** | `0 B/op`, `0 allocs/op` |
-| `StandardLink` Pipeline (`4 KiB`) | **121.8 ns/op** | **33,630 MB/s** | `0 B/op`, `0 allocs/op` |
-| `AdvancedLink` Send/Recv + `Release` (`64 B`, one chunk) | **151.8 ns/op** | **422 MB/s** | `0 B/op`, `0 allocs/op` |
-| `AdvancedLink` Send/Recv + `Release` (`4 KiB` over `256 B` chunks) | **1.46 µs/op** | **2,807 MB/s** | `0 B/op`, `0 allocs/op` |
-| `AdvancedLink` Call + `Release` via `Serve` (`64 B` req + `64 B` resp) | **555 ns/op** | **230 MB/s** | `0 B/op`, `0 allocs/op` |
-| `AdvancedLink` Call + `Release` via `Serve` (`1 KiB` req + `1 KiB` resp, `256 B` chunks) | **1.25 µs/op** | **1,642 MB/s** | `0 B/op`, `0 allocs/op` |
+| `StandardLink` Read/Write (`8 B`) | **28.6 ns/op** | **279 MB/s** | `0 B/op`, `0 allocs/op` |
+| `StandardLink` Zero-Copy (`4 KiB`) | **40.5 ns/op** | **101,060 MB/s** | `0 B/op`, `0 allocs/op` |
+| `StandardLink` Reserve/Commit (`4 KiB`) | **67.7 ns/op** | **60,520 MB/s** | `0 B/op`, `0 allocs/op` |
+| `StandardLink` Pipeline (`64 B`) | **37.6 ns/op** | **1,702 MB/s** | `0 B/op`, `0 allocs/op` |
+| `StandardLink` Pipeline (`4 KiB`, bimodal: 112–159 ns/op) | **155 ns/op** | **26,370 MB/s** | `0 B/op`, `0 allocs/op` |
+| `AdvancedLink` Send/Recv + `Release` (`64 B`, one chunk) | **152.4 ns/op** | **420 MB/s** | `0 B/op`, `0 allocs/op` |
+| `AdvancedLink` Send/Recv + `Release` (`4 KiB` over `256 B` chunks) | **1.46 µs/op** | **2,805 MB/s** | `0 B/op`, `0 allocs/op` |
+| `AdvancedLink` Call + `Release` via `Serve` (`64 B` req + `64 B` resp) | **553 ns/op** | **232 MB/s** | `0 B/op`, `0 allocs/op` |
+| `AdvancedLink` Call + `Release` via `Serve` (`1 KiB` req + `1 KiB` resp, `256 B` chunks) | **1.22 µs/op** | **1,677 MB/s** | `0 B/op`, `0 allocs/op` |
 
 ---
 

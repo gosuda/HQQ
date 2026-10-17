@@ -158,16 +158,17 @@ and SIGKILL a separate pipe holder (`sqlite/e2e/lifeline_test.go`). The C unit t
 | Link | `sqlsrv_link.c` | Two threads: `hqq_adv_serve` (requests) and the stream loop (`hqq_adv_accept_stream`). The stream loop drains the link at the end. |
 | Watcher | `sqlsrv_link.c` | One detached thread per session: `hqq_stream_recv`. Its return ends the session: stop, teardown, stream close, then the link forgets the session. |
 | Session | `src/sqlsrv_session.c` | One worker thread per session, which owns the SQLite connection and runs all requests in arrival order. |
-| Handler | `sqlsrv_session.c` (`sqlsrv_sess_request`) | Runs on a Serve worker. It hands the job to the session worker, waits, and writes the response. On context end it calls `sqlite3_interrupt` and re-interrupts until the job stops. It sends nothing for a canceled request. |
+| Handler | `sqlsrv_session.c` (`sqlsrv_sess_request`) | Runs inline on the link's receive thread while no handler runs, and on a Serve worker otherwise. It hands the job to the session worker, waits, and writes the response. On context end it calls `sqlite3_interrupt` and re-interrupts until the job stops. It sends nothing for a canceled request. |
 
 Each session is independent: its own connection, statements, cursors, and
 transaction. A long query blocks only its own session. The session worker checks the
 request context between steps, so an interrupt that arrives between two steps is not
 lost.
 
-Requests of one link run on libhqq's Serve worker pool, which grows to 64 workers per
-link (`ADV_MAX_WORKERS`). A request holds one worker until it is answered, so one link
-serves at most 64 concurrent requests. The Go driver shares one link per connector,
+While no handler runs, a request runs on the link's receive thread (escalated after 200 µs);
+concurrent requests run on libhqq's Serve worker pool, which grows to 64 workers per
+link (`ADV_MAX_WORKERS`). A request holds its thread until it is answered, so one link
+serves at most 64 concurrent worker requests plus the inline slot. The Go driver shares one link per connector,
 which is enough for the 50-connection test.
 
 Rows are pulled, batches are bounded by row count, by the 1 MiB batch budget, and by
