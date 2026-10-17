@@ -7,46 +7,42 @@
  *                     [--parent-stdin[=force]] [--lifeline-grace-ms N]
  *
  * Prints "ready <listener-name>" on stdout when the listener is published.
- * SIGINT and SIGTERM start a graceful shutdown; SIGKILL needs no cleanup
- * (SQLite recovers its files on the next open).
+ * SIGINT and SIGTERM (POSIX), or CTRL_C, CTRL_BREAK, CTRL_CLOSE and CTRL_SHUTDOWN
+ * (Windows), start a graceful shutdown; SIGKILL needs no cleanup (SQLite recovers
+ * its files on the next open).
  *
  * --parent-stdin (alias --exit-on-stdin-eof): the parent keeps the write end of a
  * pipe whose read end is this process's standard input. When the parent dies, even
  * by SIGKILL, the pipe reaches end-of-file and the server shuts down as on SIGTERM;
  * --lifeline-grace-ms bounds that shutdown. See README.md ("Parent lifeline").
  */
-#define _POSIX_C_SOURCE 200809L
-
 #include <errno.h>
-#include <limits.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdatomic.h>
 
-#include <pthread.h>
-#include <unistd.h>
 #include <sqlite3.h>
 
 #include "sqlsrv_link.h"
+#include "sqlsrv_port.h"
 #include "hqq/hqq_lifeline.h"
 
 #define SERVER_VERSION "hqq-sqlite-server, protocol 1.0"
 
 /*
  * The parent lifeline (--parent-stdin). Its callback runs on the lifeline thread
- * and only requests the shutdown: it records the reason and wakes the main
- * thread, which is blocked in sigwait(), so that the server takes the SIGTERM
- * path. The main thread stops the lifeline after the shutdown.
+ * and only requests the shutdown: it records the reason and makes the main
+ * thread, which waits in sqlsrv_shutdown_wait(), take the SIGTERM path. The main
+ * thread stops the lifeline after the shutdown.
  */
-static pthread_t g_main_thread;
 static atomic_int g_parent_reason; /* 0, or the hqq_lifeline_reason that fired */
 
 static void on_parent_gone(void *ctx, hqq_lifeline_reason reason) {
     (void)ctx;
     atomic_store(&g_parent_reason, (int)reason);
-    (void)pthread_kill(g_main_thread, SIGTERM);
+    sqlsrv_shutdown_request(SIGTERM);
 }
 
 static void usage(FILE *f) {
@@ -88,13 +84,13 @@ int main(int argc, char **argv) {
     sqlsrv_listener *lst = NULL;
     const char *name = NULL;
     char err[512];
-    sigset_t set;
     int sig = 0;
     int i;
     int lifeline_mode = 0; /* 0: off, 1: --parent-stdin, 2: --parent-stdin=force */
     uint64_t grace_ms = 5000;
     hqq_lifeline *ll = NULL;
 
+    sqlsrv_process_init();
     if (sqlite3_libversion_number() < 3024000) {
         fprintf(stderr, "hqq-sqlite-server: SQLite 3.24 or later is required\n");
         return 1;
@@ -130,7 +126,7 @@ int main(int argc, char **argv) {
             }
         } else if (strcmp(a, "--alias") == 0 && has_next) {
             char *eq;
-            char *copy = strdup(argv[++i]);
+            char *copy = sqlsrv_port_strdup(argv[++i]);
             if (copy == NULL) {
                 return 1;
             }
@@ -196,12 +192,12 @@ int main(int argc, char **argv) {
         return 2;
     }
 
-    /* Signals are handled by sigwait on this thread: block them before any thread starts. */
-    sigemptyset(&set);
-    sigaddset(&set, SIGINT);
-    sigaddset(&set, SIGTERM);
-    (void)pthread_sigmask(SIG_BLOCK, &set, NULL);
-    (void)signal(SIGPIPE, SIG_IGN);
+    /* Shutdown requests are taken by the main thread: set up before any other thread starts. */
+    if (sqlsrv_shutdown_init() != 0) {
+        fprintf(stderr, "hqq-sqlite-server: out of resources\n");
+        sqlsrv_shared_destroy(&sh);
+        return 1;
+    }
 
     if (sqlsrv_listener_start(&sh, name, &lo, &lst, err, sizeof err) != 0) {
         fprintf(stderr, "hqq-sqlite-server: %s\n", err);
@@ -213,11 +209,10 @@ int main(int argc, char **argv) {
 
     if (lifeline_mode != 0) {
         hqq_lifeline_options lf_opts;
-        if (lifeline_mode == 1 && isatty(STDIN_FILENO)) {
+        if (lifeline_mode == 1 && sqlsrv_stdin_is_terminal()) {
             fprintf(stderr, "hqq-sqlite-server: --parent-stdin: standard input is a terminal, not watched "
                             "(use --parent-stdin=force to watch it)\n");
         }
-        g_main_thread = pthread_self();
         hqq_lifeline_options_init(&lf_opts);
         lf_opts.callback = on_parent_gone;
         lf_opts.force = lifeline_mode == 2;
@@ -231,9 +226,7 @@ int main(int argc, char **argv) {
         }
     }
 
-    while (sigwait(&set, &sig) != 0) {
-        /* Retry on a spurious error. */
-    }
+    sig = sqlsrv_shutdown_wait();
     if (atomic_load(&g_parent_reason) != 0) {
         fprintf(stderr, "hqq-sqlite-server: parent lifeline (%s): shutting down\n",
                 atomic_load(&g_parent_reason) == HQQ_LIFELINE_REASON_EOF ? "standard input closed"
@@ -245,5 +238,6 @@ int main(int argc, char **argv) {
     sqlsrv_shared_wait_links(&sh);
     hqq_lifeline_stop(ll); /* joins the lifeline thread: no callback runs after this */
     sqlsrv_shared_destroy(&sh);
+    sqlsrv_shutdown_finished();
     return 0;
 }

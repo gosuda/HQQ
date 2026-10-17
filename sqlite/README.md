@@ -15,7 +15,8 @@ statements.
 | `internal/fakeserver/` | A Go stand-in for the C server (HQQ acceptor, sessions, an in-memory engine with a small SQL subset). Used by the tests. |
 | `internal/contract/` | The database/sql contract suite, run against any service (`contract.RunContract`). |
 | `e2e/` | End-to-end tests that run the contract and the driver tests against the C server. They skip without `HQQ_SQLITE_SERVER`. |
-| [`../examples/sqlite/server/`](../examples/sqlite/server) | The C server (libhqq and SQLite; the system library, or an amalgamation via `HQQ_SQLITE_AMALGAMATION_DIR`). See its README. POSIX only. |
+| [`launcher/`](launcher) | Starts the C server as a child process, after verifying its digest, and returns a `database/sql` handle for it (see its README). |
+| [`../examples/sqlite/server/`](../examples/sqlite/server) | The C server (libhqq and SQLite; the system library, or an amalgamation via `HQQ_SQLITE_AMALGAMATION_DIR`). Linux, macOS and Windows (clang-cl). See its README. |
 
 ## Using the driver
 
@@ -52,7 +53,7 @@ if err != nil {
 db := sql.OpenDB(c) // all connections of db share one link
 ```
 
-`ConnectorFromDSN(dsn)` returns the same connector for a DSN, and
+`ConnectorFromDSN(dsn)` returns a connector for a DSN, and
 `ParseDSN(dsn)` returns the listener name and the parsed `Config`. Closing the
 `*sql.DB` closes the connector (it is an `io.Closer`), and so the link.
 
@@ -70,6 +71,12 @@ appear once, and unknown options are errors.
 | `busy` | `5s` | How long the server waits for a lock held by another session. `-1s` disables the wait. |
 | `txlock` | `deferred` | BEGIN mode: `deferred`, `immediate`, or `exclusive`. |
 | `pragma.<name>` | none | A PRAGMA the server applies when a session opens (for example `pragma.query_only=1`). |
+
+The server leaves `journal_mode` at SQLite's default (rollback journal). With many
+concurrent writers on one database file, SQLite's busy handler has no queue, so a
+writer can starve past `busy`; set `pragma.journal_mode=WAL` for write-heavy
+concurrent workloads. An autocommit statement that fails with `IsBusy` did not
+commit and is safe to retry.
 
 The `Config` fields are the same options: `Database`, `Mode`, `Timeout`,
 `FetchSize`, `BusyTimeout`, `TxMode`, `Pragmas`, and `Link` (the HQQ link
@@ -236,6 +243,8 @@ configuration, and raw paths only when the policy allows them. It disables
 `ATTACH`, `DETACH`, and loadable extensions. It is for same-host, trusted clients:
 access control is the listener's permission. It does not authenticate requests.
 See PROTOCOL.md section 12.
+
+The C server with `--parent-stdin` also shuts down gracefully when the process that started it exits, including by SIGKILL (see the Parent lifeline section of `../examples/sqlite/server/README.md`). `sqlite/launcher` passes the flag itself; under hqqd, set `parent_pipe` and pass `--parent-stdin` in the service's `args`.
 
 ## Tests
 

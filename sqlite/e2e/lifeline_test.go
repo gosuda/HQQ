@@ -80,7 +80,7 @@ func TestParentStdinEOFShutsDownCleanly(t *testing.T) {
 }
 
 // TestStdinEOFWithoutFlagIsIgnored checks that, without --parent-stdin, closing
-// standard input does not stop the server: it still shuts down on SIGTERM.
+// standard input does not stop the server: it still shuts down on a graceful stop.
 func TestStdinEOFWithoutFlagIsIgnored(t *testing.T) {
 	bin := serverBinary(t)
 	dir := t.TempDir()
@@ -104,7 +104,7 @@ func TestStdinEOFWithoutFlagIsIgnored(t *testing.T) {
 		t.Fatalf("server exited on stdin EOF without --parent-stdin: %s", srv.stderr.String())
 	}
 	if err := srv.term(10 * time.Second); err != nil {
-		t.Fatalf("graceful exit on SIGTERM: %v; stderr: %s", err, srv.stderr.String())
+		t.Fatalf("graceful exit on stop: %v; stderr: %s", err, srv.stderr.String())
 	}
 }
 
@@ -121,10 +121,12 @@ func TestParentStdinHolderSIGKILL(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// The holder is this test binary re-executed; it inherits pw as fd 3.
+	// The holder is this test binary re-executed. Its standard input is the
+	// write end: the child inherits it on every platform (ExtraFiles is not
+	// supported on Windows).
 	holder := exec.Command(os.Args[0], "-test.run=^TestHelperPipeHolder$", "-test.count=1")
 	holder.Env = append(os.Environ(), "HQQSQLITE_E2E_PIPEHOLDER=1")
-	holder.ExtraFiles = []*os.File{pw}
+	holder.Stdin = pw
 	holder.Stderr = os.Stderr
 	out, err := holder.StdoutPipe()
 	if err != nil {
@@ -172,8 +174,8 @@ func TestParentStdinHolderSIGKILL(t *testing.T) {
 }
 
 // TestHelperPipeHolder is the pipe holder of TestParentStdinHolderSIGKILL: it
-// keeps the write end it inherited (fd 3) until it is killed. It runs only when
-// HQQSQLITE_E2E_PIPEHOLDER is set.
+// keeps the write end it inherited as standard input until it is killed. It
+// runs only when HQQSQLITE_E2E_PIPEHOLDER is set.
 func TestHelperPipeHolder(t *testing.T) {
 	if os.Getenv("HQQSQLITE_E2E_PIPEHOLDER") == "" {
 		t.Skip("helper process of TestParentStdinHolderSIGKILL")

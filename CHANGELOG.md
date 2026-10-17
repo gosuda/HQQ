@@ -8,11 +8,56 @@ The project follows [Semantic Versioning](https://semver.org/). While in `v0.x`,
 
 ### Added
 
-- **Parent lifeline** (`c/include/hqq/hqq_lifeline.h`): `hqq_lifeline_start` / `hqq_lifeline_stop` watch stdin (or a descriptor or handle) on a helper thread and fire once when the supervisor's pipe reaches end-of-file, so a service exits when its parent dies, including by SIGKILL. The SQLite C server gets `--parent-stdin` (alias `--exit-on-stdin-eof`, `=force` to watch a terminal) and `--lifeline-grace-ms`.
+- **SQLite package `gosuda.org/hqq/sqlite`**, promoted from `examples/sqlite/driver`: a `database/sql` driver registered as `hqq-sqlite`. Exported: `NewConnector`, `ConnectorFromDSN`, `ParseDSN`, `Connector`, `Config`, `Driver`, `DriverName`, `WithTxMode`, `Pragma`, `Mode` (`ModeReadWriteCreate`, `ModeReadWrite`, `ModeReadOnly`), `TxMode` (`TxDeferred`, `TxImmediate`, `TxExclusive`), `Error` (`Code`, `ExtendedCode`, `Message`, `Primary`), `ProtocolError`, the predicates `IsBusy`, `IsLocked`, `IsConstraint`, `IsReadOnly`, and `IsInterrupted`, the sentinels `ErrBusy`, `ErrLocked`, `ErrConstraint`, `ErrReadOnly`, `ErrInterrupted`, and `ErrOutcomeUnknown`, and the `Code*` constants. Behavior of the package:
+  - A lost link during `Exec` or `ExecStmt` wraps `ErrOutcomeUnknown` and not `driver.ErrBadConn`, so `database/sql` does not retry the statement. Other lost-link errors wrap `driver.ErrBadConn`, and `database/sql` may retry them on a new connection.
+  - `time.Time` arguments are stored as TEXT in the form `2006-01-02 15:04:05.999999999-07:00`, which keeps the offset. TEXT in a `DATE`, `DATETIME`, or `TIMESTAMP` column is returned as `time.Time` when it parses, and as `string` otherwise.
+  - Arguments are converted by the driver's `CheckNamedValue`: `uint64` values above `math.MaxInt64` and `NaN` are errors, `[]byte` and `json.RawMessage` are BLOBs, and a type without a rule is an error before anything is sent.
+  - `BeginTx` accepts the default and serializable isolation levels and refuses the others. `ReadOnly` transactions begin deferred with `query_only` set.
+  - Each `Exec` or `Query` takes one statement; a second statement is a `BAD_REQUEST` error.
+- **SQLite tests**: the database/sql contract suite (`sqlite/internal/contract`, run against the Go fake server and the C server), the protocol encodings (`sqlite/internal/wire`), the fake server (`sqlite/internal/fakeserver`), and end-to-end tests against the C server (`sqlite/e2e`).
+- **C SQLite server**: `--parent-stdin[=force]` (alias `--exit-on-stdin-eof`) shuts the server down gracefully when its standard input reaches end of file, and `--lifeline-grace-ms` bounds that shutdown.
+- **Parent lifeline**: package `lifeline` (`Attach`, `Lifeline.Close`, `Watch`, `WatchTerminal`, `WithKeepalive`) and the C header `c/include/hqq/hqq_lifeline.h` (`hqq_lifeline_options_init`, `hqq_lifeline_start`, `hqq_lifeline_watching`, `hqq_lifeline_stop`). A child exits when its parent dies, including by SIGKILL, because the kernel closes the parent's end of the pipe on its standard input.
+- **Verified executables**: package `secureexec` (`Verify`, `Verified`, `Start`, `Process`, `HashFile`, `ParseHash`, `CleanVaults`, `Policy`, `WithPolicy`, and the `With*` options). It runs the bytes it hashed: a sealed memfd on Linux, a private 0700 vault on other POSIX systems, and a share-locked handle on Windows. Errors: `ErrHashMismatch` (`*HashMismatchError`), `ErrNotRegular`, and `ErrUnsupported`.
+- **Signed release manifests**: package `secureexec/manifest` (version 1 `manifest.json` with a detached ed25519 signature that is checked before the manifest is parsed; `Parse`, `Verify`, `Scan`, `Sign`, `VerifyFiles`, `Marshal`, `GenerateKey`, and the key text functions), and the command `cmd/hqq-manifest` (`keygen`, `gen`, `sign`, `verify`, `hash`).
+- **SQLite launcher**: package `sqlite/launcher` (`Start`, `Open`, `OpenManaged`, `Server`, `Managed`, `Config`, `ManifestSource`, `ReleasePublicKey`). It verifies the server binary with `secureexec` before it runs, and starts it with `--parent-stdin` unless `DisableLifeline` is set. Errors: `ErrConfig`, `ErrManifest`, `ErrNoArtifact`, `ErrNoReleaseKey`, `ErrReadyTimeout`, and `ErrStopTimeout`.
+- **hqqd verified and parent-pipe services**: the `sha256` and `manifest` fields (mutually exclusive) run a service's executable from a verified snapshot at every start, and `parent_pipe` ties the service's standard input to hqqd. Status reports `verified` and `mechanism` while a verified process runs. `hqqd check` validates these fields.
+- **Release pipeline**: `.github/workflows/release.yml` builds, tests, and smoke-tests the SQLite server on each platform, writes `manifest.json`, `licenses.tar.gz`, and `SHA256SUMS`, signs the manifest with the `HQQ_RELEASE_SIGNING_KEY` secret, and publishes a GitHub Release from a `v*` tag. Supporting files: `scripts/release/` (fetch and verify SQLite, licenses, linkage report), `third_party/sqlite/` (pinned SQLite digests), and `docs/RELEASING.md`.
+
+### Changed
+
+- **SQLite packages moved** out of `examples/sqlite` (see Migration). The C server stays in `examples/sqlite/server`.
+- **`sqlite.Error.Code` is the primary result code.** It was the extended result code. `ExtendedCode` now holds the extended code (equal to `Code` when SQLite gives none), and `Primary()` returns `Code`.
+- **Lost links during `Exec` are not retried.** Every lost-link error used to wrap `driver.ErrBadConn`; `Exec` and `ExecStmt` now wrap `ErrOutcomeUnknown` instead.
+- **Time columns**: TEXT in a `DATE`, `DATETIME`, or `TIMESTAMP` column is returned as `time.Time` when it parses (it was `string`).
+- **Argument conversion** is the driver's `CheckNamedValue`, not the default converter of `database/sql`.
 
 ### Removed
 
-- Zig binding and its CI job (it was never verified by CI).
+- The Zig binding (`bindings/zig`) and its CI job. It was never verified by CI.
+- The packages at `examples/sqlite/driver`, `examples/sqlite/wire`, `examples/sqlite/fakeserver`, and `examples/sqlite/e2e` (moved, see Changed and Migration).
+
+### Migration (v0.6.0 → Unreleased)
+
+| v0.6.0 | Unreleased |
+| --- | --- |
+| `import _ "gosuda.org/hqq/examples/sqlite/driver"` | `import _ "gosuda.org/hqq/sqlite"` |
+| package `hqqsqlite`: `hqqsqlite.NewConnector`, `hqqsqlite.Config`, `*hqqsqlite.Error`, … | package `sqlite`: `sqlite.NewConnector`, `sqlite.Config`, `*sqlite.Error`, … |
+| `(*Error).Code` is the extended code | `(*Error).Code` is the primary code; `(*Error).ExtendedCode` is the extended code |
+| `(*Error).Primary()` is `Code & 0xFF` | `(*Error).Primary()` is `Code` |
+| `Exec` after a lost link: `driver.ErrBadConn` | `Exec` or `ExecStmt` after a lost link: `sqlite.ErrOutcomeUnknown` (not retried) |
+| TEXT in a `DATE`/`DATETIME`/`TIMESTAMP` column: `string` | `time.Time` when it parses, otherwise `string` |
+| `examples/sqlite/wire` (importable) | `sqlite/internal/wire` (internal to the module) |
+| `examples/sqlite/fakeserver` (importable) | `sqlite/internal/fakeserver` (internal to the module) |
+| `examples/sqlite/e2e` | `sqlite/e2e` |
+| `examples/sqlite/PROTOCOL.md` | `sqlite/PROTOCOL.md` |
+| `examples/sqlite/server` | unchanged |
+| `bindings/zig` | removed |
+
+### Not verified
+
+- The embedded release public key (`sqlite/launcher/release_public_key.hex`) is still a placeholder. Until the maintainer commits the real key, `launcher.ReleasePublicKey` returns `ErrNoReleaseKey`, and a manifest-based start that does not pass its own `PublicKey` fails with it. No signed release has been produced yet.
+- Windows: the `secureexec` Windows mechanism and the C lifeline on Windows are built and tested in CI only. The SQLite server's Windows builds (`windows/amd64`, `windows/arm64`, clang-cl) are part of the release, and a failing Windows build blocks publish. The Windows builds have not been run on Windows hardware outside CI, and no Windows binary has been published yet.
+- The Linux memfd path of `secureexec` and the `vm.memfd_noexec` behavior are confirmed by CI only.
 
 ## v0.6.0 — 2026-10-17
 

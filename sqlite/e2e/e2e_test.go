@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -460,25 +461,18 @@ func TestServerSIGKILLThenReconnect(t *testing.T) {
 }
 
 // TestPathPolicy checks that paths outside --allow-dir are refused with
-// FORBIDDEN, and that symbolic links out of the directory do not help.
+// FORBIDDEN. The paths use the platform's separators, and the server applies its
+// own path rules to them.
 func TestPathPolicy(t *testing.T) {
 	_, name, dir := startTestServer(t)
 	outside := t.TempDir()
 	if err := os.WriteFile(filepath.Join(outside, "victim.db"), nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Symlink(filepath.Join(outside, "victim.db"), filepath.Join(dir, "link.db")); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink(filepath.Join(outside, "missing.db"), filepath.Join(dir, "dangling.db")); err != nil {
-		t.Fatal(err)
-	}
 	cases := []string{
-		"../escape.db",
-		"sub/../../escape.db",
+		filepath.FromSlash("../escape.db"),
+		filepath.FromSlash("sub/../../escape.db"),
 		filepath.Join(outside, "victim.db"),
-		"link.db",
-		"dangling.db",
 		"..",
 	}
 	for _, db := range cases {
@@ -496,6 +490,38 @@ func TestPathPolicy(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, "inside.db")); err != nil {
 		t.Fatalf("database file not created in the allow directory: %v", err)
+	}
+}
+
+// TestPathPolicySymlinks checks that symbolic links out of --allow-dir do not
+// help: the server resolves them and refuses their targets. On Windows, creating
+// a symbolic link needs Developer Mode or SeCreateSymbolicLinkPrivilege; without
+// it the test skips with that reason.
+func TestPathPolicySymlinks(t *testing.T) {
+	_, name, dir := startTestServer(t)
+	outside := t.TempDir()
+	victim := filepath.Join(outside, "victim.db")
+	if err := os.WriteFile(victim, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	links := []struct{ link, target string }{
+		{"link.db", victim},
+		{"dangling.db", filepath.Join(outside, "missing.db")},
+	}
+	for _, l := range links {
+		if err := os.Symlink(l.target, filepath.Join(dir, l.link)); err != nil {
+			if runtime.GOOS == "windows" {
+				t.Skipf("symbolic links are not permitted on this Windows host: %v", err)
+			}
+			t.Fatal(err)
+		}
+	}
+	for _, l := range links {
+		d := openDB(t, name, l.link)
+		if err := d.Ping(); protoCode(err) != wire.ProtoForbidden {
+			t.Errorf("open %q: %v, want FORBIDDEN", l.link, err)
+		}
+		_ = d.Close()
 	}
 }
 
@@ -586,8 +612,9 @@ func TestErrorMappingAndBusy(t *testing.T) {
 	}
 }
 
-// TestGracefulShutdown sends SIGTERM. The server exits with status 0, and the
-// open connection then reports driver.ErrBadConn.
+// TestGracefulShutdown asks the server to stop gracefully (SIGTERM; CTRL_BREAK on
+// Windows). The server exits with status 0, and the open connection then reports
+// driver.ErrBadConn.
 func TestGracefulShutdown(t *testing.T) {
 	bin := serverBinary(t)
 	dir := t.TempDir()

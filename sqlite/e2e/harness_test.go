@@ -17,7 +17,6 @@ import (
 	"os/exec"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"testing"
 	"time"
 
@@ -70,7 +69,8 @@ func (w *readyWatch) Write(p []byte) (int, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.buf = append(w.buf, p...)
-	if bytes.Contains(w.buf, w.want) {
+	// A console may turn "\n" into "\r\n": accept both as the ready line.
+	if bytes.Contains(bytes.ReplaceAll(w.buf, []byte("\r\n"), []byte("\n")), w.want) {
 		w.once.Do(func() { close(w.ready) })
 	}
 	return len(p), nil
@@ -104,17 +104,18 @@ type server struct {
 
 // startServer runs the server on name with args and waits for its ready line.
 // It returns an error instead of failing the test, so that a restart can retry.
-// The server's standard input is /dev/null.
+// The server's standard input is the null device (/dev/null, NUL on Windows).
 func startServer(bin, name string, args ...string) (*server, error) {
 	return startServerStdin(bin, name, nil, args...)
 }
 
 // startServerStdin is startServer with the server's standard input set to
-// stdin (nil: /dev/null). The caller keeps the other ends of the pipe.
+// stdin (nil: the null device). The caller keeps the other ends of the pipe.
 func startServerStdin(bin, name string, stdin *os.File, args ...string) (*server, error) {
 	stdout := &readyWatch{want: []byte("ready " + name + "\n"), ready: make(chan struct{})}
 	stderr := &syncBuf{}
 	cmd := exec.Command(bin, append([]string{name}, args...)...)
+	setProcessGroup(cmd)
 	if stdin != nil {
 		cmd.Stdin = stdin
 	}
@@ -140,10 +141,11 @@ func startServerStdin(bin, name string, stdin *os.File, args ...string) (*server
 	}
 }
 
-// term sends SIGTERM (graceful shutdown) and returns the exit error, or an
-// error when the process did not exit within d.
+// term asks the server to shut down gracefully (gracefulStop: SIGTERM on POSIX,
+// CTRL_BREAK_EVENT on Windows) and returns the exit error, or an error when the
+// process did not exit within d.
 func (s *server) term(d time.Duration) error {
-	if err := s.cmd.Process.Signal(syscall.SIGTERM); err != nil {
+	if err := gracefulStop(s.cmd); err != nil {
 		return err
 	}
 	select {
@@ -167,7 +169,8 @@ func (s *server) waitErr() error {
 	return nil
 }
 
-// kill sends SIGKILL: no cleanup runs in the server (PROTOCOL.md section 10).
+// kill kills the process: SIGKILL on POSIX, TerminateProcess on Windows. No
+// cleanup runs in the server (PROTOCOL.md section 10).
 func (s *server) kill() {
 	_ = s.cmd.Process.Kill()
 	<-s.exited

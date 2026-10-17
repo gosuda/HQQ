@@ -73,7 +73,7 @@ type Config struct {
 	VerifyOptions []secureexec.Option
 
 	// DisableLifeline starts the server without a parent lifeline (no
-	// --parent-stdin). Stop then sends SIGTERM on Unix. Keep it false unless the
+	// --parent-stdin). Stop then sends SIGTERM on Unix and CTRL_BREAK on Windows. Keep it false unless the
 	// server must outlive this process.
 	DisableLifeline bool
 }

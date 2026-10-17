@@ -1,14 +1,12 @@
-#define _POSIX_C_SOURCE 200809L
-
 #include "sqlsrv_link.h"
 
 #include "hqq/hqq_listener.h"
+#include "sqlsrv_port.h"
 
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
 
 /* A link is polled this often for shutdown and for the end of Serve (ms). */
 #define LINK_POLL_MS 100L
@@ -23,8 +21,8 @@
 typedef struct lnk {
     sqlsrv_shared *sh;
     hqq_adv *adv;
-    pthread_mutex_t mu; /* guards sessions and nsessions; lock order: lnk.mu, then session mu */
-    pthread_cond_t cv;  /* registrations, unlinks and session ends */
+    sqlsrv_mutex mu; /* guards sessions and nsessions; lock order: lnk.mu, then session mu */
+    sqlsrv_cond cv;  /* registrations, unlinks and session ends */
     sqlsrv_session *sessions;
     unsigned nsessions;
     atomic_int serve_done;
@@ -33,19 +31,8 @@ typedef struct lnk {
 struct sqlsrv_listener {
     sqlsrv_shared *sh;
     hqq_acceptor *acc;
-    pthread_t th;
+    sqlsrv_thread th;
 };
-
-static void timed_wait_link(pthread_cond_t *cv, pthread_mutex_t *mu, long ms) {
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    ts.tv_nsec += ms * 1000000L;
-    if (ts.tv_nsec >= 1000000000L) {
-        ts.tv_sec += 1;
-        ts.tv_nsec -= 1000000000L;
-    }
-    (void)pthread_cond_timedwait(cv, mu, &ts);
-}
 
 static int ctx_done(const hqq_req_ctx *ctx) {
     return hqq_req_ctx_err(ctx) != HQQ_OK;
@@ -57,8 +44,8 @@ static void send_no_session(hqq_response *w) {
 }
 
 static void lnk_free(lnk *l) {
-    pthread_cond_destroy(&l->cv);
-    pthread_mutex_destroy(&l->mu);
+    sqlsrv_cond_destroy(&l->cv);
+    sqlsrv_mutex_destroy(&l->mu);
     free(l);
 }
 
@@ -66,10 +53,10 @@ static void lnk_free(lnk *l) {
 static void lnk_done(lnk *l) {
     sqlsrv_shared *sh = l->sh;
     lnk_free(l);
-    pthread_mutex_lock(&sh->mu);
+    sqlsrv_mutex_lock(&sh->mu);
     sh->live_links--;
-    pthread_cond_broadcast(&sh->cv);
-    pthread_mutex_unlock(&sh->mu);
+    sqlsrv_cond_broadcast(&sh->cv);
+    sqlsrv_mutex_unlock(&sh->mu);
 }
 
 /* Session of a stream, referenced for the caller. Waits a while for an accept that is still in flight. */
@@ -77,21 +64,21 @@ static sqlsrv_session *lnk_lookup(lnk *l, uint64_t id, hqq_req_ctx *ctx) {
     unsigned polls = 0;
     sqlsrv_session *s;
 
-    pthread_mutex_lock(&l->mu);
+    sqlsrv_mutex_lock(&l->mu);
     for (;;) {
         for (s = l->sessions; s != NULL; s = s->next) {
             if (s->id == id) {
                 sqlsrv_sess_ref(s);
-                pthread_mutex_unlock(&l->mu);
+                sqlsrv_mutex_unlock(&l->mu);
                 return s;
             }
         }
         if (ctx_done(ctx) || polls >= LOOKUP_MAX_POLLS) {
-            pthread_mutex_unlock(&l->mu);
+            sqlsrv_mutex_unlock(&l->mu);
             return NULL;
         }
         polls++;
-        timed_wait_link(&l->cv, &l->mu, LOOKUP_POLL_MS);
+        sqlsrv_cond_timedwait_ms(&l->cv, &l->mu, LOOKUP_POLL_MS);
     }
 }
 
@@ -123,7 +110,7 @@ static void lnk_retire(lnk *l, sqlsrv_session *s) {
     sqlsrv_sess_stop(s);
     (void)hqq_stream_close(s->stream);
 
-    pthread_mutex_lock(&l->mu);
+    sqlsrv_mutex_lock(&l->mu);
     link = &l->sessions;
     while (*link != NULL && *link != s) {
         link = &(*link)->next;
@@ -131,15 +118,15 @@ static void lnk_retire(lnk *l, sqlsrv_session *s) {
     if (*link == s) {
         *link = s->next;
     }
-    pthread_mutex_unlock(&l->mu);
+    sqlsrv_mutex_unlock(&l->mu);
 
     sqlsrv_sess_wait_refs(s);
 
     /* After this decrement the link may be freed by its owner: l is not used again. */
-    pthread_mutex_lock(&l->mu);
+    sqlsrv_mutex_lock(&l->mu);
     l->nsessions--;
-    pthread_cond_broadcast(&l->cv);
-    pthread_mutex_unlock(&l->mu);
+    sqlsrv_cond_broadcast(&l->cv);
+    sqlsrv_mutex_unlock(&l->mu);
 
     sqlsrv_sess_free(s);
 }
@@ -159,42 +146,42 @@ static void *watch_main(void *arg) {
 
 static void lnk_add_session(lnk *l, hqq_stream *st) {
     sqlsrv_session *s = sqlsrv_sess_new(l->sh, st, hqq_stream_id(st), l);
-    pthread_t th;
+    sqlsrv_thread th;
 
     if (s == NULL) {
         (void)hqq_stream_close(st);
         return;
     }
-    pthread_mutex_lock(&l->mu);
+    sqlsrv_mutex_lock(&l->mu);
     s->next = l->sessions;
     l->sessions = s;
     l->nsessions++;
-    pthread_cond_broadcast(&l->cv);
-    pthread_mutex_unlock(&l->mu);
+    sqlsrv_cond_broadcast(&l->cv);
+    sqlsrv_mutex_unlock(&l->mu);
 
-    if (pthread_create(&th, NULL, watch_main, s) != 0) {
+    if (sqlsrv_thread_create(&th, watch_main, s) != 0) {
         lnk_retire(l, s);
         return;
     }
-    (void)pthread_detach(th);
+    sqlsrv_thread_detach(th);
 }
 
 /* Closes every stream of the link. Under the mutex, so no session is freed meanwhile. */
 static void lnk_close_streams(lnk *l) {
     sqlsrv_session *s;
-    pthread_mutex_lock(&l->mu);
+    sqlsrv_mutex_lock(&l->mu);
     for (s = l->sessions; s != NULL; s = s->next) {
         (void)hqq_stream_close(s->stream);
     }
-    pthread_mutex_unlock(&l->mu);
+    sqlsrv_mutex_unlock(&l->mu);
 }
 
 static void lnk_wait_empty(lnk *l) {
-    pthread_mutex_lock(&l->mu);
+    sqlsrv_mutex_lock(&l->mu);
     while (l->nsessions > 0) {
-        pthread_cond_wait(&l->cv, &l->mu);
+        sqlsrv_cond_wait(&l->cv, &l->mu);
     }
-    pthread_mutex_unlock(&l->mu);
+    sqlsrv_mutex_unlock(&l->mu);
 }
 
 /*
@@ -237,9 +224,9 @@ static void *link_accept_main(void *arg) {
 /* One link: serves requests on this thread and runs the stream loop on another. */
 static void *link_main(void *arg) {
     lnk *l = arg;
-    pthread_t acc;
+    sqlsrv_thread acc;
 
-    if (pthread_create(&acc, NULL, link_accept_main, l) != 0) {
+    if (sqlsrv_thread_create(&acc, link_accept_main, l) != 0) {
         fprintf(stderr, "hqq-sqlite-server: cannot start a link thread\n");
         (void)hqq_adv_close(l->adv);
         lnk_done(l);
@@ -247,14 +234,14 @@ static void *link_main(void *arg) {
     }
     (void)hqq_adv_serve(l->adv, lnk_serve_request, l, NULL);
     atomic_store(&l->serve_done, 1);
-    (void)pthread_join(acc, NULL);
+    sqlsrv_thread_join(acc);
     lnk_done(l);
     return NULL;
 }
 
 static void link_start(sqlsrv_shared *sh, hqq_adv *adv) {
     lnk *l = calloc(1, sizeof *l);
-    pthread_t th;
+    sqlsrv_thread th;
 
     if (l == NULL) {
         (void)hqq_adv_close(adv);
@@ -263,13 +250,13 @@ static void link_start(sqlsrv_shared *sh, hqq_adv *adv) {
     l->sh = sh;
     l->adv = adv;
     atomic_init(&l->serve_done, 0);
-    if (pthread_mutex_init(&l->mu, NULL) != 0) {
+    if (sqlsrv_mutex_init(&l->mu) != 0) {
         free(l);
         (void)hqq_adv_close(adv);
         return;
     }
-    if (pthread_cond_init(&l->cv, NULL) != 0) {
-        pthread_mutex_destroy(&l->mu);
+    if (sqlsrv_cond_init(&l->cv) != 0) {
+        sqlsrv_mutex_destroy(&l->mu);
         free(l);
         (void)hqq_adv_close(adv);
         return;
@@ -281,15 +268,15 @@ static void link_start(sqlsrv_shared *sh, hqq_adv *adv) {
         lnk_free(l);
         return;
     }
-    pthread_mutex_lock(&sh->mu);
+    sqlsrv_mutex_lock(&sh->mu);
     sh->live_links++;
-    pthread_mutex_unlock(&sh->mu);
-    if (pthread_create(&th, NULL, link_main, l) != 0) {
+    sqlsrv_mutex_unlock(&sh->mu);
+    if (sqlsrv_thread_create(&th, link_main, l) != 0) {
         (void)hqq_adv_close(adv);
         lnk_done(l);
         return;
     }
-    (void)pthread_detach(th);
+    sqlsrv_thread_detach(th);
 }
 
 static void *acceptor_main(void *arg) {
@@ -307,8 +294,7 @@ static void *acceptor_main(void *arg) {
         }
         fprintf(stderr, "hqq-sqlite-server: accept: %s\n", hqq_strerror(st));
         /* A failed accept is retried after a pause; a persistent failure must not spin. */
-        struct timespec pause = {0, 50 * 1000000L};
-        (void)nanosleep(&pause, NULL);
+        sqlsrv_sleep_ms(50);
     }
     return NULL;
 }
@@ -342,7 +328,7 @@ int sqlsrv_listener_start(sqlsrv_shared *sh, const char *name, const sqlsrv_list
     }
     ls->sh = sh;
     ls->acc = acc;
-    if (pthread_create(&ls->th, NULL, acceptor_main, ls) != 0) {
+    if (sqlsrv_thread_create(&ls->th, acceptor_main, ls) != 0) {
         (void)hqq_acceptor_close(acc);
         free(ls);
         (void)snprintf(err, errcap, "cannot start the acceptor thread");
@@ -355,14 +341,14 @@ int sqlsrv_listener_start(sqlsrv_shared *sh, const char *name, const sqlsrv_list
 void sqlsrv_listener_stop(sqlsrv_listener *ls) {
     atomic_store(&ls->sh->shutting, 1);
     (void)hqq_acceptor_close(ls->acc);
-    (void)pthread_join(ls->th, NULL);
+    sqlsrv_thread_join(ls->th);
     free(ls);
 }
 
 void sqlsrv_shared_wait_links(sqlsrv_shared *sh) {
-    pthread_mutex_lock(&sh->mu);
+    sqlsrv_mutex_lock(&sh->mu);
     while (sh->live_links > 0) {
-        pthread_cond_wait(&sh->cv, &sh->mu);
+        sqlsrv_cond_wait(&sh->cv, &sh->mu);
     }
-    pthread_mutex_unlock(&sh->mu);
+    sqlsrv_mutex_unlock(&sh->mu);
 }

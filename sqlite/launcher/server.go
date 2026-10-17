@@ -82,6 +82,7 @@ func Start(ctx context.Context, cfg Config) (*Server, error) {
 	cmd.Stdout = outWriter{o: out, stdout: true}
 	cmd.Stderr = outWriter{o: out}
 	cmd.WaitDelay = waitDelay
+	setProcessGroup(cmd)
 	if err := cmd.Start(); err != nil {
 		if ll != nil {
 			_ = ll.Close()

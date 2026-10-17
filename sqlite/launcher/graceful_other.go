@@ -1,10 +1,11 @@
-//go:build !unix
+//go:build !unix && !windows
 
 package launcher
 
 import (
 	"errors"
 	"os"
+	"os/exec"
 )
 
 var errNoGracefulSignal = errors.New("launcher: no graceful signal on this platform")
@@ -14,3 +15,6 @@ var errNoGracefulSignal = errors.New("launcher: no graceful signal on this platf
 func gracefulSignal(*os.Process) error {
 	return errNoGracefulSignal
 }
+
+// setProcessGroup has no process group to set on this platform.
+func setProcessGroup(*exec.Cmd) {}

@@ -14,7 +14,7 @@
 
 #include <stdatomic.h>
 #include <stdint.h>
-#include <pthread.h>
+#include "sqlsrv_port.h"
 
 #include <sqlite3.h>
 
@@ -28,8 +28,8 @@ typedef struct sqlsrv_shared {
     unsigned max_sessions;
     int64_t shutdown_timeout_ns;
     atomic_int shutting;
-    pthread_mutex_t mu; /* guards open_sessions and live_links */
-    pthread_cond_t cv;  /* signalled when live_links drops */
+    sqlsrv_mutex mu; /* guards open_sessions and live_links */
+    sqlsrv_cond cv;  /* signalled when live_links drops */
     unsigned open_sessions;
     unsigned live_links;
 } sqlsrv_shared;
@@ -50,11 +50,11 @@ struct sqlsrv_session {
     uint64_t id;
 
     sqlsrv_shared *sh;
-    pthread_t worker;
+    sqlsrv_thread worker;
 
     /* Guarded by mu. refs counts the Serve handlers that use the session. */
-    pthread_mutex_t mu;
-    pthread_cond_t cv;
+    sqlsrv_mutex mu;
+    sqlsrv_cond cv;
     int stop;
     int refs;
     sqlsrv_job *job;

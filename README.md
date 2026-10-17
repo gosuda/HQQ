@@ -16,7 +16,7 @@ It delivers **sub-microsecond round-trip latency (~240 ns)** and **multi-GB/s th
 - **Crash and lifecycle detection (`HQQ_STL3` superblock)**: per-endpoint session tokens and heartbeats distinguish graceful peer shutdown (`io.EOF` from `Read`, `ErrPeerClosed` elsewhere) from abrupt termination (`ErrPeerGone`). Segments whose endpoints have all closed or died are re-initialized, a third endpoint is rejected (`ErrLinkBusy`), a dead initializer is taken over, and a foreign or other-version object is never modified.
 - **Formal verification and checks**: the MPMC ring (claim, completion CAS, FIFO order, progress) is model-checked with TLC ([`internal/mpmc/MPMC.tla`](internal/mpmc/MPMC.tla), bounded model, not a proof). CI runs `go vet ./...` (including `unsafeptr`), `go test ./...`, `go test -race ./...` (not on Windows), and fuzz smoke tests.
 - **Multi-client acceptor** (`NewAcceptor`, `Accept`, `Connect`): one listener name serves any number of clients. Each client has its own link segment, so a crashed client affects only its own link.
-- **Other languages and tools**: C, C++, and Rust implementations, a normative specification (`spec/`), golden conformance vectors and an interop harness, the `hqqd` process manager, and a SQLite service example. See [Other languages and interoperability](#other-languages-and-interoperability) and [Tools and examples](#tools-and-examples).
+- **Other languages and tools**: C, C++, and Rust implementations, a normative specification (`spec/`), golden conformance vectors and an interop harness, the `hqqd` process manager, a `database/sql` driver for a SQLite service (`sqlite`), and tools for verified executables and signed release manifests (`secureexec`, `cmd/hqq-manifest`). See [Other languages and interoperability](#other-languages-and-interoperability) and [Tools and examples](#tools-and-examples).
 
 ---
 
@@ -249,7 +249,7 @@ The protocol is implemented outside Go. Each implementation is checked against t
 
 | Component | Location | Status |
 | --- | --- | --- |
-| C library `libhqq` (C11): Standard, Advanced, acceptor, and listener layers | [`c/`](c/README.md), headers in [`c/include/hqq/`](c/include/hqq) | Tests and the Go/C interop pairings verified on the authoring host (macOS arm64). CI builds it on Linux, macOS, and Windows (clang-cl; MSVC is experimental). |
+| C library `libhqq` (C11): Standard, Advanced, acceptor, and listener layers, and the parent lifeline (`hqq_lifeline.h`) | [`c/`](c/README.md), headers in [`c/include/hqq/`](c/include/hqq) | Tests and the Go/C interop pairings verified on the authoring host (macOS arm64). CI builds it on Linux, macOS, and Windows (clang-cl; MSVC is experimental). |
 | C++17 header-only wrapper (`hqq::`) | [`bindings/cpp/`](bindings/cpp) | Tests, examples, and interop verified on the authoring host (macOS arm64). CI in `bindings.yml`: Linux (gcc, clang with sanitizers), macOS, and Windows (clang-cl). |
 | Rust: `hqq-sys` (FFI), `hqq` (safe API), `hqq-interop` | [`bindings/rust/`](bindings/rust) | Tests, examples, and interop verified on the authoring host (macOS arm64). CI in `bindings.yml`: Linux, macOS, and Windows (MSVC). |
 | Specification | [`spec/`](spec) | [`SPEC.md`](spec/SPEC.md) (Standard and Advanced Protocol 1.0, normative), [`MEMORY_MODEL.md`](spec/MEMORY_MODEL.md), [`PORTING.md`](spec/PORTING.md), [`ext/`](spec/ext) (Advanced Protocol 1.1 and the listener segment), [`constants.json`](spec/constants.json), [`litmus/`](spec/litmus) |
@@ -278,27 +278,234 @@ A minimal configuration with one service:
 {"services":[{"name":"echo","command":"/usr/local/bin/hqq-echo"}]}
 ```
 
-### SQLite service example
+A service can also run a verified executable and be tied to the life of hqqd. The zero digest below is a placeholder: replace it with the SHA-256 of the binary, which `hqq-manifest hash FILE` prints.
 
-[`examples/sqlite`](examples/sqlite) serves a SQLite database as an HQQ service. Each `database/sql` connection is one stream and one server session, and the client needs no cgo. The wire protocol is in [`examples/sqlite/PROTOCOL.md`](examples/sqlite/PROTOCOL.md). The directory holds the Go driver `hqq-sqlite`, a Go fake server for tests, a C server ([`examples/sqlite/server`](examples/sqlite/server), POSIX only), and end-to-end tests.
+```json
+{"services":[
+  {"name":"app-db",
+   "command":"/opt/app/bin/hqq-sqlite-server",
+   "args":["app-db","--parent-stdin","--alias","main=/var/lib/app/app.sqlite"],
+   "listener":"app-db",
+   "sha256":"0000000000000000000000000000000000000000000000000000000000000000",
+   "parent_pipe":true}
+]}
+```
+
+- `sha256`, or `manifest` (a signed release manifest that gives the digest for this platform), makes hqqd verify the executable before every start and run the verified bytes. See [Verified executables](#verified-executables).
+- `parent_pipe: true` gives the service a standard input that hqqd holds open. When hqqd exits for any reason, including SIGKILL, the service reads end of file. The C server watches it with `--parent-stdin`, as in the example; a Go service calls `lifeline.Watch`. See [Parent lifeline](#parent-lifeline).
+- While a verified process runs, `hqqd ctl status` reports `verified` and `mechanism`.
+
+### SQLite service (`sqlite`)
+
+The `sqlite` package is a `database/sql` driver, registered as `hqq-sqlite`, for a SQLite database that runs as a separate service reached through an HQQ listener. The client needs no cgo. Each `database/sql` connection is one HQQ stream of a shared link, and the server runs each stream as one session with its own SQLite connection, transaction state, and statements. The service is the C server in [`examples/sqlite/server`](examples/sqlite/server) (Linux, macOS and Windows with clang-cl), or the Go fake server used by the tests.
 
 ```go
 import (
 	"database/sql"
 
-	_ "gosuda.org/hqq/examples/sqlite/driver" // registers "hqq-sqlite"
+	_ "gosuda.org/hqq/sqlite" // registers "hqq-sqlite"
 )
 
 db, err := sql.Open("hqq-sqlite", "hqq://sqlite-svc?db=main&timeout=5s&fetch=256&busy=5s")
 ```
 
-The DSN host is the listener name of the server. Build the C server and serve a database under the alias `main`:
+The DSN host is the listener name of the server. Its options are `db` (required: an alias or a path), `mode` (`rwc`, `rw`, or `ro`), `timeout`, `fetch`, `busy`, `txlock`, and `pragma.<name>`; unknown or repeated options are errors. [`sqlite/README.md`](sqlite/README.md) gives the full list and the mapping of values and results. To keep the connector, for example to tune the link or to close the shared link yourself, use `sqlite.NewConnector`:
+
+```go
+c, err := sqlite.NewConnector("sqlite-svc", sqlite.Config{
+	Database:    "main",
+	Timeout:     5 * time.Second,
+	FetchSize:   256,
+	BusyTimeout: 5 * time.Second,
+})
+if err != nil {
+	return err
+}
+db := sql.OpenDB(c) // all connections of db share one link
+```
+
+A SQLite error is a `*sqlite.Error`: `Code` is the primary result code and `ExtendedCode` the extended one.
+
+```go
+if _, err := db.Exec("INSERT INTO users (email) VALUES (?)", email); err != nil {
+	var se *sqlite.Error
+	switch {
+	case errors.As(err, &se) && se.ExtendedCode == sqlite.CodeConstraintUnique:
+		return ErrDuplicate
+	case sqlite.IsBusy(err):
+		return ErrRetryLater
+	}
+	return err
+}
+```
+
+A lost link during `Exec` returns an error that wraps `sqlite.ErrOutcomeUnknown`, and it is not retried, because the statement may have run. Other lost-link errors wrap `driver.ErrBadConn`, so `database/sql` may retry them on a new connection. A `Query` is retried the same way, so send writes through `Exec` or inside a transaction.
+
+The database/sql contract suite (`sqlite/internal/contract`) runs against the fake server (`go test ./sqlite`) and against the C server (`sqlite/e2e`). To build and run the C server:
 
 ```sh
 cmake -S c -B build -DHQQ_BUILD_SQLITE_SERVER=ON -DHQQ_WERROR=ON
 cmake --build build --target hqq-sqlite-server
 build/sqlite-server/hqq-sqlite-server sqlite-svc --alias main=/path/to/app.db
 ```
+
+The server opens the aliases given with `--alias`, and raw paths only inside `--allow-dir`. Its wire protocol is in [`sqlite/PROTOCOL.md`](sqlite/PROTOCOL.md).
+
+### Starting the SQLite server from Go (`sqlite/launcher`)
+
+`sqlite/launcher` starts the C server as a child process, verifies it before it runs, and returns a `database/sql` handle for its listener:
+
+```go
+want, err := secureexec.ParseHash(digestHex) // 64 hex digits, from the release manifest
+if err != nil {
+	return err
+}
+m, err := launcher.OpenManaged(ctx, launcher.Config{
+	Binary:  "/opt/app/bin/hqq-sqlite-server",
+	SHA256:  want,
+	Aliases: map[string]string{"main": "/var/lib/app/app.sqlite"},
+}, launcher.WithDatabase("main"))
+if err != nil {
+	return err
+}
+defer m.Close() // closes the DB, then stops the server
+var one int
+err = m.DB.QueryRowContext(ctx, "SELECT 1").Scan(&one)
+```
+
+- `Start` hashes the binary with `secureexec` before it runs. The expected digest is `Config.SHA256`, or the entry for this platform of a signed manifest (`Config.Manifest`, whose signature is checked before the manifest is parsed). A mismatch starts nothing and returns an error that wraps `secureexec.ErrHashMismatch`.
+- The server is started with `--parent-stdin`. It shuts down gracefully, rolling back open transactions, when the process that started it exits, including by SIGKILL.
+- `Open` returns the `*sql.DB` and the `*Server` separately: close the DB first, then the server. `OpenManaged` returns both in one `Managed` value.
+- The launcher does not restart the server; hqqd does that. The details are in [`sqlite/launcher/README.md`](sqlite/launcher/README.md).
+
+### Verified executables
+
+`secureexec` verifies the SHA-256 digest of a native executable and starts it without a time-of-check/time-of-use (TOCTOU) gap, so the bytes that are hashed are the bytes that run. It uses only the standard library.
+
+Threat model in one sentence: the verifier runs as an ordinary user, the attacker is another local process or user who can write where the binary is read from, and a path swap or an in-place overwrite between the check and the exec must not change what runs; root, kernel compromise, and a compromised expected digest are out of scope.
+
+```go
+want, err := secureexec.ParseHash(expectedHex) // from a signed manifest
+if err != nil {
+	return err
+}
+v, err := secureexec.Verify("/opt/app/bin/hqq-sqlite-server", want)
+if err != nil {
+	return err // *HashMismatchError when the bytes differ
+}
+defer v.Close() // after Start; the child keeps running
+
+cmd := v.Command(ctx, "app-db", "--parent-stdin")
+cmd.Stdout = os.Stdout
+cmd.Stderr = os.Stderr
+if err := cmd.Start(); err != nil { // start while v is still open
+	return err
+}
+```
+
+`secureexec.Start` combines these steps and releases the snapshot when the child exits. The mechanism is chosen per platform:
+
+| Platform | `Mechanism()` | How the hashed bytes are protected |
+| --- | --- | --- |
+| Linux | `memfd` (`vault` when memfd is unavailable) | The file is copied once into a sealed memfd, which has no path, and runs as `/proc/self/fd/3`. The seals hold against every user, including processes of the same user. |
+| macOS, FreeBSD, other POSIX | `vault` | The file is copied into a new directory that only the owner can enter (mode 0700), as a read-only file (mode 0500), and its digest is checked after it is written. Other users cannot change it; processes of the same user can. |
+| Windows | `windows-share-lock` | The file is opened with `FILE_SHARE_READ` only, and the handle stays open while the child starts, so no other handle can write, delete, or rename it. |
+| Other platforms | none | `Verify` returns `ErrUnsupported`. |
+
+- `secureexec.Policy{TrustOwnedReadOnly: true}` (`secureexec.WithPolicy`) skips the copy for a file, and every directory above it, that root or the current user owns and that group and other cannot write. A process of the same user can then change the file between the check and the exec.
+- On POSIX the final path component must not be a symbolic link (`ELOOP`); on Windows symbolic links are resolved.
+- The signed release manifest and `cmd/hqq-manifest` are described in [Release binaries and manifests](#release-binaries-and-manifests). Details are in [`secureexec/README.md`](secureexec/README.md).
+
+### Parent lifeline
+
+The `lifeline` package and the C library tie a child process to its parent through the child's standard input. The parent gives the child the read end of a pipe and keeps the write end. The child reads its standard input until end of file. End of file comes when every holder of the write end has closed it: the parent closes it, or the parent dies in any way, including SIGKILL, because the kernel closes its descriptors.
+
+Parent side, in Go:
+
+```go
+cmd := exec.Command(server, "--parent-stdin")
+ll, err := lifeline.Attach(cmd) // sets cmd.Stdin
+if err != nil {
+	return err
+}
+defer ll.Close() // ends the child's life when the parent returns
+if err := cmd.Start(); err != nil {
+	return err
+}
+```
+
+Child side, in Go, called once early in `main`:
+
+```go
+ctx, stop := lifeline.Watch(context.Background())
+defer stop()
+<-ctx.Done() // standard input reached end of file, or failed
+```
+
+`lifeline.WithKeepalive(d)` makes the parent write one byte every `d`, so a child can notice a parent that is stopped rather than dead; `Watch` discards those bytes.
+
+The C server takes the same protocol as `--parent-stdin` (alias `--exit-on-stdin-eof`). On end of file it shuts down gracefully, rolls back open transactions, and exits with status 0; if that takes longer than `--lifeline-grace-ms` (default 5000), it exits with status 70. Other services in C use `hqq_lifeline_start` from [`c/include/hqq/hqq_lifeline.h`](c/include/hqq/hqq_lifeline.h).
+
+**Guarantee.** A service started with a lifeline is not left running as an orphan when its parent dies in any way that closes its descriptors, including SIGKILL and a crash.
+
+**Limits.**
+
+- A parent that is stopped (SIGSTOP, a debugger) rather than dead keeps the pipe open, so the child keeps running.
+- Any process that inherits the write end holds the pipe open. `os.Pipe` is close-on-exec, so only a process that inherits it on purpose can.
+- Only the calling thread survives `fork()`, so a child that forks and keeps running loses its lifeline thread. The C server must not fork after start.
+- A grandchild that inherits the child's standard input holds it open, so end of file comes only after the grandchild exits too.
+- Terminals are not watched unless forced (`lifeline.WatchTerminal`, `--parent-stdin=force`), so a closed terminal does not stop an interactive run.
+- A child must read its standard input for its whole life. `Watch` cannot interrupt a blocked read, so its goroutine ends with the process.
+
+### Release binaries and manifests
+
+A release of the SQLite server contains `hqq-sqlite-server_<os>_<arch>` binaries, a version 1 release manifest `manifest.json` (file names, sizes, SHA-256 digests, licenses), its ed25519 signature `manifest.json.sig`, `licenses.tar.gz`, and `SHA256SUMS`. The release process, key handling, and platform list are in [`docs/RELEASING.md`](docs/RELEASING.md).
+
+To verify a download, embed the release public key in your program, and check the manifest before any digest from it is used:
+
+```go
+pub, err := manifest.ParsePublicKey(releasePublicKey) // your copy of the release public key
+if err != nil {
+	return err
+}
+data, err := os.ReadFile(filepath.Join(dir, "manifest.json"))
+if err != nil {
+	return err
+}
+sig, err := os.ReadFile(filepath.Join(dir, "manifest.json.sig"))
+if err != nil {
+	return err
+}
+m, err := manifest.Verify(data, sig, pub) // the signature is checked before the manifest is parsed
+if err != nil {
+	return err
+}
+f, ok := m.Find(runtime.GOOS, runtime.GOARCH)
+if !ok {
+	return fmt.Errorf("no build of %s for %s/%s", m.Name, runtime.GOOS, runtime.GOARCH)
+}
+v, err := secureexec.Verify(filepath.Join(dir, f.Name), f.SHA256)
+if err != nil {
+	return err // *HashMismatchError when the bytes differ
+}
+defer v.Close()
+```
+
+From a clone of this repository, the same checks run on the command line:
+
+```sh
+go run ./cmd/hqq-manifest verify -pub release_public_key.hex \
+  -in manifest.json -sig manifest.json.sig -dir hqq-sqlite-release
+sha256sum -c SHA256SUMS
+```
+
+`hqq-manifest` (`cmd/hqq-manifest`) has these commands. Its exit status is 0 on success, 1 on failure, and 2 on a usage error.
+
+- `keygen -priv FILE -pub FILE` creates an ed25519 key pair as hex text. The private file is written with mode 0600, and an existing file is never overwritten.
+- `gen -dir DIR -name NAME -release REL [-license ID]... -out FILE` scans DIR for `NAME_<os>_<arch>[.exe]` artifacts and writes an unsigned manifest.
+- `sign -key FILE` or `sign -key-env VAR`, `-in FILE [-out FILE.sig]` writes the detached signature of a manifest. `-key-env` reads the private key from an environment variable, which is how CI supplies it.
+- `verify -pub FILE -in FILE -sig FILE [-dir DIR]` checks the signature and, with `-dir`, the size and SHA-256 of every artifact.
+- `hash FILE...` prints `sha256sum`-style lines.
 
 ---
 
@@ -722,6 +929,10 @@ go test ./internal/protocol -run '^$' -fuzz=FuzzPacketRoundTrip -fuzztime=10s
 go test . -run '^$' -fuzz='^FuzzConsumeAdvancedChunk$' -fuzztime=10s
 go test . -run '^$' -fuzz='^FuzzOpenOverCorruptSuperblock$' -fuzztime=10s
 
+# SQLite driver, launcher and secureexec (the e2e tests need a built C server)
+go test -race -count=1 ./sqlite/... ./secureexec/...
+HQQ_SQLITE_SERVER=/path/to/hqq-sqlite-server go test -count=1 ./sqlite/e2e/...
+
 # TLA+ model checking of the MPMC ring (requires a Java runtime)
 sh scripts/tlc.sh
 JAVA=/path/to/bin/java sh scripts/tlc.sh   # if `java` on PATH is not a working runtime
@@ -731,3 +942,4 @@ JAVA=/path/to/bin/java sh scripts/tlc.sh   # if `java` on PATH is not a working 
 - **Fuzz targets**: `FuzzPacketRoundTrip` (`internal/protocol`), `FuzzConsumeAdvancedChunk` and `FuzzOpenOverCorruptSuperblock` (root package).
 - **TLC**: `scripts/tlc.sh` downloads `tla2tools.jar` if needed and checks `internal/mpmc/MPMC.tla` with `MPMC.cfg` (`BufferSize = 2`). It picks the Java runtime from `$JAVA`, then `$JAVA_HOME/bin/java`, then `java` on `PATH`; CI uses Temurin 21. The model covers the claim and completion protocol of the ring; it does not model parking, waiter counts or aggregation, `Format`, crashes, or stale copies of reservation handles.
 - **CI-only checks**: GenMC and herd7 (`c/verify`, `memory-model` job of `c.yml`), stress litmus tests (Linux arm64), and the Windows jobs run in CI only. See [Other languages and interoperability](#other-languages-and-interoperability).
+- **`HQQ_SQLITE_SERVER`** names a built `hqq-sqlite-server`. The end-to-end tests in `sqlite/e2e` and `sqlite/launcher` (the contract suite, the driver over a real server, the launcher, and the parent lifeline) skip without it. The other `sqlite` tests run against the Go fake server.

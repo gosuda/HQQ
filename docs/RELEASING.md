@@ -30,19 +30,15 @@ through the signed manifest, and the license files are covered only by
 | `hqq-sqlite-server_linux_arm64` | `ubuntu-24.04-arm` | published |
 | `hqq-sqlite-server_darwin_arm64` | `macos-latest` | published |
 | `hqq-sqlite-server_darwin_amd64` | `macos-15-intel` | published |
-| `hqq-sqlite-server_windows_amd64.exe` | `windows-latest`, clang-cl | gated, see below |
-| `hqq-sqlite-server_windows_arm64.exe` | `windows-11-arm`, clang-cl | gated, see below |
+| `hqq-sqlite-server_windows_amd64.exe` | `windows-latest`, clang-cl | published |
+| `hqq-sqlite-server_windows_arm64.exe` | `windows-11-arm`, clang-cl | published |
 
 Each binary is built on a runner of its own platform and smoke-tested there
 (the Go end-to-end tests of `sqlite/e2e` run against the stripped binary).
 Cross-compiled binaries are not used, because they could not be run before
 publishing.
 
-Windows is gated behind the repository variable `HQQ_RELEASE_WINDOWS`. The
-server's CMake file (`examples/sqlite/server/CMakeLists.txt`) stops with a
-fatal error on `WIN32`, so the Windows jobs would fail. Set the variable to
-`true` only after the server builds and passes its tests on Windows. Until
-then the Windows jobs are skipped and the release has the four POSIX binaries.
+Windows binaries (`windows/amd64`, `windows/arm64`, clang-cl, static CRT) are part of every release; a Windows build failure blocks publish. The server's Windows build is described in [`examples/sqlite/server/README.md`](../examples/sqlite/server/README.md).
 
 ## SQLite
 
@@ -158,8 +154,8 @@ rm /tmp/release.key
 ```
 
 `keygen` never overwrites an existing file and writes the private key with mode
-0600. The release job fails before building anything when the public key file
-is missing or is not a valid key (the failure message repeats these steps).
+0600. The `publish` job fails before it signs or publishes anything when the public key
+file is missing or is not a valid key (the failure message repeats these steps).
 
 Rotation: publish a new public key in the repository and set the new private
 key as the secret. Old releases stay verifiable with the old key, so keep the
@@ -260,12 +256,10 @@ sha256sum -c SHA256SUMS
   "If the private key leaks".
 - `SHA256SUMS` is not signed; the license files are only covered by it.
 - Smoke tests exercise the server through the Go client on the build machine.
-  They do not cover every platform feature (for example Windows, which is
-  gated).
+  They do not cover every platform feature.
 - Gatekeeper and other platform trust checks are not part of this process.
   macOS binaries carry an ad-hoc signature only, and they are not notarized.
-- The Windows path is untested until the server builds on Windows; the
-  CMake and PowerShell scripts for it are unverified.
+- The Windows build and its tests run only in CI (the `build-windows` jobs of `release.yml`). The PowerShell fetch script `scripts/release/fetch-sqlite.ps1` is checked only there.
 
 ## Files
 

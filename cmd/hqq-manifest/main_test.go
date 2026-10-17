@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -38,7 +39,9 @@ func TestEndToEnd(t *testing.T) {
 	if code, out := call("keygen", "-priv", priv, "-pub", pub); code != 0 || !strings.Contains(out, "public key: ") {
 		t.Fatalf("keygen: %d %s", code, out)
 	}
-	if fi, err := os.Stat(priv); err != nil || fi.Mode().Perm() != 0o600 {
+	// Windows has no POSIX permission bits (os.Stat reports 0666), so the
+	// owner-only mode check applies to the other platforms.
+	if fi, err := os.Stat(priv); err != nil || (runtime.GOOS != "windows" && fi.Mode().Perm() != 0o600) {
 		t.Fatalf("private key mode: %v %v", fi, err)
 	}
 	if code, _ := call("keygen", "-priv", priv, "-pub", pub); code == 0 {

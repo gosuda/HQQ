@@ -8,6 +8,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"gosuda.org/hqq/sqlite"
 )
 
 func testPool(t *testing.T, db *sql.DB, caps Capabilities) {
@@ -85,18 +87,52 @@ func testPool(t *testing.T, db *sql.DB, caps Capabilities) {
 	})
 }
 
+// busyBudget bounds how long one statement of useKey retries SQLITE_BUSY.
+//
+// The workload is 32 writers, each committing autocommit statements to one
+// database file in the default rollback-journal mode. SQLite's busy handler
+// sleeps and retries with no queue or fairness, so a writer can lose the lock
+// for longer than the connector's busy timeout (5 s in the e2e runs). The
+// slowest statement measured 5.4 s while every statement still succeeded
+// eventually. SQLite does not bound lock wait time under contention, so the
+// test does not treat a BUSY as failure. A BUSY from an autocommit statement
+// means the statement did not commit, so repeating it is safe. The test still
+// requires every write and read-back to succeed within this budget, and every
+// value to match.
+const busyBudget = 60 * time.Second
+
+// retryBusy runs fn until it does not return SQLITE_BUSY, or busyBudget passes.
+func retryBusy(fn func() error) error {
+	deadline := time.Now().Add(busyBudget)
+	for {
+		err := fn()
+		if err == nil || !sqlite.IsBusy(err) || time.Now().After(deadline) {
+			return err
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 // useKey inserts key k and updates it rounds times, reading each value back.
 // It returns the first failure.
 func useKey(db *sql.DB, tbl string, k, rounds int) error {
-	if _, err := db.Exec("INSERT INTO "+tbl+" (k, v) VALUES (?, 0)", k); err != nil {
+	if err := retryBusy(func() error {
+		_, err := db.Exec("INSERT INTO "+tbl+" (k, v) VALUES (?, 0)", k)
+		return err
+	}); err != nil {
 		return fmt.Errorf("insert %d: %w", k, err)
 	}
 	for i := 1; i < rounds; i++ {
-		if _, err := db.Exec("UPDATE "+tbl+" SET v = ? WHERE k = ?", i, k); err != nil {
+		if err := retryBusy(func() error {
+			_, err := db.Exec("UPDATE "+tbl+" SET v = ? WHERE k = ?", i, k)
+			return err
+		}); err != nil {
 			return fmt.Errorf("update %d: %w", k, err)
 		}
 		var v int64
-		if err := db.QueryRow("SELECT v FROM "+tbl+" WHERE k = ?", k).Scan(&v); err != nil {
+		if err := retryBusy(func() error {
+			return db.QueryRow("SELECT v FROM "+tbl+" WHERE k = ?", k).Scan(&v)
+		}); err != nil {
 			return fmt.Errorf("select %d: %w", k, err)
 		}
 		if v != int64(i) {

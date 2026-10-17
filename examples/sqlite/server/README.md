@@ -5,7 +5,10 @@ version 1.0) on one HQQ listener. It is written in C11 on libhqq's Advanced laye
 and the SQLite C API. The Go driver in `../../sqlite` is its reference client, and
 the end-to-end tests in `../../sqlite/e2e` run that driver against it.
 
-POSIX only (Linux and macOS). Windows is not supported.
+Linux, macOS and Windows (x64 and arm64, built with clang-cl). The platform differences are in one
+layer: `src/sqlsrv_port.h`, with `src/sqlsrv_port_posix.c` (pthreads, sigwait, realpath) and
+`src/sqlsrv_port_win.c` (CreateThread, SRWLOCK, condition variables, console control events,
+GetFinalPathNameByHandleW). The database path rules are in `src/sqlsrv_pathrules.c`.
 
 ## Build
 
@@ -18,6 +21,19 @@ ctest --test-dir build -R hqqsqlite_server --output-on-failure
 ```
 
 The binary is `build/sqlite-server/hqq-sqlite-server`.
+
+On Windows, build with clang-cl and an SQLite amalgamation (there is no system SQLite). The release
+(`.github/workflows/release.yml`) uses the static C runtime, which must apply to the whole build,
+because libhqq and the server must link the same runtime:
+
+```bat
+cmake -S c -B build -G Ninja -DCMAKE_C_COMPILER=clang-cl -DCMAKE_BUILD_TYPE=Release ^
+  -DHQQ_WERROR=ON -DHQQ_BUILD_TESTS=ON -DHQQ_BUILD_SQLITE_SERVER=ON ^
+  -DHQQ_SQLITE_AMALGAMATION_DIR=C:\path\to\amalgamation -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
+```
+
+The binary is `build\sqlite-server\hqq-sqlite-server.exe`. `scripts/release/fetch-sqlite.ps1` fetches
+and verifies the pinned amalgamation.
 
 ### SQLite
 
@@ -57,11 +73,15 @@ On start it prints `ready <listener-name>` on stdout. It exits with status 2 on 
 option and 1 when the listener cannot be created (for example, the name is in use by a
 live server).
 
-`SIGINT` and `SIGTERM` start a graceful shutdown: the acceptor closes, each link
+`SIGINT` and `SIGTERM` (on Windows: the console events `CTRL_C`, `CTRL_BREAK`, `CTRL_CLOSE` and `CTRL_SHUTDOWN`) start a graceful shutdown: the acceptor closes, each link
 refuses new requests (status 8, PROTOCOL.md section 2 and libhqq section 6), running
 requests finish up to `--shutdown-timeout-ms`, then the streams close and every
 session rolls back its open transaction. `SIGKILL` runs no cleanup; SQLite recovers its
 files at the next open.
+
+On Windows, `CTRL_CLOSE_EVENT` and `CTRL_SHUTDOWN_EVENT` give the process about five seconds before
+Windows ends it, so the handler waits at most four seconds for the shutdown to finish; a longer
+shutdown is cut short by Windows. `TerminateProcess` (and `SIGKILL`) runs no cleanup on either system.
 
 ## Parent lifeline
 
@@ -117,6 +137,18 @@ and SIGKILL a separate pipe holder (`sqlite/e2e/lifeline_test.go`). The C unit t
 - Anything else is `FORBIDDEN` (9). A missing parent directory is SQLite `CANTOPEN`.
 - `ATTACH`, `DETACH` (authorizer) and loadable extensions are disabled in every
   session.
+- **Windows rules** (the same checks on every host, in `sqlsrv_pathrules.c`). Accepted: a drive-absolute
+  path (`C:\` or `C:/`) or a relative one, with `/` or `\` as separator. Refused by name: UNC and
+  `\\?\` / `\\.\` paths, rooted paths without a drive (`\x`), drive-relative paths (`C:x`), `:` anywhere
+  but the drive (alternate data streams), `< > " | ? *` and control characters, empty components,
+  components ending in `.` or a space, `..` components, and reserved device names (CON, PRN, AUX, NUL,
+  COM0-COM9, LPT0-LPT9, CONIN$, CONOUT$, with or without an extension). Symbolic links and junctions are
+  followed by the canonical path (`GetFinalPathNameByHandleW`), which must be a local `X:\` path inside
+  the allow directory. The containment test ignores ASCII case; a non-ASCII case difference is refused.
+- The check runs when the session opens. It is not a sandbox: a local process that changes the directory
+  after that can still redirect a later open (the same holds on POSIX).
+- The allow directory and every alias must be on a local or mapped drive. UNC shares and `\\?\UNC\`
+  paths are refused at start-up (the path cannot be canonicalized to a local `X:\` path).
 
 ## Design
 
@@ -152,7 +184,8 @@ length (1 MiB), variables (32766), columns (2000), and attached databases (0).
 
 - `tests/test_units.c` (`hqqsqlite_server_units`): codec and golden encodings from
   PROTOCOL.md section 16, status values, limits, pragma and flag validation, and the
-  path policy (traversal, symbolic links, dangling links, aliases, NUL).
+  path policy (traversal, symbolic links, dangling links, aliases, NUL), and the Windows path rules. The
+  Windows rules are pure functions that take the style as an argument, so they run on every host.
 - `../../sqlite/e2e` (Go): starts the server (`HQQ_SQLITE_SERVER` names the binary; the tests
   skip without it) and runs the driver against it: values, prepared and named
   statements, batches, large blobs and the 16 MiB row limit, transactions and

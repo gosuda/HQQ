@@ -18,10 +18,10 @@
 #     and create or update the GitHub Release. Without the secret, nothing is
 #     signed or published; the unsigned files are uploaded as artifacts.
 #
-# Windows: the server's CMake (examples/sqlite/server/CMakeLists.txt) stops with
-# FATAL_ERROR on WIN32, so the Windows jobs are gated behind the repository
-# variable HQQ_RELEASE_WINDOWS=true. Enable it only after the server builds on
-# Windows; until then the release contains the four POSIX binaries.
+# Windows: built natively with clang-cl (x64 on windows-latest, arm64 on windows-11-arm)
+# against the SQLite amalgamation fetched by scripts/release/fetch-sqlite.ps1, with the
+# static CRT (CMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded). These jobs are part of every
+# release: a Windows build failure blocks the publish job.
 
 name: Release
 
@@ -195,7 +195,6 @@ jobs:
 
   build-windows:
     name: Build windows/${{ matrix.goarch }} (${{ matrix.runner }})
-    if: vars.HQQ_RELEASE_WINDOWS == 'true'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 40
 
@@ -311,7 +310,7 @@ jobs:
     if: >-
       always() &&
       needs.build.result == 'success' &&
-      (needs.build-windows.result == 'success' || needs.build-windows.result == 'skipped') &&
+      needs.build-windows.result == 'success' &&
       (github.event_name == 'push' ||
         (github.event_name == 'workflow_dispatch' && inputs.dry_run == false))
     runs-on: ubuntu-24.04
@@ -361,14 +360,9 @@ jobs:
 
       - name: Check the expected binaries are all present
         shell: bash
-        env:
-          WINDOWS_ENABLED: ${{ vars.HQQ_RELEASE_WINDOWS == 'true' }}
         run: |
           set -euo pipefail
-          expected="hqq-sqlite-server_linux_amd64 hqq-sqlite-server_linux_arm64 hqq-sqlite-server_darwin_amd64 hqq-sqlite-server_darwin_arm64"
-          if [ "$WINDOWS_ENABLED" = true ]; then
-            expected="$expected hqq-sqlite-server_windows_amd64.exe hqq-sqlite-server_windows_arm64.exe"
-          fi
+          expected="hqq-sqlite-server_linux_amd64 hqq-sqlite-server_linux_arm64 hqq-sqlite-server_darwin_amd64 hqq-sqlite-server_darwin_arm64 hqq-sqlite-server_windows_amd64.exe hqq-sqlite-server_windows_arm64.exe"
           for name in $expected; do
             test -f "dist/$name" || { echo "::error::missing artifact $name"; exit 1; }
           done

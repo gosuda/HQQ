@@ -169,7 +169,7 @@ compromised expected digest are out of scope.
   parent keeps the write end of a pipe on the server's stdin. The server shuts
   down gracefully (status 0, open transactions roll back) when the parent exits
   for any reason, including SIGKILL, because the kernel closes the parent's
-  descriptors. `DisableLifeline` omits the flag; `Stop` then sends SIGTERM on Unix.
+  descriptors. `DisableLifeline` omits the flag; `Stop` then sends SIGTERM on Unix (CTRL_BREAK on Windows).
 - `Stop(ctx)` closes the pipe and waits up to `StopTimeout` (default 10 s) for a
   graceful exit. It returns the exit status error (nil for status 0). After
   `StopTimeout`, or when `ctx` ends, it kills the server and returns

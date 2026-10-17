@@ -11,9 +11,6 @@
 # macOS SDK copy) or, when HQQ_SQLITE_AMALGAMATION_DIR names a directory with
 # sqlite3.c and sqlite3.h, from that amalgamation. Nothing is downloaded.
 
-if(WIN32)
-  message(FATAL_ERROR "hqq-sqlite-server is POSIX only")
-endif()
 if(NOT TARGET hqq::hqq)
   message(FATAL_ERROR "hqq-sqlite-server must be added from libhqq's c/CMakeLists.txt")
 endif()
@@ -21,6 +18,9 @@ endif()
 set(HQQ_SQLITE_AMALGAMATION_DIR "" CACHE PATH
     "Directory with an SQLite amalgamation (sqlite3.c and sqlite3.h). Empty: use the system SQLite")
 
+# Windows (clang-cl): the static CRT is set for the whole build, not here, because
+# libhqq and the server must link the same runtime. release.yml passes
+# -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded (see README.md, "Windows").
 find_package(Threads REQUIRED)
 
 if(HQQ_SQLITE_AMALGAMATION_DIR)
@@ -45,9 +45,16 @@ endif()
 
 set(HQQSQLITE_SERVER_CORE_SOURCES
   src/sqlsrv_proto.c
+  src/sqlsrv_pathrules.c
   src/sqlsrv_policy.c
   src/sqlsrv_session.c
   src/sqlsrv_link.c)
+# The platform layer: exactly one of the two is compiled (see src/sqlsrv_port.h).
+if(WIN32)
+  list(APPEND HQQSQLITE_SERVER_CORE_SOURCES src/sqlsrv_port_win.c)
+else()
+  list(APPEND HQQSQLITE_SERVER_CORE_SOURCES src/sqlsrv_port_posix.c)
+endif()
 
 add_library(hqqsqlite_server STATIC ${HQQSQLITE_SERVER_CORE_SOURCES})
 target_include_directories(hqqsqlite_server PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src ${HQQ_SQLITE_INCLUDE_DIRS})

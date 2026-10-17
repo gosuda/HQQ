@@ -175,7 +175,7 @@ hqq-manifest hash    dist/hqq-sqlite-server_linux_amd64
 - Exit status: 0 success, 1 failure, 2 usage error.
 
 Key handling for CI: store the private key as an encrypted secret and expose it
-only to the release job, as `HQQ_RELEASE_KEY`. Ship the public key with the
+only to the release job, as `HQQ_RELEASE_SIGNING_KEY`. Ship the public key with the
 verifier, or fetch it from a pinned location. Rotate by publishing a new public
 key; old manifests remain verifiable with the old key.
 

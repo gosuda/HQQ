@@ -22,6 +22,19 @@
 
 #define LT_CHILD_GUARD_S 30u
 
+/* Writes one status byte to a pipe. The result is checked (and, if the write
+ * failed, reported by the exit status of the forked child through the absent
+ * byte) because glibc marks write() warn_unused_result. */
+static void lt_put(int fd, char c) {
+    ssize_t n;
+    do {
+        n = write(fd, &c, 1);
+    } while (n < 0 && errno == EINTR);
+    if (n != 1) {
+        _exit(7);
+    }
+}
+
 /* Callback probe: counts the firings and keeps the last reason. */
 typedef struct lt_probe {
     pthread_mutex_t mu;
@@ -263,7 +276,7 @@ static void check_tty_policy(void) {
                 _exit(6);
             }
             watching = hqq_lifeline_watching(l);
-            (void)write(ready[1], "r", 1);
+            lt_put(ready[1], 'r');
             if (!forces[k]) {
                 /* Not watched: nothing fires, even after a while. */
                 hqq_test_sleep_ms(300);
@@ -469,11 +482,11 @@ static void check_intermediary_sigkill(void) {
             o.callback = probe_cb;
             o.ctx = &pr;
             if (hqq_lifeline_start(&o, &l) == HQQ_OK) {
-                (void)write(rep[1], "s", 1); /* started and watching */
+                lt_put(rep[1], 's'); /* started and watching */
                 if (probe_wait(&pr, 20000)) {
                     probe_snapshot(&pr, &calls, &reason);
                     if (calls == 1 && reason == HQQ_LIFELINE_REASON_EOF) {
-                        (void)write(rep[1], "e", 1);
+                        lt_put(rep[1], 'e');
                         code = 0;
                     } else {
                         code = 2;

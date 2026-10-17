@@ -4,15 +4,13 @@
  * validation, and the database path policy. The request paths (SQL, batches,
  * cancellation) are covered end to end by sqlite/e2e.
  */
-#define _POSIX_C_SOURCE 200809L
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
-#include <unistd.h>
 
+#include "sqlsrv_pathrules.h"
 #include "sqlsrv_policy.h"
+#include "sqlsrv_port.h"
 #include "sqlsrv_proto.h"
 
 static int failures;
@@ -145,10 +143,117 @@ static void test_validation(void) {
     CHECK(!sqlsrv_valid_pragma_value((const uint8_t *)"a;DROP", 6));
 }
 
-/* ---- Path policy ------------------------------------------------------- */
+/* ---- Path rules (pure, the same on every host) ------------------------- */
+
+static void expect_raw(const char *s, sqlsrv_path_style style, int accepted) {
+    const char *why = sqlsrv_path_check_raw((const uint8_t *)s, strlen(s), style);
+    if ((why == NULL) != (accepted != 0)) {
+        fprintf(stderr, "%s:%d: raw path \"%s\" should be %s (%s)\n", __FILE__, __LINE__, s,
+                accepted ? "accepted" : "refused", why != NULL ? why : "no reason");
+        failures++;
+    }
+}
+
+static void expect_kind(const char *s, sqlsrv_path_style style, sqlsrv_path_kind want) {
+    CHECK(sqlsrv_path_classify((const uint8_t *)s, strlen(s), style) == want);
+}
+
+static void expect_join(const char *base, const char *p, sqlsrv_path_style style, const char *want) {
+    char *got = sqlsrv_path_join(base, (const uint8_t *)p, strlen(p), style);
+    if (got == NULL || strcmp(got, want) != 0) {
+        fprintf(stderr, "%s:%d: join(\"%s\", \"%s\") is \"%s\", want \"%s\"\n", __FILE__, __LINE__,
+                base != NULL ? base : "", p, got != NULL ? got : "(null)", want);
+        failures++;
+    }
+    free(got);
+}
+
+static void expect_split(const char *path, sqlsrv_path_style style, size_t want_dir, size_t want_leaf) {
+    size_t dir = 0;
+    size_t leaf = 0;
+    CHECK(sqlsrv_path_split(path, style, &dir, &leaf) == 0 && dir == want_dir && leaf == want_leaf);
+}
+
+static void expect_prefix(const char *dir, sqlsrv_path_style style, const char *want) {
+    char *got = sqlsrv_path_dir_prefix(dir, style);
+    if (got == NULL || strcmp(got, want) != 0) {
+        fprintf(stderr, "%s:%d: dir_prefix(\"%s\") is \"%s\", want \"%s\"\n", __FILE__, __LINE__, dir,
+                got != NULL ? got : "(null)", want);
+        failures++;
+    }
+    free(got);
+}
+
+static void test_path_rules(void) {
+    static const char *const win_bad[] = {
+        "..\\x.db", "a\\..\\b.db", "a/../b.db", "..", "...", "x:stream", "C:x.db", "C:..\\x", "\\x.db",
+        "/etc/hosts", "\\\\server\\share\\x.db", "\\\\?\\C:\\x.db", "\\\\.\\pipe\\x", "//?/C:/x.db",
+        "nul", "NUL.txt", "con.db", "COM1", "com9.log", "LPT1.txt", "CONIN$", "a\\\\b.db", "name.",
+        "name ", "a?b.db", "a<b.db", "a|b", "a\x01.db", "C:\\", "C:\\x\\", "",
+    };
+    static const char *const win_good[] = {
+        "main.db", "sub\\main.db", "sub/main.db", "a.b.c.db", ".hidden", "CONX.db", "COM10.db", "a..b",
+        "C:\\data\\x.db", "C:/data/x.db", "x\\.\\y.db", "name with spaces.db",
+    };
+    static const char *const posix_bad[] = {"../x", "a/..", "..", "/x/../y"};
+    static const char *const posix_good[] = {"a\\..\\b", "..a", "a..b", "...", "/etc/hosts", "x.db"};
+    size_t i;
+
+    for (i = 0; i < sizeof win_bad / sizeof win_bad[0]; i++) {
+        expect_raw(win_bad[i], SQLSRV_PATH_WINDOWS, 0);
+    }
+    for (i = 0; i < sizeof win_good / sizeof win_good[0]; i++) {
+        expect_raw(win_good[i], SQLSRV_PATH_WINDOWS, 1);
+    }
+    for (i = 0; i < sizeof posix_bad / sizeof posix_bad[0]; i++) {
+        expect_raw(posix_bad[i], SQLSRV_PATH_POSIX, 0);
+    }
+    for (i = 0; i < sizeof posix_good / sizeof posix_good[0]; i++) {
+        expect_raw(posix_good[i], SQLSRV_PATH_POSIX, 1);
+    }
+
+    expect_kind("C:\\x", SQLSRV_PATH_WINDOWS, SQLSRV_PATHK_ABSOLUTE);
+    expect_kind("c:/x", SQLSRV_PATH_WINDOWS, SQLSRV_PATHK_ABSOLUTE);
+    expect_kind("C:x", SQLSRV_PATH_WINDOWS, SQLSRV_PATHK_DRIVE_RELATIVE);
+    expect_kind("\\\\server\\s", SQLSRV_PATH_WINDOWS, SQLSRV_PATHK_UNC);
+    expect_kind("\\\\?\\C:\\x", SQLSRV_PATH_WINDOWS, SQLSRV_PATHK_UNC);
+    expect_kind("\\x", SQLSRV_PATH_WINDOWS, SQLSRV_PATHK_ROOTED);
+    expect_kind("/x", SQLSRV_PATH_WINDOWS, SQLSRV_PATHK_ROOTED);
+    expect_kind("x\\y", SQLSRV_PATH_WINDOWS, SQLSRV_PATHK_RELATIVE);
+    expect_kind("/x", SQLSRV_PATH_POSIX, SQLSRV_PATHK_ABSOLUTE);
+    expect_kind("x", SQLSRV_PATH_POSIX, SQLSRV_PATHK_RELATIVE);
+
+    expect_join("C:\\allow\\", "main.db", SQLSRV_PATH_WINDOWS, "C:\\allow\\main.db");
+    expect_join("C:\\allow", "sub/x.db", SQLSRV_PATH_WINDOWS, "C:\\allow\\sub\\x.db");
+    expect_join("C:\\allow\\", "D:/x.db", SQLSRV_PATH_WINDOWS, "D:\\x.db");
+    expect_join("/a/", "b", SQLSRV_PATH_POSIX, "/a/b");
+    expect_join("/a", "b", SQLSRV_PATH_POSIX, "/a/b");
+    expect_join("/a", "/etc", SQLSRV_PATH_POSIX, "/etc");
+
+    expect_split("C:\\x.db", SQLSRV_PATH_WINDOWS, 3, 3);
+    expect_split("C:\\dir\\x.db", SQLSRV_PATH_WINDOWS, 6, 7);
+    expect_split("\\x", SQLSRV_PATH_WINDOWS, 1, 1);
+    expect_split("/x/y", SQLSRV_PATH_POSIX, 2, 3);
+    expect_split("/x", SQLSRV_PATH_POSIX, 1, 1);
+
+    expect_prefix("C:\\", SQLSRV_PATH_WINDOWS, "C:\\");
+    expect_prefix("C:\\x", SQLSRV_PATH_WINDOWS, "C:\\x\\");
+    expect_prefix("/x", SQLSRV_PATH_POSIX, "/x/");
+    expect_prefix("/x/", SQLSRV_PATH_POSIX, "/x/");
+
+    CHECK(sqlsrv_path_inside("C:\\Allow\\x.db", "c:\\allow\\", SQLSRV_PATH_WINDOWS) == 1);
+    CHECK(sqlsrv_path_inside("C:\\allow", "C:\\allow\\", SQLSRV_PATH_WINDOWS) == 0);
+    CHECK(sqlsrv_path_inside("C:\\allowed\\x", "C:\\allow\\", SQLSRV_PATH_WINDOWS) == 0);
+    CHECK(sqlsrv_path_inside("D:\\allow\\x", "C:\\allow\\", SQLSRV_PATH_WINDOWS) == 0);
+    CHECK(sqlsrv_path_inside("/a/b", "/a/", SQLSRV_PATH_POSIX) == 1);
+    CHECK(sqlsrv_path_inside("/A/b", "/a/", SQLSRV_PATH_POSIX) == 0);
+    CHECK(sqlsrv_path_inside("/ab", "/a/", SQLSRV_PATH_POSIX) == 0);
+}
+
+/* ---- Path policy (uses the platform layer: real directories) ----------- */
 
 static int make_dir(const char *path) {
-    return mkdir(path, 0700);
+    return sqlsrv_port_mkdir(path);
 }
 
 static int resolve(const sqlsrv_policy *p, const char *db, char **out, sqlsrv_err *e) {
@@ -156,17 +261,25 @@ static int resolve(const sqlsrv_policy *p, const char *db, char **out, sqlsrv_er
 }
 
 static void test_policy(void) {
-    char root[128];
+    char *tmp = sqlsrv_port_tempdir();
+    char root[1024];
     char allow[1024];
     char outside[1024];
+    char secret[1024];
     char link_path[1024];
+    char target[1024];
     char err[256];
     sqlsrv_policy p;
     sqlsrv_err e;
     char *out = NULL;
 
-    (void)snprintf(root, sizeof root, "/tmp/hqqsqlsrv-policy-%ld", (long)getpid());
-    (void)rmdir(root);
+    if (tmp == NULL) {
+        CHECK(tmp != NULL);
+        return;
+    }
+    (void)snprintf(root, sizeof root, "%s/hqqsqlsrv-policy-%lu", tmp, sqlsrv_process_id());
+    free(tmp);
+    (void)sqlsrv_port_remove_dir(root);
     CHECK(make_dir(root) == 0);
     snprintf(allow, sizeof allow, "%s/allow", root);
     snprintf(outside, sizeof outside, "%s/outside", root);
@@ -179,9 +292,11 @@ static void test_policy(void) {
 
     CHECK(sqlsrv_policy_set_allow_dir(&p, allow, err, sizeof err) == 0);
     {
-        char *ra = realpath(allow, NULL);
-        char *ro = realpath(outside, NULL);
-        CHECK(ra != NULL && ro != NULL);
+        char *ra = NULL;
+        char *ro = NULL;
+        int missing = 0;
+        CHECK(sqlsrv_port_realpath(allow, &ra, &missing) == 0);
+        CHECK(sqlsrv_port_realpath(outside, &ro, &missing) == 0);
         if (ra != NULL) {
             (void)snprintf(allow, sizeof allow, "%s", ra);
             free(ra);
@@ -210,16 +325,29 @@ static void test_policy(void) {
     CHECK(resolve(&p, "missing/x.db", &out, &e) == -1 && e.status == 0x1000eu);
 
     /* A symbolic link out of the directory is followed and refused. */
+    snprintf(secret, sizeof secret, "%s/secret.db", outside);
+    CHECK(sqlsrv_port_create_file(secret) == 0);
     snprintf(link_path, sizeof link_path, "%s/hosts.db", allow);
-    CHECK(symlink("/etc/hosts", link_path) == 0);
-    CHECK(resolve(&p, "hosts.db", &out, &e) == -1 && e.status == 0x20009u);
-    CHECK(unlink(link_path) == 0);
+    if (sqlsrv_port_symlink_file(secret, link_path) == 0) {
+        CHECK(resolve(&p, "hosts.db", &out, &e) == -1 && e.status == 0x20009u);
+        CHECK(sqlsrv_port_remove_file(link_path) == 0);
+    } else {
+#if defined(_WIN32)
+        /* Creating links needs a privilege on some Windows hosts: the link checks do not run there. */
+        fprintf(stderr, "note: symbolic links are not permitted on this host; link checks skipped\n");
+#else
+        fprintf(stderr, "%s:%d: cannot create a symbolic link\n", __FILE__, __LINE__);
+        failures++;
+#endif
+    }
 
     /* A dangling symbolic link is refused as well. */
+    snprintf(target, sizeof target, "%s/no-such.db", outside);
     snprintf(link_path, sizeof link_path, "%s/dangling.db", allow);
-    CHECK(symlink("/no/such/target", link_path) == 0);
-    CHECK(resolve(&p, "dangling.db", &out, &e) == -1 && e.status == 0x20009u);
-    CHECK(unlink(link_path) == 0);
+    if (sqlsrv_port_symlink_file(target, link_path) == 0) {
+        CHECK(resolve(&p, "dangling.db", &out, &e) == -1 && e.status == 0x20009u);
+        CHECK(sqlsrv_port_remove_file(link_path) == 0);
+    }
 
     /* An embedded NUL is a bad request. */
     CHECK(sqlsrv_policy_resolve(&p, (const uint8_t *)"a\0b", 3, &out, &e) == -1 && e.status == 0x20001u);
@@ -233,9 +361,10 @@ static void test_policy(void) {
     out = NULL;
 
     sqlsrv_policy_free(&p);
-    (void)rmdir(allow);
-    (void)rmdir(outside);
-    (void)rmdir(root);
+    (void)sqlsrv_port_remove_file(secret);
+    (void)sqlsrv_port_remove_dir(allow);
+    (void)sqlsrv_port_remove_dir(outside);
+    (void)sqlsrv_port_remove_dir(root);
 }
 
 int main(void) {
@@ -244,6 +373,7 @@ int main(void) {
     test_statuses();
     test_limits();
     test_validation();
+    test_path_rules();
     test_policy();
     if (failures != 0) {
         fprintf(stderr, "%d check(s) failed\n", failures);

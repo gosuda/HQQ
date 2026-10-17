@@ -1,5 +1,3 @@
-#define _POSIX_C_SOURCE 200809L
-
 #include "sqlsrv_session.h"
 
 #include <limits.h>
@@ -7,8 +5,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
-#include <unistd.h>
 
 /* How often a waiting handler re-checks its request context (ms). */
 #define SQLSRV_POLL_MS 5L
@@ -62,11 +58,11 @@ int sqlsrv_shared_init(sqlsrv_shared *sh) {
     sh->max_sessions = 256;
     sh->shutdown_timeout_ns = INT64_C(5000000000);
     atomic_init(&sh->shutting, 0);
-    if (pthread_mutex_init(&sh->mu, NULL) != 0) {
+    if (sqlsrv_mutex_init(&sh->mu) != 0) {
         return -1;
     }
-    if (pthread_cond_init(&sh->cv, NULL) != 0) {
-        pthread_mutex_destroy(&sh->mu);
+    if (sqlsrv_cond_init(&sh->cv) != 0) {
+        sqlsrv_mutex_destroy(&sh->mu);
         return -1;
     }
     return 0;
@@ -74,18 +70,18 @@ int sqlsrv_shared_init(sqlsrv_shared *sh) {
 
 void sqlsrv_shared_destroy(sqlsrv_shared *sh) {
     sqlsrv_policy_free(&sh->policy);
-    pthread_cond_destroy(&sh->cv);
-    pthread_mutex_destroy(&sh->mu);
+    sqlsrv_cond_destroy(&sh->cv);
+    sqlsrv_mutex_destroy(&sh->mu);
 }
 
 static int reserve_session(sqlsrv_shared *sh, sqlsrv_err *e) {
     int ok = 0;
-    pthread_mutex_lock(&sh->mu);
+    sqlsrv_mutex_lock(&sh->mu);
     if (sh->open_sessions < sh->max_sessions) {
         sh->open_sessions++;
         ok = 1;
     }
-    pthread_mutex_unlock(&sh->mu);
+    sqlsrv_mutex_unlock(&sh->mu);
     if (!ok) {
         sqlsrv_errf(e, SQLSRV_STATUS_PROTO(SQLSRV_PE_LIMIT), "too many sessions (limit %u)", sh->max_sessions);
         return -1;
@@ -94,26 +90,15 @@ static int reserve_session(sqlsrv_shared *sh, sqlsrv_err *e) {
 }
 
 static void release_session(sqlsrv_shared *sh) {
-    pthread_mutex_lock(&sh->mu);
+    sqlsrv_mutex_lock(&sh->mu);
     sh->open_sessions--;
-    pthread_mutex_unlock(&sh->mu);
+    sqlsrv_mutex_unlock(&sh->mu);
 }
 
 /* ---- Helpers ----------------------------------------------------------- */
 
 static int ctx_ended(const hqq_req_ctx *ctx) {
     return hqq_req_ctx_err(ctx) != HQQ_OK;
-}
-
-static void timed_wait_ms(pthread_cond_t *cv, pthread_mutex_t *mu, long ms) {
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    ts.tv_nsec += ms * 1000000L;
-    if (ts.tv_nsec >= 1000000000L) {
-        ts.tv_sec += 1;
-        ts.tv_nsec -= 1000000000L;
-    }
-    (void)pthread_cond_timedwait(cv, mu, &ts);
 }
 
 static int fail(sqlsrv_err *e, enum sqlsrv_perr code, const char *msg) {
@@ -1136,10 +1121,10 @@ static int do_empty(sqlsrv_job *j, sqlsrv_err *e) {
 static void teardown(sqlsrv_session *s) {
     sqlite3 *db;
 
-    pthread_mutex_lock(&s->mu);
+    sqlsrv_mutex_lock(&s->mu);
     db = s->db;
     s->db = NULL;
-    pthread_mutex_unlock(&s->mu);
+    sqlsrv_mutex_unlock(&s->mu);
     if (db == NULL) {
         return;
     }
@@ -1230,7 +1215,7 @@ static int do_open(sqlsrv_session *s, const uint8_t *body, size_t len, sqlsrv_er
         return -1;
     }
     reserved = 1;
-    if ((flags & SQLSRV_OPEN_CREATE) == 0 && access(path, F_OK) != 0) {
+    if ((flags & SQLSRV_OPEN_CREATE) == 0 && sqlsrv_port_file_exists(path) == 0) {
         sqlsrv_errf(e, SQLSRV_STATUS_SQLITE(SQLITE_CANTOPEN), "unable to open database file");
         goto abort_open;
     }
@@ -1273,9 +1258,9 @@ static int do_open(sqlsrv_session *s, const uint8_t *body, size_t len, sqlsrv_er
         }
     }
 
-    pthread_mutex_lock(&s->mu);
+    sqlsrv_mutex_lock(&s->mu);
     s->db = db;
-    pthread_mutex_unlock(&s->mu);
+    sqlsrv_mutex_unlock(&s->mu);
     s->ro_active = 0;
     free(path);
     sqlsrv_buf_u16(&s->out, SQLSRV_PROTO_MAJOR);
@@ -1370,24 +1355,24 @@ static void run_job(sqlsrv_session *s, sqlsrv_job *j) {
 static void *worker_main(void *arg) {
     sqlsrv_session *s = arg;
 
-    pthread_mutex_lock(&s->mu);
+    sqlsrv_mutex_lock(&s->mu);
     for (;;) {
         if (s->job != NULL && !s->claimed) {
             sqlsrv_job *j = s->job;
             s->claimed = 1;
-            pthread_mutex_unlock(&s->mu);
+            sqlsrv_mutex_unlock(&s->mu);
             run_job(s, j);
-            pthread_mutex_lock(&s->mu);
+            sqlsrv_mutex_lock(&s->mu);
             j->done = 1;
-            pthread_cond_broadcast(&s->cv);
+            sqlsrv_cond_broadcast(&s->cv);
             continue;
         }
         if (s->stop && s->job == NULL) {
             break;
         }
-        pthread_cond_wait(&s->cv, &s->mu);
+        sqlsrv_cond_wait(&s->cv, &s->mu);
     }
-    pthread_mutex_unlock(&s->mu);
+    sqlsrv_mutex_unlock(&s->mu);
     return NULL;
 }
 
@@ -1402,18 +1387,18 @@ sqlsrv_session *sqlsrv_sess_new(sqlsrv_shared *sh, hqq_stream *st, uint64_t id, 
     s->owner = owner;
     s->next_stmt = 1;
     s->next_cursor = 1;
-    if (pthread_mutex_init(&s->mu, NULL) != 0) {
+    if (sqlsrv_mutex_init(&s->mu) != 0) {
         free(s);
         return NULL;
     }
-    if (pthread_cond_init(&s->cv, NULL) != 0) {
-        pthread_mutex_destroy(&s->mu);
+    if (sqlsrv_cond_init(&s->cv) != 0) {
+        sqlsrv_mutex_destroy(&s->mu);
         free(s);
         return NULL;
     }
-    if (pthread_create(&s->worker, NULL, worker_main, s) != 0) {
-        pthread_cond_destroy(&s->cv);
-        pthread_mutex_destroy(&s->mu);
+    if (sqlsrv_thread_create(&s->worker, worker_main, s) != 0) {
+        sqlsrv_cond_destroy(&s->cv);
+        sqlsrv_mutex_destroy(&s->mu);
         free(s);
         return NULL;
     }
@@ -1421,46 +1406,46 @@ sqlsrv_session *sqlsrv_sess_new(sqlsrv_shared *sh, hqq_stream *st, uint64_t id, 
 }
 
 void sqlsrv_sess_stop(sqlsrv_session *s) {
-    pthread_mutex_lock(&s->mu);
+    sqlsrv_mutex_lock(&s->mu);
     s->stop = 1;
     if (s->db != NULL) {
         /* Ends a running request; a request that starts later sees the stop flag. */
         sqlite3_interrupt(s->db);
     }
-    pthread_cond_broadcast(&s->cv);
-    pthread_mutex_unlock(&s->mu);
-    (void)pthread_join(s->worker, NULL);
+    sqlsrv_cond_broadcast(&s->cv);
+    sqlsrv_mutex_unlock(&s->mu);
+    sqlsrv_thread_join(s->worker);
     teardown(s);
 }
 
 void sqlsrv_sess_wait_refs(sqlsrv_session *s) {
-    pthread_mutex_lock(&s->mu);
+    sqlsrv_mutex_lock(&s->mu);
     while (s->refs > 0) {
-        pthread_cond_wait(&s->cv, &s->mu);
+        sqlsrv_cond_wait(&s->cv, &s->mu);
     }
-    pthread_mutex_unlock(&s->mu);
+    sqlsrv_mutex_unlock(&s->mu);
 }
 
 void sqlsrv_sess_free(sqlsrv_session *s) {
     sqlsrv_buf_free(&s->out);
-    pthread_cond_destroy(&s->cv);
-    pthread_mutex_destroy(&s->mu);
+    sqlsrv_cond_destroy(&s->cv);
+    sqlsrv_mutex_destroy(&s->mu);
     free(s);
 }
 
 void sqlsrv_sess_ref(sqlsrv_session *s) {
-    pthread_mutex_lock(&s->mu);
+    sqlsrv_mutex_lock(&s->mu);
     s->refs++;
-    pthread_mutex_unlock(&s->mu);
+    sqlsrv_mutex_unlock(&s->mu);
 }
 
 void sqlsrv_sess_unref(sqlsrv_session *s) {
-    pthread_mutex_lock(&s->mu);
+    sqlsrv_mutex_lock(&s->mu);
     s->refs--;
     if (s->refs == 0) {
-        pthread_cond_broadcast(&s->cv);
+        sqlsrv_cond_broadcast(&s->cv);
     }
-    pthread_mutex_unlock(&s->mu);
+    sqlsrv_mutex_unlock(&s->mu);
 }
 
 static void send_error(hqq_response *w, const sqlsrv_err *err) {
@@ -1478,17 +1463,17 @@ void sqlsrv_sess_request(sqlsrv_session *s, hqq_req_ctx *ctx, hqq_response *w, u
     j.len = len;
     j.ctx = ctx;
 
-    pthread_mutex_lock(&s->mu);
+    sqlsrv_mutex_lock(&s->mu);
     /* One request at a time: a pipelined request waits for the previous one to be answered. */
     while (s->job != NULL && !s->stop && !ctx_ended(ctx)) {
-        timed_wait_ms(&s->cv, &s->mu, SQLSRV_POLL_MS);
+        sqlsrv_cond_timedwait_ms(&s->cv, &s->mu, SQLSRV_POLL_MS);
     }
     if (ctx_ended(ctx)) {
-        pthread_mutex_unlock(&s->mu);
+        sqlsrv_mutex_unlock(&s->mu);
         return;
     }
     if (s->stop) {
-        pthread_mutex_unlock(&s->mu);
+        sqlsrv_mutex_unlock(&s->mu);
         sqlsrv_err pe;
         sqlsrv_err_proto(&pe, SQLSRV_PE_NO_SESSION, "no session on this stream");
         send_error(w, &pe);
@@ -1496,16 +1481,16 @@ void sqlsrv_sess_request(sqlsrv_session *s, hqq_req_ctx *ctx, hqq_response *w, u
     }
     s->job = &j;
     s->claimed = 0;
-    pthread_cond_broadcast(&s->cv);
+    sqlsrv_cond_broadcast(&s->cv);
     while (!j.done) {
-        timed_wait_ms(&s->cv, &s->mu, SQLSRV_POLL_MS);
+        sqlsrv_cond_timedwait_ms(&s->cv, &s->mu, SQLSRV_POLL_MS);
         /* Re-interrupt until the statement stops: a lost interrupt cannot run the request to its end. */
         if (!j.done && s->db != NULL && ctx_ended(ctx)) {
             sqlite3_interrupt(s->db);
         }
     }
     /* The job is still ours until it is cleared below, so the worker stays idle. */
-    pthread_mutex_unlock(&s->mu);
+    sqlsrv_mutex_unlock(&s->mu);
 
     canceled = ctx_ended(ctx);
     if (!canceled) {
@@ -1516,12 +1501,12 @@ void sqlsrv_sess_request(sqlsrv_session *s, hqq_req_ctx *ctx, hqq_response *w, u
         }
     }
 
-    pthread_mutex_lock(&s->mu);
+    sqlsrv_mutex_lock(&s->mu);
     s->job = NULL;
     s->claimed = 0;
     if (s->out.cap > SQLSRV_OUT_KEEP_BYTES) {
         sqlsrv_buf_free(&s->out);
     }
-    pthread_cond_broadcast(&s->cv);
-    pthread_mutex_unlock(&s->mu);
+    sqlsrv_cond_broadcast(&s->cv);
+    sqlsrv_mutex_unlock(&s->mu);
 }

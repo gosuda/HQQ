@@ -33,7 +33,7 @@ A complete example, with every setting spelled out:
     {
       "name": "echo",
       "command": "/usr/local/bin/hqq-echo",
-      "sha256": "<64 hex digits>",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
       "args": ["--listener", "echo", "--verbose"],
       "env": {"HQQ_LOG": "info"},
       "dir": "/var/lib/echo",
@@ -68,13 +68,15 @@ A complete example, with every setting spelled out:
       "name": "worker",
       "command": "/usr/local/bin/hqq-worker",
       "parent_pipe": true,
-      "manifest": {"file": "/var/lib/hqq/dist/manifest.json", "signature": "/var/lib/hqq/dist/manifest.json.sig", "public_key": "<64 hex digits>"},
+      "manifest": {"file": "/var/lib/hqq/dist/manifest.json", "signature": "/var/lib/hqq/dist/manifest.json.sig", "public_key": "0000000000000000000000000000000000000000000000000000000000000000"},
       "restart": {"policy": "always"},
       "output": {"mode": "prefix"}
     }
   ]
 }
 ```
+
+The two 64-digit zero values are placeholders, and `hqqd check` accepts the example as written. Before use, replace the `sha256` of `echo` with the SHA-256 of its `command` (`hqq-manifest hash FILE` prints it), and the `public_key` of `worker` with the hex text of the release public key.
 
 ### Top level
 

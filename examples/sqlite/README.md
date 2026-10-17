@@ -1,7 +1,7 @@
 # SQLite service: C server
 
 This directory holds the C server of the SQLite service, [`server/`](server/README.md)
-(`hqq-sqlite-server`, POSIX only). The Go driver, the protocol, and the tests live in
+(`hqq-sqlite-server`; POSIX and Windows). The Go driver, the protocol, and the tests live in
 [`../../sqlite`](../../sqlite/README.md) (`gosuda.org/hqq/sqlite`). The wire protocol is in
 [`../../sqlite/PROTOCOL.md`](../../sqlite/PROTOCOL.md).
 

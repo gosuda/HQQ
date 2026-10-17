@@ -13,9 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strings"
-	"syscall"
 	"testing"
 	"time"
 
@@ -159,9 +157,6 @@ func TestWrongHashRefused(t *testing.T) {
 // close, so the server reads end of file on its lifeline and must exit on its
 // own.
 func TestParentKilledServerExits(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("signal 0 probing is POSIX-only")
-	}
 	bin, _ := serverBinary(t)
 	dir := t.TempDir()
 	exe, err := os.Executable()
@@ -189,11 +184,7 @@ func TestParentKilledServerExits(t *testing.T) {
 	if _, err := fmt.Sscanf(strings.TrimSpace(line), "pid %d listener %s", &pid, &listener); err != nil {
 		t.Fatalf("helper line %q: %v", line, err)
 	}
-	server, err := os.FindProcess(pid)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := server.Signal(syscall.Signal(0)); err != nil {
+	if err := probeProcess(pid); err != nil {
 		t.Fatalf("server %d not running: %v", pid, err)
 	}
 
@@ -216,7 +207,7 @@ func TestParentKilledServerExits(t *testing.T) {
 	_ = helper.Wait()
 
 	deadline := time.Now().Add(10 * time.Second)
-	for server.Signal(syscall.Signal(0)) == nil {
+	for probeProcess(pid) == nil {
 		if time.Now().After(deadline) {
 			t.Fatalf("server %d still running 10s after its parent was killed", pid)
 		}

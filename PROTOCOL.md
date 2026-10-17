@@ -177,3 +177,7 @@ All public errors support `errors.Is` against the sentinel itself and against th
 | `ResponseError` (`errors.As`) | — | `Stream.Call` returns it by value when the peer's handler answered with `ResponseWriter.WriteError`. Carries `Status` and a copy of the payload. |
 
 `ErrorCode` values carried in `OpError`, tombstones, and error statuses: `0x01` memory alignment, `0x02` invalid size, `0x03` memory too small, `0x04` failed init, `0x05` connection not found, `0x06` invalid operation, `0x07` buffer overflow, `0x08` shutting down (Advanced 1.1). Each maps back to the base error above.
+
+## Application Protocols
+
+Services built on the Advanced Protocol define their own protocols over its streams and request-response messages. This document covers only the HQQ layer. The SQLite service protocol, version 1.0, which has its own version number, is in [`sqlite/PROTOCOL.md`](sqlite/PROTOCOL.md): each `database/sql` connection is one stream, and each request gets one response.

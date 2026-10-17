@@ -1,16 +1,11 @@
-#define _POSIX_C_SOURCE 200809L
-
 #include "sqlsrv_policy.h"
 
-#include <errno.h>
-#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
-#include <unistd.h>
 
-#include <sqlite3.h>
+#include "sqlsrv_pathrules.h"
+#include "sqlsrv_port.h"
 
 void sqlsrv_policy_init(sqlsrv_policy *p) {
     memset(p, 0, sizeof *p);
@@ -34,56 +29,61 @@ static void set_err(char *err, size_t cap, const char *msg) {
 }
 
 /*
- * Canonical absolute form of cand. An existing file is resolved with
- * realpath(). A missing file keeps its final name, and its parent must exist
- * (the parent is canonicalized). A dangling symbolic link is refused.
+ * Canonical absolute form of cand. An existing path is resolved by the
+ * platform (symbolic links followed). A missing file keeps its final name, and
+ * its parent must exist (the parent is canonicalized). A dangling symbolic link
+ * is refused.
  */
 static int canon_path(const char *cand, char **out, sqlsrv_err *e) {
-    char *real = realpath(cand, NULL);
-    const char *slash;
-    char *parent;
-    char *rp;
-    char *full;
-    size_t plen;
+    sqlsrv_path_style style = sqlsrv_path_host_style();
+    int missing = 0;
+    int parent_missing = 0;
+    size_t dlen = 0;
+    size_t leaf_at = 0;
     size_t rl;
     size_t bl;
     size_t need_sep;
-    struct stat sb;
+    char *parent;
+    char *rp = NULL;
+    char *full;
+    const char *leaf;
 
-    if (real != NULL) {
-        *out = real;
+    if (sqlsrv_port_realpath(cand, out, &missing) == 0) {
         return 0;
     }
-    if (errno != ENOENT && errno != ENOTDIR) {
+    if (!missing) {
         sqlsrv_err_proto(e, SQLSRV_PE_FORBIDDEN, "database path cannot be resolved");
         return -1;
     }
-    if (lstat(cand, &sb) == 0) {
+    if (sqlsrv_port_entry_exists(cand)) {
         sqlsrv_err_proto(e, SQLSRV_PE_FORBIDDEN, "database path is a dangling symbolic link");
         return -1;
     }
-    slash = strrchr(cand, '/');
-    if (slash == NULL || slash[1] == '\0' || strcmp(slash + 1, ".") == 0 || strcmp(slash + 1, "..") == 0) {
+    if (sqlsrv_path_split(cand, style, &dlen, &leaf_at) != 0) {
         sqlsrv_err_proto(e, SQLSRV_PE_FORBIDDEN, "invalid database path");
         return -1;
     }
-    plen = slash == cand ? 1 : (size_t)(slash - cand);
-    parent = malloc(plen + 1);
+    leaf = cand + leaf_at;
+    if (leaf[0] == '\0' || strcmp(leaf, ".") == 0 || strcmp(leaf, "..") == 0) {
+        sqlsrv_err_proto(e, SQLSRV_PE_FORBIDDEN, "invalid database path");
+        return -1;
+    }
+    parent = malloc(dlen + 1);
     if (parent == NULL) {
         sqlsrv_err_proto(e, SQLSRV_PE_INTERNAL, "out of memory");
         return -1;
     }
-    memcpy(parent, cand, plen);
-    parent[plen] = '\0';
-    rp = realpath(parent, NULL);
-    free(parent);
-    if (rp == NULL) {
+    memcpy(parent, cand, dlen);
+    parent[dlen] = '\0';
+    if (sqlsrv_port_realpath(parent, &rp, &parent_missing) != 0) {
+        free(parent);
         sqlsrv_errf(e, SQLSRV_STATUS_SQLITE(14), "unable to open database file");
         return -1;
     }
+    free(parent);
     rl = strlen(rp);
-    bl = strlen(slash + 1);
-    need_sep = rp[rl - 1] == '/' ? 0 : 1;
+    bl = strlen(leaf);
+    need_sep = rl > 0 && sqlsrv_path_is_sep((unsigned char)rp[rl - 1], style) ? 0 : 1;
     full = malloc(rl + need_sep + bl + 1);
     if (full == NULL) {
         free(rp);
@@ -92,20 +92,23 @@ static int canon_path(const char *cand, char **out, sqlsrv_err *e) {
     }
     memcpy(full, rp, rl);
     if (need_sep) {
-        full[rl] = '/';
+        full[rl] = sqlsrv_path_sep(style);
     }
-    memcpy(full + rl + need_sep, slash + 1, bl + 1);
+    memcpy(full + rl + need_sep, leaf, bl + 1);
     free(rp);
     *out = full;
     return 0;
 }
 
 int sqlsrv_policy_add_alias(sqlsrv_policy *p, const char *name, const char *path, char *err, size_t errcap) {
+    sqlsrv_path_style style = sqlsrv_path_host_style();
+    sqlsrv_path_kind kind;
     char *cand = NULL;
     char *canon = NULL;
     sqlsrv_err e;
     size_t i;
     size_t nlen = strlen(name);
+    size_t plen = strlen(path);
 
     if (nlen == 0 || nlen > SQLSRV_MAX_PATH_BYTES || strchr(name, '=') != NULL) {
         set_err(err, errcap, "alias name must be non-empty and must not contain '='");
@@ -117,22 +120,21 @@ int sqlsrv_policy_add_alias(sqlsrv_policy *p, const char *name, const char *path
             return -1;
         }
     }
-    if (path[0] == '/') {
-        cand = strdup(path);
-    } else {
-        char cwd[PATH_MAX];
-        if (getcwd(cwd, sizeof cwd) == NULL) {
+    /* An alias is written by the operator: absolute or relative to the working directory. */
+    kind = sqlsrv_path_classify((const uint8_t *)path, plen, style);
+    if (kind == SQLSRV_PATHK_ABSOLUTE) {
+        cand = sqlsrv_path_join(NULL, (const uint8_t *)path, plen, style);
+    } else if (kind == SQLSRV_PATHK_RELATIVE) {
+        char *cwd = sqlsrv_port_getcwd();
+        if (cwd == NULL) {
             set_err(err, errcap, "cannot read the working directory");
             return -1;
         }
-        size_t cl = strlen(cwd);
-        size_t pl = strlen(path);
-        cand = malloc(cl + 1 + pl + 1);
-        if (cand != NULL) {
-            memcpy(cand, cwd, cl);
-            cand[cl] = '/';
-            memcpy(cand + cl + 1, path, pl + 1);
-        }
+        cand = sqlsrv_path_join(cwd, (const uint8_t *)path, plen, style);
+        free(cwd);
+    } else {
+        set_err(err, errcap, "alias path must be absolute or relative (no UNC, device or drive-relative paths)");
+        return -1;
     }
     if (cand == NULL) {
         set_err(err, errcap, "out of memory");
@@ -155,7 +157,7 @@ int sqlsrv_policy_add_alias(sqlsrv_policy *p, const char *name, const char *path
         p->aliases = na;
         p->capaliases = cap;
     }
-    p->aliases[p->naliases].name = strdup(name);
+    p->aliases[p->naliases].name = sqlsrv_port_strdup(name);
     p->aliases[p->naliases].path = canon;
     if (p->aliases[p->naliases].name == NULL) {
         free(canon);
@@ -167,51 +169,41 @@ int sqlsrv_policy_add_alias(sqlsrv_policy *p, const char *name, const char *path
 }
 
 int sqlsrv_policy_set_allow_dir(sqlsrv_policy *p, const char *dir, char *err, size_t errcap) {
-    char *real = realpath(dir, NULL);
-    struct stat sb;
-    size_t rl;
+    char *real = NULL;
     char *prefix;
+    int missing = 0;
 
-    if (real == NULL) {
+    if (sqlsrv_port_realpath(dir, &real, &missing) != 0) {
         set_err(err, errcap, "--allow-dir does not exist");
         return -1;
     }
-    if (stat(real, &sb) != 0 || !S_ISDIR(sb.st_mode)) {
+    if (!sqlsrv_port_is_directory(real)) {
         free(real);
         set_err(err, errcap, "--allow-dir is not a directory");
         return -1;
     }
-    rl = strlen(real);
-    prefix = malloc(rl + 2);
+    prefix = sqlsrv_path_dir_prefix(real, sqlsrv_path_host_style());
+    free(real);
     if (prefix == NULL) {
-        free(real);
         set_err(err, errcap, "out of memory");
         return -1;
     }
-    memcpy(prefix, real, rl);
-    if (rl == 0 || real[rl - 1] != '/') {
-        prefix[rl] = '/';
-        prefix[rl + 1] = '\0';
-    } else {
-        prefix[rl] = '\0';
-    }
-    free(real);
     free(p->allow_prefix);
     p->allow_prefix = prefix;
     return 0;
 }
 
 int sqlsrv_policy_resolve(const sqlsrv_policy *p, const uint8_t *db, size_t n, char **out, sqlsrv_err *e) {
+    sqlsrv_path_style style = sqlsrv_path_host_style();
     size_t i;
+    const char *why;
     char *cand;
     char *canon = NULL;
-    size_t plen;
-    size_t cl;
 
     for (i = 0; i < p->naliases; i++) {
         const char *name = p->aliases[i].name;
         if (strlen(name) == n && memcmp(name, db, n) == 0) {
-            *out = strdup(p->aliases[i].path);
+            *out = sqlsrv_port_strdup(p->aliases[i].path);
             if (*out == NULL) {
                 sqlsrv_err_proto(e, SQLSRV_PE_INTERNAL, "out of memory");
                 return -1;
@@ -227,32 +219,13 @@ int sqlsrv_policy_resolve(const sqlsrv_policy *p, const uint8_t *db, size_t n, c
         sqlsrv_err_proto(e, SQLSRV_PE_FORBIDDEN, "database is not an alias and raw paths are disabled");
         return -1;
     }
-    /* Traversal is refused by name, so it does not depend on which parts exist. */
-    for (i = 0; i + 1 < n; i++) {
-        int starts = i == 0 || db[i - 1] == '/';
-        int ends = i + 2 == n || db[i + 2] == '/';
-        if (starts && ends && db[i] == '.' && db[i + 1] == '.') {
-            sqlsrv_err_proto(e, SQLSRV_PE_FORBIDDEN, "database path must not contain '..'");
-            return -1;
-        }
+    /* Refused by name (traversal, device names, drives), so it does not depend on which parts exist. */
+    why = sqlsrv_path_check_raw(db, n, style);
+    if (why != NULL) {
+        sqlsrv_err_proto(e, SQLSRV_PE_FORBIDDEN, why);
+        return -1;
     }
-    plen = strlen(p->allow_prefix);
-    if (n > 0 && db[0] == '/') {
-        cand = malloc(n + 1);
-        if (cand != NULL) {
-            memcpy(cand, db, n);
-            cand[n] = '\0';
-        }
-    } else {
-        cand = malloc(plen + n + 1);
-        if (cand != NULL) {
-            memcpy(cand, p->allow_prefix, plen);
-            if (n > 0) {
-                memcpy(cand + plen, db, n);
-            }
-            cand[plen + n] = '\0';
-        }
-    }
+    cand = sqlsrv_path_join(p->allow_prefix, db, n, style);
     if (cand == NULL) {
         sqlsrv_err_proto(e, SQLSRV_PE_INTERNAL, "out of memory");
         return -1;
@@ -262,9 +235,8 @@ int sqlsrv_policy_resolve(const sqlsrv_policy *p, const uint8_t *db, size_t n, c
         return -1;
     }
     free(cand);
-    cl = strlen(canon);
     /* Containment: the canonical path must lie strictly inside the allow directory. */
-    if (cl <= plen || strncmp(canon, p->allow_prefix, plen) != 0) {
+    if (!sqlsrv_path_inside(canon, p->allow_prefix, style)) {
         free(canon);
         sqlsrv_err_proto(e, SQLSRV_PE_FORBIDDEN, "database path is outside the allowed directory");
         return -1;
