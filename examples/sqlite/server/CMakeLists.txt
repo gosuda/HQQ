@@ -1,4 +1,4 @@
-# hqq-sqlite-server: the C server of examples/sqlite (PROTOCOL.md).
+# hqq-sqlite-server: the C server of the SQLite service (sqlite/PROTOCOL.md).
 #
 # Added by libhqq's c/CMakeLists.txt behind HQQ_BUILD_SQLITE_SERVER (default
 # OFF), which needs the hqq::hqq target:

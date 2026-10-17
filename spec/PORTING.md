@@ -1,6 +1,6 @@
 # Porting HQQ to a new language
 
-A step-by-step guide for writing a second (third, ...) implementation of the HQQ shared-memory protocol from [SPEC.md](SPEC.md), [MEMORY_MODEL.md](MEMORY_MODEL.md) and [constants.json](constants.json). Targets: C (the reference library `libhqq`), Rust, Zig, C++, and anything that can map shared memory and use lock-free 64-bit atomics.
+A step-by-step guide for writing a second (third, ...) implementation of the HQQ shared-memory protocol from [SPEC.md](SPEC.md), [MEMORY_MODEL.md](MEMORY_MODEL.md) and [constants.json](constants.json). Targets: C (the reference library `libhqq`), Rust, C++, and anything that can map shared memory and use lock-free 64-bit atomics.
 
 Rule zero: **the bytes in shared memory and the order of the atomic accesses are the contract; everything else (API, threading, allocation, error types) is yours.** Do not translate the Go API. Translate SPEC sections 2, 3, 5, 6, 7, 8, 9 and, if you want Advanced, 10.
 
@@ -29,7 +29,7 @@ Simple mode = **spin, then sleep with exponential backoff, never park**. It is a
 
 ## 2. Step-by-step
 
-1. **Pin the constants.** Generate a header/module from `constants.json` (offsets, magics, opcodes, flags, codes, timings). Add compile-time assertions (`_Static_assert(offsetof(...))`, `const _: () = assert!(...)`, `comptime`) for every offset and size, `sizeof(packet) == 64`, ring header 512, slot stride 128, superblock size 384. Add the platform guards of MEMORY_MODEL 6 and 7 (lock-free `u64`, little-endian).
+1. **Pin the constants.** Generate a header/module from `constants.json` (offsets, magics, opcodes, flags, codes, timings). Add compile-time assertions (`_Static_assert(offsetof(...))`, `const _: () = assert!(...)`) for every offset and size, `sizeof(packet) == 64`, ring header 512, slot stride 128, superblock size 384. Add the platform guards of MEMORY_MODEL 6 and 7 (lock-free `u64`, little-endian).
 2. **Map the segment.** Named object per SPEC 11 (Linux: open `/dev/shm/<name>` with `O_NOFOLLOW|O_CLOEXEC`, `fstat` must be a regular file, check `st_size >= total` **before** mapping, `mmap(MAP_SHARED)`; macOS/FreeBSD: `shm_open("/<name>")`, 30-byte names; Windows: `OpenFileMapping` + four semaphores). Verify the base is page-aligned.
 3. **Compute regions** with the formula of SPEC 2.1 using the *runtime* page size (do not hard-code 4096). Check against the golden vectors for 4 KiB/16 KiB/64 KiB in a unit test.
 4. **Read the superblock** (atomic loads, SC for simplicity). Implement `claim` for the *Opener* role first: `Ready` branch only (check layout, liveness at open, geometry, `cas(endpoints[1].token, 0, token)`), plus the transient failures for `Empty`/`Initializing`. Add the *Creator* branches (L2) later.
@@ -46,27 +46,27 @@ Simple mode = **spin, then sleep with exponential backoff, never park**. It is a
 
 SC = seq_cst, ACQ = acquire, REL = release, AR = acq_rel, RLX = relaxed. The *required minimums* are in MEMORY_MODEL 2; this is how to spell them. **When in doubt use SC; it is never wrong.**
 
-| Operation (SPEC reference) | C11 `<stdatomic.h>` | C++ `std::atomic` | Rust `Ordering` | Zig `AtomicOrder` |
-| --- | --- | --- | --- | --- |
-| producer/consumer claim: load `seq` (7.4) | `memory_order_acquire` | `memory_order_acquire` | `Acquire` | `.acquire` |
-| publish / release: store `seq` (K1) | `memory_order_seq_cst` | `memory_order_seq_cst` | `SeqCst` | `.seq_cst` |
-| waker: load `*Waiters` (K2) | `memory_order_seq_cst` | `memory_order_seq_cst` | `SeqCst` | `.seq_cst` |
-| waker: `fetch_add` wake word (K3) | `memory_order_release` (SC fine) | `memory_order_release` | `Release` | `.release` |
-| waiter: `fetch_add(+1)` count (W1) | `memory_order_seq_cst` | `memory_order_seq_cst` | `SeqCst` | `.seq_cst` |
-| waiter: load wake word (W2) | `memory_order_acquire` or SC | `memory_order_acquire` | `Acquire` | `.acquire` |
-| waiter: re-check load `seq` (W3) | `memory_order_seq_cst` | `memory_order_seq_cst` | `SeqCst` | `.seq_cst` |
-| waiter: `fetch_sub(1)` count (W4) | `memory_order_release` or RLX | same | `Release` | `.release` |
-| cursor `w`/`r` load / CAS / store | `memory_order_relaxed` | `memory_order_relaxed` | `Relaxed` | `.monotonic` |
-| ring header fields | store RLX; `flag` store **release** last; loads `magic`/`flag` **acquire** first | same | same | same |
-| superblock cold words | `memory_order_seq_cst` | `memory_order_seq_cst` | `SeqCst` | `.seq_cst` |
-| `state` store `Ready` | `memory_order_release` (SC fine) | same | `Release` | `.release` |
-| `state`/token load before using other words | `memory_order_acquire` | same | `Acquire` | `.acquire` |
-| `initToken`/token/state CAS | `atomic_compare_exchange_strong_explicit(..., acq_rel, acquire)` | `compare_exchange_strong(..., acq_rel, acquire)` | `compare_exchange(.., AcqRel, Acquire)` | `@cmpxchgStrong(..., .acq_rel, .acquire)` |
-| heartbeat, `pid`, `interval`, `initHeartbeat` | `memory_order_relaxed` | same | `Relaxed` | `.monotonic` |
-| payload / packet | plain `memcpy` | plain `memcpy` | raw pointer `copy_nonoverlapping` | `@memcpy` |
-| fence-based equivalent of K1/K2 and W1/W3 | `atomic_thread_fence(memory_order_seq_cst)` between the two | `std::atomic_thread_fence` | `core::sync::atomic::fence(SeqCst)` | `@fence(.seq_cst)` (older Zig) or SC accesses |
-| 64-bit wrap arithmetic | `uint64_t` (unsigned wrap is defined) | `std::uint64_t` | `wrapping_add`, `wrapping_sub` | `+%`, `-%` |
-| signed difference | `(int64_t)(seq - pos)` | `std::int64_t(seq - pos)` | `seq.wrapping_sub(pos) as i64` | `@as(i64, @bitCast(seq -% pos))` |
+| Operation (SPEC reference) | C11 `<stdatomic.h>` | C++ `std::atomic` | Rust `Ordering` |
+| --- | --- | --- | --- |
+| producer/consumer claim: load `seq` (7.4) | `memory_order_acquire` | `memory_order_acquire` | `Acquire` |
+| publish / release: store `seq` (K1) | `memory_order_seq_cst` | `memory_order_seq_cst` | `SeqCst` |
+| waker: load `*Waiters` (K2) | `memory_order_seq_cst` | `memory_order_seq_cst` | `SeqCst` |
+| waker: `fetch_add` wake word (K3) | `memory_order_release` (SC fine) | `memory_order_release` | `Release` |
+| waiter: `fetch_add(+1)` count (W1) | `memory_order_seq_cst` | `memory_order_seq_cst` | `SeqCst` |
+| waiter: load wake word (W2) | `memory_order_acquire` or SC | `memory_order_acquire` | `Acquire` |
+| waiter: re-check load `seq` (W3) | `memory_order_seq_cst` | `memory_order_seq_cst` | `SeqCst` |
+| waiter: `fetch_sub(1)` count (W4) | `memory_order_release` or RLX | same | `Release` |
+| cursor `w`/`r` load / CAS / store | `memory_order_relaxed` | `memory_order_relaxed` | `Relaxed` |
+| ring header fields | store RLX; `flag` store **release** last; loads `magic`/`flag` **acquire** first | same | same |
+| superblock cold words | `memory_order_seq_cst` | `memory_order_seq_cst` | `SeqCst` |
+| `state` store `Ready` | `memory_order_release` (SC fine) | same | `Release` |
+| `state`/token load before using other words | `memory_order_acquire` | same | `Acquire` |
+| `initToken`/token/state CAS | `atomic_compare_exchange_strong_explicit(..., acq_rel, acquire)` | `compare_exchange_strong(..., acq_rel, acquire)` | `compare_exchange(.., AcqRel, Acquire)` |
+| heartbeat, `pid`, `interval`, `initHeartbeat` | `memory_order_relaxed` | same | `Relaxed` |
+| payload / packet | plain `memcpy` | plain `memcpy` | raw pointer `copy_nonoverlapping` |
+| fence-based equivalent of K1/K2 and W1/W3 | `atomic_thread_fence(memory_order_seq_cst)` between the two | `std::atomic_thread_fence` | `core::sync::atomic::fence(SeqCst)` |
+| 64-bit wrap arithmetic | `uint64_t` (unsigned wrap is defined) | `std::uint64_t` | `wrapping_add`, `wrapping_sub` |
+| signed difference | `(int64_t)(seq - pos)` | `std::int64_t(seq - pos)` | `seq.wrapping_sub(pos) as i64` |
 
 ### 3.1 C11 reference snippets (compiled with `cc -std=c11 -Wall`)
 
@@ -193,20 +193,6 @@ static_assert(sizeof(Slot) == 128 && offsetof(Slot, packet) == 8);
 // publish: s->seq.store(pos + 1, std::memory_order_seq_cst); if (h->empty_waiters.load(std::memory_order_seq_cst)) {...}
 ```
 
-### 3.4 Zig (**not compiled**: no Zig toolchain was available; treat as a sketch)
-
-```zig
-// publish (K1..K3)
-@atomicStore(u64, &slot.seq, pos +% 1, .seq_cst);
-if (@atomicLoad(u32, &hdr.empty_waiters, .seq_cst) != 0) {
-    _ = @atomicRmw(u32, &hdr.not_empty, .Add, 1, .seq_cst);
-    // futex wake all
-}
-// claim: const d = @as(i64, @bitCast(@atomicLoad(u64, &slot.seq, .acquire) -% pos));
-comptime { std.debug.assert(@sizeOf(Slot) == 128 and @offsetOf(Slot, "packet") == 8); }
-// Use extern struct with explicit padding; std.atomic.Value(u64) is also fine.
-```
-
 ## 4. Pitfalls
 
 ### 4.1 Memory model and layout
@@ -218,7 +204,7 @@ comptime { std.debug.assert(@sizeOf(Slot) == 128 and @offsetOf(Slot, "packet") =
 5. **Taking the slot index from packet operand 1** instead of the position.
 6. **Plain-aligned structs**: i386 aligns `uint64_t` members to 4 bytes; use explicit offsets or `alignas(8)`. Never rely on `sizeof` of a C struct you did not assert.
 7. **Reading `r`/`w` once at attach and caching them forever** in a process that may share the side with another thread — or, in SPSC mode, *not storing* them. Keep the shared cursors canonical (SPEC 7.6).
-8. **Wrong wraparound arithmetic**: signed overflow in C is undefined; subtract in `uint64_t`, then cast to `int64_t`. In Rust use `wrapping_*`; in Zig use `+%`/`-%` (debug builds trap on plain `+`).
+8. **Wrong wraparound arithmetic**: signed overflow in C is undefined; subtract in `uint64_t`, then cast to `int64_t`. In Rust use `wrapping_*`.
 9. **Treating the 64-byte packet as 8-aligned to 64**: it sits at slot offset 8; use `memcpy` of 64 bytes.
 10. **Copying `seq` along with the packet** (copy exactly the packet).
 11. **Holding a view of a payload buffer after release.**

@@ -1,4 +1,4 @@
-# libhqq bindings: C++, Rust, Zig
+# libhqq bindings: C++, Rust
 
 Language bindings for the C reference library [`c/`](../c) (`libhqq`). Each binding
 wraps the three layers of the C API (Standard link, Advanced layer, acceptor and
@@ -11,10 +11,9 @@ Toolchain requirements, CI pins and the C API requests are in
 | --- | --- | --- | --- |
 | C++17 | [`cpp/`](cpp) | header-only `include/hqq/hqq.hpp`, CMake target `hqq::cpp` | tests, examples and interop verified (Apple clang, CMake 4.3) |
 | Rust | [`rust/`](rust) | Cargo workspace: `hqq-sys` (raw FFI), `hqq` (safe API), `hqq-interop` | tests, examples and interop verified (cargo 1.96); Windows builds the C library with clang-cl |
-| Zig | [`zig/`](zig) | `build.zig`, module `hqq`, examples, `hqq-interop` | **unverified, non-blocking in CI**: Zig is not installed on the host; written for Zig 0.15.2; CI runs Linux only. The first CI run failed (see Zig below) |
 
 None of the bindings needs network access to build: the C library is compiled from
-`c/` in each build (CMake `add_subdirectory`, Cargo `build.rs`, `build.zig`).
+`c/` in each build (CMake `add_subdirectory`, Cargo `build.rs`).
 
 ## Layout
 
@@ -35,11 +34,6 @@ bindings/
     hqq/                    safe API: Link, AdvLink, Stream, Message, Acceptor, Error
     hqq/tests/              integration tests; hqq/examples/ echo.rs and rpc.rs
     hqq-interop/            hqq-interop helper (contract)
-  zig/
-    build.zig               builds libhqq from c/, module hqq, examples, hqq-interop
-    src/hqq.zig             wrapper and unit tests
-    examples/               echo.zig, rpc.zig
-    interop/hqq_interop.zig hqq-interop helper (contract, unverified; CI run pending)
 ```
 
 ## Build and test
@@ -65,20 +59,6 @@ cargo run -p hqq --example rpc -- --selftest
 cargo build --release -p hqq-interop      # target/release/hqq-interop
 ```
 
-Zig's CI job runs on Linux only, with `continue-on-error: true` (see `.github/workflows/bindings.yml`)
-until a CI run confirms it. The macOS job was removed: Zig 0.15.2 cannot link its build runner
-against the Xcode 26.x SDK of macOS 26 (ziglang/zig#31669), and pointing `DEVELOPER_DIR` at the
-Command Line Tools SDK did not fix it in CI.
-
-Zig 0.15.2 (unverified here):
-
-```sh
-cd bindings/zig
-zig build
-zig build test
-zig build run-echo -- --create NAME       # or --open NAME, see examples/echo.zig
-```
-
 Interop with the Go implementation (run from the repository root, after building the
 helpers; the paths are absolute or relative to the module root):
 
@@ -92,7 +72,7 @@ The matrix runs every scenario that both helpers list, in both role directions.
 
 ## API at a glance
 
-The three bindings use the same concepts. Names follow each language.
+The C++ and Rust bindings use the same concepts, shown next to the C API. Names follow each language.
 
 | Concept | C | C++ (`hqq::`) | Rust (`hqq::`) |
 | --- | --- | --- | --- |
@@ -109,9 +89,8 @@ The three bindings use the same concepts. Names follow each language.
 | errors | `hqq_status` | `Status` (`std::error_code`), `Result<T>` | `Error` (one variant per status), `Result<T>` |
 
 Ownership: C++ and Rust release every handle in the destructor (`Message` and
-reservations included). Zig uses explicit `deinit`/`close`, with `defer` at the call site.
-Streams and messages borrow the Advanced link they come from (Rust lifetimes; C++
-documents it).
+reservations included). Streams and messages borrow the Advanced link they come from
+(Rust lifetimes; C++ documents it).
 
 Errors are never swallowed: `Result`/`Status` carry the `hqq_status`, and `hqq_error_is`
 provides the Go "wraps" relation (`Error::matches` in Rust, `Status::matches` in C++).
@@ -143,29 +122,28 @@ helpers list it, with the same variants and steps as the Go helper. The three-he
 (`TestInteropMatrix` with `go`, `cpp` and `rust` labels) ran on this host: every subtest of
 every pair passed, 0 failed, 0 skipped, in both role directions.
 
-| Scenario | C++ | Rust | Zig (unverified) |
-| --- | --- | --- | --- |
-| X-01 create, open, exchange, close (2 variants) | yes | yes | yes |
-| X-02 geometry mismatch (4 variants) | yes | yes | no |
-| X-03 third endpoint, re-join | yes | yes | no |
-| X-05 ring full, deadline | yes | yes | no |
-| X-06 bidirectional stream, sequence and CRC (ring2, ring256) | yes | yes | yes |
-| X-07 kill -9 of the peer (3 variants) | yes | yes | no |
-| X-12 parked consumer woken (ring2) | yes | yes | yes |
-| X-14 simple-mode peer (adaptive, spin-peer) | yes | yes | no |
-| X-A04 request/response, concurrent calls, errors | yes | yes | yes |
-| X-A08 request metadata (metadata, without-metadata) | yes | yes | no |
-| X-A09 graceful shutdown | yes | yes | no |
-| X-A10 acceptor, connect, busy listener, acceptor close | yes | yes | no |
+| Scenario | C++ | Rust |
+| --- | --- | --- |
+| X-01 create, open, exchange, close (2 variants) | yes | yes |
+| X-02 geometry mismatch (4 variants) | yes | yes |
+| X-03 third endpoint, re-join | yes | yes |
+| X-05 ring full, deadline | yes | yes |
+| X-06 bidirectional stream, sequence and CRC (ring2, ring256) | yes | yes |
+| X-07 kill -9 of the peer (3 variants) | yes | yes |
+| X-12 parked consumer woken (ring2) | yes | yes |
+| X-14 simple-mode peer (adaptive, spin-peer) | yes | yes |
+| X-A04 request/response, concurrent calls, errors | yes | yes |
+| X-A08 request metadata (metadata, without-metadata) | yes | yes |
+| X-A09 graceful shutdown | yes | yes |
+| X-A10 acceptor, connect, busy listener, acceptor close | yes | yes |
 
-Listed scenarios: C++ and Rust list 12 scenarios and 21 variants each; Zig lists 4
-scenarios (X-01, X-06, X-12, X-A04), and its helper has never been compiled or run here.
+Listed scenarios: C++ and Rust list 12 scenarios and 21 variants each.
 
 "Run only" means implemented and checked by hand in both directions, but not listed: the
 driver requires the Go variant and step sets for a listed scenario. C++ and Rust run X-A01
 (six variants: `all-features`, `opener-initiates`, `simultaneous`, `messages-only`,
 `request-response-only`, `none`), X-A02 (`sizes`), X-A05 (`basic`) and X-04 (`before-creator`,
-`dead`). Zig runs X-A01 (`all-features`, `none`) and X-A05 (`basic`).
+`dead`).
 
 Not implemented in C++ and Rust: X-04 `initializing`, X-A01 `bad-major` and `op-error`,
 X-A02 `sender-abort-after-chunk-1`, X-A05 `bad-parity` and `duplicate`, X-A07 (cancel,
@@ -181,10 +159,9 @@ writes (only the C helper has them) or a platform the helper does not run on.
 - The Rust serve handler catches panics and answers with an error response
   (`HQQ_ERRCODE_INVALID_OP`, payload `handler panicked`).
 - Windows is covered by CI only: C++ and Rust build the C library with clang-cl (the
-  Rust job sets `HQQ_CC=clang-cl`; cl.exe lacks always-lock-free C11 atomics on the runner);
-  Zig is not in CI on Windows.
-- Windows shared-memory names live only while a handle to them is open. The C++, Rust and
-  Zig helpers follow the Go helper: X-01 creator-closes-first expects `ErrLinkBusy` from the
+  Rust job sets `HQQ_CC=clang-cl`; cl.exe lacks always-lock-free C11 atomics on the runner).
+- Windows shared-memory names live only while a handle to them is open. The C++ and Rust
+  helpers follow the Go helper: X-01 creator-closes-first expects `ErrLinkBusy` from the
   creator's probe (the opener still holds the segment), not `ErrNotExist`. The Rust examples run
   in PowerShell, because Git Bash puts Git's `usr/bin/link.exe` before the MSVC linker.
 - `Acceptor::close` (Rust `close_shared`) and `AdvLink::close` (C++) may run while another
@@ -200,5 +177,4 @@ writes (only the C helper has them) or a platform the helper does not run on.
 - Rust: `cargo test --workspace --locked` passes (3 unit, 9 integration, 1 doc test);
   `cargo clippy --workspace --all-targets` is clean; echo and rpc self-tests pass.
 - Interop: the three-helper matrix (go, cpp, rust) passes in both directions.
-- Not run here: Zig (not installed), Windows, Linux. The Zig job and the Windows jobs
-  are confirmed only by CI.
+- Not run here: Windows, Linux. The Windows jobs are confirmed only by CI.

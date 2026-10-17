@@ -1,5 +1,6 @@
 // C++17 consumer compile check: hqq.h is usable from C++ with C linkage.
 #include "hqq/hqq.h"
+#include "hqq/hqq_lifeline.h"
 
 #include <cstdio>
 #include <cstring>

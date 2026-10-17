@@ -2,7 +2,7 @@
 
 Status: milestone M3c. The GenMC harnesses for the real ring core are in
 section 3.2 (GenMC runs only in CI). The Go implementation gets sequential
-consistency for free (all Go atomics are seq_cst). A C (or Rust/Zig/C++)
+consistency for free (all Go atomics are seq_cst). A C (or Rust/C++)
 implementation chooses a memory order per access, and the choice is
 load-bearing in exactly one place that is easy to get wrong: the **wake
 handshake** (a store-buffering / Dekker pair), see

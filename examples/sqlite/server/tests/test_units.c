@@ -2,7 +2,7 @@
  * test_units.c - unit tests of the hqq-sqlite server: the byte codec (with the
  * golden encodings of PROTOCOL.md section 16), status values, input
  * validation, and the database path policy. The request paths (SQL, batches,
- * cancellation) are covered end to end by examples/sqlite/e2e.
+ * cancellation) are covered end to end by sqlite/e2e.
  */
 #define _POSIX_C_SOURCE 200809L
 

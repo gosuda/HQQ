@@ -1,8 +1,9 @@
 name: SQLite service
 
 # The hqq-sqlite C server (examples/sqlite/server) built on libhqq, its C unit
-# tests, and the Go end-to-end tests that run the Go driver against it
-# (examples/sqlite/e2e). SQLite comes from the system: libsqlite3-dev on Ubuntu,
+# tests, the Go tests of the sqlite package (fake server, no C server needed),
+# and the Go end-to-end tests that run the Go driver against the C server
+# (sqlite/e2e). SQLite comes from the system: libsqlite3-dev on Ubuntu,
 # the SDK copy on macOS. Nothing is downloaded during the build.
 
 on:
@@ -63,12 +64,15 @@ jobs:
         run: ctest --test-dir build -R hqqsqlite_server --output-on-failure
 
       - name: Go vet
-        run: go vet ./examples/sqlite/...
+        run: go vet ./sqlite/...
+
+      - name: Go tests (Go driver and fake server, no C server)
+        run: go test -race -count=1 ./sqlite/...
 
       - name: End-to-end tests (Go driver against the C server)
         env:
           HQQ_SQLITE_SERVER: ${{ github.workspace }}/build/sqlite-server/hqq-sqlite-server
-        run: go test -count=1 -timeout 5m -v ./examples/sqlite/e2e/...
+        run: go test -count=1 -timeout 5m -v ./sqlite/e2e/...
 
   asan:
     name: Server ASan+UBSan (ubuntu)
@@ -105,4 +109,4 @@ jobs:
           HQQ_SQLITE_SERVER: ${{ github.workspace }}/build-asan/sqlite-server/hqq-sqlite-server
           ASAN_OPTIONS: detect_leaks=1:abort_on_error=1
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
-        run: go test -count=1 -timeout 10m -v ./examples/sqlite/e2e/...
+        run: go test -count=1 -timeout 10m -v ./sqlite/e2e/...

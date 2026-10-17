@@ -1,9 +1,9 @@
 # hqq-sqlite-server: the C server
 
-`hqq-sqlite-server` serves the hqq-sqlite protocol ([../PROTOCOL.md](../PROTOCOL.md),
+`hqq-sqlite-server` serves the hqq-sqlite protocol ([../../sqlite/PROTOCOL.md](../../sqlite/PROTOCOL.md),
 version 1.0) on one HQQ listener. It is written in C11 on libhqq's Advanced layer
-and the SQLite C API. The Go driver in `../driver` is its reference client, and
-the end-to-end tests in `../e2e` run that driver against it.
+and the SQLite C API. The Go driver in `../../sqlite` is its reference client, and
+the end-to-end tests in `../../sqlite/e2e` run that driver against it.
 
 POSIX only (Linux and macOS). Windows is not supported.
 
@@ -47,6 +47,9 @@ hqq-sqlite-server <listener-name> [options]
   --heartbeat-ms N         link heartbeat interval (default: libhqq's)
   --peer-timeout-ms N      peer timeout (default: libhqq's)
   --shutdown-timeout-ms N  wait for running requests on shutdown (default 5000)
+  --parent-stdin[=force]   shut down gracefully when standard input reaches end-of-file (the
+                           parent died); alias --exit-on-stdin-eof; see "Parent lifeline"
+  --lifeline-grace-ms N    forced exit if that shutdown takes longer (default 5000; 0: never)
   --version, --help
 ```
 
@@ -59,6 +62,49 @@ refuses new requests (status 8, PROTOCOL.md section 2 and libhqq section 6), run
 requests finish up to `--shutdown-timeout-ms`, then the streams close and every
 session rolls back its open transaction. `SIGKILL` runs no cleanup; SQLite recovers its
 files at the next open.
+
+## Parent lifeline
+
+`--parent-stdin` (alias `--exit-on-stdin-eof`) ties the server's life to the process that
+started it. The supervisor creates a pipe, keeps the write end, and passes the read end as
+the server's standard input. The server watches stdin with libhqq's parent lifeline
+(`hqq_lifeline.h`). Bytes the supervisor writes are discarded, so keepalives are allowed.
+When the supervisor exits, for any reason, the OS closes the write end and the server reads
+end-of-file. It then runs the SIGTERM shutdown path (listener closed, running requests
+finish, sessions roll back) and exits with status 0.
+
+- `--lifeline-grace-ms N` (default 5000, 0: never) bounds that shutdown. If the process is
+  still running N ms after the end-of-file, it exits with status 70
+  (`HQQ_LIFELINE_EXIT_CODE`) at once, without atexit handlers or flushing.
+- A terminal on stdin is not watched: the server prints one warning line and runs on, so
+  an interactive run is not stopped by a closed terminal. `--parent-stdin=force` watches it
+  anyway.
+- Standard input must be a pipe the supervisor holds. With `/dev/null` or a closed
+  descriptor the server sees end-of-file (or an error) at once and shuts down straight
+  away. A regular file is read to its end first, then the server shuts down.
+
+### Zombie-free guarantee and its limits
+
+With `--parent-stdin`, a server whose supervisor died is not left running as an orphan
+serving a listener nobody controls. This holds when the supervisor dies in any way that
+closes its descriptors, including SIGKILL, a crash, or an exit that skips cleanup.
+
+It does not hold when:
+
+- The supervisor is stopped (SIGSTOP or a debugger) rather than dead. The write end stays
+  open and the server keeps running.
+- Another process holds the write end. Every holder must close it, and a child started
+  without close-on-exec keeps the pipe open after the supervisor dies. The supervisor must
+  create the pipe close-on-exec.
+- The server forks and the forked process keeps running. Only the calling thread survives
+  `fork()`, so the lifeline thread does not exist in the child and nothing watches its
+  stdin. The server must not daemonize or fork after start.
+- The server's stdin is duplicated to a grandchild that keeps it open. The pipe then
+  reaches end-of-file only after that grandchild exits too.
+
+Covered and tested: the Go e2e tests close the supervisor's end with a transaction open,
+and SIGKILL a separate pipe holder (`sqlite/e2e/lifeline_test.go`). The C unit tests
+(`c/tests/test_lifeline.c`) cover the helper.
 
 ## Database policy
 
@@ -107,13 +153,15 @@ length (1 MiB), variables (32766), columns (2000), and attached databases (0).
 - `tests/test_units.c` (`hqqsqlite_server_units`): codec and golden encodings from
   PROTOCOL.md section 16, status values, limits, pragma and flag validation, and the
   path policy (traversal, symbolic links, dangling links, aliases, NUL).
-- `../e2e` (Go): starts the server (`HQQ_SQLITE_SERVER` names the binary; the tests
+- `../../sqlite/e2e` (Go): starts the server (`HQQ_SQLITE_SERVER` names the binary; the tests
   skip without it) and runs the driver against it: values, prepared and named
   statements, batches, large blobs and the 16 MiB row limit, transactions and
   read-only mode, cancellation of a 1e9-row recursive CTE, 50 concurrent connections,
   a client crash inside a transaction (rollback observed by another session), SIGKILL
   of the server with reconnect, the path policy, the session limit, error codes,
-  busy locks, graceful shutdown, and argument checks.
+  busy locks, graceful shutdown, argument checks, and the parent lifeline: EOF on the
+  supervisor's pipe shuts the server down with status 0 and rolls back an open transaction;
+  without `--parent-stdin` EOF is ignored; SIGKILL of the pipe's holder shuts it down.
 
 Sanitized run: build with `-DHQQ_SANITIZE=address+undefined` and point
 `HQQ_SQLITE_SERVER` at that binary (see `.github/workflows/sqlite.yml`).

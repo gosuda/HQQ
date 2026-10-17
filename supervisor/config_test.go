@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -41,6 +42,7 @@ const fullExample = `{
     {
       "name": "echo",
       "command": "/usr/local/bin/hqq-echo",
+      "sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
       "args": ["--listener", "echo"],
       "env": {"HQQ_LOG": "info"},
       "dir": "/var/lib/echo",
@@ -59,6 +61,13 @@ const fullExample = `{
       "health": {"interval": "1s", "timeout": "500ms", "failures": 3, "start_grace": "5s", "ping_method": 1},
       "exclusive_lock": "/var/lock/echo.lock",
       "output": {"mode": "file", "path": "/var/log/echo.log", "max_bytes": 10485760, "max_files": 3}
+    },
+    {
+      "name": "worker",
+      "command": "/usr/local/bin/hqq-worker",
+      "parent_pipe": true,
+      "manifest": {"file": "/var/lib/hqq/dist/manifest.json", "signature": "/var/lib/hqq/dist/manifest.json.sig", "public_key": "0000000000000000000000000000000000000000000000000000000000000000"},
+      "restart": {"policy": "always"}
     }
   ]
 }`
@@ -87,6 +96,7 @@ func TestDecodeRejects(t *testing.T) {
 	base := func(svc string) string {
 		return `{"services":[` + svc + `]}`
 	}
+	zero := strings.Repeat("0", 64)
 	cases := map[string]string{
 		"unknown field":     base(`{"name":"a","command":"x","bogus":1}`),
 		"no name":           base(`{"command":"x"}`),
@@ -103,12 +113,42 @@ func TestDecodeRejects(t *testing.T) {
 		"dup name":          base(`{"name":"a","command":"x"},{"name":"a","command":"y"}`),
 		"dup listener":      base(`{"name":"a","command":"x","listener":"l"},{"name":"b","command":"y","listener":"l"}`),
 		"dup lock":          base(`{"name":"a","command":"x","exclusive_lock":"/tmp/l"},{"name":"b","command":"y","exclusive_lock":"/tmp/l"}`),
+		"sha256 not hex":    base(`{"name":"a","command":"x","sha256":"zz"}`),
+		"sha256 + manifest": base(`{"name":"a","command":"x","sha256":"` + zero + `","manifest":{"file":"m","signature":"s","public_key":"` + zero + `"}}`),
+		"manifest no sig":   base(`{"name":"a","command":"x","manifest":{"file":"m","public_key":"` + zero + `"}}`),
+		"manifest bad key":  base(`{"name":"a","command":"x","manifest":{"file":"m","signature":"s","public_key":"xyz"}}`),
+		"manifest extra":    base(`{"name":"a","command":"x","manifest":{"file":"m","signature":"s","public_key":"` + zero + `","extra":1}}`),
 		"trailing data":     `{"services":[]} {}`,
 	}
 	for name, doc := range cases {
 		if _, err := DecodeConfig([]byte(doc)); err == nil {
 			t.Errorf("%s: accepted %s", name, doc)
 		}
+	}
+}
+
+func TestDecodeVerifiedService(t *testing.T) {
+	zero := strings.Repeat("0", 64)
+	cfg, err := DecodeConfig([]byte(`{"services":[` +
+		`{"name":"a","command":"x","sha256":"` + zero + `","parent_pipe":true},` +
+		`{"name":"b","command":"y","manifest":{"file":"m.json","signature":"m.json.sig","public_key":"` + zero + `"}}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, b := cfg.Services[0], cfg.Services[1]
+	if a.SHA256 != zero || !a.ParentPipe || a.Manifest != nil {
+		t.Fatalf("decoded %+v", a)
+	}
+	if b.Manifest == nil || b.Manifest.File != "m.json" || b.Manifest.Signature != "m.json.sig" || b.ParentPipe {
+		t.Fatalf("decoded %+v", b)
+	}
+	c := cfg.clone()
+	if !reflect.DeepEqual(cfg, c) {
+		t.Fatal("clone differs from the original")
+	}
+	c.Services[1].Manifest.File = "other.json"
+	if b.Manifest.File != "m.json" {
+		t.Fatal("clone shares the manifest with the original")
 	}
 }
 

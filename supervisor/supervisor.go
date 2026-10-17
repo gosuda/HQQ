@@ -56,6 +56,8 @@ type Status struct {
 	PID         int           `json:"pid,omitempty"`
 	StartedAt   *time.Time    `json:"started_at,omitempty"`
 	Uptime      Duration      `json:"uptime,omitempty"`
+	Verified    bool          `json:"verified,omitempty"`
+	Mechanism   string        `json:"mechanism,omitempty"`
 	Restarts    int           `json:"restarts"`
 	NextRestart *time.Time    `json:"next_restart,omitempty"`
 	LastExit    *Exit         `json:"last_exit,omitempty"`

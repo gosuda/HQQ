@@ -1,7 +1,7 @@
 name: Bindings
 
-# Builds and tests the language bindings of libhqq (bindings/cpp, bindings/rust,
-# bindings/zig). Every job builds the C library from the in-tree sources (c/),
+# Builds and tests the language bindings of libhqq (bindings/cpp, bindings/rust).
+# Every job builds the C library from the in-tree sources (c/),
 # runs the binding's own tests and examples, and then runs the interop matrix
 # (interop/, TestInteropMatrix) between the binding's hqq-interop helper and the
 # Go helper built from cmd/hqq-interop. The helper contract is
@@ -34,10 +34,6 @@ permissions:
 concurrency:
   group: bindings-${{ github.ref }}
   cancel-in-progress: true
-
-env:
-  # Pinned Zig release of the Zig binding (bindings/zig targets the 0.15 build API).
-  ZIG_VERSION: '0.15.2'
 
 jobs:
   # ---- C++ -------------------------------------------------------------------
@@ -221,63 +217,4 @@ jobs:
           ext=""
           if [ "$RUNNER_OS" = "Windows" ]; then ext=".exe"; fi
           HQQ_INTEROP_IMPLS="go=$RUNNER_TEMP/hqq-interop-go$ext,rust=$GITHUB_WORKSPACE/bindings/rust/target/release/hqq-interop$ext" \
-            go test ./interop -run '^TestInteropMatrix$' -count=1 -timeout 30m
-
-  # ---- Zig -------------------------------------------------------------------
-  # bindings/zig: build.zig compiles libhqq from c/ and the wrapper module, the
-  # examples and the hqq-interop helper. Pinned Zig release via mlugg/setup-zig.
-  # NON-BLOCKING (continue-on-error): the Linux job has not passed in CI yet (its first
-  # run failed in the Zig test compile, fixed here but not yet CI-confirmed). Remove
-  # continue-on-error once it passes.
-  # Linux only. The macOS job was removed: Zig 0.15.2 links its own build runner against
-  # the Xcode 26.x SDK of macOS 26 and fails with undefined libSystem symbols (_abort,
-  # _dispatch_*, ...; ziglang/zig#31669). Pointing DEVELOPER_DIR at the Command Line
-  # Tools SDK did not fix it in CI. Restore the macOS job when the link is fixed upstream.
-  zig:
-    name: Zig ${{ matrix.name }}
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 30
-    continue-on-error: true
-
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: Linux
-            runner: ubuntu-24.04
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6.0.2
-
-      - name: Set up Zig
-        uses: mlugg/setup-zig@v2.2.1
-        with:
-          version: ${{ env.ZIG_VERSION }}
-
-      - name: Check formatting
-        working-directory: bindings/zig
-        run: zig fmt --check .
-
-      - name: Build
-        working-directory: bindings/zig
-        run: zig build
-
-      - name: Test
-        working-directory: bindings/zig
-        run: zig build test
-
-      - name: Set up Go
-        uses: actions/setup-go@v6.4.0
-        with:
-          go-version-file: go.mod
-          check-latest: true
-          cache: true
-
-      - name: Build Go helper
-        run: go build -o "$RUNNER_TEMP/hqq-interop-go" ./cmd/hqq-interop
-
-      - name: Interop matrix (Go and Zig)
-        run: |
-          HQQ_INTEROP_IMPLS="go=$RUNNER_TEMP/hqq-interop-go,zig=$GITHUB_WORKSPACE/bindings/zig/zig-out/bin/hqq-interop" \
             go test ./interop -run '^TestInteropMatrix$' -count=1 -timeout 30m

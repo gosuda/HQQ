@@ -49,6 +49,7 @@ hqq_add_test(listener INTERNAL)
 hqq_add_test(simple)
 hqq_add_test(named INTERNAL POSIX_ONLY)
 hqq_add_test(fork POSIX_ONLY LABELS posix)
+hqq_add_test(lifeline POSIX_ONLY LABELS posix)
 hqq_add_test(stress LABELS stress TIMEOUT 180)
 
 if(HQQ_BUILD_CXX_CHECK)

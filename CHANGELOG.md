@@ -4,6 +4,16 @@ All notable changes to **HQQ** (`gosuda.org/hqq`) are documented in this file.
 
 The project follows [Semantic Versioning](https://semver.org/). While in `v0.x`, minor versions may introduce breaking wire-layout improvements accompanied by migration notes below.
 
+## Unreleased
+
+### Added
+
+- **Parent lifeline** (`c/include/hqq/hqq_lifeline.h`): `hqq_lifeline_start` / `hqq_lifeline_stop` watch stdin (or a descriptor or handle) on a helper thread and fire once when the supervisor's pipe reaches end-of-file, so a service exits when its parent dies, including by SIGKILL. The SQLite C server gets `--parent-stdin` (alias `--exit-on-stdin-eof`, `=force` to watch a terminal) and `--lifeline-grace-ms`.
+
+### Removed
+
+- Zig binding and its CI job (it was never verified by CI).
+
 ## v0.6.0 — 2026-10-17
 
 The multi-client acceptor (`NewAcceptor`, `Accept`, `Connect`) and Advanced Protocol 1.1 (negotiated cancellation, deadlines and request metadata, graceful shutdown) are added. The Go API changes are additive: no exported name of v0.5.0 was removed or changed. The shared-memory layout (`HQQ_STL3`, ring layout 2) and the 64-byte packet ABI are unchanged. Protocol 1.1 adds one opcode, one frame flag, a request metadata block, and the error status `0x08` (returned by `Shutdown`); the opcode, flag, and metadata block are used only when negotiated.

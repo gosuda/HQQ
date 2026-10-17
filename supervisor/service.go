@@ -8,11 +8,17 @@ import (
 	"math/rand/v2"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
 
 	"gosuda.org/hqq"
+	"gosuda.org/hqq/lifeline"
+	"gosuda.org/hqq/secureexec"
+	"gosuda.org/hqq/secureexec/manifest"
 )
 
 // cmdKind is a request the Supervisor sends to a service loop.
@@ -80,6 +86,9 @@ type proc struct {
 	waitErr   error
 	pstate    *os.ProcessState
 	outs      procOutputs
+	lifeline  *lifeline.Lifeline   // parent end of the stdin pipe (ParentPipe)
+	verified  *secureexec.Verified // verified executable; nil when not verified
+	mechanism string               // secureexec mechanism of verified
 
 	stopping      bool
 	healthRestart bool
@@ -174,6 +183,8 @@ func (sv *service) publish() {
 		st.PID = sv.cur.pid
 		t := sv.cur.startedAt
 		st.StartedAt = &t
+		st.Mechanism = sv.cur.mechanism
+		st.Verified = st.Mechanism != ""
 	}
 	if sv.state == StateBackoff && !sv.nextRestart.IsZero() {
 		t := sv.nextRestart
@@ -468,7 +479,7 @@ func (sv *service) spawnNow(reply chan error, auto bool) {
 	}
 }
 
-// spawn prepares the lock and the output, and starts the process.
+// spawn prepares the lock, the output and the command, and starts the process.
 func (sv *service) spawn() error {
 	spec := sv.spec
 	if err := sv.lockFor(spec); err != nil {
@@ -481,15 +492,32 @@ func (sv *service) spawn() error {
 	if err != nil {
 		return err
 	}
-	cmd := exec.Command(spec.Command, spec.Args...)
+	cmd, v, err := buildCmd(spec)
+	if err != nil {
+		outs.flush()
+		return err
+	}
 	cmd.Dir = spec.Dir
 	cmd.Env = environ(spec.Env)
 	cmd.Stdout = outs.stdout
 	cmd.Stderr = outs.stderr
 	cmd.WaitDelay = stopPipeWaitDelay
 	setProcAttr(cmd)
-	if err := cmd.Start(); err != nil {
+	var ll *lifeline.Lifeline
+	if spec.ParentPipe {
+		ll, err = lifeline.Attach(cmd)
+	}
+	if err == nil {
+		err = cmd.Start()
+	}
+	if err != nil {
 		outs.flush()
+		if ll != nil {
+			_ = ll.Close()
+		}
+		if v != nil {
+			_ = v.Close()
+		}
 		return err
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -501,10 +529,21 @@ func (sv *service) spawn() error {
 		cancel:    cancel,
 		exited:    make(chan struct{}),
 		outs:      outs,
+		lifeline:  ll,
+		verified:  v,
+	}
+	if v != nil {
+		p.mechanism = v.Mechanism()
 	}
 	go func() {
 		p.waitErr = cmd.Wait()
 		p.pstate = cmd.ProcessState
+		if p.lifeline != nil {
+			_ = p.lifeline.Close()
+		}
+		if p.verified != nil {
+			_ = p.verified.Close()
+		}
 		close(p.exited)
 	}()
 	if spec.Listener != "" {
@@ -571,6 +610,76 @@ func environ(extra map[string]string) []string {
 		env = append(env, k+"="+v)
 	}
 	return env
+}
+
+// buildCmd returns the command of spec. With sha256 or manifest, the command
+// runs from a snapshot verified against the expected digest; the returned
+// Verified must be closed once the child has exited. Without them the command
+// is a plain exec.Cmd and the Verified is nil.
+func buildCmd(spec ServiceSpec) (*exec.Cmd, *secureexec.Verified, error) {
+	if spec.SHA256 == "" && spec.Manifest == nil {
+		return exec.Command(spec.Command, spec.Args...), nil, nil
+	}
+	path, err := verifiedPath(spec)
+	if err != nil {
+		return nil, nil, err
+	}
+	want, err := expectedDigest(spec, path)
+	if err != nil {
+		return nil, nil, err
+	}
+	v, err := secureexec.Verify(path, want)
+	if err != nil {
+		return nil, nil, fmt.Errorf("verify: %w", err)
+	}
+	return v.Command(context.Background(), spec.Args...), v, nil
+}
+
+// verifiedPath returns the file that spec.Command runs, as exec finds it: a
+// bare name is looked up in PATH, and a relative path is relative to Dir.
+func verifiedPath(spec ServiceSpec) (string, error) {
+	c := spec.Command
+	if filepath.Base(c) == c && !strings.ContainsAny(c, `/\`) {
+		return exec.LookPath(c)
+	}
+	if spec.Dir != "" && !filepath.IsAbs(c) {
+		return filepath.Join(spec.Dir, c), nil
+	}
+	return c, nil
+}
+
+// expectedDigest returns the digest that the executable at path must have:
+// spec.SHA256, or the digest of its artifact in the signed manifest for this
+// platform. The manifest is read and verified on every call.
+func expectedDigest(spec ServiceSpec, path string) (secureexec.Hash, error) {
+	if spec.Manifest == nil {
+		return secureexec.ParseHash(spec.SHA256)
+	}
+	m := spec.Manifest
+	data, err := os.ReadFile(m.File)
+	if err != nil {
+		return secureexec.Hash{}, fmt.Errorf("manifest: %w", err)
+	}
+	sig, err := os.ReadFile(m.Signature)
+	if err != nil {
+		return secureexec.Hash{}, fmt.Errorf("manifest: %w", err)
+	}
+	pub, err := manifest.ParsePublicKey([]byte(m.PublicKey))
+	if err != nil {
+		return secureexec.Hash{}, err
+	}
+	mf, err := manifest.Verify(data, sig, pub)
+	if err != nil {
+		return secureexec.Hash{}, fmt.Errorf("manifest %s: %w", m.File, err)
+	}
+	f, ok := mf.Find(runtime.GOOS, runtime.GOARCH)
+	if !ok {
+		return secureexec.Hash{}, fmt.Errorf("no artifact for %s/%s in manifest", runtime.GOOS, runtime.GOARCH)
+	}
+	if f.Name != filepath.Base(path) {
+		return secureexec.Hash{}, fmt.Errorf("command %s is not the manifest artifact %s for %s/%s", path, f.Name, runtime.GOOS, runtime.GOARCH)
+	}
+	return f.SHA256, nil
 }
 
 // onExit handles the end of the current process: it decides between a

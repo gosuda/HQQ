@@ -33,6 +33,7 @@ A complete example, with every setting spelled out:
     {
       "name": "echo",
       "command": "/usr/local/bin/hqq-echo",
+      "sha256": "<64 hex digits>",
       "args": ["--listener", "echo", "--verbose"],
       "env": {"HQQ_LOG": "info"},
       "dir": "/var/lib/echo",
@@ -66,6 +67,8 @@ A complete example, with every setting spelled out:
     {
       "name": "worker",
       "command": "/usr/local/bin/hqq-worker",
+      "parent_pipe": true,
+      "manifest": {"file": "/var/lib/hqq/dist/manifest.json", "signature": "/var/lib/hqq/dist/manifest.json.sig", "public_key": "<64 hex digits>"},
       "restart": {"policy": "always"},
       "output": {"mode": "prefix"}
     }
@@ -105,6 +108,9 @@ A complete example, with every setting spelled out:
 | `health`         | see below      | Health checks. Requires `listener`. |
 | `exclusive_lock` | none           | Path of an advisory lock file that hqqd holds while the service is managed. |
 | `output`         | see below      | Where stdout and stderr go. |
+| `sha256`         | none           | Expected SHA-256 digest of `command`: 64 hex digits. The command is verified and started through `secureexec`. Exclusive with `manifest`. See "Verified executables". |
+| `manifest`       | none           | Signed release manifest that gives the digest of `command` for this platform: `file`, `signature` and `public_key`, all required. Exclusive with `sha256`. |
+| `parent_pipe`    | `false`        | Ties the standard input of the service to hqqd. See "Parent pipe". |
 
 ### `restart`
 
@@ -150,6 +156,47 @@ again. The service therefore has to accept (`Acceptor.Accept`) and serve
 | `max_bytes` | `10485760` | Size at which the file is rotated. |
 | `max_files` | `3`        | Rotated files kept: `path.1` … `path.N`. |
 
+### Verified executables
+
+With `sha256` or `manifest`, hqqd verifies the executable before every start
+and runs the verified bytes, so a file replaced after the check does not run.
+The check is repeated at each start: a restart verifies again, and a rotated
+manifest takes effect at the next start. The protection is the one of
+`gosuda.org/hqq/secureexec` for the platform, and its README has the threat
+model. `verified` and `mechanism` in Status name it:
+
+- Linux: `memfd`, a sealed in-kernel copy (`vault` when memfd is unavailable).
+- macOS and other unix: `vault`, a private verified copy in a 0700 directory.
+- Windows: `windows-share-lock`, the file held open without write or delete sharing.
+
+A `manifest` names three files: `file` (`manifest.json`), `signature`
+(`manifest.json.sig`) and `public_key` (the hex text of the release's ed25519
+public key). The signature is checked before the manifest is parsed. The entry
+for hqqd's `GOOS/GOARCH` must name the base name of `command`. Paths are
+relative to hqqd's working directory.
+
+A mismatch, a bad signature, a missing platform entry or a different artifact
+name makes the start fail, and no process runs. A start that is requested
+(`hqqd ctl start`, or autostart) reports the error and leaves the service
+`failed`. A restart after an exit counts as a failed start: it is retried with
+backoff until the restart limit is reached. `last_error` says why. `hqqd check`
+validates the fields but not the files, which are read at each start.
+
+The digests come from the release. `hqq-manifest hash FILE` prints
+`SHA256  FILE`, as `sha256sum` does, and `hqq-manifest verify` checks a release
+directory against its signed manifest (see `secureexec/README.md`).
+
+### Parent pipe
+
+With `parent_pipe: true`, hqqd gives the service's standard input the read end
+of a pipe and keeps the write end while the service runs. When hqqd exits for
+any reason, including SIGKILL, the kernel closes the write end and the service
+reads end of file on its standard input. A Go service calls `lifeline.Watch`
+(package `gosuda.org/hqq/lifeline`) early in `main` and exits when the returned
+context ends. Any other service must read its standard input until end of file;
+the C server takes `--parent-stdin` for this. A service that never reads its
+standard input does not end with hqqd.
+
 ## States
 
 | State       | Meaning |
@@ -165,6 +212,8 @@ again. The service therefore has to accept (`Acceptor.Accept`) and serve
 Status (`hqqd ctl status <name>`, or `list`) reports the state, `pid`,
 `started_at`, `uptime`, `restarts`, `next_restart`, `last_exit` (`code`,
 `signal`, `at`), `health` (`ok`, `at`, `latency`, `error`) and `last_error`.
+
+While a process runs, Status also reports `verified` (true when the process was started from a verified executable) and `mechanism` (the `secureexec` mechanism that protects it). Both are absent when no process runs or it was not verified.
 
 ## Stopping and signals
 

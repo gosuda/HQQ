@@ -280,7 +280,7 @@
 //
 // The same protocol is implemented outside Go: libhqq in C (c/, with the
 // Advanced layer and the acceptor), a header-only C++17 wrapper, Rust
-// (bindings/rust: hqq-sys and hqq), and a Zig binding. The language-neutral
+// (bindings/rust: hqq-sys and hqq). The language-neutral
 // specification is spec/SPEC.md, with spec/MEMORY_MODEL.md for memory orders
 // and spec/PORTING.md for porting. Golden vectors are in conformance/, and the
 // two-process interop harness is in interop/ (helper: cmd/hqq-interop).

@@ -1,0 +1,479 @@
+# Release: hqq-sqlite-server binaries, signed manifest, GitHub Release.
+#
+# Decision: every binary is built NATIVELY on a runner of its own platform, and
+# smoke-tested there (the Go contract tests in sqlite/ run against the stripped
+# binary). Cross-compiled binaries are not used: they could not be run before
+# publishing. The platform runners are the ones c.yml already uses.
+#
+# Pipeline:
+#   build (per platform): fetch and verify the pinned SQLite amalgamation
+#     (scripts/release/fetch-sqlite.sh), configure and build the server with
+#     HQQ_SQLITE_AMALGAMATION_DIR, run the C unit tests, strip, smoke test with
+#     `go test ./sqlite/...` against the binary, write a linkage report, upload
+#     the binary and the report as a workflow artifact.
+#   publish (tags v* or workflow_dispatch with dry_run=false): gather the
+#     binaries, write licenses, build cmd/hqq-manifest, generate manifest.json,
+#     sign it with HQQ_RELEASE_SIGNING_KEY, verify the signature with the public
+#     key committed at sqlite/launcher/release_public_key.hex, write SHA256SUMS,
+#     and create or update the GitHub Release. Without the secret, nothing is
+#     signed or published; the unsigned files are uploaded as artifacts.
+#
+# Windows: the server's CMake (examples/sqlite/server/CMakeLists.txt) stops with
+# FATAL_ERROR on WIN32, so the Windows jobs are gated behind the repository
+# variable HQQ_RELEASE_WINDOWS=true. Enable it only after the server builds on
+# Windows; until then the release contains the four POSIX binaries.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Build, test and stage only: do not sign or publish'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build ${{ matrix.goos }}/${{ matrix.goarch }} (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            goos: linux
+            goarch: amd64
+            generator: Ninja
+            exe: ''
+            link_flags: -static-libgcc
+          - runner: ubuntu-24.04-arm
+            goos: linux
+            goarch: arm64
+            generator: Ninja
+            exe: ''
+            link_flags: -static-libgcc
+          - runner: macos-latest
+            goos: darwin
+            goarch: arm64
+            generator: Unix Makefiles
+            exe: ''
+            link_flags: ''
+          - runner: macos-15-intel
+            goos: darwin
+            goarch: amd64
+            generator: Unix Makefiles
+            exe: ''
+            link_flags: ''
+
+    permissions:
+      contents: read
+
+    env:
+      # Recommended SQLite compile definitions for the amalgamation, passed
+      # through CMAKE_C_FLAGS (they reach sqlite3.c and sqlite3.h alike).
+      # SQLITE_THREADSAFE=1 is set by the CMake file itself. Column metadata
+      # (SQLITE_ENABLE_COLUMN_METADATA) is not enabled: the server only uses
+      # sqlite3_column_decltype and sqlite3_column_name.
+      SQLITE_C_DEFINES: >-
+        -DSQLITE_DQS=0
+        -DSQLITE_OMIT_LOAD_EXTENSION
+        -DSQLITE_DEFAULT_WAL_SYNCHRONOUS=1
+        -DSQLITE_USE_URI=0
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@v6.4.0
+        with:
+          go-version-file: go.mod
+
+      - name: Install build tools (Linux)
+        if: matrix.goos == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake ninja-build unzip
+
+      - name: Fetch and verify SQLite
+        id: sqlite
+        shell: bash
+        run: |
+          dir=$(scripts/release/fetch-sqlite.sh -d "$RUNNER_TEMP/sqlite-amalgamation")
+          echo "dir=$dir" >> "$GITHUB_OUTPUT"
+
+      - name: Configure
+        shell: bash
+        env:
+          AMALGAMATION: ${{ steps.sqlite.outputs.dir }}
+          C_FLAGS: ${{ env.SQLITE_C_DEFINES }} -ffile-prefix-map=${{ github.workspace }}=.
+          LINK_FLAGS: ${{ matrix.link_flags }}
+        run: |
+          cmake -S c -B build -G "${{ matrix.generator }}" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DHQQ_WERROR=ON \
+            -DHQQ_BUILD_TESTS=ON \
+            -DHQQ_BUILD_STRESS=OFF \
+            -DHQQ_BUILD_SQLITE_SERVER=ON \
+            -DHQQ_SQLITE_AMALGAMATION_DIR="$AMALGAMATION" \
+            -DCMAKE_C_FLAGS="$C_FLAGS" \
+            -DCMAKE_EXE_LINKER_FLAGS="$LINK_FLAGS"
+
+      - name: Build the server and its unit tests
+        run: cmake --build build --target hqq-sqlite-server hqqsqlite_server_unit_tests
+
+      - name: Unit tests (C)
+        run: ctest --test-dir build -R hqqsqlite_server --output-on-failure --timeout 120
+
+      - name: Stage and strip
+        shell: bash
+        env:
+          BINARY: ${{ matrix.goos }}_${{ matrix.goarch }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          out="dist/hqq-sqlite-server_${BINARY}${{ matrix.exe }}"
+          cp "build/sqlite-server/hqq-sqlite-server${{ matrix.exe }}" "$out"
+          if [ "$(uname -s)" = Linux ]; then
+            strip --strip-all "$out"
+          else
+            strip -x "$out"
+            # strip invalidates the linker's ad-hoc signature (needed on arm64).
+            codesign --force --sign - "$out"
+            codesign --verify --verbose=2 "$out"
+          fi
+          ls -l "$out"
+
+      - name: Smoke test (Go contract tests against the binary)
+        shell: bash
+        env:
+          BINARY: hqq-sqlite-server_${{ matrix.goos }}_${{ matrix.goarch }}${{ matrix.exe }}
+        run: |
+          set -o pipefail
+          export HQQ_SQLITE_SERVER="$GITHUB_WORKSPACE/dist/$BINARY"
+          go test -count=1 -timeout 10m -v ./sqlite/... 2>&1 | tee smoke.log
+          # The e2e package skips without a usable binary. Run it alone and fail
+          # on any skip except the TestHelper* re-exec helpers, which always skip.
+          go test -count=1 -timeout 10m -v ./sqlite/e2e/... 2>&1 | tee e2e.log
+          if grep -- '--- SKIP' e2e.log | grep -qv -- 'SKIP: TestHelper'; then
+            echo "::error::an end-to-end test was skipped; the binary was not exercised"
+            exit 1
+          fi
+
+      - name: Linkage report
+        shell: bash
+        run: |
+          scripts/release/linkage.sh \
+            "dist/hqq-sqlite-server_${{ matrix.goos }}_${{ matrix.goarch }}${{ matrix.exe }}" \
+            "dist/linkage_${{ matrix.goos }}_${{ matrix.goarch }}.txt"
+          cat "dist/linkage_${{ matrix.goos }}_${{ matrix.goarch }}.txt"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: hqq-sqlite-server_${{ matrix.goos }}_${{ matrix.goarch }}${{ matrix.exe }}
+          path: |
+            dist/hqq-sqlite-server_${{ matrix.goos }}_${{ matrix.goarch }}${{ matrix.exe }}
+            dist/linkage_${{ matrix.goos }}_${{ matrix.goarch }}.txt
+          if-no-files-found: error
+          retention-days: 30
+
+  build-windows:
+    name: Build windows/${{ matrix.goarch }} (${{ matrix.runner }})
+    if: vars.HQQ_RELEASE_WINDOWS == 'true'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-latest
+            goarch: amd64
+            msvc_arch: x64
+          - runner: windows-11-arm
+            goarch: arm64
+            msvc_arch: arm64
+
+    permissions:
+      contents: read
+
+    env:
+      SQLITE_C_DEFINES: >-
+        -DSQLITE_DQS=0
+        -DSQLITE_OMIT_LOAD_EXTENSION
+        -DSQLITE_DEFAULT_WAL_SYNCHRONOUS=1
+        -DSQLITE_USE_URI=0
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@v6.4.0
+        with:
+          go-version-file: go.mod
+
+      - name: Set up MSVC developer environment
+        uses: ilammy/msvc-dev-cmd@v1.13.0
+        with:
+          arch: ${{ matrix.msvc_arch }}
+
+      - name: Fetch and verify SQLite
+        id: sqlite
+        shell: pwsh
+        run: |
+          $dir = & scripts/release/fetch-sqlite.ps1 -Dest (Join-Path $env:RUNNER_TEMP 'sqlite-amalgamation')
+          if ($LASTEXITCODE -ne 0) { throw 'fetch-sqlite.ps1 failed' }
+          "dir=$dir" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Configure
+        shell: bash
+        env:
+          AMALGAMATION: ${{ steps.sqlite.outputs.dir }}
+        run: |
+          cmake -S c -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DHQQ_WERROR=ON \
+            -DHQQ_BUILD_TESTS=ON \
+            -DHQQ_BUILD_STRESS=OFF \
+            -DHQQ_BUILD_SQLITE_SERVER=ON \
+            -DHQQ_SQLITE_AMALGAMATION_DIR="$AMALGAMATION" \
+            -DCMAKE_C_COMPILER=clang-cl \
+            -DCMAKE_CXX_COMPILER=clang-cl \
+            -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded \
+            -DCMAKE_C_FLAGS="$SQLITE_C_DEFINES"
+
+      - name: Build the server and its unit tests
+        run: cmake --build build --target hqq-sqlite-server hqqsqlite_server_unit_tests
+
+      - name: Unit tests (C)
+        run: ctest --test-dir build -R hqqsqlite_server --output-on-failure --timeout 120
+
+      - name: Stage
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp build/sqlite-server/hqq-sqlite-server.exe "dist/hqq-sqlite-server_windows_${{ matrix.goarch }}.exe"
+
+      - name: Smoke test (Go contract tests against the binary)
+        shell: bash
+        env:
+          BINARY: hqq-sqlite-server_windows_${{ matrix.goarch }}.exe
+        run: |
+          set -o pipefail
+          export HQQ_SQLITE_SERVER="$GITHUB_WORKSPACE/dist/$BINARY"
+          go test -count=1 -timeout 10m -v ./sqlite/... 2>&1 | tee smoke.log
+          go test -count=1 -timeout 10m -v ./sqlite/e2e/... 2>&1 | tee e2e.log
+          if grep -- '--- SKIP' e2e.log | grep -qv -- 'SKIP: TestHelper'; then
+            echo "::error::an end-to-end test was skipped; the binary was not exercised"
+            exit 1
+          fi
+
+      - name: Linkage report
+        shell: bash
+        run: |
+          scripts/release/linkage.sh \
+            "dist/hqq-sqlite-server_windows_${{ matrix.goarch }}.exe" \
+            "dist/linkage_windows_${{ matrix.goarch }}.txt"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: hqq-sqlite-server_windows_${{ matrix.goarch }}.exe
+          path: |
+            dist/hqq-sqlite-server_windows_${{ matrix.goarch }}.exe
+            dist/linkage_windows_${{ matrix.goarch }}.txt
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    name: Publish release
+    needs: [build, build-windows]
+    if: >-
+      always() &&
+      needs.build.result == 'success' &&
+      (needs.build-windows.result == 'success' || needs.build-windows.result == 'skipped') &&
+      (github.event_name == 'push' ||
+        (github.event_name == 'workflow_dispatch' && inputs.dry_run == false))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    permissions:
+      # Only this job may write to the repository (create or update the Release).
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@v6.4.0
+        with:
+          go-version-file: go.mod
+
+      - name: Check release ref and public key
+        shell: bash
+        env:
+          PUBKEY: sqlite/launcher/release_public_key.hex
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_REF_TYPE" != tag ]; then
+            echo "::error::a real release needs a tag ref (v*); this run is on ${GITHUB_REF_NAME}. Run with dry_run=true or tag the commit."
+            exit 1
+          fi
+          case "$GITHUB_REF_NAME" in v*) ;; *)
+            echo "::error::release tags start with v: ${GITHUB_REF_NAME}"; exit 1 ;;
+          esac
+          if ! grep -Eq '^[0-9a-f]{64}$' "$PUBKEY" 2>/dev/null; then
+            echo "::error::$PUBKEY is missing or is not a 32-byte hex public key."
+            echo "::error::Maintainer: run 'go run ./cmd/hqq-manifest keygen -priv release.key -pub release.pub' locally,"
+            echo "::error::commit release.pub as $PUBKEY (never the private key), and store release.key as the HQQ_RELEASE_SIGNING_KEY secret."
+            exit 1
+          fi
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v7.0.0
+        with:
+          pattern: hqq-sqlite-server_*
+          path: dist
+          merge-multiple: true
+
+      - name: Check the expected binaries are all present
+        shell: bash
+        env:
+          WINDOWS_ENABLED: ${{ vars.HQQ_RELEASE_WINDOWS == 'true' }}
+        run: |
+          set -euo pipefail
+          expected="hqq-sqlite-server_linux_amd64 hqq-sqlite-server_linux_arm64 hqq-sqlite-server_darwin_amd64 hqq-sqlite-server_darwin_arm64"
+          if [ "$WINDOWS_ENABLED" = true ]; then
+            expected="$expected hqq-sqlite-server_windows_amd64.exe hqq-sqlite-server_windows_arm64.exe"
+          fi
+          for name in $expected; do
+            test -f "dist/$name" || { echo "::error::missing artifact $name"; exit 1; }
+          done
+          count=$(find dist -maxdepth 1 -name 'hqq-sqlite-server_*' -type f | wc -l | tr -d ' ')
+          want=$(echo $expected | wc -w | tr -d ' ')
+          [ "$count" = "$want" ] || { echo "::error::expected $want binaries, found $count"; exit 1; }
+          ls -l dist
+
+      - name: Build hqq-manifest
+        shell: bash
+        run: go build -trimpath -o "$RUNNER_TEMP/bin/hqq-manifest" ./cmd/hqq-manifest && echo "HQQ=$RUNNER_TEMP/bin/hqq-manifest" >> "$GITHUB_ENV"
+
+      - name: Write licenses
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts/release/write-licenses.sh dist/licenses "$GITHUB_REF_NAME"
+          mkdir -p dist/licenses/linkage
+          mv dist/linkage_*.txt dist/licenses/linkage/
+          tar --sort=name --owner=0 --group=0 --numeric-owner -czf dist/licenses.tar.gz -C dist licenses
+          tar -tzf dist/licenses.tar.gz
+
+      - name: Generate manifest.json
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$HQQ" gen -dir dist -name hqq-sqlite-server -release "$GITHUB_REF_NAME" \
+            -license MIT -license LicenseRef-SQLite-Public-Domain \
+            -out dist/manifest.json
+          cat dist/manifest.json
+
+      - name: Check for the signing key
+        id: key
+        shell: bash
+        env:
+          KEY: ${{ secrets.HQQ_RELEASE_SIGNING_KEY }}
+        run: |
+          if [ -n "$KEY" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::HQQ_RELEASE_SIGNING_KEY is not set: skipping signing and publishing. Unsigned files are uploaded as the release-unsigned artifact."
+          fi
+
+      - name: Sign manifest.json
+        if: steps.key.outputs.present == 'true'
+        shell: bash
+        env:
+          HQQ_RELEASE_SIGNING_KEY: ${{ secrets.HQQ_RELEASE_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          "$HQQ" sign -key-env HQQ_RELEASE_SIGNING_KEY -in dist/manifest.json -out dist/manifest.json.sig
+
+      - name: Verify the signature with the committed public key
+        if: steps.key.outputs.present == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          pub=sqlite/launcher/release_public_key.hex
+          "$HQQ" verify -pub "$pub" -in dist/manifest.json -sig dist/manifest.json.sig -dir dist
+          # Negative check: a changed manifest must not verify.
+          cp dist/manifest.json "$RUNNER_TEMP/tampered.json"
+          printf ' ' >> "$RUNNER_TEMP/tampered.json"
+          if "$HQQ" verify -pub "$pub" -in "$RUNNER_TEMP/tampered.json" -sig dist/manifest.json.sig; then
+            echo "::error::a tampered manifest verified"
+            exit 1
+          fi
+
+      - name: Write SHA256SUMS
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          "$HQQ" hash hqq-sqlite-server_* manifest.json licenses.tar.gz > SHA256SUMS
+          if [ -f manifest.json.sig ]; then
+            "$HQQ" hash manifest.json.sig >> SHA256SUMS
+          fi
+          sha256sum -c SHA256SUMS
+          cat SHA256SUMS >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload unsigned release files (no signing key)
+        if: steps.key.outputs.present != 'true'
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: release-unsigned
+          path: |
+            dist/manifest.json
+            dist/licenses.tar.gz
+            dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Create or update the GitHub Release
+        if: steps.key.outputs.present == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          files=(dist/hqq-sqlite-server_* dist/manifest.json dist/manifest.json.sig dist/licenses.tar.gz dist/SHA256SUMS)
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            gh release upload "$TAG" "${files[@]}" --repo "$REPO" --clobber
+          else
+            gh release create "$TAG" "${files[@]}" --repo "$REPO" --verify-tag --title "$TAG" \
+              --notes "Signed release binaries of hqq-sqlite-server. Verify manifest.json.sig with the committed public key, then the binaries with manifest.json. See docs/RELEASING.md."
+          fi

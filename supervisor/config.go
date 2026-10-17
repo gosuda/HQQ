@@ -8,6 +8,9 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"gosuda.org/hqq/secureexec"
+	"gosuda.org/hqq/secureexec/manifest"
 )
 
 // Config is the set of services one Supervisor manages.
@@ -26,6 +29,21 @@ type ServiceSpec struct {
 	// not run through a shell. Args are its arguments.
 	Command string   `json:"command"`
 	Args    []string `json:"args,omitempty"`
+
+	// SHA256 is the expected SHA-256 digest of Command, as 64 hex digits. When
+	// set, the command is verified and started through secureexec: the bytes
+	// that run are the bytes that were hashed. Exclusive with Manifest.
+	SHA256 string `json:"sha256,omitempty"`
+
+	// Manifest takes the expected digest of Command from a signed release
+	// manifest, for the platform hqqd runs on. Exclusive with SHA256.
+	Manifest *ManifestSpec `json:"manifest,omitempty"`
+
+	// ParentPipe connects the standard input of the service to a pipe that
+	// hqqd holds open while the service runs (see package lifeline). The
+	// service must read its standard input until end of file, or call
+	// lifeline.Watch, to end when hqqd does.
+	ParentPipe bool `json:"parent_pipe,omitempty"`
 
 	// Env is added to the environment of hqqd; a key already present is
 	// overridden. Dir is the working directory (default: hqqd's).
@@ -131,6 +149,20 @@ type OutputSpec struct {
 	// MaxFiles is the number of rotated files kept: Path.1 .. Path.N
 	// (default 3).
 	MaxFiles int `json:"max_files,omitempty"`
+}
+
+// ManifestSpec names a signed release manifest that gives the expected digest
+// of the command. File and Signature are read at every start of the service.
+type ManifestSpec struct {
+	// File is the manifest.json of the release.
+	File string `json:"file"`
+
+	// Signature is the detached ed25519 signature of File (manifest.json.sig).
+	Signature string `json:"signature"`
+
+	// PublicKey is the hex text of the 32-byte ed25519 public key that signed
+	// the manifest.
+	PublicKey string `json:"public_key"`
 }
 
 // Duration is a time.Duration that is written and read as a string such as
@@ -293,6 +325,27 @@ func (s ServiceSpec) validate() error {
 	}
 	if s.Health.Interval < 0 || s.Health.Timeout < 0 || s.Health.StartGrace < 0 || s.Health.Failures < 0 {
 		return errors.New("health values must not be negative")
+	}
+	if s.SHA256 != "" && s.Manifest != nil {
+		return errors.New("sha256 and manifest are mutually exclusive")
+	}
+	if s.SHA256 != "" {
+		if _, err := secureexec.ParseHash(s.SHA256); err != nil {
+			return fmt.Errorf("sha256: %w", err)
+		}
+	}
+	if m := s.Manifest; m != nil {
+		switch {
+		case m.File == "":
+			return errors.New("manifest.file is required")
+		case m.Signature == "":
+			return errors.New("manifest.signature is required")
+		case m.PublicKey == "":
+			return errors.New("manifest.public_key is required")
+		}
+		if _, err := manifest.ParsePublicKey([]byte(m.PublicKey)); err != nil {
+			return err
+		}
 	}
 	switch s.Output.mode() {
 	case modeInherit, modePrefix:
@@ -480,6 +533,10 @@ func (s ServiceSpec) clone() ServiceSpec {
 	if s.Autostart != nil {
 		v := *s.Autostart
 		s.Autostart = &v
+	}
+	if s.Manifest != nil {
+		m := *s.Manifest
+		s.Manifest = &m
 	}
 	if s.Restart.Backoff.Jitter != nil {
 		v := *s.Restart.Backoff.Jitter

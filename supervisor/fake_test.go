@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"gosuda.org/hqq"
+	"gosuda.org/hqq/lifeline"
 )
 
 // The fake service is this test binary, re-executed with envFake set. TestMain
@@ -27,6 +28,15 @@ const (
 	envCounter  = "HQQD_FAKE_COUNTER" // file counting the incarnations
 	envCrashes  = "HQQD_FAKE_CRASHES" // incarnations that crash (mode crash)
 	envTag      = "HQQD_FAKE_TAG"     // ignored; changing it changes the spec
+)
+
+// Markers of the parent_pipe test: the watch mode writes envReady once its
+// lifeline is watched and envMark when the lifeline ends. envSupervisor makes
+// the test binary run a supervisor (see runSupervisorHelper).
+const (
+	envReady      = "HQQD_FAKE_READY"
+	envMark       = "HQQD_FAKE_MARK"
+	envSupervisor = "HQQD_FAKE_SUPERVISOR"
 )
 
 const (
@@ -42,6 +52,9 @@ var fakeIgnoreTerm bool
 func TestMain(m *testing.M) {
 	if mode := os.Getenv(envFake); mode != "" {
 		runFake(mode)
+	}
+	if os.Getenv(envSupervisor) != "" {
+		runSupervisorHelper()
 	}
 	os.Exit(m.Run())
 }
@@ -104,10 +117,42 @@ func runFake(mode string) {
 			closeAt = time.After(after)
 		}
 		serveFake(listener, closeAt, 0)
+	case "watch":
+		// Holds the lifeline on stdin: ctx ends when the parent is gone.
+		ctx, stop := lifeline.Watch(context.Background())
+		touch(os.Getenv(envReady))
+		<-ctx.Done()
+		touch(os.Getenv(envMark))
+		stop()
+		syscall.Exit(0)
 	default:
 		fmt.Fprintln(os.Stderr, "unknown fake mode", mode)
 		syscall.Exit(2)
 	}
+	syscall.Exit(0)
+}
+
+// touch creates the empty file at path. An empty path is ignored.
+func touch(path string) {
+	if path != "" {
+		_ = os.WriteFile(path, nil, 0o600)
+	}
+}
+
+// runSupervisorHelper runs a supervisor with one parent_pipe service in mode
+// watch, and blocks until the test kills it.
+func runSupervisorHelper() {
+	spec := bareSpec("pipe", "watch")
+	spec.ParentPipe = true
+	sv, err := New(Config{Services: []ServiceSpec{spec}})
+	if err == nil {
+		err = sv.Start(context.Background(), spec.Name)
+	}
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "supervisor helper:", err)
+		syscall.Exit(2)
+	}
+	time.Sleep(time.Minute)
 	syscall.Exit(0)
 }
 

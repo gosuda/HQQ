@@ -10,7 +10,7 @@ name: Interop
 # named by HQQ_INTEROP_C_TARGET (clang-cl on Windows, as in c.yml) and add the
 # helper to HQQ_INTEROP_IMPLS as c=<path>.
 #
-# To add another implementation (Rust, Zig, C++, ...): add a build step that
+# To add another implementation (Rust, C++, ...): add a build step that
 # produces an executable named hqq-interop (hqq-interop.exe on Windows), then
 # append ",<label>=<path>" to HQQ_INTEROP_IMPLS in the "Run interop matrix" step.
 

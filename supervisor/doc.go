@@ -14,6 +14,11 @@
 //     which the service is failed (RestartSpec);
 //   - stops it gracefully: the stop method the service serves over HQQ, or
 //     the stop signal on unix, then a kill after the stop timeout (ServiceSpec);
+//   - verifies the executable against a SHA-256 digest or a signed release
+//     manifest before every start, and starts the verified copy
+//     (ServiceSpec.SHA256 and ServiceSpec.Manifest);
+//   - optionally ties its standard input to a pipe that ends when the
+//     supervisor does (ServiceSpec.ParentPipe);
 //   - holds an advisory lock file for the lifetime of the service, so that a
 //     single supervisor runs it (ServiceSpec.ExclusiveLock);
 //   - reports every state change as an Event, and answers snapshots as Status.

@@ -6,14 +6,14 @@ Required memory ordering for every word of a shared HQQ segment, the happens-bef
 
 Orders are given in C11/C++11 terms and map to the other languages as follows.
 
-| Order | C11 `<stdatomic.h>` | C++ `std::atomic` | Rust `core::sync::atomic::Ordering` | Zig `std.builtin.AtomicOrder` |
-| --- | --- | --- | --- | --- |
-| **RLX** relaxed (atomic, no ordering) | `memory_order_relaxed` | `memory_order_relaxed` | `Relaxed` | `.monotonic` |
-| **ACQ** acquire (loads) | `memory_order_acquire` | `memory_order_acquire` | `Acquire` | `.acquire` |
-| **REL** release (stores) | `memory_order_release` | `memory_order_release` | `Release` | `.release` |
-| **AR** acquire-release (RMW) | `memory_order_acq_rel` | `memory_order_acq_rel` | `AcqRel` | `.acq_rel` |
-| **SC** sequentially consistent | `memory_order_seq_cst` | `memory_order_seq_cst` | `SeqCst` | `.seq_cst` |
-| **PLAIN** non-atomic access | ordinary load/store, `memcpy` | ordinary / `std::memcpy` | raw-pointer `read`/`write`/`copy_nonoverlapping` (never `&`/`&mut` to memory another process may change) | ordinary / `@memcpy` |
+| Order | C11 `<stdatomic.h>` | C++ `std::atomic` | Rust `core::sync::atomic::Ordering` |
+| --- | --- | --- | --- |
+| **RLX** relaxed (atomic, no ordering) | `memory_order_relaxed` | `memory_order_relaxed` | `Relaxed` |
+| **ACQ** acquire (loads) | `memory_order_acquire` | `memory_order_acquire` | `Acquire` |
+| **REL** release (stores) | `memory_order_release` | `memory_order_release` | `Release` |
+| **AR** acquire-release (RMW) | `memory_order_acq_rel` | `memory_order_acq_rel` | `AcqRel` |
+| **SC** sequentially consistent | `memory_order_seq_cst` | `memory_order_seq_cst` | `SeqCst` |
+| **PLAIN** non-atomic access | ordinary load/store, `memcpy` | ordinary / `std::memcpy` | raw-pointer `read`/`write`/`copy_nonoverlapping` (never `&`/`&mut` to memory another process may change) |
 
 The Go reference implementation uses `sync/atomic`, whose operations are all sequentially consistent. **Every requirement below is therefore met trivially by the reference; a port in another language chooses the orders itself and MUST NOT choose a weaker order than the "required minimum" column.** Choosing SC everywhere on cold-path words (superblock, endpoint records, ring header) is allowed and RECOMMENDED for the reference C library: those words are touched at attach time and at heartbeat rate only.
 
@@ -150,8 +150,8 @@ All of them are 64-bit atomics; **no tearing**. Their orders are in section 2. T
 ## 6. Alignment and 64-bit atomics
 
 * Every `u64` word of the superblock, the endpoint records, the ring header and the slot sequence number is **8-byte aligned** at its fixed offset from a **page-aligned** segment base (all offsets in `constants.json` are multiples of 8; wake words and waiter counts are `u32`, 4-aligned). The packet inside a slot is at slot offset 8 (8-aligned, **not** 64- or 16-aligned); read/write it with `memcpy` or 8-byte accesses only.
-* **Lock-free 64-bit atomics that work across processes are required**: `_Atomic(uint64_t)` with `ATOMIC_LLONG_LOCK_FREE == 2`, `atomic_is_lock_free(&x)` true (C), `std::atomic<uint64_t>::is_always_lock_free` (C++), `AtomicU64::from_ptr` plus a platform check (Rust ≥ 1.75), `@atomicLoad(u64, ...)` on a target with native 64-bit atomics (Zig). On a 32-bit target insist on native double-word atomics (x86 `cmpxchg8b`, ARMv7 `ldrexd`/`strexd`) and **force 8-byte alignment** (`alignas(8)`; on i386 a `uint64_t` struct member is only 4-aligned by default).
-* **Unsupported platforms:** a platform where 64-bit atomics are emulated with process-local locks silently loses mutual exclusion between processes. These are 32-bit MIPS (`mips`, `mipsle`) and ARM before ARMv7 (ARMv5/6). The Go implementation refuses to compile there (`arch_unsupported.go`); a port MUST do the same (`#error`, `compile_error!`, `@compileError`).
+* **Lock-free 64-bit atomics that work across processes are required**: `_Atomic(uint64_t)` with `ATOMIC_LLONG_LOCK_FREE == 2`, `atomic_is_lock_free(&x)` true (C), `std::atomic<uint64_t>::is_always_lock_free` (C++), `AtomicU64::from_ptr` plus a platform check (Rust ≥ 1.75). On a 32-bit target insist on native double-word atomics (x86 `cmpxchg8b`, ARMv7 `ldrexd`/`strexd`) and **force 8-byte alignment** (`alignas(8)`; on i386 a `uint64_t` struct member is only 4-aligned by default).
+* **Unsupported platforms:** a platform where 64-bit atomics are emulated with process-local locks silently loses mutual exclusion between processes. These are 32-bit MIPS (`mips`, `mipsle`) and ARM before ARMv7 (ARMv5/6). The Go implementation refuses to compile there (`arch_unsupported.go`); a port MUST do the same (`#error`, `compile_error!`).
 * **No lock, no emulation**: a port must not protect shared words with a mutex, a futex-based lock, or `pthread` primitives that live in process-private memory.
 * Use the addresses of the shared words directly (`atomic_load_explicit((_Atomic uint64_t *)(base + off), ...)`); never keep a second *non-atomic* mapping of the same memory for access to these words, and never access them through `volatile` instead of atomics.
 
@@ -182,7 +182,7 @@ All words (`u64`, `u32`, packet words) are **little-endian in memory**. The Go c
 
 The parent will place these under `conformance/`; each is necessary, none is sufficient alone.
 
-1. **Static layout checks** (compile time): every offset and size of `constants.json` (`_Static_assert(offsetof(...))`, `const_assert!`, `comptime`), `sizeof(superblock) == 384`, `sizeof(packet) == 64`, header 512, stride 128, `ATOMIC_LLONG_LOCK_FREE == 2`, little-endian.
+1. **Static layout checks** (compile time): every offset and size of `constants.json` (`_Static_assert(offsetof(...))`, `const_assert!`), `sizeof(superblock) == 384`, `sizeof(packet) == 64`, header 512, stride 128, `ATOMIC_LLONG_LOCK_FREE == 2`, little-endian.
 2. **Golden vectors**: the 9 packet vectors and the 12 layout vectors for three page sizes of `constants.json`; parse a Go-written segment image (`TestSpecSegmentImage`'s image) and produce a byte-identical image for the same operation sequence.
 3. **Slot protocol unit tests** equal to `internal/mpmc/spec_constants_test.go`: publish/release `seq` values, full/empty, FIFO, second lap, wraparound of `pos` near `2^64` (start positions `2^64 - 2`).
 4. **Two-thread and two-process stress** (bounded, a few seconds): producer writes `n` messages each carrying a counter and a checksum of its payload; the consumer verifies order, integrity and that the payload was never torn; ring of 2 and 4 slots to force constant wraparound and constant full/empty; run on x86-64 **and** AArch64 hardware (weak ordering bugs do not show on x86 for acquire/release errors in the data path; Dekker errors do show on x86 for a `release`-only waker).

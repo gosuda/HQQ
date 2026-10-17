@@ -111,6 +111,26 @@ Verified: `test_adv` (negotiation, chunking, streams, calls, steady-state alloca
 `test_listener` (round trips, busy listener, bad records, closed acceptor), and the
 interop matrix (`interop/`, scenarios X-A01..X-A10, all four Go/C pairings).
 
+## Parent lifeline (`include/hqq/hqq_lifeline.h`)
+
+`hqq_lifeline_start` watches a descriptor (default: standard input) on a helper thread.
+A supervisor keeps the write end of a pipe; when it dies, for any reason including
+SIGKILL, the read end reaches end-of-file and the callback fires once with
+`HQQ_LIFELINE_REASON_EOF` (other read errors give `HQQ_LIFELINE_REASON_ERROR`). Bytes
+received are discarded, so keepalives are allowed. Terminals are not watched unless
+`force` is set. With `grace_ms`, the process exits with `HQQ_LIFELINE_EXIT_CODE` if
+`hqq_lifeline_stop` does not follow the callback within that time.
+
+* The callback runs on the helper thread. It must only request an orderly shutdown (set a
+  flag, write a self-pipe, or `pthread_kill` the thread that waits), and it must not call
+  `hqq_lifeline_stop`.
+* `hqq_lifeline_stop` detaches without firing and joins the thread. POSIX wakes the thread
+  through a private self-pipe (poll, no polling loop). Windows sets a flag and calls
+  `CancelSynchronousIo` until the blocked `ReadFile` returns.
+* The server uses it for `--parent-stdin` (`examples/sqlite/server/README.md`).
+
+Verified on POSIX by `test_lifeline`. The Windows backend is compiled and run only in CI.
+
 ## Platforms
 
 | Platform | Named segment | Parking |
@@ -135,6 +155,7 @@ and 32-bit MIPS/ARMv5-6 targets are rejected at compile time.
 | `src/hqq_link.c` | the link: peer monitor, heartbeat, reads, writes, reservations, close (SPEC 6, 7, 8, 9) |
 | `src/hqq_named.c`, `src/hqq_names.c` | named segments, safe unlink, name validation (SPEC 11) |
 | `src/hqq_platform_posix.c`, `src/hqq_platform_win32.c` | the operating-system layer |
+| `src/hqq_lifeline.c` | parent lifeline: a helper thread that watches stdin (or a descriptor or handle) and fires once on EOF or a read error (`include/hqq/hqq_lifeline.h`); POSIX poll/self-pipe, Windows ReadFile/CancelSynchronousIo |
 | `tests/` | dependency-free tests (`test_*.c`), golden vectors from `spec/constants.json` |
 | `tools/hqq_echo.c` | interop CLI (create or open a named link, echo or client mode) |
 | `verify/` | memory-model tooling (litmus, GenMC); not built by the library |
@@ -150,6 +171,7 @@ and 32-bit MIPS/ARMv5-6 targets are rejected at compile time.
 | `simple` | the three wait policies deliver, time out and cancel |
 | `named` (POSIX) | name validation, create/open rules, transient errors, foreign and undersized objects, safe unlink, reuse after death |
 | `fork` (POSIX) | two processes: echo including full-size messages, opener first, crash detection with drain, graceful close |
+| `lifeline` (POSIX) | parent lifeline: EOF fires once and the child exits, keepalives are drained, a pseudo-terminal is not watched unless forced, stop does not fire, a bad descriptor fires ERROR, start/stop safety, forced exit after the grace period and a stop in time, and SIGKILL of the supervisor (the service exits within about 1 s) |
 | `stress` | bounded threads on one link, rings of 2 and 256 slots, both directions, exactly-once and checksums |
 | `cxx17`, `smoke` | the public header compiles as C++17 and links; version and atomics self-test |
 

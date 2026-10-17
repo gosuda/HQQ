@@ -1,6 +1,6 @@
 # `hqq-interop`: the interoperability helper contract
 
-Status: normative for every helper executable (Go, C, and later Rust, Zig, C++). A helper is a program named `hqq-interop` (`hqq-interop.exe` on Windows) that runs **one role of one scenario in one process**. The driver (`interop/`, Go test package) starts one process per role and checks the JSON results. The Go helper is `cmd/hqq-interop`; its code is the reference for every rule below. Where this document and the Go code disagree, this document is the bug to fix first (report it), then the code.
+Status: normative for every helper executable (Go, C, and later Rust, C++). A helper is a program named `hqq-interop` (`hqq-interop.exe` on Windows) that runs **one role of one scenario in one process**. The driver (`interop/`, Go test package) starts one process per role and checks the JSON results. The Go helper is `cmd/hqq-interop`; its code is the reference for every rule below. Where this document and the Go code disagree, this document is the bug to fix first (report it), then the code.
 
 Scope of the contract: what the helper prints, how it exits, how processes synchronize, what is sent on the wire and in shared memory. Nothing in this document constrains the helper's internal design.
 

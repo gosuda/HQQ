@@ -2,13 +2,18 @@ package supervisor
 
 import (
 	"context"
+	"crypto/ed25519"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
 	"time"
+
+	"gosuda.org/hqq/secureexec"
+	"gosuda.org/hqq/secureexec/manifest"
 )
 
 // skipWithoutSignals skips tests that depend on POSIX stop signals: Windows
@@ -450,5 +455,204 @@ func TestStopDuringBackoffPreventsRestart(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 	if st, _ := sv.Status(spec.Name); st.State != StateStopped || st.Restarts != 0 || st.NextRestart != nil {
 		t.Fatalf("after Stop in backoff: %+v", st)
+	}
+}
+
+// fileExists reports whether path exists.
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+// selfDigest returns the path, SHA-256 digest and size of the running test
+// binary: the executable the fake services run.
+func selfDigest(t *testing.T) (string, secureexec.Hash, int64) {
+	t.Helper()
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum, size, err := secureexec.HashFile(exe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return exe, sum, size
+}
+
+func TestSHA256StartsVerifiedProcess(t *testing.T) {
+	_, sum, _ := selfDigest(t)
+	spec := bareSpec("verified", "silent")
+	spec.SHA256 = sum.String()
+	sv, _ := newTestSupervisor(t, Config{Services: []ServiceSpec{spec}})
+	ctx := ctxT(t, 20*time.Second)
+	if err := sv.Start(ctx, spec.Name); err != nil {
+		t.Fatal(err)
+	}
+	st := waitState(t, sv, spec.Name, StateReady)
+	if !st.Verified || st.Mechanism == "" {
+		t.Fatalf("status = %+v", st)
+	}
+	if err := sv.Stop(ctx, spec.Name); err != nil {
+		t.Fatal(err)
+	}
+	if st, _ := sv.Status(spec.Name); st.Verified || st.Mechanism != "" {
+		t.Fatalf("stopped service still reports verification: %+v", st)
+	}
+}
+
+func TestSHA256MismatchNeverStartsProcess(t *testing.T) {
+	spec := bareSpec("bad", "silent")
+	spec.SHA256 = strings.Repeat("0", 64)
+	counter := filepath.Join(tempDir(t), "count")
+	spec.Env[envCounter] = counter
+	sv, rec := newTestSupervisor(t, Config{Services: []ServiceSpec{spec}})
+	ctx := ctxT(t, 20*time.Second)
+	if err := sv.Start(ctx, spec.Name); !errors.Is(err, secureexec.ErrHashMismatch) {
+		t.Fatalf("Start: %v, want a hash mismatch", err)
+	}
+	st, _ := sv.Status(spec.Name)
+	if st.State != StateFailed || !strings.Contains(st.LastError, "sha256 mismatch") {
+		t.Fatalf("status = %+v", st)
+	}
+	if !rec.has(spec.Name, StateFailed, "sha256 mismatch") {
+		t.Fatal("no failed event names the mismatch")
+	}
+	if _, err := os.Stat(counter); err == nil {
+		t.Fatal("the service process started")
+	}
+}
+
+// writeManifest writes into dir a manifest.json holding entry, and its
+// signature made with signer. It returns the manifest block of a service that
+// reads them.
+func writeManifest(t *testing.T, dir string, signer ed25519.PrivateKey, pub ed25519.PublicKey, entry manifest.File) *ManifestSpec {
+	t.Helper()
+	data, err := manifest.Marshal(&manifest.Manifest{
+		Version:  manifest.Version,
+		Name:     "svc",
+		Release:  "v1",
+		Files:    []manifest.File{entry},
+		Licenses: []string{"MIT"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sig, err := manifest.Sign(data, signer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	file := filepath.Join(dir, "manifest.json")
+	if err := os.WriteFile(file, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(file+".sig", sig, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return &ManifestSpec{File: file, Signature: file + ".sig", PublicKey: string(manifest.FormatPublicKey(pub))}
+}
+
+func TestManifestSelectsVerifiedArtifact(t *testing.T) {
+	exe, sum, size := selfDigest(t)
+	pub, priv, err := manifest.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, other, err := manifest.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	good := manifest.File{OS: runtime.GOOS, Arch: runtime.GOARCH, Name: filepath.Base(exe), SHA256: sum, Size: size}
+	otherOS := good
+	otherOS.OS = "nonesuch"
+	renamed := good
+	renamed.Name = "renamed-" + good.Name
+	cases := []struct {
+		name   string
+		signer ed25519.PrivateKey
+		entry  manifest.File
+		ok     bool
+		err    error  // expected errors.Is target, if any
+		msg    string // expected substring of the Start error, if any
+	}{
+		{name: "signed artifact", signer: priv, entry: good, ok: true},
+		{name: "bad signature", signer: other, entry: good, err: manifest.ErrBadSignature},
+		{name: "no entry for platform", signer: priv, entry: otherOS, msg: "no artifact for " + runtime.GOOS + "/" + runtime.GOARCH},
+		{name: "name mismatch", signer: priv, entry: renamed, msg: "is not the manifest artifact"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := tempDir(t)
+			spec := bareSpec("signed", "silent")
+			spec.Manifest = writeManifest(t, dir, tc.signer, pub, tc.entry)
+			counter := filepath.Join(dir, "count")
+			spec.Env[envCounter] = counter
+			sv, _ := newTestSupervisor(t, Config{Services: []ServiceSpec{spec}})
+			ctx := ctxT(t, 20*time.Second)
+			err := sv.Start(ctx, spec.Name)
+			if tc.ok {
+				if err != nil {
+					t.Fatal(err)
+				}
+				st := waitState(t, sv, spec.Name, StateReady)
+				if !st.Verified || st.Mechanism == "" {
+					t.Fatalf("status = %+v", st)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("Start succeeded")
+			}
+			if tc.err != nil && !errors.Is(err, tc.err) {
+				t.Fatalf("Start: %v, want %v", err, tc.err)
+			}
+			if tc.msg != "" && !strings.Contains(err.Error(), tc.msg) {
+				t.Fatalf("Start: %v, want %q", err, tc.msg)
+			}
+			st, _ := sv.Status(spec.Name)
+			if st.State != StateFailed || st.LastError == "" {
+				t.Fatalf("status = %+v", st)
+			}
+			if _, err := os.Stat(counter); err == nil {
+				t.Fatal("the service process started")
+			}
+		})
+	}
+}
+
+// TestParentPipeEndsChildWhenSupervisorDies runs a supervisor in a helper
+// process. The child watches the pipe on its stdin: it must not end while the
+// supervisor lives, and must end soon after the supervisor is killed.
+func TestParentPipeEndsChildWhenSupervisorDies(t *testing.T) {
+	dir := tempDir(t)
+	ready := filepath.Join(dir, "ready")
+	mark := filepath.Join(dir, "exited")
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	helper := exec.Command(exe)
+	helper.Env = append(os.Environ(), envSupervisor+"=1", envReady+"="+ready, envMark+"="+mark)
+	if err := helper.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = helper.Process.Kill()
+		_ = helper.Wait()
+	})
+	waitFor(t, "the child to watch its lifeline", func() bool { return fileExists(ready) })
+	time.Sleep(300 * time.Millisecond)
+	if fileExists(mark) {
+		t.Fatal("the child ended while its supervisor is alive")
+	}
+	if err := helper.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	_ = helper.Wait()
+	deadline := time.Now().Add(5 * time.Second)
+	for !fileExists(mark) {
+		if time.Now().After(deadline) {
+			t.Fatal("the child did not end after its supervisor was killed")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }

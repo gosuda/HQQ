@@ -1,6 +1,6 @@
 /*
  * sqlsrv_proto.h - constants, status codes and byte codecs of the hqq-sqlite
- * protocol 1.0 (examples/sqlite/PROTOCOL.md). Integers are little-endian and
+ * protocol 1.0 (sqlite/PROTOCOL.md). Integers are little-endian and
  * fixed width; there is no padding.
  */
 #ifndef SQLSRV_PROTO_H
