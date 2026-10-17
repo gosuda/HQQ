@@ -77,7 +77,10 @@ set(HQQ_SOURCES
   src/hqq_adv_stream.c
   src/hqq_adv_msg.c
   src/hqq_listener.c
-  src/hqq_lifeline.c)
+  src/hqq_lifeline.c
+  src/hqq_rpc.c
+  src/hqq_rpc_session.c
+  src/hqq_rpc_server.c)
 if(WIN32)
   list(APPEND HQQ_SOURCES src/hqq_platform_win32.c)
 else()

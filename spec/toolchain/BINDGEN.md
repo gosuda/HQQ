@@ -166,7 +166,8 @@ Alignment and size are the wire rules of section 4.5. "Fixed" means the encoded 
 | `str<=N` | `3 + 4 + N + 1` |
 | `bytes<=N` | `3 + 4 + N` |
 | `T[]<=N` | `3 + 4 + N * wc(T)` |
-| `struct` | sum of `wc` of the fields |
+| fixed `struct S` | `align(S) - 1 + size(S)` (it starts at its alignment and ends with its trailing padding, like `T[N]`) |
+| non-fixed `struct` | sum of `wc` of the fields (the fields align themselves; there is no start alignment and no trailing padding) |
 | `union` | `3 + 4 + max(wc(payload))` over the cases that have a payload (0 if none) |
 | handle | `3 + 4` |
 
@@ -225,11 +226,11 @@ The parser MUST reject a file that violates any rule below. Each diagnostic carr
 | V14 | `@borrowed` appears only on `out bytes` or `out T[]`. |
 | V15 | `@free("sym")` appears only on a borrowed `out` parameter, an `out str`, or a return of type `str`, `bytes` or `T[]`. |
 | V16 | If a function has an `out` parameter or return of a handle type `T` and `T` has `owned_by P`, the function has exactly one `in` parameter of type `P`. |
-| V26 | A function whose return type is a `struct`, a `union` or an array with a non-fixed element (a composite return) MUST be a `shim` and MUST have `@max_out(N)` on its return. A `struct` return of a non-shim function is allowed only if the struct has `@c` and all fields are fixed. |
+| V26 | A function whose return type is a `struct`, a `union` or an array with a non-fixed element (a composite return) MUST be a `shim` and MUST have `@max_out(N)` on its return. A `struct` return of a non-shim function is allowed only if the struct has `@c` and all fields are fixed. A **fixed** struct returned by a shim is a fixed value: it is encoded in `G2` (4.6.3), has no `V2` term, and `@max_out` is still required and checked by V41. |
 | V27 | A return or borrowed `out` of type `str`, `bytes` or `T[]` MUST carry a `<=` bound, so that the response bound (4.6.3) is known before the call. |
 | V28 | A non-shim function returns void, a scalar, a handle, `str`, `bytes`, a scalar array (with a `@len_of` binding), or a fixed `@c` struct. |
 | V29 | `@intercept` is only valid on `@allow(wire)` functions. |
-| V31 | `@allow(server)` functions have no opcode and are not `@intercept`. |
+| V31 | `@allow(server)` functions have no opcode and are not `@intercept`. V29 and V31 describe the same defect when `@intercept` is on an `@allow(server)` function; a parser MAY report both rule ids for it. |
 | V38 | An `in` or `inout` parameter has a scalar, `bool`, handle, `str`, `bytes`, fixed array `T[N]`, or `T[]` with a fixed element type. Composite in-parameters (a struct, a union, an array of variable-size elements) are not supported in this revision (12.2); only returns and `out` values can be composite. |
 
 **Error convention and handle lifetime**
@@ -257,7 +258,7 @@ The parser MUST reject a file that violates any rule below. Each diagnostic carr
 | --- | --- |
 | V35 | An `include` string has length 1 to 256, consists of `[A-Za-z0-9_./+-]`, does not start with `/`, and contains no `..` component. |
 | V36 | A `@c` string and an `@free` symbol have length 1 to 64, start with a letter or `_`, and consist of letters, digits, `_`, space and `*`; an `@free` symbol is a single identifier. |
-| V37 | No identifier (type, const, function, parameter, field or case name) begins with `hqq` in any letter case, so generated names (which all begin with `hqq`, `HQQ`, or the reserved forms of 9.2) cannot collide with IDL names. After the Go name transformation of 9.2, the exported Go names the generator emits (types, consts, methods, `<Fn>Async`, `<Fn>Future`, `<Type>Tag`) are pairwise distinct, none of them is `Client`, `Dial`, `Close` or `Conn`, no union case is named `Tag`, and the capitalized field names of a struct or union are distinct. Go keywords and predeclared identifiers need no check: types and consts are capitalized, parameters are prefixed `p_`, and locals of the generated code are lowercase names that no exported or prefixed name can equal. |
+| V37 | No identifier (type, const, function, parameter, field or case name) begins with `hqq` in any letter case, so generated names (which all begin with `hqq`, `HQQ`, or the reserved forms of 9.2) cannot collide with IDL names. After the Go name transformation of 9.2, the exported Go names the generator emits (types, consts, methods, `<Fn>Async`, `<Fn>Future`, `<Type>Tag`) are pairwise distinct, none of them is `Client`, `Dial`, `Close`, `Kill` or `Conn` (the package surface of 9.4), no union case is named `Tag`, and the capitalized field names of a struct or union are distinct. Go keywords and predeclared identifiers need no check: types and consts are capitalized, parameters are prefixed `p_`, and locals of the generated code are lowercase names that no exported or prefixed name can equal. |
 
 ### 2.6 Canonical form and interface digest
 
@@ -654,7 +655,7 @@ Fields are little-endian. The header has no checksum and no padding.
 1. `DataSize >= HDR`.
 2. Reserved `flags` bits are 0; a non-RESPONSE frame has `flags == 0`; `F_DETAIL` implies `F_FAIL`.
 3. The kind is allowed in this direction and in the current state: HELLO is first and only once; REQUEST only after a successful handshake; a CONT only while a multi-frame message is being received.
-4. For REQUEST, RESPONSE, HELLO, HELLO_REPLY, CLOSE and CLOSE_ACK: `DataSize - HDR == min(total, CHUNK)`. HELLO and HELLO_REPLY additionally need `total == 64`; CLOSE and CLOSE_ACK need `total == 0`.
+4. For REQUEST, RESPONSE, HELLO, HELLO_REPLY, CLOSE and CLOSE_ACK: `DataSize - HDR == min(total, CHUNK)`; a violation is a protocol violation. CLOSE and CLOSE_ACK additionally need `total == 0`. A HELLO or HELLO_REPLY with consistent framing but `total != 64` is **not** a protocol violation: the server answers a HELLO with BAD_HELLO (4.11), and a client treats a HELLO_REPLY with `total != 64` as a protocol violation of the server.
 5. `total <= max_message` (5.5), and `total <= HARD_MAX_MESSAGE`.
 6. For CONT: the rules of 4.8.
 7. `op`: a REQUEST whose `op` is 0, above `op_count`, or not an `@allow(wire)` opcode is **not** a protocol violation: it is answered with E_UNKNOWN_OP (4.10) and the session continues.
@@ -673,7 +674,7 @@ A **body** is a byte string. Positions are measured from its first byte. To **al
 | `bytes` | `align(4)`, `u32 n`, `n` bytes. |
 | `T[]` | `align(4)`, `u32 count`, then `count` values of type `T`, each encoded by its own rule (so each element aligns itself). |
 | nullable `str`, `bytes`, `T[]` | As above, with `n` or `count` equal to `NULL_LEN` meaning NULL: nothing follows (no data, no NUL). A non-nullable value MUST NOT use `NULL_LEN`. |
-| `struct` | The fields in declaration order, each encoded by its own rule. A struct whose fields are all fixed is rounded up with trailing zero bytes to a multiple of its alignment, so it has the layout of a C struct with natural alignment and `sizeof == stride`. A struct with a variable field has no trailing padding. |
+| `struct` | A struct whose fields are all fixed starts with `align(a)`, where `a` is its largest field alignment, then encodes the fields in declaration order, each aligned to its own type, and ends with trailing zero bytes up to a multiple of `a`; it has the layout of a C struct with natural alignment and `sizeof == stride`. A struct with a variable field has no start alignment and no trailing padding: its fields in declaration order, each aligning itself. |
 | `union` | `align(4)`, `u32 tag` (the case number), then the payload of that case encoded by its type, if the case has one. A tag that names no case MUST be rejected. |
 | handle | `align(4)`, `u32 id` (4.9). Nullable handle: id 0. |
 
@@ -705,7 +706,8 @@ For a function `F` with parameters `p1..pn` and return `r`:
 
 ```text
 request body = G1  [pad to 8 if V1 is not empty]  V1
-G1 (fixed group), in declaration order, each field aligned to its type:
+G1 (fixed group), in declaration order of the parameters, each field aligned to its type
+    (wire-in fixed values and out-buffer `cap` fields are interleaved in that one order):
     for each wire-in parameter of a fixed type: its value
     for each `out` parameter that is caller-supplied storage (`out bytes`, `out T[]`, not @borrowed):
         a u32 `cap` (bytes for bytes, elements for T[])
@@ -894,10 +896,10 @@ The `aux` field of a RESPONSE is a `u32` status. `0` means the function was call
 | 7 | E_PROTOCOL | `protocol violation` | Session-level: the peer violated the protocol (5.4). Sent only with `id == 0`. |
 | 8 | E_SHUTTING_DOWN | `shutting down` | Session-level: the server is stopping (5.2). Sent only with `id == 0`. |
 | 9 to `0xFF` | reserved | | Never sent. The runtime replaces an interceptor or shim result in this range with E_INTERNAL. A client that receives one has a protocol violation. |
-| `0x0100` to `0xFFFF` | application | empty | Returned by an interceptor (7.3) before the function ran, or by a shim (4.6.6, after it ran). Unspecified by this document. |
+| `0x0100` to `0xFFFF` | application | empty string | Returned by an interceptor (7.3) before the function ran, or by a shim (4.6.6, after it ran). The meaning is the service's. |
 | `0x10000` and above | reserved | | MUST NOT be sent. |
 
-The message text is informational and at most `MSG_MAX` bytes: the runtime always sends exactly the text of the table (so that frames are reproducible, 10.1), and a client MUST NOT parse it. These strings are normative for the server; the detail text of 4.6.4 is not. The status number is the contract.
+The message text is informational and at most `MSG_MAX` bytes: the runtime always sends exactly the text of the table (so that frames are reproducible, 10.1), and a client MUST NOT parse it. **Every nonzero status body is a `str` value (4.5)**, including the empty one: the body of an application status is the empty string, 5 bytes `00000000 00`, and a status response of `total 0` is a protocol violation for the receiver. These strings are normative for the server; the detail text of 4.6.4 is not. The status number is the contract.
 
 A RESPONSE with `id == 0` is a **final frame**: after it the server tears the session down and closes the link. A client that receives one fails every call still in flight (6.3).
 
@@ -945,7 +947,7 @@ OPEN response (Advanced status 0), 12 + name_len bytes
 12  ...  name           the shared-memory name, ASCII, no NUL
 ```
 
-An error is an Advanced error response with status `0x50000 + code` and a UTF-8 text payload of at most `OPEN_MSG_MAX` bytes (statuses below `0x10000` are reserved for HQQ itself, as in `sqlite/PROTOCOL.md` section 7): code 1 VERSION (`proto_major != 1`), 2 GEOMETRY, 3 BUSY (`max_sessions` reached), 4 INTERNAL.
+An error is an Advanced error response with status `0x50000 + code` and a UTF-8 text payload of at most `OPEN_MSG_MAX` bytes (statuses below `0x10000` are reserved for HQQ itself, as in `sqlite/PROTOCOL.md` section 7): code 1 VERSION (`proto_major != 1`), 2 GEOMETRY, 3 BUSY (`max_sessions` reached), 4 INTERNAL. Code 4 also answers requests that no other code covers, with these texts: `bad open request` (length other than 16 or a wrong `OPEN_MAGIC`), `unknown method` (a method other than `BG_OPEN`), `control link already used` (a second OPEN on one control link), and `shutting down` (an OPEN while the server stops).
 
 **Server-side bounds before OPEN.** The control link is unauthenticated input from any process that can open the listener. The server therefore bounds it:
 
@@ -962,11 +964,11 @@ name = first 8 bytes of the listener name, every byte outside [A-Za-z0-9_-] repl
        followed by ".s" and 16 lowercase hexadecimal digits from the platform's cryptographic random source
 ```
 
-The name has at most 26 bytes, within the macOS limit of 30 (SPEC 11.1). The server creates the segment with `hqq_standard_create(name, B, S, perm, ...)` before it answers, so the client finds a published, live Primary. `hqq_standard_create` is not strictly exclusive: it re-initializes an existing name whose endpoints are all gone (`named_link.go`, `createNamed`; SPEC 11.3). With 64 random bits a collision is negligible, and a collision with a live segment is `HQQ_ERR_LINK_BUSY`, which the server retries with a new random part, up to 8 times. The control link then idles; the client closes it after HELLO_REPLY. The server closes its end when the peer closes it, after `open_timeout`, or when the session starts, whichever is first.
+The name has at most 26 bytes, within the macOS limit of 30 (SPEC 11.1). The server creates the segment with `hqq_standard_create(name, B, S, perm, ...)` before it answers, so the client finds a published, live Primary. `hqq_standard_create` is not strictly exclusive: it re-initializes an existing name whose endpoints are all gone (`named_link.go`, `createNamed`; SPEC 11.3). With 64 random bits a collision is negligible, and a collision with a live segment is `HQQ_ERR_LINK_BUSY`, which the server retries with a new random part, up to 8 times. The control link then idles; the client closes it after HELLO_REPLY. The server closes its end when the peer closes it, after `open_timeout`, on stop, or when the session thread has read a valid HELLO (whatever reply status follows), whichever is first.
 
 **Cleanup of the session name.** The server unlinks the session name (`hqq_link_unlink`) as soon as it has read a valid HELLO frame (the client has attached by then); the mapping stays valid. A server that dies between the OPEN response and the HELLO leaves the name behind, and the client removes it (`hqq.Unlink(name)`, `named_link.go`) when its attach or its HELLO wait fails. A client that dies in the same window leaves it for the server to remove when the `open_timeout` for HELLO expires (the server closes the link, which removes the name because it is the creator, SPEC 11.4).
 
-**Session link.** The client opens the session link with `hqq.OpenStandardLink(name, B, S, opts)` (`named_link.go`), a **single attempt** (it waits up to `AttachTimeout` for a creator that is still initializing, then returns an error matching `ErrFailedInit`). `rt` therefore wraps it in its own loop: retry while the error matches `hqq.ErrFailedInit` or `os.ErrNotExist`, with a delay doubling from 1 ms to 100 ms, until `ConnectTimeout`; every other error is final. `opts.Exclusive` is set; `opts.PeerTimeout` is set to 2 s explicitly when the caller left it 0, because 0 means 5 s in both `options.go` and `hqq.h` (the C server sets the same value explicitly, 5.5).
+**Session link.** The client opens the session link with `hqq.OpenStandardLink(name, B, S, opts)` (`named_link.go`), a **single attempt** (it waits up to `AttachTimeout` for a creator that is still initializing, then returns an error matching `ErrFailedInit`). `rt` therefore wraps it in its own loop: retry while the error matches `hqq.ErrFailedInit` or `os.ErrNotExist`, except that an error matching `hqq.ErrLinkBusy` or `hqq.ErrIncompatibleLayout` is **final** even though both wrap `ErrFailedInit`; the delay doubles from 1 ms to 100 ms, until `ConnectTimeout`; every other error is final. `opts.Exclusive` is set; `opts.PeerTimeout` is set to 2 s explicitly when the caller left it 0, because 0 means 5 s in both `options.go` and `hqq.h` (the C server sets the same value explicitly, 5.5).
 
 **HELLO.** The client's first frame is HELLO (`kind 0x04`, `id 0`, `total 64`, `aux 0`), body:
 
@@ -1007,11 +1009,11 @@ The server checks, in this order, and the first failure is the HELLO_REPLY `aux`
 | 3 | GEOMETRY | `buffer_size != S` or `buffer_count != B` of the link. |
 | 4 | LIMIT | `max_message` below 4096 or above `HARD_MAX_MESSAGE`; `max_in_flight` above `B`. |
 
-Granted values: `max_in_flight = min(requested or B, server option, B)`, `max_message = min(requested or default, server option)`; both are 0 in a reply with a nonzero `aux`. After a nonzero status the server sends the reply (it carries the server digest so the client can report both) with timeout 0 (5.2) and closes the session. The client turns the reply into `*rt.MismatchError` (6.2). A HELLO that does not arrive within `open_timeout` ends the session and removes the segment.
+Granted values: `max_in_flight = min(requested or B, server option, B)`, `max_message = min(requested or default, server option)`; `max_in_flight`, `max_message` and `max_handles` are all 0 in a reply with a nonzero `aux` (vector `HELLO_REPLY_DIGEST`). After a nonzero status the server sends the reply (it carries the server digest so the client can report both) with timeout 0 (5.2) and closes the session. The client turns the reply into `*rt.MismatchError` (6.2). A HELLO that does not arrive within `open_timeout` ends the session and removes the segment.
 
 ### 4.12 Pipelining and ordering
 
-- **Request ids.** The client numbers requests `1, 2, 3, ...` per session; after `0xFFFFFFFF` the next id is 1 (0 is never used). The id is assigned when the request is committed. The server requires each REQUEST id to be exactly the successor of the previous one under the same rule (the successor of `0xFFFFFFFF` is 1); any other value is a protocol violation. Vectors `WRAP_A_REQ` and `WRAP_B_REQ` (4.14) pin the wrap.
+- **Request ids.** The client numbers requests `1, 2, 3, ...` per session; after `0xFFFFFFFF` the next id is 1 (0 is never used). The id is assigned when the request is committed. The server requires each REQUEST id to be exactly the successor of the previous one under the same rule (the successor of `0xFFFFFFFF` is 1), and the first request of a session to carry id 1; any other value is a protocol violation. Vectors `WRAP_A_REQ` and `WRAP_B_REQ` (4.14) pin the wrap: they continue a session whose previous request id was `0xFFFFFFFE`, so `WRAP_A_REQ` cannot open a session (test harnesses set the server's "last id" accordingly).
 - **FIFO.** The server executes requests in arrival order and sends exactly one RESPONSE (one message, one or more frames) per REQUEST, in the same order, with the request's `id` and `op`. A client that sees a response with another id or op than the oldest unanswered request has a protocol violation (5.4).
 - **Pipelining.** The client MAY issue further requests before earlier ones are answered (async API, 8.3). The server needs no knowledge of it.
 - **Flow control.** The response frames of request `q` are at most `rf(q) = max(1, ceil(RESP_BOUND(q) / CHUNK))`. This also covers an error response, because `HDR + ERRBODY_MAX` fits one frame (4.2). Let `R` be the sum of `rf` over the unanswered requests. The client MUST NOT commit a request `q` unless both conditions hold:
@@ -1240,7 +1242,7 @@ The server answers without calling the function: `aux = 3` (E_BAD_HANDLE), flags
 09000000000000000000000000000000
 ```
 
-**Request id wrap.** In another session, two `ml_add` requests carry `id 0xFFFFFFFF` and then `id 1` (the successor, 4.12). The frames are the same as `R3_REQ` apart from the id and the arguments:
+**Request id wrap.** In a session whose previous request carried `id 0xFFFFFFFE` (a test sets the server's last id to that value), two `ml_add` requests carry `id 0xFFFFFFFF` and then `id 1` (the successor, 4.12). The frames are the same as `R3_REQ` apart from the id and the arguments:
 
 ```hex vector=WRAP_A_REQ
 01000100ffffffff08000000000000000100000002000000
@@ -1327,7 +1329,7 @@ A session ends for one of the reasons in this table. Every path runs the same te
 
 1. Stop reading requests. Discard a partially assembled message. If a response reservation is held (link failure in the middle of a call), complete it with `hqq_write_abort`. The call in progress (if any) has already finished: a session thread is the only executor of its calls.
 2. Destroy every live handle in **descending creation sequence** through the type's destroy adapter, under the execution lock when `serialize(session)`. A child is always newer than its parent (5.1), so children go first. Teardown ignores `@retain_on_fail` and interceptors: **every entry is consumed** after its adapter returned. A destroy that reports failure is counted and logged through `on_log`; the process cannot retry, so the object may leak inside the library.
-3. Call `on_session_end` (5.5), so hand-written code can release per-session state it attached in `on_session_start`.
+3. Call `on_session_end` (5.5), so hand-written code can release per-session state it attached in `on_session_start`. `on_session_start` runs when the session thread starts, before HELLO, and `on_session_end` always pairs with it, so a session whose handshake failed still calls both.
 4. Send CLOSE_ACK if the trigger was CLOSE (`aux` = number of destroy failures: those of step 2 and of explicit destroys that cascaded earlier).
 5. `hqq_close` the link. The server is the creator, so this removes the segment name if it is still there (it is normally gone, 4.11).
 6. Free the session and decrement the session count.
@@ -1418,27 +1420,27 @@ All are in `bindgen/rt` (signatures in 9.3). Every error is a pointer type or a 
 
 | Type or value | Fields | `errors.Is` matches |
 | --- | --- | --- |
-| `*TransportError` | `Func string` (C name of the call), `Err error` (the `hqq` error), `Unknown bool` | `Err` (through `Unwrap`), and `ErrOutcomeUnknown` iff `Unknown` |
-| `*ProtocolError` | `Func`, `Reason string`, `Unknown bool` | `hqq.ErrProtocol`, `ErrOutcomeUnknown` iff `Unknown` |
-| `*StatusError` | `Func`, `Status uint32`, `Msg string` | by status: `ErrUnknownOp` (1), `ErrBadRequest` (2), `ErrBadHandle` (3), `ErrLimit` (4), `ErrDenied` (5), `ErrInternal` (6, and also `ErrOutcomeUnknown`), `hqq.ErrProtocol` (7), `ErrShuttingDown` (8) |
-| `*LibError` | `Func`, `Code int64` (the library's return value, 0 for `null`), `Detail string` | nothing by default; use `errors.As` |
-| `*MismatchError` | `Reason uint32` (HELLO_REPLY status), `Local`, `Remote [32]byte` | `ErrInterfaceMismatch` |
+| `*TransportError` | `Func string` (C name of the call), `Err error` (the `hqq` error), `Unknown bool`, unexported `svc` | `Err` (through `Unwrap`), and `ErrOutcomeUnknown` iff `Unknown` |
+| `*ProtocolError` | `Func`, `Reason string`, `Unknown bool`, unexported `svc` | `hqq.ErrProtocol`, `ErrOutcomeUnknown` iff `Unknown` |
+| `*StatusError` | `Func`, `Status uint32`, `Msg string`, unexported `svc`; no `Unknown` field | by status: `ErrUnknownOp` (1), `ErrBadRequest` (2), `ErrBadHandle` (3), `ErrLimit` (4), `ErrDenied` (5), `ErrInternal` (6), `hqq.ErrProtocol` (7), `ErrShuttingDown` (8); and `ErrOutcomeUnknown` for statuses 6, 7 and 8 (its `Is` method computes this) |
+| `*LibError` | `Func`, `Code int64` (the library's return value, 0 for `null`), `Detail string`, unexported `svc` | nothing by default; use `errors.As` |
+| `*MismatchError` | `Reason uint32` (HELLO_REPLY status), `Local`, `Remote [32]byte` | `ErrInterfaceMismatch` for every `Reason` (digest, version, geometry, limit, bad hello): a refused handshake is an interface or configuration mismatch, and `Reason` tells which |
 | `*OpenError` | `Code uint32` (bootstrap status minus `0x50000`), `Msg string` | `ErrLimit` for code 3 (BUSY) and 2 (GEOMETRY) |
 | `ErrSessionBroken` | sentinel | returned (wrapped in `*TransportError` with `Unknown false`) by every call after the session failed |
 | `ErrConcurrentUse` | sentinel | returned when a second `BeginRequest` or `Wait` starts while the first one's `Enc` or `Dec` is still open on the same `Conn` (re-entrancy). Concurrent use from two goroutines is **not** detected in production builds (8.2) |
 | `ErrFutureUsed` | sentinel | returned by `Wait` of a future that was already waited for, discarded by `Sync`, abandoned by `Close`, or is the zero future of a failed `Async` call (8.3) |
 | `ErrForeignHandle`, `ErrInvalidArg` | sentinels | themselves |
 
-`StatusError`, `LibError`, `TransportError` and `ProtocolError` carry the function name so that `err.Error()` reads `microlib: ml_counter_add: library error -1: overflow`.
+`StatusError`, `LibError`, `TransportError` and `ProtocolError` carry the function name in `Func` and the service name in an unexported field that `rt` sets from `Iface.Service`, so that `err.Error()` reads `microlib: ml_counter_add: library error -1: overflow`.
 
 ### 6.3 Unknown outcome and `ErrPeerGone`
 
 A call has a known outcome in only three situations: its response was fully received and released; it was refused by the client before the request was committed (an argument error, `BeginRequest` failure, session already broken); or the server answered a call-level status other than E_INTERNAL (6), in which case the function did not run. **E_INTERNAL is an unknown outcome** (4.6.6): the call may have run before the server detected the problem, so the stub marks the `*StatusError` with `ErrOutcomeUnknown`.
 
-Every other case is an **unknown outcome**: the request was committed to the ring and the response was not completely received when the session failed. This covers `hqq.ErrPeerGone` (the server died or stopped heartbeating), `hqq.ErrPeerClosed` (the server closed; the draining rule delivers responses already published, so a call that got its response is not affected), a final frame with E_PROTOCOL or E_SHUTTING_DOWN, a protocol violation by the server, `CallTimeout`, and `Close` with calls in flight. Those errors carry `Unknown: true`; the library call may or may not have run, and may still run (the server executes committed requests while it drains).
+Every other case is an **unknown outcome**: the request was committed to the ring and the response was not completely received when the session failed. This covers `hqq.ErrPeerGone` (the server died or stopped heartbeating), `hqq.ErrPeerClosed` (the server closed; the draining rule delivers responses already published, so a call that got its response is not affected), a final frame with E_PROTOCOL or E_SHUTTING_DOWN, a protocol violation by the server, `CallTimeout`, and `Close` with calls in flight. Those errors match `ErrOutcomeUnknown` (through the `Unknown` field of `*TransportError` and `*ProtocolError`, and through `StatusError.Is` for statuses 6, 7 and 8); the library call may or may not have run, and may still run (the server executes committed requests while it drains).
 
 - **No automatic retry.** The runtime never replays a request. Whether a call is safe to repeat is a property of the C function, which only the caller knows.
-- **`CallTimeout`.** A `Wait` that exceeds `CallTimeout` returns `ErrTimeout` (wrapped, `Unknown: true`) and the call stays registered as pending, so the caller MAY `Wait` again. A synchronous stub does not retry; it marks the call abandoned (its response is discarded when it arrives) and returns the error. The session stays usable because FIFO ids keep it in sync. The server's call is not interrupted (there is no cancellation, 1.2).
+- **`CallTimeout`.** A `Wait` that exceeds `CallTimeout` returns `ErrTimeout` (wrapped, `Unknown: true`) and the call stays registered as pending, so the caller MAY `Wait` again; it stays pending, and keeps counting in the flow-control sum `R` of 4.12, until a later `Wait`, `Sync` or `Close`. The synchronous stub does not retry and does not abandon the call (there is no `Abandon` API): it returns the error. The session stays usable because FIFO ids keep it in sync, and the late response is read and buffered by the next `Wait` or `Sync`. The server's call is not interrupted (there is no cancellation, 1.2).
 - **Peer death detection.** The client learns of a dead server from the peer monitor of its blocked `ReserveRead`: at most `max(peer_timeout, 4 * the server's heartbeat interval)` after the last heartbeat (SPEC 6.3), 2 s with the defaults. The error is `hqq.ErrPeerGone`; the session is broken.
 
 ### 6.4 Crash and panic containment
@@ -1542,7 +1544,7 @@ Three rules fix who may run concurrently: the server runs one thread per session
 
 | Value | Contract of the library | Server behavior |
 | --- | --- | --- |
-| `session` (default) | The library is safe if it is entered by one session at a time. | A process-wide **execution lock** (`hqqrpc_exec_begin`, `hqqrpc_exec_end`, 9.5, built on `hqq_plat_mutex_*`, 12.1 item 3) is held around every entry into library code. For a call it is taken **once**, after the response was reserved, and covers the interceptor, the destroy cascade, the C function, the error predicate and detail functions, borrowed-result copies and `@free` (4.7.1 steps 7 to 13). Teardown takes it around the destroy calls. Sessions otherwise run concurrently: ring waits, decoding, publishing and the response reservation happen outside the lock. The lock is a plain mutex, not recursive; the runtime functions documented as "called with the lock held" (`hqqrpc_handle_destroy_children`) never take it themselves. |
+| `session` (default) | The library is safe if it is entered by one session at a time. | An **execution lock** shared by all sessions of one `hqqrpc_server` (`hqqrpc_exec_begin`, `hqqrpc_exec_end`, 9.5, built on `hqq_plat_mutex_*`, 12.1 item 3) is held around every entry into library code; two servers in one process do not exclude each other, so a process that hosts one library MUST run one server. For a call it is taken **once**, after the response was reserved, and covers the interceptor, the destroy cascade, the C function, the error predicate and detail functions, borrowed-result copies and `@free` (4.7.1 steps 7 to 13). Teardown takes it around the destroy calls. Sessions otherwise run concurrently: ring waits, decoding, publishing and the response reservation happen outside the lock. The lock is a plain mutex, not recursive; the runtime functions documented as "called with the lock held" (`hqqrpc_handle_destroy_children`) never take it themselves. |
 | `none` | The library is thread-safe: calls from different sessions may run at the same time. | The lock calls are no-ops. |
 
 The value is the contract, not a mode switch: it is also emitted into `hqqrpc_iface.serialize` and reported by the server at start-up. The name is kept from the brief; the exclusion unit is one call, so with `session` sessions interleave call by call and a session never overlaps another session inside the library (**decision**: the brief fixes the two names but not the exact meaning). Calls of one session are always sequential, on the session's own thread. A library with thread affinity needs a dedicated executor thread, which is not provided (12.2).
@@ -1566,8 +1568,8 @@ Every wire function has a synchronous method and an async method (9.4). `FooAsyn
 
 1. **Single goroutine.** Issue and wait happen on the goroutine that owns the `Conn` (8.2). The runtime starts no goroutine.
 2. **Copy at issue.** `FooAsync` copies the request arguments into the ring slot, so the caller may reuse its `src` slices at once. Destination slices of `out` buffers MUST stay valid and untouched until `Wait` returns.
-3. **Wait in any order.** `Wait` on a later future first reads the responses of all earlier unanswered calls and keeps them in per-call buffers (a copy of one response, bounded by flow control to `B * S` bytes for the whole session, 4.12), then returns its own response decoded in place. An earlier future's `Wait` later decodes from its buffer. Waiting in issue order never copies.
-4. **Wait once.** A future is single-use and carries the **request id** (`u32`) of its call. `Wait` fails with `rt.ErrFutureUsed`, before it reads anything, unless the `Call` it holds is non-nil, is still pending, and has `call.id == id`; a `Wait` that completes (successfully or not), `Sync`, and `Close` each clear the pending state and recycle the call object, so a second `Wait`, a `Wait` after `Sync`, and the zero future of a failed `Async` call all get `ErrFutureUsed` instead of another request's response. A recycled `Call` receives a new, larger id, so a stale future cannot match it again before the id wraps after 2^32 requests (residual, accepted).
+3. **Wait in any order.** `Wait` on a later future first reads the responses of all earlier unanswered calls and keeps each in a per-call buffer (a copy of that response), then returns its own response decoded in place. An earlier future's `Wait` later decodes from its buffer. Waiting in issue order never copies. **The buffered bytes are bounded by the sum of `RESP_BOUND` over the futures that have been answered but not yet waited for**: every unwaited future keeps its buffer until `Wait`, `Sync` or `Close`, so a caller that issues and never waits holds memory in proportion to the number of futures. Flow control (4.12) bounds only the responses still in the ring, to `B` frames.
+4. **Wait once.** A future is single-use and carries the **request id** (`u32`) of its call. `Wait` fails with `rt.ErrFutureUsed`, before it reads anything, unless the `Call` it holds is non-nil, is still pending, and has `call.id == id`; a `Wait` that completes (successfully or not), `Sync`, and `Close` each clear the pending state and recycle the call object, so a second `Wait` and a `Wait` after `Sync` both get `ErrFutureUsed` instead of another request's response. **The zero future of a failed `Async` call** has no `*Client`, so `rt` cannot see it: the generated `Wait` therefore begins with `if f.c == nil { return <zero results>, rt.ErrFutureUsed }` (9.4), before it touches `f.c.c`. A recycled `Call` receives a new, larger id, so a stale future cannot match it again before the id wraps after 2^32 requests (residual, accepted).
 5. **Issue can block.** `FooAsync` blocks (by reading and buffering responses) when flow control (4.12) forbids the commit, and while the request ring is full. It does not run without bound: the server always drains.
 6. **Futures left unwaited.** `Conn.Sync()` waits for every unanswered call and discards unclaimed results; `Close` abandons them (unknown outcome, 6.3).
 7. **No dependent calls.** A handle returned by a pending call cannot be used before its `Wait` (the id is not known). The batch envelope is reserved for this (4.13).
@@ -1629,7 +1631,7 @@ hqq-bindgen [flags] file.idl
   -print-digest       print the SHA-256 of the canonical text as 64 hex digits and exit
 ```
 
-- Generated files begin with `// Code generated by hqq-bindgen from <file.idl> (interface digest <hex>). DO NOT EDIT.` (C files use the same text in a `/* */` comment) so that Go tooling treats them as generated.
+- Generated files begin with `// Code generated by hqq-bindgen from <file.idl> (interface digest <hex>). DO NOT EDIT.` (C files use the same text in a `/* */` comment) so that Go tooling treats them as generated. `<file.idl>` is the **last path element** of the input path (`microlib.idl` even when the command line says `../../testdata/microlib/microlib.idl`), so the output does not depend on where the generator ran.
 - Output is deterministic: no timestamps, no host paths, declaration order and sorted tables as specified. Go output passes through `go/format`; C output is produced by the emitter with 4-space indentation.
 - A consumer wires it with `//go:generate go run gosuda.org/hqq/cmd/hqq-bindgen -go-out . -go-strip ml_ -c-out server ../../testdata/microlib/microlib.idl`. CI runs the same command with `-check` (10.6), the pattern of `c/tools/gen_constants.py --check`.
 - **Go names.** The rules are fixed so that the emitter output is a function of the IDL:
@@ -1637,8 +1639,8 @@ hqq-bindgen [flags] file.idl
   2. *Types and consts.* The first letter of a `struct`, `union`, `handle` or `const` name is upper-cased; the rest is unchanged (`Counter`, `ML_OK`). A union adds `<Name>Tag` and one constant `<Name><Case>` per case.
   3. *Fields.* Struct fields and union payload fields are the capitalized IDL names; a union struct has the field `Tag`.
   4. **Parameters.** Every parameter is named `p_<idlname>` in the generated signature (`p_c`, `p_delta`, `p_src`). The IDL name appears only in doc comments. Results are unnamed in the signature; their meaning is listed in the doc comment.
-  5. *Locals.* Locals of generated code are lowercase names from a fixed set (`c`, `f`, `e`, `d`, `b`, `err`, `body`, `call`, `off`, `end`, `n`, `v`, `i`, `id`, `ret`, `rc`, `cnt`, `out`). Package-level unexported identifiers all begin with `hqq` (`hqqIface`, `hqqLE`, `hqqOpAdd`). Because parameters carry the `p_` prefix, types and consts begin with a capital letter, and IDL identifiers cannot begin with `hqq` (V37), no generated name can collide with an IDL name or with another generated name, and no Go keyword or predeclared identifier can appear as an identifier.
-  6. *Reserved names.* The names `Client`, `Dial`, `Close` and `Conn` are taken by the generated package surface, and a function name that maps to one of them is a validation error (V37), as is any collision among `X`, `XAsync`, `XFuture`, type names, tag constants and consts after the transformation.
+  5. *Locals.* Locals of generated code are lowercase names from this family: `c`, `f`, `e`, `d`, `b`, `err`, `body`, `call`, `off`, `end`, `n`, `v`, `i`, `id`, `ret`, `rc`, `cnt`, `out`, `r`, `s`, with a decimal suffix (`v1`, `i1`, `cnt1`, `out1`, `r1`) when a function needs more than one of a kind. Package-level unexported identifiers all begin with `hqq` (`hqqIface`, `hqqLE`, `hqqOpAdd`). Because parameters carry the `p_` prefix, types and consts begin with a capital letter, and IDL identifiers cannot begin with `hqq` (V37), no generated name can collide with an IDL name or with another generated name, and no Go keyword or predeclared identifier can appear as an identifier.
+  6. *Reserved names.* The names `Client`, `Dial`, `Close`, `Kill` and `Conn` are taken by the generated package surface (`Conn` is the accessor method of `Client`), and a function name that maps to one of them is a validation error (V37), as is any collision among `X`, `XAsync`, `XFuture`, type names, tag constants and consts after the transformation.
 
 ### 9.3 Go runtime: package `rt`
 
@@ -1793,7 +1795,7 @@ type OpenError      struct{ Code uint32; Msg string }
 type Pool[T any] struct{ /* unexported */ }
 
 func NewPool[T any](max int, dial func(ctx context.Context) (T, error), closeFn func(T) error) *Pool[T]
-func (p *Pool[T]) Get(ctx context.Context) (T, error) // reuses an idle value or dials a new one while fewer than max exist
+func (p *Pool[T]) Get(ctx context.Context) (T, error) // reuses an idle value or dials a new one while fewer than max exist; after Close it returns an error matching net.ErrClosed
 func (p *Pool[T]) Put(v T)                            // returns a healthy value
 func (p *Pool[T]) Discard(v T)                        // closes a broken value and frees its slot
 func (p *Pool[T]) Close() error
@@ -1956,7 +1958,7 @@ Rules the emitter follows (the Go signature is a function of the IDL signature):
 1. Parameters are the non-derived `in` and `inout` parameters in C order, plus caller-supplied `out` buffers (as `[]byte` or `[]T`, in their C position), plus, for a composite return, a trailing destination slice.
 2. Results are: the return value (omitted when it is bound by `@len_of`, when it is a `status` code with a single `ok` value, or when it is void); then each non-derived `out` or `inout` parameter in C order (a caller-supplied buffer is returned as `dst[:n]`); then `error`.
 3. A `status` return with several `ok` values is the first result. A `null` or `predicate` convention reports failure as `*rt.LibError`; the success value is returned as usual.
-4. `str` becomes `string`, `bytes` becomes `[]byte`, `T[]` becomes `[]T`, a union becomes a struct with a `Tag` and one field per payload, a struct becomes a struct, a handle type becomes a struct embedding `rt.Handle`. `str`, `bytes` and arrays that come back are fresh copies, never views of shared memory.
+4. `str` becomes `string`, `bytes` becomes `[]byte`, `T[]` becomes `[]T`, a union becomes a struct with a `Tag` and one field per payload, a struct becomes a struct, a handle type becomes a struct embedding `rt.Handle`. **Nullable values:** a `@nullable` `str` is `*string` (nil is NULL); a `@nullable` `bytes` or `T[]` is a slice where nil is NULL and an empty non-nil slice is a present empty value; a `@nullable` handle uses the nil `Handle` for NULL. `str`, `bytes` and arrays that come back are fresh copies, never views of shared memory.
 5. A future is `struct { c *Client; call *rt.Call; id uint32 }` plus the destination slice where the result is written into caller storage; `Async` stores `call.ID()` in `id`, and `Wait` passes `(call, id)` to `rt.Conn.Wait`, which rejects reuse (8.3).
 6. An `out` handle with `@error(status)` that comes back as id 0 (success with a NULL object) is returned as the nil `Handle` without error (4.6.5).
 
@@ -1993,6 +1995,9 @@ func (c *Client) AddAsync(p_a, p_b int32) (AddFuture, error) {
 }
 
 func (f AddFuture) Wait() (int32, error) {
+	if f.c == nil {
+		return 0, rt.ErrFutureUsed
+	}
 	d, err := f.c.c.Wait(f.call, f.id)
 	if err != nil {
 		return 0, err
@@ -2033,6 +2038,9 @@ func (c *Client) CounterAddAsync(p_c Counter, p_delta int64) (CounterAddFuture, 
 }
 
 func (f CounterAddFuture) Wait() (int64, error) {
+	if f.c == nil {
+		return 0, rt.ErrFutureUsed
+	}
 	d, err := f.c.c.Wait(f.call, f.id)
 	if err != nil {
 		return 0, err
@@ -2060,6 +2068,9 @@ func (f CounterAddFuture) Wait() (int64, error) {
 ```go
 // CounterCheck: G2 is ret i32 (size 4). A failure with detail is G2, zero padding to 8, then D (4.6.4).
 func (f CounterCheckFuture) Wait() error {
+	if f.c == nil {
+		return rt.ErrFutureUsed
+	}
 	d, err := f.c.c.Wait(f.call, f.id)
 	if err != nil {
 		return err
@@ -2084,6 +2095,9 @@ func (f CounterCheckFuture) Wait() error {
 
 // CursorFree: destroy with @error(status, ok(ML_OK)). The server consumed the handle whatever the status (5.1).
 func (f CursorFreeFuture) Wait() error {
+	if f.c == nil {
+		return rt.ErrFutureUsed
+	}
 	d, err := f.c.c.Wait(f.call, f.id)
 	if err != nil {
 		return err
@@ -2124,6 +2138,9 @@ func (c *Client) CursorOpenAsync(p_c Counter, p_step int32) (CursorOpenFuture, e
 }
 
 func (f CursorOpenFuture) Wait() (Cursor, error) {
+	if f.c == nil {
+		return Cursor{}, rt.ErrFutureUsed
+	}
 	d, err := f.c.c.Wait(f.call, f.id)
 	if err != nil {
 		return Cursor{}, err
@@ -2167,6 +2184,9 @@ func (c *Client) XorAsync(p_src []byte, p_key uint8, p_dst []byte) (XorFuture, e
 }
 
 func (f XorFuture) Wait() ([]byte, error) {
+	if f.c == nil {
+		return nil, rt.ErrFutureUsed
+	}
 	d, err := f.c.c.Wait(f.call, f.id)
 	if err != nil {
 		return nil, err
@@ -2191,6 +2211,9 @@ func (f XorFuture) Wait() ([]byte, error) {
 
 ```go
 func (f CellsFuture) Wait() ([]Cell, error) {
+	if f.c == nil {
+		return nil, rt.ErrFutureUsed
+	}
 	d, err := f.c.c.Wait(f.call, f.id)
 	if err != nil {
 		return nil, err
@@ -3154,7 +3177,7 @@ Fuzz corpora seed from the vectors. The Go targets run for 5 seconds in CI like 
 
 ### 10.3 Unit and conformance tests per component
 
-- **Parser**: one negative test per validation rule of 2.5 (a minimal IDL that violates exactly that rule, expecting the rule id and position), including V37 (`hqq` prefix, reserved Go names, collisions after the Go name transformation), V38, V39, V40 (nested `T[N]` overflow, a static bound above `2^30`) and V41 (`@max_out` below `wc`); positive tests for every grammar production and for the annotation places of 2.4; `include` and `@c` injection attempts (V35, V36); numeric edge cases of 2.1; determinism of the canonical form under reordering of consts and comments; the `retain=` field of the handle line; a table of digests of small IDL files that is part of `vectors.json`.
+- **Parser**: one negative test per validation rule of 2.5 (a minimal IDL that violates exactly that rule, expecting the rule id and position), including V37 (`hqq` prefix, reserved Go names, collisions after the Go name transformation), V38, V39, V40 (nested `T[N]` overflow, a static bound above `2^30`) and V41 (`@max_out` below `wc`); positive tests for every grammar production and for the annotation places of 2.4; `include` and `@c` injection attempts (V35, V36); numeric edge cases of 2.1; determinism of the canonical form under reordering of consts and comments; the `retain=` field of the handle line; a golden table of digests of small IDL files kept in the `bindgen/idl` tests (not in `vectors.json`, which holds only the blocks of this document); `wc` and `SizeOf` of fixed and non-fixed structs at every start alignment.
 - **Go runtime**: flow control (4.12) against a scripted slow server: no deadlock with `B = 2` and 100 async calls, the `rf > B` synchronous rule, `max_in_flight`, the `rf` cache per `(op, cap)`; out-of-order `Wait`; id wrap at `0xFFFFFFFF`; `CallTimeout` abandonment; **futures**: a second `Wait`, a `Wait` after `Sync`, a zero future and a recycled `Call` all return `ErrFutureUsed` and read nothing; **re-entrancy**: a second `BeginRequest` before `Submit` and a call with an unreleased `Dec` return `ErrConcurrentUse` (concurrent goroutines are covered only by running the suite under `-race`, 8.2); `Close` with calls in flight and `Close` with unread responses (drained to CLOSE_ACK); `Kill` from another goroutine unblocks a `Wait`; the session is marked broken after `hqq.ErrInvalidSize` and `hqq.ErrUnexpectedPacket`; the session open retry loop (4.11) against a link that is created late; `PeerTimeout` 0 becomes 2 s; allocation tests (`testing.AllocsPerRun` is 0 for `Add` and for `AddAsync` plus in-order `Wait` after warm-up, with `CallTimeout == 0` only; out-of-order `Wait` and `CallTimeout > 0` are excluded because they allocate, 1.3).
 - **C runtime**: frame validity rules of 4.4 one by one (each violation tears the session down and sends E_PROTOCOL), including a header that is rewritten after the check (the runtime must use its copy and `DataSize`); chunk assembly (bounds, wrong `aux`, wrong length, `total` above `max_message`, alignment of the assembly buffer); every decoder of `hqqrpc_rd_*` at its boundaries (length exactly at the end, one above, `NULL_LEN`, NUL missing, embedded NUL, count times size overflow); the writers: bound exceeded, embedded NUL, capacity exceeded, sticky error, `commit` with an error set (publishes nothing, the dispatch return converts the held reservation); `resp_begin` in place versus scratch (`HDR + body_cap` equal to `S` and `S + 1`); **held reservation**: every non-success path after `resp_begin` produces exactly one error frame and no tombstone (hook veto, writer failure, shim status outside the application range, `E_INTERNAL`), and teardown with a held reservation aborts it; handle table full gives E_LIMIT without calling the library; **destroy semantics** (5.1): a failing destroy consumes the entry, a failing `@retain_on_fail` destroy keeps it, a failing child in a cascade is consumed and the parent's destroy still runs, teardown consumes every entry and destroys no pointer twice, a failing destroy is counted in the `CLOSE_ACK` `aux`; teardown order with the `Cursor` child; **interceptor** (7.3): a test thread rewrites the request slot between the verdict and the library call (a hook that approves `"a.db"` while the slot changes to `"b.db"`): the library must see the approved bytes; a `str` that loses its NUL in the slot cannot make the server read past its copy; `serialize(none)` versus `session` (a second session blocks while the first is inside the library); `on_session_*` callbacks; `copy_request`; **stop** (5.2): a session blocked waiting for a request returns within the poll interval after `hqqrpc_server_stop`, a client that never reads responses is torn down after `write_stall_timeout`, final frames never block, `hqqrpc_server_run` with a library call that never returns yields `HQQ_ERR_TIMEOUT` and `hqqrpc_server_destroy` refuses; bootstrap bounds (4.11): `max_control_links`, `2 * B * S` above `max_segment_bytes`, an OPEN that never arrives, the control link unlinked after accept.
 - **Platform mutex** (`c/tests/test_platform_mutex.c`): lock and unlock from two threads, contention, destroy of an unlocked mutex, on POSIX and under the Windows CI job.

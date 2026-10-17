@@ -1,0 +1,13 @@
+// microbench.idl: the functions of the benchmarks of BINDGEN.md 10.5 that microlib.idl does not declare.
+// ml_work is a C loop of known cost (microlib.h); ml_add is repeated here so that the trivial-call and the
+// fixed-cost benchmarks run against one server.
+idl 1;
+
+@serialize(session)
+service microbench;
+
+include "microlib.h";
+
+fn ml_add(a: i32, b: i32) -> i32;
+
+fn ml_work(iters: u32) -> u64;

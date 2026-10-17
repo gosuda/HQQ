@@ -165,6 +165,12 @@ void hqq_plat_thread_join(const hqq_allocator *a, hqq_plat_thread *t) {
     hqq_free(a, t, sizeof *t);
 }
 
+void hqq_plat_thread_detach(hqq_plat_thread *t) {
+    if (t != NULL) {
+        (void)pthread_detach(t->t);
+    }
+}
+
 struct hqq_plat_event {
     pthread_mutex_t m;
     pthread_cond_t c;
@@ -254,6 +260,38 @@ int hqq_plat_event_wait(hqq_plat_event *e, uint64_t timeout_ns) {
     set = e->set;
     pthread_mutex_unlock(&e->m);
     return set;
+}
+
+struct hqq_plat_mutex {
+    pthread_mutex_t m;
+};
+
+hqq_plat_mutex *hqq_plat_mutex_create(const hqq_allocator *a) {
+    struct hqq_plat_mutex *m = (struct hqq_plat_mutex *)hqq_alloc(a, sizeof *m);
+    if (m == NULL) {
+        return NULL;
+    }
+    if (pthread_mutex_init(&m->m, NULL) != 0) {
+        hqq_free(a, m, sizeof *m);
+        return NULL;
+    }
+    return m;
+}
+
+void hqq_plat_mutex_destroy(const hqq_allocator *a, hqq_plat_mutex *m) {
+    if (m == NULL) {
+        return;
+    }
+    pthread_mutex_destroy(&m->m);
+    hqq_free(a, m, sizeof *m);
+}
+
+void hqq_plat_mutex_lock(hqq_plat_mutex *m) {
+    (void)pthread_mutex_lock(&m->m);
+}
+
+void hqq_plat_mutex_unlock(hqq_plat_mutex *m) {
+    (void)pthread_mutex_unlock(&m->m);
 }
 
 /* ---- Named shared memory --------------------------------------------------------------- */

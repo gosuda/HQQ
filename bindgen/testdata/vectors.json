@@ -1,0 +1,249 @@
+{
+  "microlib": {
+    "idl": "microlib/microlib.idl",
+    "canonical": "HQQ-IDL 1\nservice microlib\nhandle Counter parent=- destroy=ml_counter_free retain=0\nhandle Cursor parent=Counter destroy=ml_cursor_free retain=0\nunion Cell 1:Int:i64 2:Text:str<=16 3:Null:-\nfn 1 ml_add p=in:a:i32 p=in:b:i32 ret=i32 err=none ok=- detail=0 max_out=-\nfn 2 ml_counter_new p=in:start:i64 ret=Counter err=null ok=- detail=0 max_out=-\nfn 3 ml_counter_add p=in:c:Counter p=in:delta:i64 p=out:total:i64 ret=i32 err=status ok=0 detail=1 max_out=-\nfn 4 ml_counter_free p=in:c:Counter ret=- err=none ok=- detail=0 max_out=-\nfn 5 ml_cursor_open p=in:c:Counter p=in:step:i32 ret=Cursor err=null ok=- detail=0 max_out=-\nfn 6 ml_cursor_next p=in:cur:Cursor p=out:value:i64 ret=i32 err=status ok=0,1 detail=0 max_out=-\nfn 7 ml_cursor_free p=in:cur:Cursor ret=i32 err=status ok=0 detail=0 max_out=-\nfn 8 ml_xor p=in:src:bytes<=65536 p=in:n:size:len_of=src p=in:key:u8 p=out:dst:bytes p=in:cap:size:len_of=dst ret=size:len_of=dst err=predicate ok=- detail=0 max_out=-\nfn 9 ml_hash p=in:s:str<=255 ret=u64 err=none ok=- detail=0 max_out=-\nfn 10 ml_cells p=in:c:Counter p=in:max:i32 ret=Cell[]<=256 err=none ok=- detail=0 max_out=8192\nfn 11 ml_counter_check p=in:c:Counter p=in:limit:i32 ret=i32 err=status ok=0 detail=1 max_out=-\n",
+    "digest": "06a738744a1ea9f11fb08cc41afbe48e1891c76e60830a276e98cf8c15944e5c",
+    "geometry": {
+      "buffer_size": 16384,
+      "buffer_count": 64
+    },
+    "frames": [
+      {
+        "name": "HELLO",
+        "id": 0,
+        "dir": "c2s",
+        "hex": "04000000000000004000000000000000485142470100000000000000004000004000000040000000000000010000000006a738744a1ea9f11fb08cc41afbe48e1891c76e60830a276e98cf8c15944e5c"
+      },
+      {
+        "name": "HELLO_REPLY",
+        "id": 0,
+        "dir": "s2c",
+        "hex": "05000000000000004000000000000000485142470100000000000000400000000000000100100000000000000000000006a738744a1ea9f11fb08cc41afbe48e1891c76e60830a276e98cf8c15944e5c"
+      },
+      {
+        "name": "HELLO_REPLY_DIGEST",
+        "id": 0,
+        "dir": "s2c",
+        "hex": "05000000000000004000000001000000485142470100000000000000000000000000000000000000000000000000000006a738744a1ea9f11fb08cc41afbe48e1891c76e60830a276e98cf8c15944e5c"
+      },
+      {
+        "name": "R1_REQ",
+        "id": 1,
+        "dir": "c2s",
+        "hex": "01000200010000000800000000000000f8ffffffffffff7f"
+      },
+      {
+        "name": "R1_RESP",
+        "id": 1,
+        "dir": "s2c",
+        "hex": "0200020001000000040000000000000001000100"
+      },
+      {
+        "name": "R2_REQ",
+        "id": 2,
+        "dir": "c2s",
+        "hex": "0100030002000000100000000000000001000100000000006400000000000000"
+      },
+      {
+        "name": "R2_RESP",
+        "id": 2,
+        "dir": "s2c",
+        "hex": "02030300020000001d00000000000000ffffffff000000000000000000000000080000006f766572666c6f7700"
+      },
+      {
+        "name": "R3_REQ",
+        "id": 3,
+        "dir": "c2s",
+        "hex": "010001000300000008000000000000000700000023000000"
+      },
+      {
+        "name": "R3_RESP",
+        "id": 3,
+        "dir": "s2c",
+        "hex": "020001000300000004000000000000002a000000"
+      },
+      {
+        "name": "R4_REQ",
+        "id": 4,
+        "dir": "c2s",
+        "hex": "01000800040000000f00000000000000ff0000000800000003000000010203"
+      },
+      {
+        "name": "R4_RESP",
+        "id": 4,
+        "dir": "s2c",
+        "hex": "02000800040000000f00000000000000030000000000000003000000fefdfc"
+      },
+      {
+        "name": "R5_REQ",
+        "id": 5,
+        "dir": "c2s",
+        "hex": "01000800050000000f00000000000000ff0000000200000003000000010203"
+      },
+      {
+        "name": "R5_RESP",
+        "id": 5,
+        "dir": "s2c",
+        "hex": "02020800050000000800000000000000ffffffffffffffff"
+      },
+      {
+        "name": "R6_REQ",
+        "id": 6,
+        "dir": "c2s",
+        "hex": "010003000600000010000000000000000100010000000000ffffffffffffffff"
+      },
+      {
+        "name": "R6_RESP",
+        "id": 6,
+        "dir": "s2c",
+        "hex": "02000300060000000b000000050000000600000064656e69656400"
+      },
+      {
+        "name": "R7_REQ",
+        "id": 7,
+        "dir": "c2s",
+        "hex": "0100030007000000100000000000000009000100000000000100000000000000"
+      },
+      {
+        "name": "R7_RESP",
+        "id": 7,
+        "dir": "s2c",
+        "hex": "02000300070000000f000000030000000a0000006261642068616e646c6500"
+      },
+      {
+        "name": "R8_REQ",
+        "id": 8,
+        "dir": "c2s",
+        "hex": "01000a000800000008000000000000000100010003000000"
+      },
+      {
+        "name": "R8_RESP",
+        "id": 8,
+        "dir": "s2c",
+        "hex": "02000a000800000020000000000000000300000001000000feffffffffffffff02000000020000006869000003000000"
+      },
+      {
+        "name": "R9_REQ",
+        "id": 9,
+        "dir": "c2s",
+        "hex": "010005000900000008000000000000000100010003000000"
+      },
+      {
+        "name": "R9_RESP",
+        "id": 9,
+        "dir": "s2c",
+        "hex": "0200050009000000040000000000000002000100"
+      },
+      {
+        "name": "R10_REQ",
+        "id": 10,
+        "dir": "c2s",
+        "hex": "010007000a000000040000000000000002000100"
+      },
+      {
+        "name": "R10_RESP",
+        "id": 10,
+        "dir": "s2c",
+        "hex": "020207000a000000040000000000000002000000"
+      },
+      {
+        "name": "R11_REQ",
+        "id": 11,
+        "dir": "c2s",
+        "hex": "010007000b000000040000000000000002000100"
+      },
+      {
+        "name": "R11_RESP",
+        "id": 11,
+        "dir": "s2c",
+        "hex": "020007000b0000000f000000030000000a0000006261642068616e646c6500"
+      },
+      {
+        "name": "R12_REQ",
+        "id": 12,
+        "dir": "c2s",
+        "hex": "01000b000c00000008000000000000000100010005000000"
+      },
+      {
+        "name": "R12_RESP",
+        "id": 12,
+        "dir": "s2c",
+        "hex": "02030b000c0000001700000000000000ffffffff000000000a0000006f766572206c696d697400"
+      },
+      {
+        "name": "R13_REQ",
+        "id": 13,
+        "dir": "c2s",
+        "hex": "010004000d000000040000000000000001000100"
+      },
+      {
+        "name": "R13_RESP",
+        "id": 13,
+        "dir": "s2c",
+        "hex": "020004000d0000000000000000000000"
+      },
+      {
+        "name": "CLOSE",
+        "id": 0,
+        "dir": "c2s",
+        "hex": "08000000000000000000000000000000"
+      },
+      {
+        "name": "CLOSE_ACK",
+        "id": 0,
+        "dir": "s2c",
+        "hex": "09000000000000000000000000000000"
+      }
+    ]
+  },
+  "sqlite_lowlevel": {
+    "idl": "sqlite_lowlevel.idl",
+    "canonical": "HQQ-IDL 1\nservice sqlite_lowlevel\nhandle Db parent=- destroy=sqlite3_close retain=1\nhandle Stmt parent=Db destroy=sqlite3_finalize retain=0\nstruct Rows ncols:u32 cells:Value[]\nunion Value 1:Int:i64 2:Float:f64 3:Text:str 4:Blob:bytes 5:Null:-\nfn 1 sqlite3_open_v2 p=in:filename:str<=4096 p=out:db:Db p=in:flags:i32 p=in:zvfs:str<=64:nullable ret=i32 err=status ok=0 detail=1 max_out=-\nfn 2 sqlite3_close p=in:db:Db ret=i32 err=status ok=0 detail=0 max_out=-\nfn 3 sqlite3_prepare_v2 p=in:db:Db p=in:sql:str<=1048576 p=in:nbyte:i32:len_of=sql p=out:stmt:Stmt p=out:tail:u32:offset_in=sql ret=i32 err=status ok=0 detail=1 max_out=-\nfn 4 sqlite3_step p=in:stmt:Stmt ret=i32 err=status ok=100,101 detail=1 max_out=-\nfn 5 sqlite3_finalize p=in:stmt:Stmt ret=i32 err=status ok=0 detail=0 max_out=-\nfn 6 sqlite3_column_count p=in:stmt:Stmt ret=i32 err=none ok=- detail=0 max_out=-\nfn 7 sqlite3_bind_int64 p=in:stmt:Stmt p=in:index:i32 p=in:value:i64 ret=i32 err=status ok=0 detail=1 max_out=-\nfn 8 bind_text p=in:stmt:Stmt p=in:index:i32 p=in:text:str<=1048576 p=in:n:i32:len_of=text ret=i32 err=status ok=0 detail=1 max_out=-\nfn 9 fetch_rows p=in:stmt:Stmt p=in:max:i32 ret=Rows err=none ok=- detail=0 max_out=65536\n",
+    "digest": "06a17c1abf350b8ba75b1249f05524b638f41c83f9c296326d638ba35c8b5850"
+  },
+  "chunking": {
+    "buffer_size": 128,
+    "frames": [
+      {
+        "name": "C_REQ_1",
+        "id": 1,
+        "dir": "c2s",
+        "hex": "01000800010000007a000000000000005a0000006e0000006e000000000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f60616263"
+      },
+      {
+        "name": "C_REQ_2",
+        "id": 1,
+        "dir": "c2s",
+        "hex": "03000000010000007a000000700000006465666768696a6b6c6d"
+      },
+      {
+        "name": "C_RESP_1",
+        "id": 1,
+        "dir": "s2c",
+        "hex": "02000800010000007a000000000000006e000000000000006e0000005a5b58595e5f5c5d52535051565754554a4b48494e4f4c4d42434041464744457a7b78797e7f7c7d72737071767774756a6b68696e6f6c6d62636061666764651a1b18191e1f1c1d12131011161714150a0b08090e0f0c0d02030001060704053a3b3839"
+      },
+      {
+        "name": "C_RESP_2",
+        "id": 1,
+        "dir": "s2c",
+        "hex": "03000000010000007a000000700000003e3f3c3d323330313637"
+      }
+    ]
+  },
+  "wrap": {
+    "frames": [
+      {
+        "name": "WRAP_A_REQ",
+        "id": 4294967295,
+        "dir": "c2s",
+        "hex": "01000100ffffffff08000000000000000100000002000000"
+      },
+      {
+        "name": "WRAP_B_REQ",
+        "id": 1,
+        "dir": "c2s",
+        "hex": "010001000100000008000000000000000300000004000000"
+      }
+    ]
+  }
+}

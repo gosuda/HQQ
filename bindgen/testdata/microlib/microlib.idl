@@ -1,0 +1,56 @@
+idl 1;
+
+@serialize(session)
+service microlib;
+
+include "microlib.h";
+
+const ML_OK: i32 = 0;
+const ML_EMPTY: i32 = 1;
+const ML_PARTIAL: i32 = 2;
+
+@c("ml_counter *")
+handle Counter destroy ml_counter_free;
+
+@c("ml_cursor *")
+handle Cursor owned_by Counter destroy ml_cursor_free;
+
+union Cell {
+    case 1 Int: i64;
+    case 2 Text: str<=16;
+    case 3 Null;
+}
+
+fn ml_add(a: i32, b: i32) -> i32;
+
+@error(null)
+fn ml_counter_new(start: i64) -> Counter;
+
+@intercept
+@error(status, ok(ML_OK), detail(ml_counter_errmsg, c))
+fn ml_counter_add(c: Counter, delta: i64, out total: i64) -> i32;
+
+fn ml_counter_free(c: Counter);
+
+@error(null)
+fn ml_cursor_open(c: Counter, step: i32) -> Cursor;
+
+@error(status, ok(ML_OK, ML_EMPTY))
+fn ml_cursor_next(cur: Cursor, out value: i64) -> i32;
+
+@error(status, ok(ML_OK))
+fn ml_cursor_free(cur: Cursor) -> i32;
+
+@error(predicate(ml_xor_failed))
+fn ml_xor(src: bytes<=65536, n: size @len_of(src), key: u8,
+          out dst: bytes, cap: size @len_of(dst)) -> size @len_of(dst);
+
+fn ml_hash(s: str<=255) -> u64;
+
+shim fn ml_cells(c: Counter, max: i32) -> Cell[]<=256 @max_out(8192);
+
+@error(status, ok(ML_OK), detail(ml_counter_errmsg, c))
+fn ml_counter_check(c: Counter, limit: i32) -> i32;
+
+@allow(server) fn ml_counter_errmsg(c: Counter) -> str<=1024;
+@allow(server) fn ml_xor_failed(r: size) -> i32;

@@ -238,6 +238,13 @@ void hqq_plat_thread_join(const hqq_allocator *a, hqq_plat_thread *t) {
     hqq_free(a, t, sizeof *t);
 }
 
+void hqq_plat_thread_detach(hqq_plat_thread *t) {
+    if (t != NULL && t->handle != NULL) {
+        CloseHandle(t->handle);
+        t->handle = NULL;
+    }
+}
+
 struct hqq_plat_event {
     HANDLE handle;
 };
@@ -273,6 +280,34 @@ void hqq_plat_event_reset(hqq_plat_event *e) {
 
 int hqq_plat_event_wait(hqq_plat_event *e, uint64_t timeout_ns) {
     return WaitForSingleObject(e->handle, ceil_ms(timeout_ns, 0)) == WAIT_OBJECT_0;
+}
+
+struct hqq_plat_mutex {
+    SRWLOCK lock;
+};
+
+hqq_plat_mutex *hqq_plat_mutex_create(const hqq_allocator *a) {
+    struct hqq_plat_mutex *m = hqq_alloc(a, sizeof *m);
+    if (m == NULL) {
+        return NULL;
+    }
+    InitializeSRWLock(&m->lock);
+    return m;
+}
+
+void hqq_plat_mutex_destroy(const hqq_allocator *a, hqq_plat_mutex *m) {
+    if (m == NULL) {
+        return;
+    }
+    hqq_free(a, m, sizeof *m);
+}
+
+void hqq_plat_mutex_lock(hqq_plat_mutex *m) {
+    AcquireSRWLockExclusive(&m->lock);
+}
+
+void hqq_plat_mutex_unlock(hqq_plat_mutex *m) {
+    ReleaseSRWLockExclusive(&m->lock);
 }
 
 /* ---- Named shared memory -------------------------------------------------------------------- */

@@ -184,6 +184,12 @@ static void free_link_state(hqq_adv *a) {
     a->all_streams = NULL;
     while (!adv_queue_empty(&a->reqq)) {
         hqq_msg *m = (hqq_msg *)adv_queue_pop(&a->reqq);
+        hqq_req_ctx *rc = (hqq_req_ctx *)m->rc;
+
+        /* A queued request is owned by its context too (c->req = m): release it once, below or here. */
+        if (rc != NULL) {
+            rc->req = NULL;
+        }
         adv_msg_put(m);
     }
     adv_queue_free(ap, &a->reqq);

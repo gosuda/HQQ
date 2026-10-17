@@ -1,0 +1,65 @@
+idl 1;
+
+@serialize(session)
+service sqlite_lowlevel;
+
+include "sqlite3.h";
+include "sqlite_shims.h";
+
+const SQLITE_OK: i32 = 0;
+const SQLITE_ROW: i32 = 100;
+const SQLITE_DONE: i32 = 101;
+
+@c("sqlite3 *")
+handle Db destroy sqlite3_close;
+
+@c("sqlite3_stmt *")
+handle Stmt owned_by Db destroy sqlite3_finalize;
+
+union Value {
+    case 1 Int: i64;
+    case 2 Float: f64;
+    case 3 Text: str;
+    case 4 Blob: bytes;
+    case 5 Null;
+}
+
+struct Rows {
+    ncols: u32;
+    cells: Value[];          // nrows * ncols cells, row-major
+}
+
+@intercept
+@error(status, ok(SQLITE_OK), detail(sqlite3_errmsg, db))
+fn sqlite3_open_v2(filename: str<=4096, out db: Db, flags: i32, zvfs: str<=64 @nullable) -> i32;
+
+// sqlite3_close answers SQLITE_BUSY while statements are unfinalized and then keeps the connection.
+@retain_on_fail
+@error(status, ok(SQLITE_OK))
+fn sqlite3_close(db: Db) -> i32;
+
+@error(status, ok(SQLITE_OK), detail(sqlite3_errmsg, db))
+fn sqlite3_prepare_v2(db: Db, sql: str<=1048576, nbyte: i32 @len_of(sql),
+                      out stmt: Stmt, out tail: u32 @offset_in(sql)) -> i32;
+
+@error(status, ok(SQLITE_ROW, SQLITE_DONE), detail(stmt_errmsg, stmt))
+fn sqlite3_step(stmt: Stmt) -> i32;
+
+// sqlite3_finalize returns the error of the last step but always frees the statement.
+@error(status, ok(SQLITE_OK))
+fn sqlite3_finalize(stmt: Stmt) -> i32;
+
+fn sqlite3_column_count(stmt: Stmt) -> i32;
+
+@error(status, ok(SQLITE_OK), detail(stmt_errmsg, stmt))
+fn sqlite3_bind_int64(stmt: Stmt, index: i32, value: i64) -> i32;
+
+// sqlite3_bind_text takes a destructor callback (unsupported). The shim passes SQLITE_TRANSIENT.
+@error(status, ok(SQLITE_OK), detail(stmt_errmsg, stmt))
+shim fn bind_text(stmt: Stmt, index: i32, text: str<=1048576, n: i32 @len_of(text)) -> i32;
+
+// Steps up to `max` rows and encodes at most 65536 bytes; rows are copied out of SQLite before the next step.
+shim fn fetch_rows(stmt: Stmt, max: i32) -> Rows @max_out(65536);
+
+@allow(server) fn sqlite3_errmsg(db: Db) -> str<=1024;
+@allow(server) shim fn stmt_errmsg(stmt: Stmt) -> str<=1024;

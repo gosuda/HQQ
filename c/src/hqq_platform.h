@@ -38,6 +38,10 @@ typedef struct hqq_plat_event hqq_plat_event;
 hqq_plat_thread *hqq_plat_thread_start(const hqq_allocator *a, void (*fn)(void *), void *arg, int *os_err);
 /* Joins the thread and frees its handle. */
 void hqq_plat_thread_join(const hqq_allocator *a, hqq_plat_thread *t);
+/* Detaches a thread that cannot be joined (it is stuck in foreign code at shutdown): the system
+ * reclaims its resources when it ends. The handle is NOT freed, because the thread may still read
+ * it, and must not be joined afterwards. */
+void hqq_plat_thread_detach(hqq_plat_thread *t);
 
 /* A manual-reset event: once signalled it stays signalled. */
 hqq_plat_event *hqq_plat_event_create(const hqq_allocator *a);
@@ -46,6 +50,20 @@ void hqq_plat_event_signal(hqq_plat_event *e);
 void hqq_plat_event_reset(hqq_plat_event *e);
 /* Waits up to timeout_ns for the signal; returns 1 if signalled, 0 on timeout. */
 int hqq_plat_event_wait(hqq_plat_event *e, uint64_t timeout_ns);
+
+/*
+ * A plain, non-recursive mutex (the execution lock of the bindgen C runtime,
+ * BINDGEN.md 8.1). No timed lock and no try-lock. Lock and unlock must be called
+ * by the same thread; locking a mutex the thread already holds deadlocks.
+ * hqq_plat_mutex_destroy() requires an unlocked mutex that no thread is waiting
+ * for. create returns NULL on failure (allocator or OS); destroy(NULL) is a no-op.
+ */
+typedef struct hqq_plat_mutex hqq_plat_mutex;
+
+hqq_plat_mutex *hqq_plat_mutex_create(const hqq_allocator *a);
+void hqq_plat_mutex_destroy(const hqq_allocator *a, hqq_plat_mutex *m);
+void hqq_plat_mutex_lock(hqq_plat_mutex *m);
+void hqq_plat_mutex_unlock(hqq_plat_mutex *m);
 
 /* ---- Named shared memory (SPEC 11) ---------------------------------------------- */
 
