@@ -293,7 +293,9 @@ impl Env {
 
 /// Delivers SIGKILL to this process; it does not return. On Unix this is the
 /// kill(2) system call, declared directly: std links the C library already, and
-/// no crate is needed for one call. Elsewhere `taskkill /F` ends the process.
+/// no crate is needed for one call. On Windows it is TerminateProcess on the
+/// current process (a child `taskkill` would print its own line on stdout and
+/// hide the result line the driver looks for).
 pub fn kill_self() -> ! {
     #[cfg(unix)]
     {
@@ -306,13 +308,18 @@ pub fn kill_self() -> ! {
             kill(std::process::id() as i32, SIGKILL);
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        let _ = std::process::Command::new("taskkill")
-            .arg("/F")
-            .arg("/PID")
-            .arg(std::process::id().to_string())
-            .status();
+        use std::ffi::c_void;
+        extern "system" {
+            fn GetCurrentProcess() -> *mut c_void;
+            fn TerminateProcess(process: *mut c_void, exit_code: u32) -> i32;
+        }
+        // SAFETY: both calls take only the pseudo handle of this process and a
+        // constant exit code; no memory is involved.
+        unsafe {
+            TerminateProcess(GetCurrentProcess(), 1);
+        }
     }
     loop {
         thread::park();
