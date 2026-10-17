@@ -275,11 +275,12 @@ func TestStreamCallServeProtocol11ZeroAlloc(t *testing.T) {
 				// synchronous ring wait that has to park arms a context
 				// wake-up, which allocates (as in protocol 1.0, for every
 				// cancelable context). How often the wait parks depends on
-				// scheduling, so this case tolerates a few parks per hundred
-				// calls; a per-call allocation would be 1.0 or more.
+				// scheduling (on a loaded Linux runner up to ~0.4 per call was
+				// seen), so this case tolerates a fraction of calls parking; a
+				// per-call allocation would be 1.0 or more.
 				limit := 0.0
 				if v.deadline && !tc.dispatcher {
-					limit = 0.25
+					limit = 0.6
 				}
 				if allocs > limit {
 					t.Fatalf("CallWith+Release with Serve allocates %v per operation (both endpoints), want at most %v", allocs, limit)

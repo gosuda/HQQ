@@ -92,7 +92,8 @@ function Test-Archive([string]$Path) {
 if ([string]::IsNullOrEmpty($Dest)) {
     $Dest = Join-Path ([System.IO.Path]::GetTempPath()) "hqq-sqlite-$Version"
 }
-$Dest = [System.IO.Path]::GetFullPath((Join-Path (Get-Location) $Dest))
+# Path.Combine keeps an absolute $Dest as is; Join-Path would append it to the cwd.
+$Dest = [System.IO.Path]::GetFullPath([System.IO.Path]::Combine((Get-Location).ProviderPath, $Dest))
 $RootFull = $Root.TrimEnd('\', '/')
 $Sep = [System.IO.Path]::DirectorySeparatorChar
 if ($Dest.Equals($RootFull, [StringComparison]::OrdinalIgnoreCase) -or

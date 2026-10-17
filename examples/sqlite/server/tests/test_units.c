@@ -262,12 +262,14 @@ static int resolve(const sqlsrv_policy *p, const char *db, char **out, sqlsrv_er
 
 static void test_policy(void) {
     char *tmp = sqlsrv_port_tempdir();
-    char root[1024];
+    /* Each derived path gets a buffer larger than its source plus suffix, so
+     * the format-truncation analysis can prove nothing is cut. */
+    char root[512];
     char allow[1024];
     char outside[1024];
-    char secret[1024];
-    char link_path[1024];
-    char target[1024];
+    char secret[2048];
+    char link_path[2048];
+    char target[2048];
     char err[256];
     sqlsrv_policy p;
     sqlsrv_err e;
