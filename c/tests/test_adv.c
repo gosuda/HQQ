@@ -240,13 +240,17 @@ static void check_steady_state(void) {
     hqq_test_thread *t;
     hqq_msg *m = NULL;
     unsigned char *buf = malloc(600);
-    unsigned round;
-    long before;
+    unsigned attempt, round;
+    long before = 0, after = 1;
     pair_open_with(&pr, ADV_COUNT, ADV_SIZE, &counting);
     negotiate_pair(&pr, HQQ_FEATURES_ALL, HQQ_FEATURES_ALL);
     t = hqq_test_thread_start(serve_thread, pr.s);
     fill(buf, 600, 3);
-    /* Warm-up: pools, waiters, the request worker and the deadline timer are created. */
+    /* Warm-up: message pools, parked-waiter nodes and the deadline timer are created. */
+    {
+        hqq_wait w = {1000000LL, NULL};
+        HQQ_CHECK_STATUS(hqq_stream_recv(hqq_adv_stream0(pr.s), &m, &w), HQQ_ERR_TIMEOUT);
+    }
     for (round = 0; round < 20; round++) {
         hqq_msg *resp = NULL;
         HQQ_CHECK_STATUS(hqq_stream_send(hqq_adv_stream0(pr.p), buf, 300, NULL), HQQ_OK);
@@ -260,21 +264,29 @@ static void check_steady_state(void) {
             hqq_msg_release(resp);
         }
     }
-    before = atomic_load(&hook_allocs);
-    for (round = 0; round < 200; round++) {
-        hqq_msg *resp = NULL;
-        HQQ_CHECK_STATUS(hqq_stream_send(hqq_adv_stream0(pr.p), buf, 300, NULL), HQQ_OK);
-        HQQ_CHECK_STATUS(hqq_stream_recv(hqq_adv_stream0(pr.s), &m, NULL), HQQ_OK);
-        if (m != NULL) {
-            hqq_msg_release(m);
-            m = NULL;
+    /* A 200 us scheduler pause while an inline handler runs escalates the dispatcher thread,
+     * which allocates once for the replacement thread; a per-call leak allocates in every batch. */
+    for (attempt = 0; attempt < 5; attempt++) {
+        before = atomic_load(&hook_allocs);
+        for (round = 0; round < 200; round++) {
+            hqq_msg *resp = NULL;
+            HQQ_CHECK_STATUS(hqq_stream_send(hqq_adv_stream0(pr.p), buf, 300, NULL), HQQ_OK);
+            HQQ_CHECK_STATUS(hqq_stream_recv(hqq_adv_stream0(pr.s), &m, NULL), HQQ_OK);
+            if (m != NULL) {
+                hqq_msg_release(m);
+                m = NULL;
+            }
+            HQQ_CHECK_STATUS(hqq_stream_call(hqq_adv_stream0(pr.p), 4, buf, 300, &resp, NULL), HQQ_OK);
+            if (resp != NULL) {
+                hqq_msg_release(resp);
+            }
         }
-        HQQ_CHECK_STATUS(hqq_stream_call(hqq_adv_stream0(pr.p), 4, buf, 300, &resp, NULL), HQQ_OK);
-        if (resp != NULL) {
-            hqq_msg_release(resp);
+        after = atomic_load(&hook_allocs);
+        if (after == before) {
+            break;
         }
     }
-    HQQ_CHECK(atomic_load(&hook_allocs) == before);
+    HQQ_CHECK(after == before);
     HQQ_CHECK_STATUS(hqq_adv_close(pr.s), HQQ_OK);
     pr.s = NULL;
     hqq_test_thread_join(t);
