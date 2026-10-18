@@ -140,7 +140,7 @@ When packaging a C library wrapper in its own repository (such as `hqq-sqlite3` 
 2. **Use Normalized Upstream Versioning**:
    - Tag releases using `v<WrapperMajor>.<WrapperMinor>.<NormalizedCVersion>`:
      - Increment `<WrapperMajor>.<WrapperMinor>` when the Go wrapper API or C shim changes.
-     - Set `<NormalizedCVersion>` to the upstream C library's canonical integer version (for example, `3490100` for SQLite `3.49.1.0` -> `v0.1.3490100`; `10507` for Zstandard `1.5.7` -> `v0.2.10507`).
+     - Set `<NormalizedCVersion>` to the upstream C library's canonical integer version (for example, `3490100` for SQLite `3.49.1.0` -> `v0.1.3490100`; `10507` for Zstandard `1.5.7` -> `v0.3.10507`).
 
 ---
 
