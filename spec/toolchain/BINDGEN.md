@@ -3241,7 +3241,7 @@ Measured on a quiet M1, cross-process, 64-byte payload, after the Standard link 
 | `BenchmarkAdd/hqq-sync` | 310 to 323 ns |
 | `BenchmarkAdd/hqq-pipe-*` | 160 to 177 ns per call |
 | `BenchmarkRoundTrip/echo` | 186 to 187 ns |
-| zstd example (`gosuda.org/hqq-zstd`), 64 KiB to 1 MiB inputs, pipelined, against cgo | within 2% |
+| zstd example (`gosuda.org/zstd`), 64 KiB to 1 MiB inputs, pipelined, against cgo | within 2% |
 
 The per-call overhead is about 6 times (pipelined) to about 12 times (synchronous) that of a cgo call. The advantage of the design is isolation, no cgo, overlap with Go work and coarse calls, not trivial calls (1.3).
 

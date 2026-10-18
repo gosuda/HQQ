@@ -6,7 +6,7 @@ The project follows [Semantic Versioning](https://semver.org/). While in `v0.x`,
 
 ## Unreleased
 
-This cycle adds `hqq-bindgen` for cgo-free Go-to-C IPC code generation (including C header `.idl` bootstrapping via `hqq-bindgen init` / `-from-header` and the `.agents/skills/hqq-bindgen` agent skill), introduces `secureexec`, `lifeline`, and `launch` for verified and parent-tied child servers, moves the SQLite and Zstandard services into standalone Go modules (`gosuda.org/hqq-sqlite3` and `gosuda.org/hqq-zstd`), and optimizes both the Go and C fast paths.
+This cycle adds `hqq-bindgen` for cgo-free Go-to-C IPC code generation (including C header `.idl` bootstrapping via `hqq-bindgen init` / `-from-header` and the `.agents/skills/hqq-bindgen` agent skill), introduces `secureexec`, `lifeline`, and `launch` for verified and parent-tied child servers, moves the SQLite and Zstandard services into standalone Go modules (`gosuda.org/sqlite3` and `gosuda.org/zstd`), and optimizes both the Go and C fast paths.
 
 ### Added
 
@@ -38,15 +38,15 @@ This cycle adds `hqq-bindgen` for cgo-free Go-to-C IPC code generation (includin
 ### Removed
 
 - **Zig binding (`bindings/zig`)**: removed because it was not exercised in CI.
-- **SQLite and Zstandard packages (`examples/sqlite/*`, `sqlite/`, `bindgen/examples/*`, `third_party/*`)**: extracted into standalone repositories `gosuda.org/hqq-sqlite3` and `gosuda.org/hqq-zstd`.
+- **SQLite and Zstandard packages (`examples/sqlite/*`, `sqlite/`, `bindgen/examples/*`, `third_party/*`)**: extracted into standalone repositories `gosuda.org/sqlite3` and `gosuda.org/zstd`.
 - **`hqqd` and `supervisor` package**: removed `cmd/hqqd`, `hqqd ctl`, and `gosuda.org/hqq/supervisor` (introduced in v0.6.0) to keep the repository focused on IPC transport and point-to-point child launching (`launch`, `lifeline`, `secureexec`).
 
 ### Migration (v0.6.0 to Unreleased)
 
 | v0.6.0 | Unreleased |
 | :--- | :--- |
-| `import _ "gosuda.org/hqq/examples/sqlite/driver"` | `import _ "gosuda.org/hqq-sqlite3"` (standalone module `gosuda.org/hqq-sqlite3`) |
-| `examples/sqlite/server` | `gosuda.org/hqq-sqlite3` (`sqlite3/server`) |
+| `import _ "gosuda.org/hqq/examples/sqlite/driver"` | `import _ "gosuda.org/sqlite3"` (standalone module `gosuda.org/sqlite3`) |
+| `examples/sqlite/server` | `gosuda.org/sqlite3` (`sqlite3/server`) |
 | `hqqd`, `hqqd ctl`, `import "gosuda.org/hqq/supervisor"` | removed; use host supervision (`systemd`, `launchd`, container runtime), `launch` for child servers, and `lifeline` + `secureexec` |
 | `bindings/zig` | removed |
 

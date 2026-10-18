@@ -286,8 +286,8 @@
 // two-process interop harness is in interop/ (helper: cmd/hqq-interop).
 //
 // Services built on the protocol are generated with hqq-bindgen (bindgen/ and
-// cmd/hqq-bindgen) and live in standalone modules such as gosuda.org/hqq-sqlite3
-// and gosuda.org/hqq-zstd. Packages launch, secureexec, and lifeline start
+// cmd/hqq-bindgen) and live in standalone modules such as gosuda.org/sqlite3
+// and gosuda.org/zstd. Packages launch, secureexec, and lifeline start
 // executables verified by digest and tie a child process to its parent.
 //
 // # Platform Notes

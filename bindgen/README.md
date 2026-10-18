@@ -36,8 +36,8 @@ You supply the `.idl` file (written by hand or bootstrapped from `.h` via `hqq-b
 | `bindgen/e2e/microlib` | Generated client and server for `microlib` plus the end-to-end integration and differential test suite. |
 | `bindgen/bench` | Microbenchmarks comparing generated IPC calls directly against in-process cgo ([`bindgen/bench/README.md`](bench/README.md)). |
 | `.agents/skills/hqq-bindgen` | Agent skill guide for bootstrapping `.idl` from `.h`, generating bindings, and designing idiomatic Go APIs ([`.agents/skills/hqq-bindgen/SKILL.md`](../.agents/skills/hqq-bindgen/SKILL.md)). |
-| `gosuda.org/hqq-zstd` | Standalone module wrapping zstd 1.5.7 via `hqq-bindgen`, with correctness tests and cgo crossover benchmarks. |
-| `gosuda.org/hqq-sqlite3` | Standalone module providing the SQLite IDL service, the `hqq-sqlite-server` C server, and the `hqq-sqlite` `database/sql` driver. |
+| `gosuda.org/zstd` | Standalone module wrapping zstd 1.5.7 via `hqq-bindgen`, with correctness tests and cgo crossover benchmarks. |
+| `gosuda.org/sqlite3` | Standalone module providing the SQLite IDL service, the `hqq-sqlite-server` C server, and the `hqq-sqlite` `database/sql` driver. |
 | `launch` | Verified child-process starter (`secureexec` + `lifeline` + `ready <listener>` handshake). |
 
 ## Operational limits
@@ -50,7 +50,7 @@ You supply the `.idl` file (written by hand or bootstrapped from `.h` via `hqq-b
 
 ## Measured status
 
-All measurements below were collected on an Apple M1 (`darwin/arm64`, Go 1.27, quiet machine, spin wait policy, median of 3 runs at `-benchtime 1s` for `bindgen/bench` and `gosuda.org/hqq-sqlite3`, and `-benchtime 300ms` for `gosuda.org/hqq-zstd`). The C server runs as a separate child process placed by the macOS kernel scheduler (macOS does not expose thread-affinity APIs). Reproduction commands are in [`bindgen/bench/README.md`](bench/README.md).
+All measurements below were collected on an Apple M1 (`darwin/arm64`, Go 1.27, quiet machine, spin wait policy, median of 3 runs at `-benchtime 1s` for `bindgen/bench` and `gosuda.org/sqlite3`, and `-benchtime 300ms` for `gosuda.org/zstd`). The C server runs as a separate child process placed by the macOS kernel scheduler (macOS does not expose thread-affinity APIs). Reproduction commands are in [`bindgen/bench/README.md`](bench/README.md).
 
 ### 1. Call with no work (`ml_add`)
 
@@ -91,7 +91,7 @@ XOR over an input buffer into an equal-sized output buffer (`cgo` passes Go slic
 
 At 64 KiB, performance is dominated by copying the request into shared memory and copying the response out, whereas `cgo` reads and writes the Go heap buffer in place. Enabling defensive request copying (`copy_request`, design §7.2) adds 10% on synchronous 64 B calls (414 ns vs 375 ns), 4% at 1 KiB (590 ns vs 567 ns), 0-2% when pipelined, and 1% at 64 KiB (15,996 ns vs 15,788 ns), so it remains opt-in. Increasing the ring slot size so 64 KiB fits in a single frame (`hqq-sync-bigbuf`) lowers synchronous 64 KiB latency from 15,788 ns to 13,001 ns.
 
-### 4. Real-world C library: zstd 1.5.7 (`gosuda.org/hqq-zstd`)
+### 4. Real-world C library: zstd 1.5.7 (`gosuda.org/zstd`)
 
 Calling the same zstd 1.5.7 C implementation via in-process `cgo` (`cgo_sync`) versus the `hqq-bindgen` server (`server_sync` and `server_pipelined`). Ratios report `server_time / cgo_time`:
 
@@ -118,11 +118,11 @@ Absolute latencies behind the ratios above:
 | Decompress `1 MiB` | `697,856 ns` | `835,988 ns` | `731,675 ns` |
 | Decompress `64 MiB` | `44.59 ms` | `57.67 ms` | not run |
 
-For coarse compression workloads (`64 KiB` to `1 MiB`, including `256 KiB` at `705,377 ns` vs `695,542 ns`, or `1.4%`), pipelined `hqq-bindgen` stays within **2% of in-process cgo** on one goroutine, and two concurrent sessions against two cgo threads stay within **2% at 1 MiB** (`1.515 ms` vs `1.490 ms`, `1.02×`), **11% at 64 MiB** (`138.6 ms` vs `124.3 ms`), and **11% at 64 KiB** (`96.7 µs` vs `87.1 µs`). A no-op `ZSTD_versionNumber()` call takes `26.7 ns` via cgo, `339.8 ns` synchronous, and `155.8 ns` pipelined. Full benchmark details live in the `gosuda.org/hqq-zstd` repository.
+For coarse compression workloads (`64 KiB` to `1 MiB`, including `256 KiB` at `705,377 ns` vs `695,542 ns`, or `1.4%`), pipelined `hqq-bindgen` stays within **2% of in-process cgo** on one goroutine, and two concurrent sessions against two cgo threads stay within **2% at 1 MiB** (`1.515 ms` vs `1.490 ms`, `1.02×`), **11% at 64 MiB** (`138.6 ms` vs `124.3 ms`), and **11% at 64 KiB** (`96.7 µs` vs `87.1 µs`). A no-op `ZSTD_versionNumber()` call takes `26.7 ns` via cgo, `339.8 ns` synchronous, and `155.8 ns` pipelined. Full benchmark details live in the `gosuda.org/zstd` repository.
 
-### 5. SQLite service (`gosuda.org/hqq-sqlite3` on `hqq-bindgen`)
+### 5. SQLite service (`gosuda.org/sqlite3` on `hqq-bindgen`)
 
-`gosuda.org/hqq-sqlite3` (`"sqlite3"`) implements `database/sql/driver` directly over the `hqq-bindgen` SQLite client and C server (`hqq-sqlite-server`):
+`gosuda.org/sqlite3` (`"sqlite3"`) implements `database/sql/driver` directly over the `hqq-bindgen` SQLite client and C server (`hqq-sqlite-server`):
 
 | Workload | `hqq-sqlite` (`hqq-bindgen`) |
 | :--- | ---: |

@@ -184,8 +184,8 @@ defer srv.Close()
 ```
 
 Official zero-`cgo` C library modules built on `hqq-bindgen`:
-- [**`gosuda.org/hqq-sqlite3`**](https://github.com/gosuda/hqq-sqlite3): Pure-Go `database/sql` SQLite driver (`"sqlite3"`) and `hqq-sqlite-server`.
-- [**`gosuda.org/hqq-zstd`**](https://github.com/gosuda/hqq-zstd): Pure-Go Zstandard (`libzstd`) client and `zstd_server`.
+- [**`gosuda.org/sqlite3`**](https://github.com/gosuda/hqq-sqlite3): Pure-Go `database/sql` SQLite driver (`"sqlite3"`) and `hqq-sqlite-server`.
+- [**`gosuda.org/zstd`**](https://github.com/gosuda/hqq-zstd): Pure-Go Zstandard (`libzstd`) client and `zstd_server`.
 
 ---
 
