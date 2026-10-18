@@ -2,206 +2,186 @@
 
 All notable changes to **HQQ** (`gosuda.org/hqq`) are documented in this file.
 
-The project follows [Semantic Versioning](https://semver.org/). While in `v0.x`, minor versions may introduce breaking wire-layout improvements accompanied by migration notes below.
+The project follows [Semantic Versioning](https://semver.org/). While in `v0.x`, minor releases may introduce breaking wire-layout or API improvements accompanied by explicit migration tables below.
 
 ## Unreleased
 
+This cycle promotes the pure-Go `database/sql` SQLite driver to `gosuda.org/hqq/sqlite`, adds `hqq-bindgen` for cgo-free Go-to-C IPC code generation, introduces `secureexec`, `lifeline`, `launch`, and `sqlite/launcher` for verified and parent-tied child servers, and optimizes both the Go and C fast paths.
+
 ### Added
 
-- **SQLite package `gosuda.org/hqq/sqlite`**, promoted from `examples/sqlite/driver`: a `database/sql` driver registered as `hqq-sqlite`. Exported: `NewConnector`, `ConnectorFromDSN`, `ParseDSN`, `Connector`, `Config`, `Driver`, `DriverName`, `WithTxMode`, `Pragma`, `Mode` (`ModeReadWriteCreate`, `ModeReadWrite`, `ModeReadOnly`), `TxMode` (`TxDeferred`, `TxImmediate`, `TxExclusive`), `Error` (`Code`, `ExtendedCode`, `Message`, `Primary`), `ProtocolError`, the predicates `IsBusy`, `IsLocked`, `IsConstraint`, `IsReadOnly`, and `IsInterrupted`, the sentinels `ErrBusy`, `ErrLocked`, `ErrConstraint`, `ErrReadOnly`, `ErrInterrupted`, and `ErrOutcomeUnknown`, and the `Code*` constants. Behavior of the package:
-  - A lost link during `Exec` or `ExecStmt` wraps `ErrOutcomeUnknown` and not `driver.ErrBadConn`, so `database/sql` does not retry the statement. Other lost-link errors wrap `driver.ErrBadConn`, and `database/sql` may retry them on a new connection.
-  - `time.Time` arguments are stored as TEXT in the form `2006-01-02 15:04:05.999999999-07:00`, which keeps the offset. TEXT in a `DATE`, `DATETIME`, or `TIMESTAMP` column is returned as `time.Time` when it parses, and as `string` otherwise.
-  - Arguments are converted by the driver's `CheckNamedValue`: `uint64` values above `math.MaxInt64` and `NaN` are errors, `[]byte` and `json.RawMessage` are BLOBs, and a type without a rule is an error before anything is sent.
-  - `BeginTx` accepts the default and serializable isolation levels and refuses the others. `ReadOnly` transactions begin deferred with `query_only` set.
-  - Each `Exec` or `Query` takes one statement; a second statement is a `BAD_REQUEST` error.
-- **SQLite tests**: the database/sql contract suite (`sqlite/internal/contract`, run against the Go fake server and the C server), the protocol encodings (`sqlite/internal/wire`), the fake server (`sqlite/internal/fakeserver`), and end-to-end tests against the C server (`sqlite/e2e`).
-- **C SQLite server**: `--parent-stdin[=force]` (alias `--exit-on-stdin-eof`) shuts the server down gracefully when its standard input reaches end of file, and `--lifeline-grace-ms` bounds that shutdown.
-- **Parent lifeline**: package `lifeline` (`Attach`, `Lifeline.Close`, `Watch`, `WatchTerminal`, `WithKeepalive`) and the C header `c/include/hqq/hqq_lifeline.h` (`hqq_lifeline_options_init`, `hqq_lifeline_start`, `hqq_lifeline_watching`, `hqq_lifeline_stop`). A child exits when its parent dies, including by SIGKILL, because the kernel closes the parent's end of the pipe on its standard input.
-- **Verified executables**: package `secureexec` (`Verify`, `Verified`, `Start`, `Process`, `HashFile`, `ParseHash`, `CleanVaults`, `Policy`, `WithPolicy`, and the `With*` options). It runs the bytes it hashed: a sealed memfd on Linux, a private 0700 vault on other POSIX systems, and a share-locked handle on Windows. Errors: `ErrHashMismatch` (`*HashMismatchError`), `ErrNotRegular`, and `ErrUnsupported`.
-- **Signed release manifests**: package `secureexec/manifest` (version 1 `manifest.json` with a detached ed25519 signature that is checked before the manifest is parsed; `Parse`, `Verify`, `Scan`, `Sign`, `VerifyFiles`, `Marshal`, `GenerateKey`, and the key text functions), and the command `cmd/hqq-manifest` (`keygen`, `gen`, `sign`, `verify`, `hash`).
-- **Launcher for HQQ servers**: package `launch` (`Start`, `Config`, `ManifestSource`, `Server`, `NewListenerName`, `ReadyPrefix`, `DefaultLifelineFlag`, `StartError`, `ReadyTimeoutError`; errors `ErrConfig`, `ErrManifest`, `ErrNoArtifact`, `ErrReadyTimeout`, `ErrStopTimeout`). It verifies the server binary with `secureexec` (SHA-256 or a signed manifest) before it runs, starts it with a parent lifeline (`--parent-stdin`, configurable), waits for `ready <listener>` on stdout, and stops it gracefully, then by kill after `StopTimeout`. It does not restart or supervise. Package `sqlite/launcher` (`Start`, `Open`, `OpenManaged`, `Server`, `Managed`, `Config`, `ManifestSource`, `ReleasePublicKey`) is the SQLite layer on top of it, with the embedded release key and the `database/sql` handle. Errors of `sqlite/launcher`: `ErrConfig`, `ErrManifest`, `ErrNoArtifact`, `ErrNoReleaseKey`, `ErrReadyTimeout`, and `ErrStopTimeout`.
-- **Release pipeline**: `.github/workflows/release.yml` builds, tests, and smoke-tests the SQLite server on each platform, writes `manifest.json`, `licenses.tar.gz`, and `SHA256SUMS`, signs the manifest with the `HQQ_RELEASE_SIGNING_KEY` secret, and publishes a GitHub Release from a `v*` tag. Supporting files: `scripts/release/` (fetch and verify SQLite, licenses, linkage report), `third_party/sqlite/` (pinned SQLite digests), and `docs/RELEASING.md`.
-- **Benchmarks**: `BenchmarkCompareRoundTripZeroCopy`, and payload and deadline variants of `BenchmarkAdvancedLinkRequestResponse`.
-- **`hqq-bindgen`**: the command `cmd/hqq-bindgen` (`-go-out`, `-go-package`, `-go-strip`, `-c-out`, `-check`, `-print-canonical`, `-print-digest`) and the packages `bindgen/idl` (parser, validation rules V1 to V41, canonical form, interface digest, wire plan), `bindgen/gen` (`Go`, `C`) and `bindgen/rt` (the Go client runtime: `Dial`, `Conn`, futures, `Pool`, `Enc`, `Dec`, error types). It generates a Go client and a C server from an interface description, so Go can call a C library that runs in its own process over HQQ shared memory without cgo. Design and wire format: `spec/toolchain/BINDGEN.md`. Overview, limits and measured status: `bindgen/README.md`.
-- **C runtime for generated servers**: `c/include/hqq/hqq_rpc.h` (`hqqrpc_*`: readers and writers, the handle table, interceptors, `hqqrpc_server_*`, `hqqrpc_main`) with `c/src/hqq_rpc.c`, `hqq_rpc_session.c`, and `hqq_rpc_server.c` in the library sources, and the platform mutex `hqq_plat_mutex_*` and `hqq_plat_thread_detach` in `hqq_platform.h`. `hqqrpc_main` returns `HQQ_ERR_UNSUPPORTED` on Windows.
-- **hqq-bindgen examples and tests**: `bindgen/e2e/microlib` (end-to-end suite against the real C server: every call, handles and teardown order, oversize bodies, pipelining and flow control, peer death, limits, a differential test), `bindgen/bench` (cgo comparison benchmarks), `bindgen/examples/zstd` (zstd 1.5.7 from a pinned source: `scripts/release/fetch-zstd.sh`, `third_party/zstd/`), `bindgen/examples/sqlite3` (a low-level SQLite service that reuses the path and open policy files of the hand-written server), and the workflow `.github/workflows/bindgen.yml`.
-- **`hqq-sqlite-gen`**: package `sqlite/gendriver`, a `database/sql` driver on the generated SQLite client. It passes the whole `sqlite/internal/contract` suite (107 cases in 11 groups). `contract.Capabilities.NoInterrupt` makes the deadline case use a finite query, because the generator has no call cancellation. It coexists with `hqq-sqlite`; nothing was replaced.
+- **SQLite package `gosuda.org/hqq/sqlite`**, promoted from `examples/sqlite/driver`: a `database/sql` driver registered as `hqq-sqlite`. Exported symbols: `NewConnector`, `ConnectorFromDSN`, `ParseDSN`, `Connector`, `Config`, `Driver`, `DriverName`, `WithTxMode`, `Pragma`, `Mode` (`ModeReadWriteCreate`, `ModeReadWrite`, `ModeReadOnly`), `TxMode` (`TxDeferred`, `TxImmediate`, `TxExclusive`), `Error` (`Code`, `ExtendedCode`, `Message`, `Primary`), `ProtocolError`, the predicates `IsBusy`, `IsLocked`, `IsConstraint`, `IsReadOnly`, and `IsInterrupted`, the sentinels `ErrBusy`, `ErrLocked`, `ErrConstraint`, `ErrReadOnly`, `ErrInterrupted`, and `ErrOutcomeUnknown`, and the `Code*` constants. Package behavior:
+  - A lost link during `Exec` or `ExecStmt` wraps `ErrOutcomeUnknown` rather than `driver.ErrBadConn`, so `database/sql` never automatically re-runs a write whose commit state is unknown. Other lost-link errors wrap `driver.ErrBadConn` so `database/sql` can retry on a fresh connection.
+  - `time.Time` parameters are stored as `TEXT` formatted with `2006-01-02 15:04:05.999999999-07:00`, preserving the UTC offset. `TEXT` values read from `DATE`, `DATETIME`, or `TIMESTAMP` columns are returned as `time.Time` when they match a supported timestamp layout, and as `string` otherwise.
+  - Parameters are validated by the driver's `CheckNamedValue`: `uint64` values above `math.MaxInt64` and `NaN` floats fail locally before transmission, `[]byte` and `json.RawMessage` are encoded as `BLOB`, and unsupported Go types fail immediately.
+  - `BeginTx` accepts default and `LevelSerializable` isolation levels and rejects weaker levels. `ReadOnly` transactions begin in `DEFERRED` mode with `PRAGMA query_only = 1`.
+  - Each `Exec` or `Query` executes a single SQL statement; multi-statement strings are rejected with `BAD_REQUEST`.
+- **SQLite test and contract suites**: the shared `database/sql` contract suite (`sqlite/internal/contract`, executed against both the Go fake server and the C server), wire codecs (`sqlite/internal/wire`), in-process fake server (`sqlite/internal/fakeserver`), and multi-process end-to-end tests against the C binary (`sqlite/e2e`).
+- **C SQLite server parent lifeline**: `--parent-stdin[=force]` (alias `--exit-on-stdin-eof`) shuts the server down cleanly and rolls back active transactions when standard input reaches `EOF`; `--lifeline-grace-ms` bounds shutdown duration before forced exit.
+- **Parent lifeline**: Go package `lifeline` (`Attach`, `Lifeline.Close`, `Watch`, `WatchTerminal`, `WithKeepalive`) and C header `c/include/hqq/hqq_lifeline.h` (`hqq_lifeline_options_init`, `hqq_lifeline_start`, `hqq_lifeline_watching`, `hqq_lifeline_stop`). Child processes exit automatically when their parent terminates, including via `SIGKILL`, because the OS kernel closes the parent's pipe write descriptor.
+- **Verified executables**: package `secureexec` (`Verify`, `Verified`, `Start`, `Process`, `HashFile`, `ParseHash`, `CleanVaults`, `Policy`, `WithPolicy`, and `With*` options). Executes the exact bytes verified by SHA-256 without a TOCTOU gap using a write-sealed `memfd` on Linux, a private `0700` vault directory on macOS/FreeBSD/POSIX, and a `FILE_SHARE_READ`-locked file handle on Windows. Exports `ErrHashMismatch` (`*HashMismatchError`), `ErrNotRegular`, and `ErrUnsupported`.
+- **Signed release manifests**: package `secureexec/manifest` (version 1 `manifest.json` with a detached ed25519 signature verified prior to JSON parsing; `Parse`, `Verify`, `Scan`, `Sign`, `VerifyFiles`, `Marshal`, `GenerateKey`, and key formatting helpers) and CLI tool `cmd/hqq-manifest` (`keygen`, `gen`, `sign`, `verify`, `hash`).
+- **HQQ server launcher**: package `launch` (`Start`, `Config`, `ManifestSource`, `Server`, `NewListenerName`, `ReadyPrefix`, `DefaultLifelineFlag`, `StartError`, `ReadyTimeoutError`; sentinels `ErrConfig`, `ErrManifest`, `ErrNoArtifact`, `ErrReadyTimeout`, `ErrStopTimeout`). Verifies the target binary with `secureexec`, attaches a `--parent-stdin` lifeline, waits for the `ready <listener>` handshake line on stdout, and stops the process gracefully before killing after `StopTimeout`. Package `sqlite/launcher` (`Start`, `Open`, `OpenManaged`, `Server`, `Managed`, `Config`, `ManifestSource`, `ReleasePublicKey`) layers `database/sql` connector setup and embedded release-key lookup on top of `launch`.
+- **Release pipeline**: `.github/workflows/release.yml` builds, tests, and smoke-tests `hqq-sqlite-server` natively across Linux, macOS, and Windows, generates `manifest.json`, `licenses.tar.gz`, and `SHA256SUMS`, signs the manifest with `HQQ_RELEASE_SIGNING_KEY`, and publishes GitHub Releases from `v*` tags. Supporting scripts live in `scripts/release/`, pinned SQLite amalgamation digests in `third_party/sqlite/`, and operational docs in `docs/RELEASING.md`.
+- **Benchmarks**: `BenchmarkCompareRoundTripZeroCopy` plus payload-size and deadline variants of `BenchmarkAdvancedLinkRequestResponse`.
+- **`hqq-bindgen`**: CLI tool `cmd/hqq-bindgen` (`-go-out`, `-go-package`, `-go-strip`, `-c-out`, `-check`, `-print-canonical`, `-print-digest`) and packages `bindgen/idl` (lexer, parser, validation rules V1 through V41, canonical formatter, SHA-256 interface digest, wire planner), `bindgen/gen` (`Go`, `C`), and `bindgen/rt` (Go client runtime: `Dial`, `Conn`, futures, `Pool`, `Enc`, `Dec`, error types). Generates a pure-Go client and C server from an `.idl` file so Go programs can invoke out-of-process C libraries over HQQ shared memory without cgo. Normative design: `spec/toolchain/BINDGEN.md`; overview and benchmarks: `bindgen/README.md`.
+- **C runtime for generated servers**: `c/include/hqq/hqq_rpc.h` (`hqqrpc_*`: in-place readers/writers, generation-checked handle table, interceptors, `hqqrpc_server_*`, `hqqrpc_main`) implemented in `c/src/hqq_rpc.c`, `hqq_rpc_session.c`, and `hqq_rpc_server.c`, plus cross-platform mutex and detached-thread primitives (`hqq_plat_mutex_*`, `hqq_plat_thread_detach`) in `hqq_platform.h`. `hqqrpc_main` runs on POSIX platforms and returns `HQQ_ERR_UNSUPPORTED` on Windows.
+- **`hqq-bindgen` examples and test suites**: `bindgen/e2e/microlib` (end-to-end suite against the compiled C server covering all parameter kinds, handle lifecycles and reverse-creation-order teardown, oversize payloads, pipelining, peer crash, and differential model checking), `bindgen/bench` (cgo vs HQQ benchmark suite), `bindgen/examples/zstd` (pinned zstd 1.5.7 via `scripts/release/fetch-zstd.sh` and `third_party/zstd/`), `bindgen/examples/sqlite3` (generated low-level SQLite service reusing the hand-written server's path and open-policy modules), and `.github/workflows/bindgen.yml`.
+- **`hqq-sqlite-gen`**: package `sqlite/gendriver`, a `database/sql` driver built on top of the `hqq-bindgen` SQLite client. Passes all 107 test cases across 11 groups in `sqlite/internal/contract` (using `contract.Capabilities.NoInterrupt` for the query-cancellation test because `hqq-bindgen` does not support mid-call cancellation). Coexists alongside `hqq-sqlite`.
 
 ### Changed
 
-- **SQLite packages moved** out of `examples/sqlite` (see Migration). The C server stays in `examples/sqlite/server`.
-- **`sqlite.Error.Code` is the primary result code.** It was the extended result code. `ExtendedCode` now holds the extended code (equal to `Code` when SQLite gives none), and `Primary()` returns `Code`.
-- **Lost links during `Exec` are not retried.** Every lost-link error used to wrap `driver.ErrBadConn`; `Exec` and `ExecStmt` now wrap `ErrOutcomeUnknown` instead.
-- **Time columns**: TEXT in a `DATE`, `DATETIME`, or `TIMESTAMP` column is returned as `time.Time` when it parses (it was `string`).
-- **Argument conversion** is the driver's `CheckNamedValue`, not the default converter of `database/sql`.
-- **Standard link fast path**: the round trip of a 64-byte message is about 40 ns shorter (in-process, quiet machine: 235 to 192 ns; Go client to C server across processes: 230–237 to 186–187 ns, M1). `Write`, `Read`, `ReadZeroCopy`, `WriteZeroCopy`, `ReserveRead`, and `ReserveWrite` no longer build a cancellation value or closures per call and publish with plain stores. `CopyID` is derived from the claimed send-ring position (same values as before), the unused operand words of a copy packet are not rewritten (they are zero by invariant; SPEC 9.1 now says a sender may skip the store of a word that is already zero, and `TestStandardLinkPacketsKeepUnusedOperandsZero` pins it), and a spin wait re-reads the ring four times per step and polls for cancellation every 8th step.
-- **SPEC 9.1** states that a sender may skip the store of an operand word that is already zero. Operands 3..6 (words 4..7) of a Standard ring are defined by no Standard opcode and are zeroed by `Format`; no wire behavior changes.
-- **`Serve` sets no timer per request.** The 200 µs escalation watchdog is armed lazily: handlers that return in time never touch the timer, and one armed timer covers many of them. When it fires it escalates a handler that has run for at least 200 µs, re-arms for the remainder if the handler is younger, and stays off while nothing runs. Escalation timing and semantics are unchanged; `Serve` stops the timer before it returns. Measured gain on an Advanced `Call` of 64 bytes: about 7% (584 to 541 ns in-process).
-- **Request deadlines are computed from the arrival time.** The deadline of a handler's context is the arrival time plus the caller's budget, without an extra clock read per request.
-- **C `hqq_adv_serve` runs requests inline.** A Go client's 64-byte `Call` to a C server took about 35 µs (M1), because every request was handed to a worker thread and every event woke every parked thread of the link. While no handler runs, the link's receive thread now runs the next request itself, as the Go `Serve` does: about 0.6 µs per call (average 605–632 ns, p50 541–583 ns, p99 708–792 ns, `BenchmarkAdvancedCallCServer`, quiet M1). A handler that holds the receive thread for 200 µs is escalated: a new thread takes over receiving, so cancels, responses and further requests are processed, and handlers that wait for a later request, a cancel or a call on the same link do not deadlock (each such handler pays the 200–400 µs escalation, as in the Go `Serve`). While a handler runs, further requests go to worker threads (started on demand, at most 64). The request and completion paths wake only the threads that wait for them. `hqq_adv_serve` returns after every handler has returned. No API change; `hqq_handler_fn` documents that handlers run on a thread of the link. New: `c/tools/hqq_adv_echo`, `BenchmarkAdvancedCallCServer` (`HQQ_ADV_ECHO`), and the test `adv_serve`.
-- **The adaptive wait spins longer** (`WaitAdaptive`): the Go spin phase is 256 steps (it was 64; a step re-reads the slot four times, about 24 ns, so about 6 µs instead of 1.5 µs), and the C library's spin phase is 1024 single-read steps (it was 64; about 4 µs). `spec/constants.json` `wait.spin_iterations` and SPEC 8.4 say 256 for the Go default. The old window was shorter than the reply of a peer that works for 1–3 µs, which pushed such waits into the `Gosched` phase and its scheduler wake-ups (on macOS each yield signals another thread). Through the generated SQLite client a prepared point select went from 6.4 to 3.1 µs, `SELECT 1` from 17 to 3.4 µs, and 1,000 inserts in a transaction from 4.8 to 1.0 ms. Removing the experimental Go-side `LinkOptions.Exclusive` mode costs 3–6% on the Go microbenchmarks (synchronous `Add` 322 to 343 ns, echo round trip 234 to 241 ns against the same server binary); the spin-window change more than pays for it in the SQLite workloads. Idle CPU is unchanged (`HQQ_PERF_TESTS`: 0.1–0.2%).
-- **`sqlite` internals**: argument conversion, time layouts and column metadata moved to `sqlite/internal/convert`, DSN parsing to `sqlite/internal/dsn`, so that `hqq-sqlite` and `hqq-sqlite-gen` share them. Behavior and exported API of `sqlite` are unchanged.
+- **SQLite package paths**: moved from `examples/sqlite/*` to top-level `sqlite` (see Migration table below). The C server remains in `examples/sqlite/server`.
+- **`sqlite.Error.Code` holds the primary result code**: previously held the extended result code. `ExtendedCode` now stores the extended code (defaulting to `Code` when no extended code is present), and `Primary()` returns `Code`.
+- **No automatic retry on lost links during `Exec`**: `Exec` and `ExecStmt` now wrap `ErrOutcomeUnknown` instead of `driver.ErrBadConn` when the link drops mid-call.
+- **Time column scanning**: `TEXT` values in `DATE`, `DATETIME`, and `TIMESTAMP` columns now scan as `time.Time` when valid (previously scanned as raw `string`).
+- **Driver-level argument validation**: parameter conversion uses the driver's `CheckNamedValue` implementation rather than `database/sql`'s default converter.
+- **StandardLink fast path**: 64-byte round-trip latency dropped by ~40 ns (235 ns to 192.7 ns in-process on Apple M1; 230–237 ns to 186–187 ns across processes from Go client to C server). `Write`, `Read`, `ReadZeroCopy`, `WriteZeroCopy`, `ReserveRead`, and `ReserveWrite` avoid per-call closure/cancellation setup, derive `CopyID` from the claimed producer slot position, skip zeroing already-zero unused operand words (codified in `spec/SPEC.md` §9.1 and verified by `TestStandardLinkPacketsKeepUnusedOperandsZero`), and unroll spin-wait checks to four slot reads per step with cancellation polling every 8th step.
+- **`spec/SPEC.md` §9.1**: explicitly permits senders to omit writing operand words that are already zero by ring invariant (`Format` zeroes words 4..7, which no Standard opcode modifies).
+- **Lazy escalation timer in `Serve`**: `Serve` no longer allocates or resets a timer on every request. The 200 µs inline-handler escalation watchdog is armed lazily, so fast handlers never touch the timer and a single timer covers bursts of requests. Measured gain on a 64-byte `AdvancedLink.Call`: ~7% (584 ns to 541 ns in-process).
+- **Monotonic arrival-time deadlines**: request handler deadlines are computed from the receive path's monotonic timestamp plus the caller's transmitted time budget, saving a redundant clock read per request.
+- **Inline request execution in C (`hqq_adv_serve`)**: previously, every request arriving at a C server was handed off to a worker thread and woke all parked threads on the link (~35 µs per 64-byte call on Apple M1). `hqq_adv_serve` now mirrors Go's `Serve`: when no handler is running, the receive thread executes the incoming request inline (~0.6 µs per call: 605–632 ns mean, 541–583 ns p50, 708–792 ns p99 in `BenchmarkAdvancedCallCServer`). If an inline handler runs longer than 200 µs, a new thread takes over receiving so cancellations, responses, and recursive calls never deadlock, and overlapping requests dispatch to on-demand worker threads (up to 64). Added `c/tools/hqq_adv_echo`, `BenchmarkAdvancedCallCServer`, and `c/tests/test_adv_serve.c`.
+- **Wider adaptive spin window (`WaitAdaptive`)**: increased the Go adaptive spin phase from 64 to 256 four-read steps (~6 µs instead of ~1.5 µs; `spec/constants.json` `wait.spin_iterations` and `SPEC.md` §8.4) and the C spin phase from 64 to 1024 single-read steps (~4 µs). The previous 1.5 µs window expired before a peer performing 1–3 µs of work (such as a SQLite query) could reply, pushing callers into `runtime.Gosched` thread hand-offs. With the wider spin window, a prepared point select through `hqq-sqlite-gen` dropped from 6.4 µs to 3.1 µs, `SELECT 1` from 17 µs to 3.4 µs, and a 1,000-row transactional insert from 4.8 ms to 1.0 ms, while idle CPU stays at 0.1–0.2%.
+- **Shared SQLite internals**: parameter conversion, timestamp parsing, and DSN handling moved into `sqlite/internal/convert` and `sqlite/internal/dsn` so `hqq-sqlite` and `hqq-sqlite-gen` share a single implementation.
 
 ### Fixed
 
-- **libhqq (C): requests could be dropped without a response.** A request context allocated while the context pool was empty (many concurrent requests) was not zeroed. For a request without a time budget its `has_deadline` and `deadline_mono` held whatever the allocator returned, so the deadline timer could end the request as expired, the worker skipped it, and the caller waited for a response that never came. Every context is now zeroed. Found through intermittent hangs of the SQLite end-to-end tests on Windows, where the C server serves 32 concurrent sessions. The Go library is not affected (Go zeroes allocations). Regression test: `c/tests/test_adv_uninit.c` (an allocator that poisons every block).
-- Creating or listening on a segment whose initializer had stalled could fail with the transient initialization error at the very end of the takeover window: the give-up check read the clock after the takeover check had. The claim loops (`claimSuperblock`, `claimListener`) now retry the takeover once the window has elapsed.
-- CI: the SQLite e2e and launcher packages run serially (`go test -p 1`), and the launcher contract harness kills a server that stops answering after 60 s and logs its output, so a stuck call fails the run with a diagnosis instead of waiting for the `go test` timeout.
-- **libhqq (C): closing an Advanced link that held a request nobody served released it twice.** A request that reached a link was owned by its request queue and by its request context at the same time. `hqq_adv_close` put the message back while draining the queue and again while freeing the contexts. The message landed on the pool's free list twice, and the pool drain then freed it and read it again: a heap-use-after-free under AddressSanitizer and a double free with other allocators. Only a link whose requests were queued but never served was affected, because a worker clears the context when it takes a message. Any program that closes an Advanced link without having called `hqq_adv_serve`, or after serving ended with requests still queued, could hit it. `free_link_state` now detaches the context from a queued request before releasing it. The Go library is not affected. Regression test: `c/tests/test_adv_close_queued.c`.
+- **libhqq (C): uninitialized deadline fields in newly allocated request contexts**. When the C server's context pool ran dry under high concurrency, freshly `malloc`-allocated request contexts did not zero `has_deadline` and `deadline_mono`. Requests without a caller deadline could read garbage bytes as an expired deadline and be silently dropped by worker threads, hanging the caller (`sqlite/e2e` on Windows with 32 concurrent sessions). All allocated contexts are now zero-initialized, covered by `c/tests/test_adv_uninit.c` using a poison allocator.
+- **Takeover boundary race in `claimSuperblock` and `claimListener`**: when an initializer stalled, the outer timeout check read the monotonic clock slightly after the inner takeover check, occasionally failing with a transient initialization error on the final iteration instead of taking over. The claim loop now retries takeover once the takeover window has elapsed.
+- **CI diagnostics for SQLite e2e and launcher suites**: `sqlite/e2e` and `sqlite/launcher` run with `go test -p 1`, and the contract test runner terminates and dumps server logs after 60 s if a call stalls.
+- **libhqq (C): double release of unserved queued requests in `hqq_adv_close`**. An incoming request queued for `Serve` was referenced by both the request queue and its request context; closing an `AdvancedLink` without draining requests via `hqq_adv_serve` returned the pooled message to the free list twice (use-after-free under ASan). `free_link_state` now detaches the context reference before releasing queued requests, covered by `c/tests/test_adv_close_queued.c`.
+- **Windows MSVC (`cl.exe`) C11 atomics and `/W4 /WX` support**: enabled `/experimental:c11atomics` alongside `/std:c11` in `c/CMakeLists.txt` and `bindings/rust/hqq-sys/build.rs`, replaced POSIX-only `<strings.h>` and `_Static_assert` spellings with portable C11 equivalents, and guarded MSVC warnings `C4100`, `C4127`, `C4200`, `C4324`, and `C4702` across `c/` and `examples/sqlite/server`. All 22 CTest suites now build and pass under `cl.exe` on both `windows-latest` (x64) and `windows-11-arm` (arm64).
 
 ### Removed
 
-- The Zig binding (`bindings/zig`) and its CI job. It was never verified by CI.
-- The packages at `examples/sqlite/driver`, `examples/sqlite/wire`, `examples/sqlite/fakeserver`, and `examples/sqlite/e2e` (moved, see Changed and Migration).
-- **`hqqd` and package `supervisor`** (released in v0.6.0): the process manager `cmd/hqqd`, its configuration format, its admin protocol (`hqqd ctl`), and the `supervisor` package (`Supervisor`, `New`, `Config`, `ServiceSpec`, `ServeAdmin`, `DialAdmin`, `AdminClient`, and their related types). A process manager is outside the scope of an IPC library. Packages `lifeline` and `secureexec` stay.
+- **Zig binding (`bindings/zig`)**: removed because it was not exercised in CI.
+- **Legacy paths under `examples/sqlite/`**: `examples/sqlite/driver`, `examples/sqlite/wire`, `examples/sqlite/fakeserver`, and `examples/sqlite/e2e` (moved to `sqlite/`).
+- **`hqqd` and `supervisor` package**: removed `cmd/hqqd`, `hqqd ctl`, and `gosuda.org/hqq/supervisor` (introduced in v0.6.0) to keep the repository focused on IPC transport and point-to-point child launching (`launch`, `sqlite/launcher`, `lifeline`, `secureexec`).
 
-### Migration (v0.6.0 → Unreleased)
+### Migration (v0.6.0 to Unreleased)
 
 | v0.6.0 | Unreleased |
-| --- | --- |
+| :--- | :--- |
 | `import _ "gosuda.org/hqq/examples/sqlite/driver"` | `import _ "gosuda.org/hqq/sqlite"` |
-| package `hqqsqlite`: `hqqsqlite.NewConnector`, `hqqsqlite.Config`, `*hqqsqlite.Error`, … | package `sqlite`: `sqlite.NewConnector`, `sqlite.Config`, `*sqlite.Error`, … |
+| package `hqqsqlite`: `hqqsqlite.NewConnector`, `hqqsqlite.Config`, `*hqqsqlite.Error`, ... | package `sqlite`: `sqlite.NewConnector`, `sqlite.Config`, `*sqlite.Error`, ... |
 | `(*Error).Code` is the extended code | `(*Error).Code` is the primary code; `(*Error).ExtendedCode` is the extended code |
 | `(*Error).Primary()` is `Code & 0xFF` | `(*Error).Primary()` is `Code` |
 | `Exec` after a lost link: `driver.ErrBadConn` | `Exec` or `ExecStmt` after a lost link: `sqlite.ErrOutcomeUnknown` (not retried) |
-| TEXT in a `DATE`/`DATETIME`/`TIMESTAMP` column: `string` | `time.Time` when it parses, otherwise `string` |
-| `examples/sqlite/wire` (importable) | `sqlite/internal/wire` (internal to the module) |
-| `examples/sqlite/fakeserver` (importable) | `sqlite/internal/fakeserver` (internal to the module) |
+| `TEXT` in a `DATE`/`DATETIME`/`TIMESTAMP` column: `string` | `time.Time` when it parses, otherwise `string` |
+| `examples/sqlite/wire` (importable) | `sqlite/internal/wire` (module-internal) |
+| `examples/sqlite/fakeserver` (importable) | `sqlite/internal/fakeserver` (module-internal) |
 | `examples/sqlite/e2e` | `sqlite/e2e` |
 | `examples/sqlite/PROTOCOL.md` | `sqlite/PROTOCOL.md` |
 | `examples/sqlite/server` | unchanged |
-| `hqqd`, `hqqd ctl`, `import "gosuda.org/hqq/supervisor"` | removed; use the process manager of the host (systemd, launchd, a container runtime) to start and restart services, `sqlite/launcher` to start the SQLite server from Go, and `lifeline` and `secureexec` for parent-tied and verified starts |
+| `hqqd`, `hqqd ctl`, `import "gosuda.org/hqq/supervisor"` | removed; use host supervision (`systemd`, `launchd`, container runtime), `sqlite/launcher` or `launch` for child servers, and `lifeline` + `secureexec` |
 | `bindings/zig` | removed |
 
-### Not verified
+### Verification Notes and Known Limitations
 
-- The embedded release public key (`sqlite/launcher/release_public_key.hex`) is still a placeholder. Until the maintainer commits the real key, `launcher.ReleasePublicKey` returns `ErrNoReleaseKey`, and a manifest-based start that does not pass its own `PublicKey` fails with it. No signed release has been produced yet.
-- Known limitation: an adaptive ring wait that has to park while its context is cancelable (a `Call` with a deadline or cancelable context, or `Serve` with a cancelable context) allocates once per park, because `waiter.park` in `internal/mpmc` arms a `context.AfterFunc` to wake the parked waiter. How often a wait parks depends on scheduling, so a loaded machine can see occasional allocations on `Call` and `Serve`. Use `WaitSpin` to avoid parking altogether. The zero-allocation tests of the root package run their pairs with `WaitSpin` for this reason.
-- Windows: the `secureexec` Windows mechanism and the C lifeline on Windows are built and tested in CI only. The SQLite server's Windows builds (`windows/amd64`, `windows/arm64`, clang-cl) are part of the release, and a failing Windows build blocks publish. The Windows builds have not been run on Windows hardware outside CI, and no Windows binary has been published yet.
-- The Linux memfd path of `secureexec` and the `vm.memfd_noexec` behavior are confirmed by CI only.
-- hqq-bindgen: the C server runs on POSIX systems only (`hqqrpc_main` returns `HQQ_ERR_UNSUPPORTED` on Windows; the runtime sources compile there and `bindings/rust` builds them). The suites were run on macOS arm64 and, for the microlib end-to-end suite, in a Linux arm64 container; Linux x86_64, Windows, and TSan runs of the Go suites were not run, and `.github/workflows/bindgen.yml` was linted but has not run on GitHub.
-- hqq-bindgen measurements are macOS arm64 (Apple M1) only, except for a `linux/arm64` check of `BenchmarkWork` in a container on the same machine. A synchronous generated call costs about 335 ns against 25 ns for cgo on macOS, where the synchronous overhead jumps at `ml_work(256)` (1,338–1,795 ns against 396 ns for cgo); with client and server pinned to separate cores on `linux/arm64` (`HQQ_BENCH_SERVER_CPU=1 taskset -c 0`), the synchronous overhead stays flat at 358–476 ns across `iters=0..1024` (962 ns against 486 ns at `iters=256`), pointing to macOS thread placement on Apple silicon. Bare-metal x86_64 Linux was not measured. See `bindgen/README.md` for the tables and caveats.
+- **Placeholder release public key**: `sqlite/launcher/release_public_key.hex` currently holds a placeholder string until the first signed release key is generated. Until replaced, `launcher.ReleasePublicKey()` returns `ErrNoReleaseKey`, and manifest-verified launches must supply an explicit `PublicKey`.
+- **Context wake-up allocation on kernel park**: when an adaptive ring wait parks in the kernel while using a cancelable or deadline context, `waiter.park` in `internal/mpmc` registers a `context.AfterFunc` callback, which allocates once per kernel park. Use `WaitSpin` or `context.Background()` when strict zero-allocation behavior under heavy scheduling contention is required.
+- **Platform test coverage**: Linux (`memfd` and `vm.memfd_noexec`) and Windows (`windows-share-lock`, Windows lifeline, `clang-cl` and MSVC builds) are verified continuously in GitHub Actions across `ci.yml`, `c.yml`, `bindgen.yml`, `sqlite.yml`, `interop.yml`, and `bindings.yml`.
+- **`hqq-bindgen` platform and scheduler notes**: `hqqrpc_main` supports POSIX servers only (`HQQ_ERR_UNSUPPORTED` on Windows). On macOS arm64 (Apple M1), `BenchmarkWork` exhibits a scheduler core-placement jump around `iters=256` in synchronous mode (1,795 ns vs 396 ns cgo), whereas pinning client and server to separate cores in `linux/arm64` on the same hardware (`HQQ_BENCH_SERVER_CPU=1 taskset -c 0`) keeps synchronous IPC overhead flat at 358–476 ns across `iters=0..1024`. See `bindgen/README.md` for full data.
 
-## v0.6.0 — 2026-10-17
+## v0.6.0 (2026-10-17)
 
-The multi-client acceptor (`NewAcceptor`, `Accept`, `Connect`) and Advanced Protocol 1.1 (negotiated cancellation, deadlines and request metadata, graceful shutdown) are added. The Go API changes are additive: no exported name of v0.5.0 was removed or changed. The shared-memory layout (`HQQ_STL3`, ring layout 2) and the 64-byte packet ABI are unchanged. Protocol 1.1 adds one opcode, one frame flag, a request metadata block, and the error status `0x08` (returned by `Shutdown`); the opcode, flag, and metadata block are used only when negotiated.
+This release introduces the multi-client acceptor (`NewAcceptor`, `Accept`, `Connect`), Advanced Protocol 1.1 (negotiated request cancellation, deadline and trace metadata propagation, and graceful `Shutdown`), the C11 reference library (`libhqq`), C++17 and Rust bindings, formal specification documents under `spec/`, and the SQLite service example. All Go API changes relative to v0.5.0 are additive, and the `HQQ_STL3` superblock, ring layout 2, and 64-byte packet ABI remain unchanged.
 
 ### Added
 
-- **Multi-client acceptor.** `NewAcceptor`, `NewAcceptorContext`, `Acceptor` (`Accept`, `Close`, `Name`, `Addr`, `Stats`), `AcceptorConfig`, `AcceptorStats`, `Connect`, and `DefaultAcceptorQueueSize`. A listener is a named segment (layout `HQQ_LSN1`, see `spec/ext/LISTENER_DRAFT.md`); each client creates its own link segment and announces it in the listener's queue. New errors: `ErrListenerBusy`, `ErrListenerClosed`, `ErrListenerGone`, `ErrAcceptorClosed`.
-- **Advanced Protocol 1.1** (negotiated; a 1.0 peer negotiates 1.0): `FeatureCancel` (`OpCancel`, opcode `0x07`), `FeatureMetadata` (request metadata block, frame flag `AdvFlagMeta`), `CallOptions`, `Stream.CallWith`, `AdvancedLink.CallWith`, `Request.Caller`, `Request.Trace`, `AdvancedLink.Shutdown`, `ErrShuttingDown`, `ErrCodeShuttingDown` (`0x08`), `ResponseError.Is`, `AdvancedOptions.StreamListenGrace`, `AdvancedStats.CanceledRequests`, `AdvancedStats.RefusedRequests`. `CurrentProtocolVersion()` returns 1.1. With `FeatureMetadata`, a `Call` whose context has a deadline sends the remaining time with the request, and the handler's context gets that deadline.
-- **Specification** (`spec/`): `SPEC.md` (segment layout, superblock, roles, initialization, liveness, ring, wait/wake, Standard and Advanced Protocol 1.0, platform naming, error codes), `MEMORY_MODEL.md`, `PORTING.md`, `FINDINGS.md`, `constants.json`, litmus tests, and the extension documents `ext/PROTOCOL_1_1_DRAFT.md` and `ext/LISTENER_DRAFT.md`.
-- **C library** `libhqq` (`c/`): Standard and Advanced layers, acceptor and listener, public headers in `c/include/hqq/`.
-- **Bindings** (`bindings/`): header-only C++17 wrapper (`hqq::`), Rust workspace (`hqq-sys`, `hqq`, `hqq-interop`), Zig binding.
-- **Conformance and interop**: golden vectors in `conformance/`, the `cmd/hqq-interop` helper, and the two-process matrix in `interop/` (`HQQ_INTEROP_IMPLS` selects the implementations).
-- **Memory-model verification** (`c/verify/`): GenMC harnesses, herd7 litmus tests, and stress litmus tests. These run in CI only.
-- **hqqd** process manager (`cmd/hqqd`, `supervisor` package): starts and health-checks services, restarts them with backoff, and is controlled over an HQQ admin listener (`hqqd ctl`).
-- **SQLite service example** (`examples/sqlite`): wire protocol, `database/sql` driver `hqq-sqlite`, C server, Go fake server, and end-to-end tests.
+- **Multi-client acceptor**: `NewAcceptor`, `NewAcceptorContext`, `Acceptor` (`Accept`, `Close`, `Name`, `Addr`, `Stats`), `AcceptorConfig`, `AcceptorStats`, `Connect`, and `DefaultAcceptorQueueSize`. Uses listener layout `HQQ_LSN1` (`spec/ext/LISTENER_DRAFT.md`) where each client creates an isolated link segment and publishes a connect record. New sentinels: `ErrListenerBusy`, `ErrListenerClosed`, `ErrListenerGone`, `ErrAcceptorClosed`.
+- **Advanced Protocol 1.1** (negotiated; 1.0 peers negotiate 1.0): `FeatureCancel` (`OpCancel`, opcode `0x07`), `FeatureMetadata` (request metadata block, frame flag `AdvFlagMeta`), `CallOptions`, `Stream.CallWith`, `AdvancedLink.CallWith`, `Request.Caller`, `Request.Trace`, `AdvancedLink.Shutdown`, `ErrShuttingDown`, `ErrCodeShuttingDown` (`0x08`), `ResponseError.Is`, `AdvancedOptions.StreamListenGrace`, `AdvancedStats.CanceledRequests`, and `AdvancedStats.RefusedRequests`. `CurrentProtocolVersion()` returns `1.1`.
+- **Formal specification (`spec/`)**: `SPEC.md`, `MEMORY_MODEL.md`, `PORTING.md`, `FINDINGS.md`, `constants.json`, hardware/formal litmus tests, and extension drafts `ext/PROTOCOL_1_1_DRAFT.md` and `ext/LISTENER_DRAFT.md`.
+- **C11 reference library `libhqq` (`c/`)**: Standard and Advanced layers, multi-client acceptor and listener, and public headers in `c/include/hqq/`.
+- **Language bindings (`bindings/`)**: header-only C++17 wrapper (`hqq::`), Rust workspace (`hqq-sys`, `hqq`, `hqq-interop`), and Zig binding.
+- **Conformance and interoperability suite**: golden byte vectors in `conformance/`, `cmd/hqq-interop`, and the two-process test matrix in `interop/`.
+- **Memory-model verification (`c/verify/`)**: GenMC model-checking drivers, herd7 litmus tests, and weak-memory stress litmus tests.
+- **Process supervisor (`cmd/hqqd`, `supervisor`)**: experimental process manager (subsequently removed in Unreleased).
+- **SQLite service (`examples/sqlite`)**: wire protocol, `database/sql` driver `hqq-sqlite`, C server, Go fake server, and end-to-end tests.
 
 ### Changed
 
-- **Held stream requests.** `OpenStream` to a peer that has not called `ListenStreams` yet is held for `AdvancedOptions.StreamListenGrace` (default 2 s) instead of failing at once. A held request is accepted when the peer calls `ListenStreams`, in arrival order, as if it had just arrived. It is refused with `ErrConnNotFound` when the grace period ends, when the link fails, or when `Shutdown` runs. A request is refused at once when the held requests and the accepted streams not yet returned by `AcceptStream` fill `IncomingQueueSize`, and every request is refused at once when the grace is negative.
-- **`ListenStreams` ordering.** The link is marked as listening before the dispatcher starts, so a stream request routed in between is no longer refused.
-- **Handler contexts are per request.** Each `ServeHQQ` gets its own context. It is canceled when the caller cancels (`FeatureCancel`), when the deadline the caller sent expires (`FeatureMetadata`), when the stream the request arrived on closes, and when `Serve` ends. The context is valid only during `ServeHQQ`.
-- **Canceled requests are not answered.** No response is sent when the caller gave up, or the deadline passed, while the handler ran. A request that is canceled before its handler starts is not passed to the handler.
-- **`Stream.Close` cancels handlers.** The contexts of handlers still running for requests received on the closed stream are canceled. `Serve` still answers them as far as the peer's stream exists.
-- **`Serve` after `Shutdown`.** After a successful `AdvancedLink.Shutdown`, `Serve` returns nil, also when called later.
-- **`Config.Features` default.** The default is now all supported features (`FeatureMessages|FeatureRequestResponse|FeatureCancel|FeatureMetadata`), so `Listen` and `Dial` negotiate the 1.1 features when the peer supports them.
+- **Held stream open requests**: `OpenStream` arriving before the peer calls `ListenStreams` is held for `AdvancedOptions.StreamListenGrace` (default 2 s) instead of failing immediately, and accepted in FIFO order once `ListenStreams` runs.
+- **`ListenStreams` registration order**: marks the link as listening before starting the background dispatcher so concurrent stream requests cannot slip through.
+- **Per-request handler contexts**: every `ServeHQQ` invocation receives its own `context.Context`, canceled on peer `OpCancel`, caller deadline expiry, stream closure, or `Serve` exit.
+- **Suppressed responses for canceled requests**: handlers whose context was canceled by the caller or deadline do not transmit a response frame.
+- **`Stream.Close` cancels in-flight handlers**: closing a stream cancels contexts for handlers still running on requests from that stream.
+- **`Serve` after `Shutdown`**: `Serve` returns `nil` after `AdvancedLink.Shutdown` completes.
+- **`Config.Features` default**: requests all supported features (`FeatureMessages | FeatureRequestResponse | FeatureCancel | FeatureMetadata`) by default.
 
 ### Fixed
 
-- A stalled initializer could write into a segment after another endpoint took the initialization over. Ownership is now checked before each publish step, before each 256 KiB zeroing slice, and before each 1024-slot `Format` slice. A frozen initializer can still complete one slice after takeover; the residual window is documented in `spec/SPEC.md` §5.3 (`spec/FINDINGS.md` F-01, mitigated).
-- Windows named segments: a wake granted one semaphore token per parked process, so after a name was reused a stale count could release millions of tokens and cause a burst of spurious wake-ups. A wake now grants one token per published slot (F-02; compiled and vetted for Windows only).
-- A heartbeat timestamp more than 1 s in the future is no longer taken as fresh. A wall clock stepped backwards made a dead endpoint look alive: a creator got `ErrLinkBusy`, and an opener joined a dead primary until the clock passed the stale value (F-04).
-- When the set of refused message keys evicted an entry while that message's chunks were still arriving, the next chunk failed the whole receive path with `ErrProtocol`. Such chunks are now drained (F-07).
-- A multi-chunk message whose `End` chunk never arrives keeps its memory charge. Such a message is now reclaimed when a later message would be refused, after 2^16 received chunks without progress; a reclaimed response fails its call with `ErrReassemblyLimit` (F-09).
-- With heartbeats disabled (`HeartbeatInterval < 0`), each send checks the peer, so a closed or dead peer is noticed without a blocking call (F-10).
-- `ListenStreams`: a stream request routed while `ListenStreams` was starting was refused (see Changed).
-- Named links: once a segment is claimed or joined, a later empty object under the same name is no longer treated as this link's, so `Close` does not act on it (`spec/SPEC.md` §11.4).
-- Documentation: `OpProtoNegotiate` and `OpProtoAck` operand 2 is reserved (sent as zero, ignored on receipt). It was documented as capability flags; the wire behavior is unchanged (F-03).
+- **Stalled initializer ownership checks (F-01)**: initializers now verify superblock ownership before each 256 KiB zeroing slice, each 1024-slot `Format` slice, and each publish CAS step (`spec/SPEC.md` §5.3).
+- **Windows semaphore token count (F-02)**: wake operations on Windows named segments now release one semaphore token per published slot rather than one per parked process count after name reuse.
+- **Future heartbeat timestamps (F-04)**: heartbeats more than 1 s ahead of the wall clock are no longer treated as perpetually fresh after backward clock jumps.
+- **Refused-message eviction drain (F-07)**: subsequent chunks of a refused multi-chunk message whose key was evicted from the refusal ring are now drained cleanly instead of failing the receive path with `ErrProtocol`.
+- **Abandoned multi-chunk reassembly reclamation (F-09)**: incomplete messages that stall without an `AdvFlagEnd` chunk are reclaimed when a newer message needs reassembly budget after $2^{16}$ received chunks without progress.
+- **Peer liveness check with heartbeats disabled (F-10)**: when `HeartbeatInterval < 0`, each send checks the peer's superblock state so a closed peer is detected without blocking.
+- **Named segment identity after replacement**: once an endpoint claims or joins a segment, a newly created empty object under the same OS name is never mistaken for the original (`spec/SPEC.md` §11.4).
+- **Negotiation operand 2 documentation (F-03)**: documented operand 2 of `OpProtoNegotiate` and `OpProtoAck` as reserved zero.
 
-### Breaking notes
+### Breaking Notes
 
-- **Go API:** additive only. Every exported declaration of v0.5.0 exists with the same signature. Added: the declarations listed under Added, plus `AdvancedStats.CanceledRequests`, `AdvancedStats.RefusedRequests`, and `AdvancedOptions.StreamListenGrace`.
-- **Feature set:** `NegotiatedFeatures()` of a `Listen` or `Dial` link now includes `FeatureCancel` and `FeatureMetadata` when the peer supports them. Code that compares the value with `FeatureMessages|FeatureRequestResponse` must test the bits instead. Set `Config.Features` to `FeatureMessages|FeatureRequestResponse` to keep 1.0 features only.
-- **Stream open timing:** `OpenStream` can wait up to `StreamListenGrace` for a peer that has not called `ListenStreams` yet, instead of failing at once.
-- **Handler cancellation:** a handler that blocks on its context gets it canceled on peer cancel, deadline, stream close, or `Serve` end, and its response is then not sent.
-- **Wire and ABI:** the superblock (`HQQ_STL3`), the ring layout (2), and the 64-byte packet layout are unchanged. Protocol 1.1 adds opcode `OpCancel` (`0x07`) and frame flag `AdvFlagMeta` (`1 << 6`); both are used only when negotiated, so a 1.0 peer sees 1.0 frames. A v0.5.0 responder answers a 1.1 request with minor 0 and its own features, which the 1.1 initiator accepts (read from the negotiation code; see Not verified).
+- **Go API**: strictly additive relative to v0.5.0.
+- **Default feature mask**: `NegotiatedFeatures()` on `Listen` and `Dial` links now includes `FeatureCancel` and `FeatureMetadata` when both peers support Protocol 1.1. Check individual feature bits with `&` rather than testing exact equality against `FeatureMessages | FeatureRequestResponse`.
+- **Stream open grace**: `OpenStream` waits up to `StreamListenGrace` (default 2 s) before failing with `ErrConnNotFound` when the peer has not called `ListenStreams`.
 
-### Not verified
+## v0.5.0 (2026-10-16)
 
-- Cross-version interop with v0.5.0 peers: the negotiation behavior above was read from the code, not run.
-- Windows: the Go library and the Windows semaphore path were compiled and vetted only; the Windows test jobs run in CI.
-- The Zig binding (`bindings/zig`) is written for Zig 0.15.2 and runs in CI only.
-- GenMC, herd7, and stress litmus checks (`c/verify`) run in CI only.
-- Not run for this release: the full test suite, `-race`, benchmarks, and the conformance and interop suites.
-
-## v0.5.0 — 2026-10-16
-
-The Advanced API is redesigned around `Stream` and pooled `Message`s, with a `net/http`-like server (`Handler`, `ResponseWriter`, `Request`, `Mux`, `Serve`). Send, receive, and request-response allocate nothing in steady state. **The Go API of the Advanced layer changes incompatibly; the wire protocol (Advanced Protocol 1.0), the packet ABI, and the shared-memory layout (`HQQ_STL3`) are unchanged.** The `StandardLink` API is unchanged.
+This release redesigns the `AdvancedLink` Go API around typed `Stream` handles, pooled `Message` buffers, and a `net/http`-style `Serve` / `Handler` / `ResponseWriter` RPC server that achieves zero heap allocations in steady state. **The Go API of the Advanced layer changes incompatibly; the wire protocol (Advanced Protocol 1.0), 64-byte packet ABI, and `HQQ_STL3` shared-memory layout are unchanged.**
 
 ### Breaking
 
-- **Streams are objects.** `OpenStream` and `AcceptStream` return `*Stream` (previously `uint64` IDs). `Stream` has `ID`, `Send`, `Recv`, `Call`, and `Close`. Stream 0 is the link itself (`AdvancedLink.Stream()`); `AdvancedLink.Send`, `Recv`, and `Call` are exactly `Stream().Send`, `Recv`, and `Call`.
-- **Received data is a pooled `*Message`** (`Bytes`, `Len`, `StreamID`, `Release`). `Recv` and `Call` return `*Message`; `Release` is called at most once and the message must not be used afterwards. `Recv` returns data messages of its stream only, never requests or responses.
-- **Servers use `Serve` with a `Handler`.** `Handler.ServeHQQ(ctx, w *ResponseWriter, req *Request)` replaces `ServeHQQ(ctx, AdvancedMessage) ([]byte, error)`. `Request` has `Method`, `Payload`, and `StreamID`; `ResponseWriter` has `Write` and `WriteError`. `Request` and `ResponseWriter` are valid only during `ServeHQQ`. Requests are consumed only by `Serve`.
-- **`AdvancedResponseError` is now `ResponseError`** (`Status`, `Payload`), returned by value from `Call`, with `Payload` a copy. The message text is `hqq: response error …`.
-- **`FeatureLargeCopy` is now `FeatureMessages`** (same value, `1<<0`); `Stats.LargeMessages` and `LargeBytes` are now `Stats.Messages` and `MessageBytes`. `Config.Features` defaults to `FeatureMessages|FeatureRequestResponse`.
-- **`Stream.Close()` takes no context.** It waits for room in the tx ring and returns the error of sending `OpConnClose`; the stream is closed locally even if that fails. A second `Close` returns `ErrClosed`, and `Close` on stream 0 returns `ErrInvalidOp`.
-- **Close semantics.** After a local close, `Send`, `Recv`, and `Call` return `ErrClosed`. After the peer closes a stream, `Recv` returns the queued messages and then `ErrPeerClosed`, and `Send` and `Call` return `ErrPeerClosed`; blocked calls wake. `ErrConnNotFound` is no longer returned for unknown or closed stream IDs (it remains the base of `ErrPeerGone` and the refusal when the peer is not listening).
-- **Unmatched traffic is dropped.** A response without a waiting call is no longer delivered to a receiver: it is dropped and counted in `Stats().DroppedMessages` (a late response to a canceled call still goes to `AbandonedResponses`). Data for an unknown or closed stream is dropped and counted as well.
-- **Overflow is decided per destination queue.** `OverflowPolicy` applies to each stream's queue, the request queue consumed by `Serve`, and the accept queue; `IncomingQueueSize` sizes all of them. Under `OverflowBlock`, requests fill the request queue when no `Serve` runs, and then stall the receive path. `OverflowFail` makes `Recv` return queued messages first and then `ErrIncomingOverflow`. `ErrIncomingOverflow` now refers to the queue a message is routed to.
-- **A success response always has status 0.** A non-zero status exists only on error responses (`WriteError`).
-- **Removed:** `AdvancedMessage`, `SendLarge`, `Receive`, `CallOn`, `Respond`, `RespondError`, `MessageHandler`, `Mux.OnMessage`, `CloseStream`, `AdvancedLink.Read` and `Write`, `ErrAdvancedActive`, `AdvancedResponseError`, `FeatureLargeCopy`, `Stats.LargeMessages` and `LargeBytes`. A `StandardLink` is the way to use raw `Read`/`Write`.
+- **Typed `Stream` objects**: `OpenStream` and `AcceptStream` return `*Stream` instead of raw `uint64` IDs. `Stream` provides `ID`, `Send`, `Recv`, `Call`, and `Close`. Stream `0` represents the link itself (`AdvancedLink.Stream()`).
+- **Pooled `*Message` results**: `Recv` and `Call` return `*Message` (`Bytes`, `Len`, `StreamID`, `Release`). `Recv` returns data messages for its stream only, never RPC requests or responses.
+- **`net/http`-style `Serve` and `Handler`**: `Handler.ServeHQQ(ctx, w *ResponseWriter, req *Request)` replaces `ServeHQQ(ctx, AdvancedMessage) ([]byte, error)`. `Request` exposes `Method`, `Payload`, and `StreamID`; `ResponseWriter` exposes `Write` and `WriteError`.
+- **`ResponseError` value type**: `AdvancedResponseError` is renamed to `ResponseError{Status, Payload}` and returned by value from `Call`.
+- **Feature and stats renames**: `FeatureLargeCopy` is renamed to `FeatureMessages` (`1 << 0`), and `Stats.LargeMessages` / `LargeBytes` are renamed to `Stats.Messages` / `MessageBytes`.
+- **Context-free `Stream.Close()`**: `Stream.Close()` takes no context, waits for room in the transmit ring to send `OpConnClose`, and marks the stream closed locally.
+- **Stream close sentinels**: local stream closure returns `ErrClosed`, and remote stream closure returns `ErrPeerClosed` (after draining queued messages on `Recv`), replacing `ErrConnNotFound` on closed stream IDs.
+- **Unmatched traffic dropped**: unmatched responses and data frames for unknown or closed streams are dropped and counted in `Stats().DroppedMessages`.
+- **Per-queue overflow**: `OverflowPolicy` applies independently to each stream queue, the `Serve` request queue, and the stream-accept queue.
+- **Removed symbols**: `AdvancedMessage`, `SendLarge`, `Receive`, `CallOn`, `Respond`, `RespondError`, `MessageHandler`, `Mux.OnMessage`, `CloseStream`, `AdvancedLink.Read` and `Write`, `ErrAdvancedActive`, `AdvancedResponseError`, `FeatureLargeCopy`, `Stats.LargeMessages`, and `Stats.LargeBytes`.
 
 ### Added
 
 - `Stream`, `AdvancedLink.Stream`, `Message`, `Handler`, `HandlerFunc`, `Request`, `ResponseWriter`, `ResponseError`, `FeatureMessages`, `Stats.Messages`, and `Stats.MessageBytes`.
-- `ResponseWriter.WriteError(status, p)`: replaces the body written so far and sets the error status; a later `Write` appends to that body. Status 0 is sent as `ErrCodeInvalidOp`; a payload larger than `MaxMessageSize` becomes status `ErrCodeBufferOverflow` with an empty payload. `ResponseWriter.Write` beyond `MaxMessageSize` writes nothing and returns `ErrBufferOverflow`. A handler that writes nothing answers with an empty success response.
-- `Mux.NotFound` handles unregistered methods; without it the answer is status `ErrCodeInvalidOp` with payload `hqq: unknown method`.
-- Tests: `alloc_test.go` (zero-allocation checks for `Send`/`Recv`/`Release` and `Call`/`Release` against `Serve`), `stream_test.go` (stream isolation, drop accounting, close and peer-close semantics, per-queue overflow, ordering, `Serve` escalation); `advanced_bench_test.go` (three benchmarks). The multi-process test, the fuzz target, and the examples use the new API; a stream example was added.
+- `ResponseWriter.WriteError(status, p)` and `Mux.NotFound`.
+- Zero-allocation test suite (`alloc_test.go`), stream lifecycle and escalation tests (`stream_test.go`), and Advanced microbenchmarks (`advanced_bench_test.go`).
 
 ### Changed
 
-- **Receive path and routing.** One receive path assembles messages and routes them: responses to the waiting `Call`, requests to the request queue consumed by `Serve`, data to the queue of its stream. A goroutine that finds no dispatcher receives synchronously; a background dispatcher starts when several goroutines wait concurrently or streams are used. A synchronous receiver never waits for a full queue under `OverflowBlock`: it hands the delivery to a helper goroutine that keeps the order, and the dispatcher takes over, so a caller's `Recv` or `Call` timeout cannot lose another goroutine's message.
-- **`Serve` is adaptive.** One receiver goroutine at a time takes requests. While no handler is running, it runs each handler inline, which saves a goroutine hand-off per request. A handler still running after 200 µs hands the receiver role to a new goroutine, so a handler that waits for a later request cannot deadlock `Serve`; while any handler is running, requests go to pooled workers (started on demand, at most `BufferCount`, kept until `Serve` returns). The switch is per episode: as soon as a request arrives with nothing running, it runs inline again. A request that arrives behind a slow inline handler waits up to about 200 µs. `Serve` still returns `ctx.Err()`, nil on a graceful peer close, and otherwise the receive error.
-- **Pooled buffers per link.** Messages, request and response bodies, reassembly bookkeeping, and pending-call channels are pooled per link; message buffers come in power-of-two size classes from 64 B up to exactly `MaxMessageSize`. Reassembly accounting is unchanged (each message is charged its announced size plus 256 bytes), but the buffer is rounded up to a power of two, so the memory held can reach twice the charge.
-- **Streams other than 0 exist only on a link whose dispatcher is running** (`OpenStream`, `AcceptStream`, and `ListenStreams` start it), so a `Recv` or `Call` blocked on a stream always wakes through the stream's close signal.
-- **The dispatcher and control-sender ring waits no longer pass the link-lifetime context to the ring**; `Close` wakes them through the closed channel of the `StandardLink`, so parked dispatcher waits do not allocate.
-- `ErrClosed` keeps the message `hqq: link closed`, also when it is returned for a locally closed stream.
-- `Stats.DroppedMessages` now also counts unmatched responses and data for unknown or closed streams.
-- The wire protocol is unchanged. `PROTOCOL.md` describes the routing, overflow, `Serve`, and stream-close behavior of the Go API; `README.md` has an API guide and a section on buffer ownership and zero-allocation operation.
+- **Unified receive path and synchronous fast path**: a single receive path reassembles messages and routes them to waiting `Call` channels, the `Serve` request queue, or per-stream queues. Single-waiter calls with no open streams read synchronously from the ring without a background dispatcher.
+- **Adaptive inline/worker `Serve`**: `Serve` executes handlers inline on the receiver goroutine when no other handler is running, escalating to a new receiver goroutine after 200 µs and dispatching overlapping requests to pooled workers (bounded by `BufferCount`).
+- **Per-link size-class buffer pools**: messages, request/response bodies, reassembly state, and call channels are pooled per link in power-of-two size classes from `64 B` to `MaxMessageSize`.
 
 ### Performance
 
-Measured on `darwin/arm64` with v0.4.1 and v0.5.0 run interleaved (9 runs each, `benchstat`); request-response for v0.5.0 is the median of a separate quiet run after the final `Serve` change.
+Measured on `darwin/arm64` comparing v0.4.1 and v0.5.0 across 9 interleaved runs with `benchstat`:
 
 | Benchmark | v0.4.1 | v0.5.0 | Change |
-| --- | --- | --- | --- |
-| Large message (4 KiB over 256 B chunks, `bufferCount` 1024) | 1.577 µs, 4192 B/op, 2 allocs/op | 1.399 µs, 0 B/op, 0 allocs/op | −11% |
-| Request-response (1 KiB + 1 KiB, 256 B chunks) | 1.508 µs, 2240 B/op, 4 allocs/op | 1.29 µs, 0 B/op, 0 allocs/op | −14% |
-| Small message (64 B) | — | 145.5 ns, 0 B/op, 0 allocs/op | new |
+| :--- | :--- | :--- | :--- |
+| Large message (`4 KiB` over `256 B` chunks, `bufferCount` 1024) | `1.577 µs`, `4192 B/op`, `2 allocs/op` | `1.399 µs`, `0 B/op`, `0 allocs/op` | `-11%` |
+| Request-response (`1 KiB` + `1 KiB`, `256 B` chunks) | `1.508 µs`, `2240 B/op`, `4 allocs/op` | `1.29 µs`, `0 B/op`, `0 allocs/op` | `-14%` |
+| Small message (`64 B`) | not present | `145.5 ns`, `0 B/op`, `0 allocs/op` | new |
 
-- The v0.4.1 request-response benchmark used a hand-written `Receive`/`Respond` loop, which no longer exists; the v0.5.0 benchmark runs `Serve`. For the same `Serve`-based shape, v0.4.1 measured 5.2 µs, 2313 B/op, 5 allocs/op, so `Serve` is about 4.5× faster.
-- A cancelable context on `Send`, `Call`, or `Serve` can still allocate occasionally when a wait parks and arms the context wake-up. The allocation tests use `context.Background()`, and they are skipped under `-race`, where `sync.Pool` drops items at random.
-
-### Migration (v0.4.1 → v0.5.0)
+### Migration (v0.4.1 to v0.5.0)
 
 | v0.4.1 | v0.5.0 |
-| --- | --- |
+| :--- | :--- |
 | `FeatureLargeCopy` | `FeatureMessages` |
 | `Stats.LargeMessages` / `LargeBytes` | `Stats.Messages` / `MessageBytes` |
-| `l.SendLarge(ctx, 0, p)` → `(msgID, err)` | `l.Send(ctx, p)` → `err` |
+| `l.SendLarge(ctx, 0, p)` -> `(msgID, err)` | `l.Send(ctx, p)` -> `err` |
 | `l.SendLarge(ctx, id, p)` | `s.Send(ctx, p)` |
-| `l.Receive(ctx)` → `AdvancedMessage` | `l.Recv(ctx)` / `s.Recv(ctx)` → `*Message` (data only), then `m.Release()` |
+| `l.Receive(ctx)` -> `AdvancedMessage` | `l.Recv(ctx)` / `s.Recv(ctx)` -> `*Message` (data only), then `m.Release()` |
 | `msg.Payload` / `msg.ConnectionID` | `m.Bytes()` / `m.StreamID()` |
-| `l.Call(ctx, method, req)` → `[]byte` | `m, err := l.Call(...)`, read `m.Bytes()`, `m.Release()` |
-| `l.CallOn(ctx, id, method, req)` → `AdvancedMessage` | `s.Call(ctx, method, req)` → `*Message` |
-| `l.OpenStream(ctx)` / `AcceptStream(ctx)` → `uint64` | → `*Stream` |
-| `l.CloseStream(ctx, id)` | `s.Close()` (no context; a second call returns `ErrClosed`) |
+| `l.Call(ctx, method, req)` -> `[]byte` | `m, err := l.Call(...)`, read `m.Bytes()`, `m.Release()` |
+| `l.CallOn(ctx, id, method, req)` -> `AdvancedMessage` | `s.Call(ctx, method, req)` -> `*Message` |
+| `l.OpenStream(ctx)` / `AcceptStream(ctx)` -> `uint64` | returns `*Stream` |
+| `l.CloseStream(ctx, id)` | `s.Close()` (no context; second call returns `ErrClosed`) |
 | `Handler.ServeHQQ(ctx, AdvancedMessage) ([]byte, error)` | `ServeHQQ(ctx, w *ResponseWriter, req *Request)` |
 | handler returns `payload, nil` | `w.Write(payload)` |
-| handler returns `AdvancedResponseError{S, P}` or an `error` | `w.WriteError(S, P)` |
+| handler returns `AdvancedResponseError{S, P}` or `error` | `w.WriteError(S, P)` |
 | `req.MethodID` / `req.Payload` / `req.ConnectionID` | `req.Method()` / `req.Payload()` / `req.StreamID()` |
 | `l.Respond` / `l.RespondError` after `Receive` | removed: run `Serve` with a `Handler` |
 | `MessageHandler` / `Mux.OnMessage` | removed: use `Stream.Recv` |
@@ -210,110 +190,66 @@ Measured on `darwin/arm64` with v0.4.1 and v0.5.0 run interleaved (9 runs each, 
 | `AdvancedLink.Read` / `Write`, `ErrAdvancedActive` | removed: use a `StandardLink` before negotiating |
 | `ErrConnNotFound` for a closed stream ID | `ErrClosed` (local close) / `ErrPeerClosed` (peer close) |
 | unmatched response delivered to `Receive` | dropped, counted in `DroppedMessages` |
-| `Respond(…, status≠0, …)` success with a status | not expressible: success is status 0, `WriteError` carries a status |
+| `Respond(..., status!=0, ...)` success with non-zero status | success is always status `0`; `WriteError` carries non-zero status |
 
-## v0.4.1 — 2026-10-16
+## v0.4.1 (2026-10-16)
 
-A hardening pass over the public API, the shared-memory ABI, segment lifecycle, the MPMC ring, and the Advanced dispatcher. **Both the Go API and the shared-memory ABI change incompatibly**: all endpoints of a link must be upgraded together, and segments created by earlier revisions are rejected. This is the first tagged release; the migration table below is relative to the previous, untagged revision (v0.2.0).
+This release hardens the public Go API, the shared-memory superblock ABI (`HQQ_STL3`), segment lifecycle and takeover rules, MPMC ring reservation completion, and the Advanced dispatcher. **Both the Go API and the shared-memory ABI change incompatibly relative to v0.2.0**: endpoints must be upgraded together, and `HQQ_STL2` segments are rejected with `ErrIncompatibleLayout`.
 
 ### Breaking
 
-**API**
+**API**:
 
-- The offset-based (`uintptr`) constructors are gone. One constructor per kind remains: `NewStandardLink(mem []byte, …)` / `NewAdvancedLink(mem []byte, …)` for caller-owned memory (page-aligned, at least `SizeStandardLink` bytes), `CreateStandardLink` / `OpenStandardLink` / `CreateAdvancedLink` / `OpenAdvancedLink` for named segments. The `*WithOptions`, `*Memory`, and `OpenNamed*` variants are removed; options are a regular last parameter.
-- `CreateStandardLink`/`CreateAdvancedLink` take `perm os.FileMode` plus the options struct; `Config.Mode` is now `Config.Perm`.
-- `AdvancedLink` stream methods are renamed: `Listen` → `ListenStreams`, `Accept` → `AcceptStream`, `Dial` → `OpenStream` (package-level `Listen`/`Dial` are unchanged). New `CloseStream`.
-- Getters lost their `Get` prefix: `Mode`, `Type`, `ProtocolState`, `NegotiatedVersion`, `NegotiatedFeatures`, `Stats`. `CurrentProtocolVersion` is a function, not a variable.
-- Removed types and methods: `Connection`, `ConnectionState` and its constants; `Capability*` and `GetNegotiatedCapabilities` (the capability word stays on the wire, always sent as `0` and ignored on receipt); `IsLargeCopyEnabled`, `IsRequestResponseEnabled` (test `NegotiatedFeatures()&FeatureLargeCopy != 0`); the `LargeMessageThreshold`/`IsLargeMessage` methods of the link types (use the package functions); `(*AdvancedLink).Standard()`.
-- `CallOn` and `SendLarge` return `ErrConnNotFound` for any non-zero connection ID that is not an open stream (previously any ID was accepted). `Respond`/`RespondError` are unchecked on purpose.
-- `NewStandardLink`/`NewAdvancedLink` with a nil or empty slice return `ErrMemorySmall` (offset `0` used to return `ErrMemoryAlign`); `NewAdvancedLink` now validates the slice length too.
-- `StandardLink.LocalAddr()` returns this endpoint's role address (`"hqq-primary"` or `"hqq-secondary"`, previously a constant `"hqq-local"`); `ReadFrom` returns the peer's role address (previously the last address given to `WriteTo`, or `"hqq-remote"`); `WriteTo` ignores its address.
-- `ReadFrom` has datagram semantics: it copies `len(p)` bytes, discards the rest of the message, and returns `n == len(p)` with a nil error (previously it behaved like `Read` and queued the tail). A pending tail left by `Read`/`ReadZeroCopy` is returned as the next datagram.
-- After `Close`, queued read tails are no longer served: `Read`, `ReadZeroCopy`, `ReserveRead`, and `ReadFrom` return `ErrClosed`.
-- `CreateStandardLink`, `CreateAdvancedLink`, and `Listen` no longer fail with `os.ErrExist` on an existing name; see "Changed" for the reuse rules.
-- `OpenStandardLink`, `OpenAdvancedLink`, and `Dial` no longer initialize, re-initialize, or take over a segment (they used to re-initialize a segment whose endpoints were gone and become Primary). They fail with transient errors matching `ErrFailedInit` instead; see "Changed".
-- `OverflowDrop` now refuses an incoming stream with `OpError(ErrCodeBufferOverflow)` (previously: `OpConnAccept` followed by `OpConnClose`). The peer's `OpenStream` fails with `ErrBufferOverflow`.
-- A failed negotiation is terminal: later `Negotiate`, `NegotiateProtocol`, and `WaitForNegotiation` calls return the new `ErrNegotiationFailed` (they returned `ErrAlreadyNegotiated`). A canceled context or timeout during negotiation also leaves the link in `ProtocolStateFailed`.
-- `SizeStandardLink` returns `0` for `bufferCount > 1<<24`, `bufferSize > 1<<30`, or a size that does not fit `uintptr`/`int`; those configurations now fail with `ErrInvalidSize`.
-- Builds for `GOARCH=mips`, `mipsle`, and `arm` with `GOARM` below 7 fail (`arch_unsupported.go`).
-- Internal `mpmc` package: `MPMCInit` and `_RoundUpPowerOf2` are removed. `SizeMPMCRing` returns `0` and `Format` panics for a size that is not a power of two of at least 2 (it no longer rounds up); `Attach` rejects such sizes; one-slot rings are not supported.
+- Removed raw `uintptr` offset constructors; use `NewStandardLink(mem []byte, ...)` and `NewAdvancedLink(mem []byte, ...)` for caller-owned memory, and `CreateStandardLink` / `OpenStandardLink` / `CreateAdvancedLink` / `OpenAdvancedLink` for named segments.
+- `CreateStandardLink` and `CreateAdvancedLink` take `perm os.FileMode` plus the options struct; `Config.Mode` is renamed to `Config.Perm`.
+- Renamed `AdvancedLink` stream methods: `Listen` to `ListenStreams`, `Accept` to `AcceptStream`, and `Dial` to `OpenStream` (package-level `hqq.Listen` and `hqq.Dial` are unchanged).
+- Dropped `Get` prefixes on getters (`Mode`, `Type`, `ProtocolState`, `NegotiatedVersion`, `NegotiatedFeatures`, `Stats`), made `CurrentProtocolVersion()` a function, and removed `Connection`, `ConnectionState`, `Capability*`, `IsLargeCopyEnabled`, `IsRequestResponseEnabled`, and `(*AdvancedLink).Standard()`.
+- `StandardLink.ReadFrom` now implements datagram truncation semantics and returns the peer's role address (`"hqq-primary"` or `"hqq-secondary"`).
+- After `Close`, unread partial message tails are discarded and reads return `ErrClosed`.
+- Creators (`Create*`, `Listen`) reclaim existing segments whose endpoints are all dead and fail with `ErrLinkBusy` if any endpoint is alive; openers (`Open*`, `Dial`) never initialize, re-initialize, or take over a segment.
+- Failed protocol negotiation is terminal (`ErrNegotiationFailed`).
+- Rejects builds on `GOARCH=mips`, `mipsle`, and `arm` with `GOARM < 7` via `arch_unsupported.go`.
 
-**ABI**
+**ABI**:
 
-- The superblock magic changes from `HQQ_STL2` (`0x4851515F53544C32`) to `HQQ_STL3` (`0x4851515F53544C33`). `HQQ_STL2` segments are rejected with `ErrIncompatibleLayout`, and v0.2.0 endpoints cannot attach to `HQQ_STL3` segments.
-- `Major`/`Minor` (offsets 16/24) now hold the **layout version 3.0** (previously the protocol version 1.0). Offset 88 is `RequiredFeatures` (a bit set a reader must understand; none defined, any set bit is `ErrIncompatibleLayout`) and offset 96 is `CreatorToken` (both were reserved zeros); offsets 104..127 stay reserved. All other offsets are unchanged (`InitToken` 72, `InitHeartbeat` 80, endpoint records at 128 and 256).
-- Unchanged: the MPMC ring layout (version 2, 512-byte header), the 64-byte packet ABI, and the protocol version (1.0).
+- Superblock magic updated from `HQQ_STL2` (`0x4851515F53544C32`) to `HQQ_STL3` (`0x4851515F53544C33`), layout version `3.0`, adding `RequiredFeatures` (offset 88) and `CreatorToken` (offset 96).
 
 ### Added
 
-- `(*AdvancedLink).CloseStream(ctx, connectionID)`: removes the local stream registration and sends `OpConnClose` to the peer, which removes its own; IDs are never reused.
-- `ErrNegotiationFailed` (wraps `ErrInvalidOp`).
-- `GeometryError` and `Geometry` (`errors.As`): an existing segment's recorded geometry differs from the caller's; matches `ErrInvalidSize`.
-- Superblock fields `RequiredFeatures` and `CreatorToken`; roles for named endpoints (creator, opener, caller-owned memory); initializer takeover and safe unlink as specified in PROTOCOL.md.
-- Waiter aggregation in `internal/mpmc`: goroutines blocked on the same ring side share one kernel park per process; `emptyWaiters`/`fullWaiters` count parked processes. `ProducerSlot.Owned()` and `ConsumerSlot.Owned()`.
-- Control sender: a goroutine with a bounded queue (`max(BufferCount, 16)` replies) that sends the replies generated by the receive path, so the dispatcher never waits for the tx ring. `AdvancedStats.DroppedMessages` also counts dropped replies to `OpConnCreate`.
-- `shm.NamesPersist` and `(*SharedMemory).NameRefersToSelf()` (internal), `fallocate`-based allocation on Linux.
-- Tests: superblock layout and takeover, named-segment reuse and safe unlink, `ReadFrom` datagram semantics and tail FIFO, stale reservation copies, negotiation terminal state, control-sender flood and `CloseStream`, waiter aggregation; `HQQ_PERF_TESTS=1` gates CPU-ratio tests. `benchmark.yml` runs the perf tests and benchmarks with `-benchtime 100ms` (instead of `1000x`, which mostly measured warm-up); benchmark alerts stay informational (`fail-on-alert: false`) because the benchmark action treats throughput (MB/s) as smaller-is-better. Test shared-memory names carry a per-process sequence number so that tests never share a name on platforms with a coarse clock.
-- TLA+: the model checks completion CAS as a guard (`CompletionCAS` invariant) and requires `BufferSize >= 2`; `scripts/tlc.sh` documents the `JAVA` environment variable.
+- `(*AdvancedLink).CloseStream(ctx, connectionID)`, `ErrNegotiationFailed`, and `*GeometryError` (`Want`, `Got`).
+- Superblock `RequiredFeatures` and `CreatorToken`, process-level waiter aggregation in `internal/mpmc`, non-blocking control sender in `AdvancedLink`, and Linux `fallocate` backing allocation.
 
 ### Changed
 
-- **Create and Listen reuse existing names.** `CreateStandardLink`, `CreateAdvancedLink`, and `Listen` re-initialize an existing segment whose endpoints are both closed or dead (the caller becomes Primary and owns the name with a new `CreatorToken`), fail with `ErrLinkBusy` if an endpoint is alive (a creator never joins a live segment), fail with `ErrIncompatibleLayout` for a foreign or other-version object (left untouched), `ErrInvalidSize` for a smaller object, a transient `ErrFailedInit` variant for a zero-size object, and `ErrInvalidName` for a non-regular object on Linux. On Windows an existing name always means a live handle.
-- **Openers never initialize.** `OpenStandardLink`, `OpenAdvancedLink`, and `Dial` only join a live segment as Secondary and never initialize, re-initialize, or take over a segment, so they never become Primary on a named segment and never write `CreatorToken`. On an `Empty` segment they wait up to `AttachTimeout` for the creator and then fail with a transient error (matches `ErrFailedInit`) without touching it; on an `Initializing` segment (stalled or not) they wait up to `AttachTimeout` and then fail with a transient error; on a `Ready` segment with no live endpoint they fail immediately with a transient `hqq: shared memory segment has no live endpoint`. A new creator (`Create*`, `Listen`) recovers the name. `Dial` retries on all of these, so it also retries while the segment has no live endpoint, until a new `Listen` reuses the name or `ctx` ends.
-- **Foreign data is never overwritten.** Before any endpoint claims an `Empty` segment, the whole superblock page must be zero, otherwise the call returns `ErrIncompatibleLayout` without writing (also for `NewStandardLink` on caller-owned memory). A `Ready` segment with another magic or layout major, or an unknown `RequiredFeatures` bit, is rejected before join and before takeover.
-- **Takeover is relative to first sight.** A dead initializer is taken over, by a creator or an endpoint on caller-owned memory only, after its token and heartbeat stayed unchanged for `max(PeerTimeout, 2s)` on the local monotonic clock (previously: age of a wall-clock timestamp); a stalled initializer is given its full window even past `AttachTimeout`. The initializer checks ownership and the context before `Format` and before every 8 MiB zeroing chunk, and publishes with `CAS(InitToken, me, 0)` before bumping the epoch and storing `Ready`.
-- **Contexts bound every wait.** `Dial` and `Listen` return `ctx.Err()` as soon as their context is done, also inside the claim, the endpoint-liveness watch, and the ring attach (these waits were not bounded by the context before).
-- **Safe unlink.** `Close` and `Unlink` remove a name only if it still refers to this endpoint's instance (Linux: same device/inode and `CreatorToken`; macOS/FreeBSD: re-open and compare `CreatorToken`); a missing or replaced name is a no-op returning nil. A failed fresh create removes its name.
-- **Linux shared memory** is opened with `O_NOFOLLOW`, must be a regular file, and is allocated with `fallocate` (falls back to `ftruncate` on `EOPNOTSUPP`/`ENOSYS`), so a full tmpfs fails with `ENOSPC` at creation. Windows: an exclusive create fails with `os.ErrExist` when the mapping or any semaphore name exists.
-- **Slot completion.** Completion through a copyable handle (`ProducerSlot.Commit`, `ConsumerSlot.Release`, as used by `WriteZeroCopy`, `ReserveWrite`, and `ReserveRead`) is a compare-and-swap from the claimed value: a stale copy neither modifies the ring nor wakes anyone, and `StandardWriteReservation`/`StandardReadReservation` return `ErrInvalidOp` from `Commit`/`Abort`/`Release` and nil from `Buffer`. `Enqueue`/`Dequeue` and the `*ZeroCopyCancel` paths keep plain atomic stores (the claimant is the single owner).
-- **Standard reads.** One read call returns bytes of at most one message; unread tails form a FIFO and are never merged. `Read`, `ReadZeroCopy`, and `ReserveRead` now share the same receive helpers (`recvMessage`, `consume`, `classify`), `Close` waits for zero-copy callbacks that serve a tail, and `Close` from inside a zero-copy callback deadlocks (documented).
-- **Dispatcher and streams.** The receive path never waits for the tx ring; stream accepts and refusals and the error responses to requests refused by `MaxReassemblyBytes` are sent by the control sender. A stream becomes visible to `AcceptStream` only after its `OpConnAccept` is on the tx ring. `OverflowBlock` for streams waits at receive time for `AcceptStream`.
-- An `OpError` from the peer with an unknown error code matches `ErrProtocol`.
-- `NamedStandardLink.Unlink`/`NamedAdvancedLink.Unlink` return nil for a missing name.
-- The `unsafe.Pointer` open path is a single function (`NewStandardLink` → `openStandardLink`); `createAlignedBuffer` is removed.
-- `mpmc`: `T` must not contain Go pointers (documented); `park_darwin.go` documents the private `__ulock_*` interface and `os_sync_wait_on_address` (macOS 14.4+) as the public alternative.
-- Documentation (README, PROTOCOL.md, package comment) rewritten for the above; README benchmarks re-measured.
+- Creators reuse abandoned names safely; openers never initialize; foreign non-zero pages are rejected without modification; initializer takeover uses monotonic progress tracking; `Close` and `Unlink` verify `CreatorToken` before removing a name; and reservation completion uses a compare-and-swap guard against copied reservation structs.
 
 ### Fixed
 
-- A stale copy of an already committed or released reservation could complete the slot a second time and corrupt ring state.
-- The dispatcher could block on a full tx ring while sending stream accepts or refusals, deadlocking two peers that flood each other.
-- `OverflowDrop` answered a stream with an accept that was immediately followed by a close.
-- Concurrent partial readers could receive bytes of two messages in one call.
-- A queued read tail was still served after `Close`.
-- `Close` of a creator removed the name unconditionally, so a segment that somebody else created under the same name after the original was removed or reused could be unlinked.
-- On Linux a symbolic link planted under a shm name was followed (names are now opened with `O_NOFOLLOW`).
-- A foreign object was claimed and overwritten whenever its state word was `0`; now the whole first page must be zero.
-- Waits inside a single `Dial`/`Listen` attempt (claim, liveness watch, ring attach) did not honor the caller's context.
-- Test fixes: `TestMuxServe` and `TestConcurrentReadWrite` no longer rely on timing or miscount results.
-- `MPMC.tla`: the comment on a failed CAS and the dead `Liveness` definition are fixed or removed; the verification status lists what is not modeled.
+- Fixed copied-reservation double completion, dispatcher transmit-ring deadlocks under bidirectional flood, concurrent partial-read message mixing, premature `Close` unlinking of replaced names, Linux `/dev/shm` symlink traversal (`O_NOFOLLOW`), and un-canceled waits inside `Dial`/`Listen`.
 
 ### Removed
 
-- All API listed under "Breaking".
-- `internal/race`: the `//go:norace` helpers are gone. Payload copies are plain `copy`/`clear`; `go test -race ./...` reports no races without them.
-- `mpmc.MPMCInit`, `_RoundUpPowerOf2`.
-- Fixed 50 ms wake-latency assertions in `TestNamedLinkBlockedCallsWakePromptly` and the mpmc wake tests (now hang bounds only); CPU-ratio assertions run only with `HQQ_PERF_TESTS=1`.
+- All deprecated v0.2.0 constructors, getters, `internal/race` `//go:norace` wrappers, and `mpmc.MPMCInit`.
 
 ### Migration
 
 | v0.2.0 | v0.4.1 |
-| --- | --- |
-| `OpenStandardLink(offset uintptr, n, size)` | removed; `NewStandardLink(mem, n, size, LinkOptions{})` |
+| :--- | :--- |
+| `OpenStandardLink(offset uintptr, n, size)` | `NewStandardLink(mem, n, size, LinkOptions{})` |
 | `OpenStandardLinkWithOptions(offset, n, size, opts)` | `NewStandardLink(mem []byte, n, size, opts)` |
 | `OpenStandardLinkMemory(mem, n, size, opts)` | `NewStandardLink(mem, n, size, opts)` |
 | `NewAdvancedLink(offset, n, size)`, `NewAdvancedLinkWithOptions(offset, n, size, opts)` | `NewAdvancedLink(mem []byte, n, size, opts AdvancedOptions)` |
 | `NewAdvancedLinkMemory(mem, n, size, opts)` | `NewAdvancedLink(mem, n, size, opts)` |
 | `CreateStandardLink(name, n, size, mode)` | `CreateStandardLink(name, n, size, perm, LinkOptions{})` |
 | `CreateStandardLinkWithOptions(name, n, size, mode, opts)` | `CreateStandardLink(name, n, size, perm, opts)` |
-| `OpenNamedStandardLink(name, n, size)`, `…WithOptions(…, opts)` | `OpenStandardLink(name, n, size, opts)` |
+| `OpenNamedStandardLink(name, n, size)`, `...WithOptions(..., opts)` | `OpenStandardLink(name, n, size, opts)` |
 | `CreateAdvancedLink(name, n, size, mode)` | `CreateAdvancedLink(name, n, size, perm, AdvancedOptions{})` |
 | `CreateAdvancedLinkWithOptions(name, n, size, mode, opts)` | `CreateAdvancedLink(name, n, size, perm, opts)` |
-| `OpenNamedAdvancedLink(name, n, size)`, `…WithOptions(…, opts)` | `OpenAdvancedLink(name, n, size, opts)` |
+| `OpenNamedAdvancedLink(name, n, size)`, `...WithOptions(..., opts)` | `OpenAdvancedLink(name, n, size, opts)` |
 | `(*AdvancedLink).Listen(ctx)` | `ListenStreams(ctx)` |
 | `(*AdvancedLink).Accept(ctx)` | `AcceptStream(ctx)` |
 | `(*AdvancedLink).Dial(ctx)` | `OpenStream(ctx)` |
-| — | `(*AdvancedLink).CloseStream(ctx, id)` |
+| not present | `(*AdvancedLink).CloseStream(ctx, id)` |
 | `Connection`, `ConnectionState`, `ConnectionState{Closed,Opening,Open,Closing}` | removed |
 | `Capability{None,LargeBuffers,HighThroughput,LowLatency}`, `GetNegotiatedCapabilities()` | removed (capability word is sent as `0`, ignored on receipt) |
 | `GetMode()` / `GetType()` | `Mode()` / `Type()` |
@@ -328,63 +264,41 @@ A hardening pass over the public API, the shared-memory ABI, segment lifecycle, 
 | `(*AdvancedLink).Standard()` | removed |
 | `Create*`/`Listen` on an existing name: `os.ErrExist` | re-initialize if both endpoints are gone; `ErrLinkBusy` if an endpoint is alive; `ErrIncompatibleLayout` / `ErrInvalidSize` / `ErrInvalidName` for unusable objects |
 | `Open*`/`Dial` on a segment whose endpoints are gone: re-initialize and become Primary | transient error (`hqq: shared memory segment has no live endpoint`); `Dial` retries until a new `Listen` (or `Create*`) reuses the name |
-| `ReadFrom` = `Read`; address `"hqq-remote"` or the last `WriteTo` address | datagram `ReadFrom` returning the peer's role address (`"hqq-secondary"` on a Primary link, `"hqq-primary"` on a Secondary link) |
+| `ReadFrom` = `Read`; address `"hqq-remote"` or last `WriteTo` address | datagram `ReadFrom` returning peer role address (`"hqq-secondary"` on Primary, `"hqq-primary"` on Secondary) |
 | `LocalAddr()` = `"hqq-local"` | `"hqq-primary"` / `"hqq-secondary"` (this endpoint's role) |
 | `WriteTo(p, addr)` recorded `addr` | `addr` ignored |
 | `CallOn`/`SendLarge` on any non-zero ID | `ErrConnNotFound` unless the ID is an open stream |
 | negotiation repeated after failure: `ErrAlreadyNegotiated` | `ErrNegotiationFailed` (terminal) |
-| (no equivalent) | `*GeometryError` (matches `ErrInvalidSize`, `errors.As` for `Want`/`Got`) |
-| superblock `HQQ_STL2` | `HQQ_STL3`; segments of either version are rejected by the other (`ErrIncompatibleLayout`): recreate segments after upgrading, upgrade both endpoints together |
+| no equivalent | `*GeometryError` (matches `ErrInvalidSize`, `errors.As` for `Want`/`Got`) |
+| superblock `HQQ_STL2` | `HQQ_STL3`; recreate segments after upgrading and upgrade both endpoints together |
 | `internal/race` helpers | removed |
 
 ## v0.2.0 (untagged)
 
+Initial hardening milestone introducing adaptive kernel parking, superblock crash detection, high-level `Listen`/`Dial`/`Serve` APIs, and TLA+ model checking of the MPMC ring.
+
 ### Highlights
 
-- **Cross-Process Adaptive Parking (`internal/mpmc`)**: Replaced pure busy-spin loops with adaptive waiting (`WaitAdaptive`: tight re-check, `runtime.Gosched`, then cross-process Linux `futex` / macOS `__ulock_wait` / Windows named semaphores for named segments / bounded backoff elsewhere). Idle blocked reader CPU drops from ~165% to **~0.1%**.
-- **Superblock v2 (`HQQ_STL2`) & Crash Detection**: Added per-endpoint session tokens, periodic heartbeats (the recorded PID is diagnostic only), graceful close markers (`ErrPeerClosed`), abrupt crash detection (`ErrPeerGone`), reuse of segments whose endpoints all closed or died by `OpenNamed*` / `Dial`, initializer crash takeover, and 3rd-endpoint rejection (`ErrLinkBusy`).
-- **Ergonomic High-Level APIs**: Added `hqq.Listen` / `hqq.Dial`, `AdvancedLink.Negotiate`, `AdvancedLink.Serve` + `hqq.Mux` (`Handler` / `HandlerFunc`), `OpenStandardLinkMemory`, `AlignedBuffer`, and standalone `hqq.Unlink`.
-- **Zero `go vet` Warnings**: Reworked `internal/mpmc` and `internal/mmap` pointer arithmetic so plain `go vet ./...` (including `unsafeptr`) passes with zero warnings across Linux, macOS, and Windows.
-- **TLA+ Model Checking (`internal/mpmc/MPMC.tla`)**: Repaired the TLA+ specification, removed the broken post-module proof stub, and model-checked `NoRace` (writer + reader exclusivity), `DataIntegrity`, `FIFOBound`, `FIFOClaimOrder`, and `SystemProgress` with TLC on a bounded model (`scripts/tlc.sh`, 662,863 states, 0 errors). This is a bounded check, not a proof; parking, `Format`, and crashes are not modeled.
+- **Cross-Process Adaptive Parking (`internal/mpmc`)**: replaced pure busy-spin loops with `WaitAdaptive` (tight spin re-check, `runtime.Gosched`, then Linux `futex`, macOS `__ulock_wait`, or Windows named semaphores), dropping idle reader CPU from ~165% to **~0.1%**.
+- **Superblock v2 (`HQQ_STL2`) & Crash Detection**: added per-endpoint session tokens, periodic heartbeats, graceful close markers (`ErrPeerClosed`), abrupt crash detection (`ErrPeerGone`), stale segment reuse, initializer takeover, and 3rd-endpoint rejection (`ErrLinkBusy`).
+- **Ergonomic High-Level APIs**: added `hqq.Listen` / `hqq.Dial`, `AdvancedLink.Negotiate`, `AdvancedLink.Serve` + `hqq.Mux` (`Handler` / `HandlerFunc`), `OpenStandardLinkMemory`, `AlignedBuffer`, and `hqq.Unlink`.
+- **Zero `go vet` Warnings**: reworked `internal/mpmc` and `internal/mmap` pointer arithmetic to pass default `go vet ./...` (including `unsafeptr`) across Linux, macOS, and Windows.
+- **TLA+ Model Checking (`internal/mpmc/MPMC.tla`)**: verified `NoRace`, `DataIntegrity`, `FIFOBound`, `FIFOClaimOrder`, and `SystemProgress` with TLC (`scripts/tlc.sh`, 662,863 states, 0 errors).
 
 ### Added
 
-- `hqq.Listen(ctx, name, cfg)` and `hqq.Dial(ctx, name, cfg)` for one-step named IPC setup and negotiation (`connect.go`).
-- `hqq.Mux`, `hqq.Handler`, `hqq.HandlerFunc`, and `(*AdvancedLink).Serve(ctx, handler)` for ergonomic request-response RPC dispatch (`rpc.go`).
-- `(*AdvancedLink).Negotiate(ctx, features)` to auto-select initiator/responder roles from `Link.Mode()`, plus simultaneous `NegotiateProtocol` collision resolution (`advanced.go`).
-- `OpenStandardLinkMemory(mem []byte, bufferCount, bufferSize int, opts LinkOptions)`, `NewAdvancedLinkMemory(mem, bufferCount, bufferSize, opts AdvancedOptions)`, and `AlignedBuffer(size uintptr) []byte` for safe in-process or custom-mapped links (`standard.go`, `advanced.go`).
-- `hqq.Unlink(name string)` and `shm.Unlink(name string)` to remove leftover shared-memory segments without mapping them (`named_link.go`, `internal/shm`).
-- `LinkOptions` (`WaitPolicy`, `HeartbeatInterval`, `PeerTimeout`, `AttachTimeout`), `OverflowPolicy` (`OverflowBlock`, `OverflowDrop`, `OverflowFail`), and `PeerState` (`PeerNotConnected`, `PeerConnected`, `PeerClosed`, `PeerGone`) (`options.go`, `superblock.go`).
-- `AdvancedOptions.MaxReassemblyBytes` (default `4 × MaxMessageSize`): bounds the memory held by all incomplete multi-chunk messages; a message that would exceed it is refused without allocating (`advanced.go`, `advanced_io.go`).
-- Granular sentinel errors (`ErrClosed`, `ErrPeerClosed`, `ErrPeerGone`, `ErrLinkBusy`, `ErrIncompatibleLayout`, `ErrNotNegotiated`, `ErrAlreadyNegotiated`, `ErrNegotiationRejected`, `ErrUnexpectedPacket`, `ErrProtocol`, `ErrMessageAborted`, `ErrAdvancedActive`, `ErrNotListening`, `ErrAlreadyListening`, `ErrIncomingOverflow`, `ErrReassemblyLimit`, `ErrInvalidName`), each wrapping one base (`net.ErrClosed`, `io.EOF`, `os.ErrDeadlineExceeded`, or a legacy HQQ sentinel) for `errors.Is` (`errors.go`; see the PROTOCOL.md error table).
-- Windows: cross-process parking for named segments through four named kernel semaphores per segment (`<object name>.hqq-sem0`…`3`), `WaitOnAddress` parking for unnamed memory, `mode` translated to a DACL for the mapping and its semaphores, and `CurrentSize` via `NtQuerySection` so a size mismatch reports `ErrInvalidSize` (`internal/mpmc`, `internal/shm`).
-- Multi-process crash/graceful-close/stale-reuse tests (`lifecycle_test.go`), fuzz targets (`fuzz_test.go`, `internal/protocol/fuzz_test.go`), runnable GoDoc examples (`example_test.go`), and Unix domain socket / OS pipe comparison benchmarks (`compare_unix_test.go`).
+- `hqq.Listen`, `hqq.Dial`, `hqq.Mux`, `hqq.Handler`, `hqq.HandlerFunc`, `(*AdvancedLink).Serve`, `(*AdvancedLink).Negotiate`, `OpenStandardLinkMemory`, `NewAdvancedLinkMemory`, `AlignedBuffer`, and `hqq.Unlink`.
+- `LinkOptions`, `OverflowPolicy`, `PeerState`, `AdvancedOptions.MaxReassemblyBytes`, and granular sentinel errors wrapping standard library base errors.
+- Windows cross-process named-semaphore parking, `WaitOnAddress` unnamed parking, DACL permission translation, and `NtQuerySection` size verification.
+- Multi-process crash/lifecycle tests (`lifecycle_test.go`), fuzz targets, runnable GoDoc examples, and Unix socket / OS pipe comparison benchmarks.
 
 ### Changed
 
-- Split the monolithic 2,448-line `link.go` into focused modules: `errors.go`, `options.go`, `superblock.go`, `standard.go`, `reservation.go`, `packetconn.go`, `advanced.go`, `advanced_io.go`, `advanced_dispatch.go`, `advanced_stream.go`, `named_link.go`, `rpc.go`, and `connect.go`.
-- Consolidated 12 duplicated MPMC ring claim loops into unified `claimProducer` and `claimConsumer` paths with 64-byte slot alignment (`slotAlign = 64`) and a 512-byte cache-line-isolated header (`internal/mpmc/mpmc.go`).
-- Fixed `SizeMPMCRing` double-counting of 256 header bytes (`internal/mpmc/mpmc.go`).
-- Changed Windows default shared-memory namespace from `Global\` (which requires elevated `SeCreateGlobalPrivilege`) to `Local\`, while preserving explicit `Global\` prefix support (`internal/shm/shm_windows.go`).
-- Replaced fragile `//go:linkname` bindings to Go runtime internal `internal/race` symbols with self-contained `//go:norace` memory helpers (`internal/race`).
-- `StandardLink.Read` returns `io.EOF` itself (instead of `ErrPeerClosed`) after a graceful peer close, as the `io.Reader` contract requires; `io.Copy`, `io.ReadAll`, and `bufio.Scanner` now treat it as a normal end of stream (`standard.go`).
-- `AdvancedLink.Dial` allocates even connection IDs on Primary and odd IDs on Secondary (as specified); a peer `OpConnCreate` with ID `0`, the wrong parity, or an ID in use is refused with `ErrCodeInvalidOp` instead of overwriting the existing connection (`advanced_stream.go`).
-- Aborted Advanced messages are no longer delivered: `Receive`, `Serve`, and `MessageHandler` drop aborted requests and data messages, and an aborted response fails `Call`/`CallOn` with `ErrMessageAborted` instead of returning an empty success (`advanced_io.go`, `rpc.go`).
-- Ring attach failures on a `Ready` segment report `ErrIncompatibleLayout` instead of a bare `ErrFailedInit` (`standard.go`).
-- Windows shared-memory names are limited so that the mapping name plus the 9-character semaphore suffix fits 259 UTF-16 units (`ErrInvalidName` otherwise).
+- Split monolithic `link.go` into focused files (`errors.go`, `options.go`, `superblock.go`, `standard.go`, `reservation.go`, `packetconn.go`, `advanced.go`, `advanced_io.go`, `advanced_dispatch.go`, `advanced_stream.go`, `named_link.go`, `rpc.go`, `connect.go`).
+- Unified MPMC producer/consumer claim paths with 64-byte slot alignment and a 512-byte cache-line-isolated header.
+- Defaulted Windows shared-memory namespace to `Local\` instead of `Global\`.
+- Updated `StandardLink.Read` to return `io.EOF` on graceful peer close, enforced stream ID parity in `AdvancedLink.Dial`, and dropped aborted multi-chunk messages instead of delivering partial payloads.
 
 ### Fixed
 
-- Fixed data races in `StandardLink` (`readDeadline`, `writeDeadline`, `remoteAddr`, `recvRemainder`, and `Close` vs in-flight ring operations).
-- Fixed `NamedStandardLink.Close` and `NamedAdvancedLink.Close` unmapping shared memory before draining in-flight readers/writers (`SIGSEGV` hazard).
-- Fixed `SIGBUS` hazard when opening a named shared memory segment before the creator finished `ftruncate` (`internal/shm`).
-- Fixed shared-memory name traversal (`../`, slashes, NUL, and macOS 31-byte `PSHMNAMLEN` validation) and added `O_CLOEXEC` (`internal/shm`).
-- Fixed `AdvancedLink` dispatcher failing permanently when a late response arrives for a context-canceled `Call` (`advanced_dispatch.go`).
-- Fixed `StandardLink.Read` / `ReadZeroCopy` / `ReserveRead` silently corrupting state if called on `OpConnCopy` frames (`standard.go`, `reservation.go`).
-- Fixed `Dial` retrying forever on permanent `ErrFailedInit` variants such as `ErrIncompatibleLayout`; it now retries only while the name is missing or the listener is still sizing/initializing the segment (`connect.go`).
-- Fixed a data race (double unmap / double handle close) when `Close` or `Unlink` was called concurrently on a `NamedStandardLink` / `NamedAdvancedLink` (`named_link.go`).
-- Fixed a race that could recycle a `Call` result channel still holding a stale result into the global pool, delivering one call's error to an unrelated call (`advanced_io.go`, `advanced_dispatch.go`).
-- Fixed unbounded growth of incomplete reassembly buffers when a sender's abort frame was never delivered (`advanced_io.go`).
-- Fixed a context wake-up callback that could touch a ring's wait word after the operation returned and the mapping was unmapped (`internal/mpmc`).
-- Fixed a panicking zero-copy callback wedging the ring permanently: `WriteZeroCopy` publishes a tombstone, `ReadZeroCopy` and the mpmc dequeue release the slot, and the mpmc enqueue publishes a zeroed element before the panic propagates (`standard.go`, `internal/mpmc`).
-- Fixed the CI fuzz step, which named non-existent fuzz targets and therefore fuzzed nothing (`.github/workflows/ci.yml`).
+- Resolved data races in `StandardLink` deadlines and `Close`, `SIGSEGV` unmap-before-drain hazards in named links, `SIGBUS` races before `ftruncate`, shared-memory name traversal bugs, dispatcher crashes on late canceled-call responses, and panicking zero-copy callback ring wedges.

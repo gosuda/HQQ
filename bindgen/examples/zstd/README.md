@@ -1,53 +1,57 @@
-# zstd through hqq-bindgen
+# `bindgen/examples/zstd`: Zstandard 1.5.7 via `hqq-bindgen`
 
-This directory is the first real library behind hqq-bindgen: a subset of Zstandard 1.5.7 described by [zstd.idl](zstd.idl), a generated Go client ([zstd_client.go](zstd_client.go)), a C server built from the generated glue and the pinned zstd source ([server/](server)), and tests and benchmarks that drive the server over HQQ shared memory and compare it with the same library called through cgo. The Go client never uses cgo; only the comparison package [internal/cgozstd](internal/cgozstd) does, behind a build tag. The design is in [spec/toolchain/BINDGEN.md](../../../spec/toolchain/BINDGEN.md).
+This directory wraps Zstandard 1.5.7 using `hqq-bindgen`: a declarative interface in [`zstd.idl`](zstd.idl), a generated pure-Go client ([`zstd_client.go`](zstd_client.go)), a C server built from the generated dispatch glue and the pinned Zstandard 1.5.7 source ([`server/`](server)), and an end-to-end test and benchmark suite comparing out-of-process shared-memory IPC against in-process `cgo` ([`internal/cgozstd`](internal/cgozstd), guarded by `-tags zstdcgo`). The Go client package never uses `cgo`. See [`spec/toolchain/BINDGEN.md`](../../../spec/toolchain/BINDGEN.md) for the full toolchain specification.
 
-## What it demonstrates
+## What this example demonstrates
 
-| Feature of the design | Where |
+| `hqq-bindgen` Feature | How `zstd.idl` Uses It |
 | :--- | :--- |
-| Error convention in the result: `@error(predicate(ZSTD_isError), detail(ZSTD_getErrorName, ret))` | every function that returns `size_t`; Go sees a `*rt.LibError` with the library's text, `ErrorCodeOf` gives the `ZSTD_ErrorCode` |
-| Caller-supplied output buffers with a capacity, written in place into the response slot | `ZSTD_compress`, `ZSTD_decompress`, the context variants and both stream shims |
-| Large messages as CONT frames, bounded by the IDL (`bytes<=N`) and by `max_message` | 64 MiB buffers in both directions |
-| Handles with a destroy function, per-session tables, teardown on session end | `CCtx` and `DCtx` |
-| Interceptor | `ZSTD_CCtx_setParameter` (parameter allowlist and a window bound) |
-| `shim` functions that flatten structs with pointers | `ZSTD_compressStream2_flat`, `ZSTD_decompressStream_flat` |
-| Pipelining | `*Async` calls and futures; the stream tests keep four compress calls in flight |
-| Default deny | only the functions of the IDL have an opcode; `ZSTD_isError` and `ZSTD_getErrorName` are `@allow(server)` and cannot be called by a client |
-| `serialize(none)` | zstd is re-entrant and contexts are independent, so sessions run inside the library at the same time |
+| Predicate error convention: `@error(predicate(ZSTD_isError), detail(ZSTD_getErrorName, ret))` | Applied to every `size_t`-returning function; Go callers receive `*rt.LibError` with `ZSTD_getErrorName` text and extract the `ZSTD_ErrorCode` via `zstd.ErrorCodeOf(err)`. |
+| In-place caller-sized output buffers (`out dst: bytes`) | `ZSTD_compress`, `ZSTD_decompress`, context variants, and streaming shims write compressed/decompressed bytes directly into the reserved response ring slot. |
+| Multi-frame `CONT` transfers (`bytes<=N` and `max_message`) | Supports compressing and decompressing 64 MiB payloads in both directions. |
+| Session-scoped handles with automatic teardown | `CCtx` (`ZSTD_createCCtx` / `ZSTD_freeCCtx`) and `DCtx` (`ZSTD_createDCtx` / `ZSTD_freeDCtx`) are tracked per session and freed automatically on disconnect or crash. |
+| Pre-call `@intercept` policy hook | `ZSTD_CCtx_setParameter` enforces a parameter allowlist and caps `windowLog <= 27`, rejecting worker-thread creation (`ZSTD_c_nbWorkers`) with `rt.ErrDenied`. |
+| Pointer-struct flattening via `shim` functions | `ZSTD_compressStream2_flat` and `ZSTD_decompressStream_flat` replace `ZSTD_inBuffer*` and `ZSTD_outBuffer*` pointer structs with flat byte slices and scalar counts. |
+| Asynchronous pipelining (`*Async` futures) | Streaming compression pipelines four chunks in flight concurrently on a single `CCtx`. |
+| Default-deny opcode table (`@allow(server)`) | Helper functions `ZSTD_isError` and `ZSTD_getErrorName` are marked `@allow(server)` so they are used by server error formatting without exposing client opcodes. |
+| Lock-free multi-session execution (`serialize(none)`) | Because Zstandard functions and separate `CCtx`/`DCtx` handles are re-entrant, concurrent sessions execute in parallel without a server lock. |
 
 ## Files
 
-| Path | Content |
+| Path | Description |
 | :--- | :--- |
-| `zstd.idl` | the interface |
-| `zstd_client.go` | generated Go client (package `zstd`) |
-| `zstd.go` | hand-written: `DefaultOptions`, `CompressBound`, `ErrorCode`, `ErrorCodeOf` |
-| `server/zstd_server.{c,h}` | generated glue |
-| `server/zstd_hooks.c`, `server/main.c` | hand-written interceptor, shims, process entry and geometry |
-| `server/CMakeLists.txt` | builds `zstd_server` and the zstd library from a source directory |
-| `build.sh` | fetches, builds, prints the environment of the tests |
-| `internal/cgozstd` | zstd called through cgo (build tag `zstdcgo`) |
-| `*_test.go` | tests and benchmarks |
-| `../../../scripts/release/fetch-zstd.sh` | fetches and verifies the pinned source |
-| `../../../third_party/zstd` | `VERSION`, `SHA256`, `LICENSE` of the pinned release |
+| `zstd.idl` | Zstandard interface definition. |
+| `zstd_client.go` | Generated pure-Go client (`package zstd`). |
+| `zstd.go` | Hand-written helpers: `DefaultOptions`, `CompressBound`, `ErrorCode`, and `ErrorCodeOf`. |
+| `server/zstd_server.{c,h}` | Generated C server glue. |
+| `server/zstd_hooks.c`, `server/main.c` | Hand-written parameter interceptor, streaming shims, and `hqqrpc_main` entry point. |
+| `server/CMakeLists.txt` | CMake configuration building `zstd_server` and `libzstd` from the verified source tree. |
+| `build.sh` | Fetches pinned Zstandard 1.5.7, compiles `zstd_server`, and outputs environment exports for `eval`. |
+| `internal/cgozstd` | In-process `cgo` reference wrapper (compiled only with `-tags zstdcgo`). |
+| `*_test.go` | Integration, fault-injection, streaming, and cgo-comparison tests and benchmarks. |
+| `../../../scripts/release/fetch-zstd.sh` | Downloads and verifies the pinned Zstandard release tarball. |
+| `../../../third_party/zstd` | Pinned `VERSION`, `SHA256`, and `LICENSE` files for Zstandard 1.5.7. |
 
-Regenerate with `go generate ./bindgen/examples/zstd/`. The check that the committed files are current is `go run ./cmd/hqq-bindgen -check -go-out bindgen/examples/zstd -go-strip ZSTD_ -c-out bindgen/examples/zstd/server bindgen/examples/zstd/zstd.idl`.
+Regenerate bindings with `go generate ./bindgen/examples/zstd/`, or check freshness in CI with:
 
-## Fetch, build, run
+```sh
+go run ./cmd/hqq-bindgen -check -go-out bindgen/examples/zstd -go-strip ZSTD_ -c-out bindgen/examples/zstd/server bindgen/examples/zstd/zstd.idl
+```
 
-The zstd source is not in the repository. `fetch-zstd.sh` downloads the official release tarball named in `third_party/zstd/VERSION`, refuses it unless its SHA-256 equals `third_party/zstd/SHA256` (nothing is unpacked on a mismatch), checks that the tarball's `LICENSE` equals `third_party/zstd/LICENSE`, and unpacks it outside the repository (default `${TMPDIR:-/tmp}/hqq-zstd-1.5.7`). The release also publishes the same digest as `zstd-1.5.7.tar.gz.sha256`. There is no PowerShell variant: the server is POSIX only (BINDGEN.md 1.2).
+## Fetch, build, and run
 
-`build.sh` runs the fetch, builds with CMake and Ninja, and prints a script for `eval`:
+Zstandard's C source tree is not vendor-committed into the repository. Instead, `scripts/release/fetch-zstd.sh` downloads the official release archive specified in `third_party/zstd/VERSION`, verifies its SHA-256 digest against `third_party/zstd/SHA256` before unpacking, verifies that the archive's `LICENSE` file matches `third_party/zstd/LICENSE` byte-for-byte, and extracts it outside the repository (`${TMPDIR:-/tmp}/hqq-zstd-1.5.7`).
+
+Run `build.sh` to fetch the source, build the server with CMake and Ninja, and export the test environment variables:
 
 ```sh
 eval "$(bindgen/examples/zstd/build.sh)"
 go test -race -tags zstdcgo ./bindgen/examples/zstd/...
 ```
 
-It exports `HQQ_ZSTD_SERVER` (the server binary, which the tests start with `launch.Start` after hashing it), `CGO_CFLAGS` and `CGO_LDFLAGS` (the zstd library built from the same source). `-s address+undefined` additionally builds the server with AddressSanitizer and UndefinedBehaviorSanitizer and points `HQQ_ZSTD_SERVER` at it; the cgo library stays unsanitized. Without `HQQ_ZSTD_SERVER` the tests that need a server skip and the fetch-script tests still run. Without `-tags zstdcgo` the comparisons with the in-process library are not compiled, and `go build ./...` needs no zstd headers.
+`build.sh` exports `HQQ_ZSTD_SERVER` (used by the test suite via `launch.Start` with SHA-256 verification) along with `CGO_CFLAGS` and `CGO_LDFLAGS` pointing to the static `libzstd.a` built from the exact same source. Passing `-s address+undefined` builds `zstd_server` with ASan and UBSan enabled. Without `-tags zstdcgo`, the package builds and runs against the HQQ server without requiring any C headers on the Go side.
 
-By hand, without the script:
+To build and start the server manually:
 
 ```sh
 zdir=$(scripts/release/fetch-zstd.sh)
@@ -56,7 +60,7 @@ cmake --build /tmp/hqq-zstd-build
 /tmp/hqq-zstd-build/zstd_server my-zstd        # prints "ready my-zstd"
 ```
 
-The glue and the hooks build with `-Wall -Wextra -Wpedantic -Werror` (`HQQ_WERROR` defaults to ON in this project); zstd's own sources are third-party code and use the default flags. Client side:
+Calling the server from Go:
 
 ```go
 c, err := zstd.Dial(ctx, "my-zstd", zstd.DefaultOptions())
@@ -64,133 +68,119 @@ if err != nil {
 	return err
 }
 defer c.Close()
+
 dst := make([]byte, zstd.CompressBound(uint64(len(src))))
 frame, err := c.Compress(dst, src, 3)
 ```
 
-`ZSTD_getFrameContentSize` reads at most `ZSTD_FRAMEHEADER_MAX` (18) bytes: pass `frame[:min(len(frame), int(zstd.ZSTD_FRAMEHEADER_MAX))]`; a longer slice is refused with `rt.ErrInvalidArg` before it is sent. A destination slice is the output capacity; the result is its prefix that the library produced.
+Note on `ZSTD_getFrameContentSize`: the IDL bounds its input slice to `ZSTD_FRAMEHEADER_MAX` (`18` bytes), so pass `frame[:min(len(frame), int(zstd.ZSTD_FRAMEHEADER_MAX))]`; passing a longer slice fails client-side with `rt.ErrInvalidArg` before touching the ring.
 
-### Optional: system libzstd
+## Geometry and flow-control limits
 
-The cgo comparison can link another libzstd, for example Homebrew's, by setting `CGO_CFLAGS=-I/opt/homebrew/include` and `CGO_LDFLAGS=-L/opt/homebrew/lib -lzstd` yourself. That path is unverified: the tests compare compressed bytes, which are only guaranteed equal between identical releases and settings. `TestVersionMatchesPin` fails when the in-process version differs from the server's.
+Because Zstandard workloads routinely compress multi-megabyte buffers, `zstd.DefaultOptions()` and `server/main.c` negotiate a larger ring geometry than `rt.Options{}`'s 16 KiB default:
 
-## Geometry and limits
-
-`rt.Options{}` selects 16 KiB frames and 16 MiB messages, which is too small for this library, so the example fixes its own defaults in two places that must agree: `zstd.DefaultOptions()` for the client and `server/main.c` for the server. The values are negotiated at connect time (BINDGEN.md 4.11, 5.5); a client may ask for another geometry up to the server's maximum.
-
-| Setting | Value | Why |
+| Parameter | Default Value | Rationale |
 | :--- | ---: | :--- |
-| Frame size `S` | 65,536 | A call with a destination of at most 65,501 bytes has a one-frame response bound (the bound is the capacity plus 19 bytes of framing and the frame body holds 65,520 bytes), so the library writes its output directly into the response slot. That covers compressing inputs of up to about 65,200 bytes and decompressing frames to up to 65,501 bytes. |
-| Frame count `B` | 64 | `max_in_flight` is 64 as well; see the table below. |
-| `max_message` | 128 MiB | A 64 MiB buffer and its compressed form fit; `ZSTD_MAX_SRC` of the IDL (512 MiB) is the contract of the interface, the session limit is the effective bound. A request above the granted limit fails with `rt.ErrInvalidArg` before it is sent. |
-| `max_buffer_size`, `max_segment_bytes` | 1 MiB, 256 MiB | 1 MiB frames at `B = 64` need a 128 MiB segment. |
-| `scratch_keep` | 8 MiB | Multi-frame messages are assembled in per-session scratch; scratch up to 8 MiB is kept between calls. |
-| `copy_request` | off | The library reads request bytes in place from the ring slot. `--copy-request` copies single-frame requests first (BINDGEN.md 7.2); the benchmarks compare the two. |
-| `serialize` | none | Sessions run in the library concurrently. |
+| Frame size `S` | `65,536` (`64 KiB`) | Any call whose output capacity is `<= 65,501 B` (65,520 B frame body minus 19 B framing header) fits in a single response frame (`rf = 1`) and writes directly into the response ring slot without server scratch buffering. |
+| Frame count `B` | `64` | Matches `max_in_flight = 64` (8 MiB total segment size per session: `2 * 64 * 65536`). |
+| `max_message` | `128 MiB` | Accommodates a 64 MiB uncompressed payload plus worst-case `CompressBound` overhead. Requests exceeding the negotiated limit fail locally with `rt.ErrInvalidArg`. |
+| `max_buffer_size`, `max_segment_bytes` | `1 MiB`, `256 MiB` | Allows callers to request up to 1 MiB frames (`B = 64` -> `128 MiB` segment). |
+| `scratch_keep` | `8 MiB` | Retains per-session multi-frame reassembly scratch buffers up to 8 MiB across calls. |
+| `copy_request` | `off` | Reads single-frame requests in place from the ring slot (`--copy-request` enables defensive copying for comparison benchmarks). |
+| `serialize` | `none` | Independent sessions execute concurrently across cores. |
 
-A session segment at the defaults is 8 MiB (`2 * 64 * 65536`). Every flag of `hqqrpc_main` overrides the defaults (`--buffer-size`, `--buffer-count`, `--max-message`, `--max-handles`, `--copy-request`, `--spin`, and the others of `hqq_rpc.h`).
+**Pipelining depth (`floor(B / rf)`)**: credit flow control (`spec/toolchain/BINDGEN.md` §4.12) admits $\lfloor B / \mathit{rf} \rfloor$ concurrent calls in flight, where $\mathit{rf}$ is the number of response frames required for `CompressBound(n)` at `S = 64 KiB` and `B = 64`:
 
-**Pipelining depth.** The flow-control rule of BINDGEN.md 4.12 admits `floor(B / rf)` calls in flight, where `rf` is the number of response frames of the call's bound. For `ZSTD_compress` with the capacity of `CompressBound(n)` at the defaults:
-
-| Input `n` | `rf` | Calls in flight |
+| Uncompressed Input `n` | Response Frames (`rf`) | Max Concurrent Calls in Flight |
 | ---: | ---: | ---: |
-| up to 16 KiB | 1 | 64 |
-| 64 KiB | 2 | 32 |
-| 256 KiB | 5 | 12 |
-| 1 MiB | 17 | 3 |
-| 2 MiB | 33 | 1 |
-| 4 MiB and above | 65 or more | synchronous: `rf` exceeds `B` |
+| up to `16 KiB` | `1` | `64` |
+| `64 KiB` | `2` | `32` |
+| `256 KiB` | `5` | `12` |
+| `1 MiB` | `17` | `3` |
+| `2 MiB` | `33` | `1` |
+| `4 MiB` and above | `>= 65` | `1` (synchronous fallback since `rf > B`) |
 
-A caller that wants deeper pipelining of large buffers raises `B` (up to 4096) within `max_segment_bytes`, or compresses in chunks as the stream tests do.
+## Exposed IDL functions
 
-## Functions in the IDL
-
-| Function | Kind | Notes |
+| Function | Category | Behavior |
 | :--- | :--- | :--- |
-| `ZSTD_compress`, `ZSTD_decompress` | one-shot | `out dst` with capacity; `@error(predicate(ZSTD_isError), detail(...))` |
-| `ZSTD_compressBound` | scalar | `CompressBound` in Go computes it locally; the call exists to check the formula |
-| `ZSTD_getFrameContentSize` | scalar | returns `ZSTD_CONTENTSIZE_UNKNOWN` and `ZSTD_CONTENTSIZE_ERROR` as results, not failures |
-| `ZSTD_versionNumber`, `ZSTD_versionString`, `ZSTD_minCLevel`, `ZSTD_maxCLevel` | scalar | the trivial calls of the benchmarks |
-| `ZSTD_createCCtx`, `ZSTD_freeCCtx`, `ZSTD_createDCtx`, `ZSTD_freeDCtx` | handles | `@error(null)` on create; free is the destroy function and consumes the handle |
-| `ZSTD_compressCCtx`, `ZSTD_decompressDCtx` | context one-shot | the library ignores advanced parameters in `ZSTD_compressCCtx` |
-| `ZSTD_CCtx_setParameter` | `@intercept` | allows compression level, window log (at most 27), strategy, content size, checksum and dictionary id flags; every other parameter, including `ZSTD_c_nbWorkers`, gets `rt.ErrDenied` |
-| `ZSTD_CCtx_setPledgedSrcSize`, `ZSTD_CCtx_reset`, `ZSTD_DCtx_reset` | context state | |
-| `ZSTD_compressStream2_flat`, `ZSTD_decompressStream_flat` | `shim` | see below |
-| `ZSTD_isError`, `ZSTD_getErrorName` | `@allow(server)` | error predicate and detail text; no opcode |
+| `ZSTD_compress`, `ZSTD_decompress` | One-shot | Writes into caller-sized `out dst: bytes`; errors mapped via `@error(predicate(ZSTD_isError), detail(...))`. |
+| `ZSTD_compressBound` | Scalar | Also available locally in Go as `zstd.CompressBound(n)`. |
+| `ZSTD_getFrameContentSize` | Scalar | Returns `ZSTD_CONTENTSIZE_UNKNOWN` (`^uint64(0)`) and `ZSTD_CONTENTSIZE_ERROR` (`^uint64(1)`) as normal return values. |
+| `ZSTD_versionNumber`, `ZSTD_versionString`, `ZSTD_minCLevel`, `ZSTD_maxCLevel` | Metadata | Zero-work scalar queries (`ZSTD_versionNumber` is `BenchmarkTrivialCall`). |
+| `ZSTD_createCCtx`, `ZSTD_freeCCtx`, `ZSTD_createDCtx`, `ZSTD_freeDCtx` | Handles | `@error(null)` on creation; `free*` consumes and destroys the session handle. |
+| `ZSTD_compressCCtx`, `ZSTD_decompressDCtx` | Context one-shot | Reuses context allocations across calls without re-allocating state. |
+| `ZSTD_CCtx_setParameter` | `@intercept` | Permits `compressionLevel`, `windowLog` (`<= 27`), `strategy`, `contentSizeFlag`, `checksumFlag`, and `dictIDFlag`; rejects `nbWorkers` and unbounded memory parameters with `rt.ErrDenied`. |
+| `ZSTD_CCtx_setPledgedSrcSize`, `ZSTD_CCtx_reset`, `ZSTD_DCtx_reset` | Context state | Resets context state or pledges uncompressed input length. |
+| `ZSTD_compressStream2_flat`, `ZSTD_decompressStream_flat` | Streaming `shim` | Flattens `ZSTD_inBuffer` / `ZSTD_outBuffer` for streaming compression and decompression. |
+| `ZSTD_isError`, `ZSTD_getErrorName` | `@allow(server)` | Server-only error helpers (no client opcode). |
 
-**Streaming.** `ZSTD_compressStream2(cctx, ZSTD_outBuffer *, ZSTD_inBuffer *, endOp)` takes structs that hold pointers, which have no wire form, and composite in-parameters are outside the design (BINDGEN.md V38). The shims in `server/zstd_hooks.c` unpack them: `src` and `srcSize` are the input buffer and the call returns the consumed count; `dst` with its capacity is the output buffer and the call returns the produced prefix; the result is the library's own return value (the bytes still to flush, or the next input size for the decoder). A caller loops exactly as with the C API, resending `src[consumed:]` when the output buffer filled. Calls on one context depend on each other, so one context is one pipeline: when the destination holds `CompressBound(len(src))` zstd consumes the whole input whatever it outputs, which lets the compress calls of consecutive chunks be in flight together (the stream tests do this with a depth of four); decompression depends on the output buffer and runs call by call.
+### Deliberately omitted APIs
 
-## Not exposed, and why
-
-| Left out | Reason |
+| Omitted API | Reason |
 | :--- | :--- |
-| Dictionaries (`ZSTD_*_usingDict`, `ZSTD_CDict`, `ZSTD_DDict`, `ZDICT_*`) | Expressible (two `bytes` in-parameters, handles for prepared dictionaries) but not part of this subset; the tests are dictionary-free. |
-| `ZSTD_inBuffer` and `ZSTD_outBuffer` as arguments | Structs with pointer members and composite in-parameters; replaced by the two shims. |
-| `ZSTD_compressStream`, `ZSTD_initCStream` and the other older streaming entry points | Superseded by `ZSTD_compressStream2` and `ZSTD_decompressStream`. |
-| `ZSTD_c_nbWorkers`, `jobSize`, `overlapLog` | The server is built without `ZSTD_MULTITHREAD` and a client must not start threads in the server. `ZSTD_c_nbWorkers` is declared in the IDL so that a client can name it, and the interceptor refuses it. |
-| `hashLog`, `chainLog`, `searchLog`, `minMatch`, `targetLength`, long-distance matching, `windowLog` above 27 | `hashLog` and `chainLog` accept values up to 30 and would let a client request multi-GiB tables; a window above 27 produces frames that the server's own decoder refuses by default. |
-| Advanced decompression parameters (`ZSTD_DCtx_setParameter`) | Not needed for the subset. |
-| Frame inspection beyond `ZSTD_getFrameContentSize`, `ZSTD_estimate*Size`, static and advanced-allocator contexts, sequence producers | Out of scope for the example. |
-| A level policy | `ZSTD_compress` and `ZSTD_compressCCtx` are not intercepted, because an interceptor makes the server copy every `bytes` in-argument into private memory (BINDGEN.md 4.7.1 step 5) and would remove the in-place read. The library clamps a level above `ZSTD_maxCLevel()` (22) or below `ZSTD_minCLevel()` to the limit instead of failing. Levels 20 to 22 use hundreds of MiB per context, so a deployment that serves untrusted clients limits sessions (`--max-sessions`) or the process's memory. |
+| Dictionary APIs (`ZSTD_*_usingDict`, `ZSTD_CDict`, `ZSTD_DDict`) | Expressible in the IDL via `bytes` and handles, but omitted to keep the example focused on standard frames. |
+| Raw `ZSTD_inBuffer` / `ZSTD_outBuffer` structs | Structs containing raw C pointers have no wire representation (rule V38); replaced by `*_flat` shims. |
+| Legacy streaming (`ZSTD_initCStream`, `ZSTD_compressStream`) | Superseded by `ZSTD_compressStream2`. |
+| `ZSTD_c_nbWorkers`, `jobSize`, `overlapLog` | Server builds single-threaded per session (`ZSTD_MULTITHREAD` off); clients must not spawn internal worker threads inside the server. |
+| Unbounded table parameters (`hashLog`, `chainLog`, `windowLog > 27`) | Prevents a client from requesting multi-gigabyte hash tables or emitting frames that standard decoders reject. |
 
-## Errors
+## Error codes pinned by the test suite
 
-A failed `size_t` call returns a `*rt.LibError`: `Code` is `int64(ret)`, minus the `ZSTD_ErrorCode`; `Detail` is the text of `ZSTD_getErrorName`. `zstd.ErrorCodeOf(err)` returns the code. The session stays usable after a library failure and after `rt.ErrDenied`. The failures that the tests pin, with the text of release 1.5.7:
+When any `size_t` function fails, the client returns `*rt.LibError` where `zstd.ErrorCodeOf(err)` extracts the `ZSTD_ErrorCode` and `Detail` holds `ZSTD_getErrorName(ret)`. The session remains healthy after both library errors and `@intercept` policy refusals:
 
-| Call | Code | Detail |
+| Operation | `ZSTD_ErrorCode` | `Detail` String (zstd 1.5.7) |
 | :--- | ---: | :--- |
-| `Decompress` of data that is not a frame | 10 | `Unknown frame descriptor` |
-| `Decompress` of a truncated frame, whatever the cut | 72 | `Src size is incorrect` |
-| `Decompress` of a checksummed frame with a changed byte | 22 | `Restored data doesn't match checksum` |
-| `Decompress` of a frame with a reserved block type | 20 | `Data corruption detected` |
-| `Compress` or `Decompress` into a buffer that is too small | 70 | `Destination buffer is too small` |
-| `CCtxSetParameter` with a value outside the library's bounds | 42 | `Parameter is out of bound` |
-| `CCtxSetParameter` of a frame parameter after compression started | 60 | `Operation not authorized at current processing stage` |
-| `CompressBound` of a size above `ZSTD_MAX_INPUT_SIZE` | 72 | `Src size is incorrect` |
-
-An empty input to `Decompress` is not an error: the library takes it for no frames and returns zero bytes. A level outside the library's range is clamped, not rejected.
+| `Decompress` on non-zstd bytes | `10` | `Unknown frame descriptor` |
+| `Decompress` on a truncated frame | `72` | `Src size is incorrect` |
+| `Decompress` on a frame with a corrupted payload byte | `22` | `Restored data doesn't match checksum` |
+| `Decompress` on a frame with a reserved block type | `20` | `Data corruption detected` |
+| `Compress` or `Decompress` into an undersized `dst` slice | `70` | `Destination buffer is too small` |
+| `CCtxSetParameter` with an out-of-range value | `42` | `Parameter is out of bound` |
+| `CCtxSetParameter` mid-stream when stage forbids changes | `60` | `Operation not authorized at current processing stage` |
+| `CompressBound` above `ZSTD_MAX_INPUT_SIZE` | `72` | `Src size is incorrect` |
 
 ## Tests
 
-The tests need `HQQ_ZSTD_SERVER`; the cgo comparisons also need `-tags zstdcgo`.
+Run the full test suite (requiring `HQQ_ZSTD_SERVER` and `-tags zstdcgo` for differential checks against in-process `cgo`):
 
-| Test | What it catches |
+| Test | Coverage |
 | :--- | :--- |
-| `TestRoundTripSizesAndLevels`, `TestRoundTripIncompressible` | Wrong bytes or lengths at 0, 1, 63, 64, 4 KiB, 1 MiB and 64 MiB (CONT frames in both directions), levels 1, 3, 19 (19 up to 1 MiB), and frames that differ from the in-process library |
-| `TestDecompress*`, `TestDestinationTooSmall`, `TestSetParameterPolicyAndLibraryBounds`, `TestCompressBoundRefusesImpossibleSize`, `TestFrameContentSizeResultsAreNotFailures`, `TestStreamCallsRejectBadDirective`, `TestLevelsOutsideTheLibraryRangeAreClamped` | Each error path, with its code and text; a session that breaks after a library failure; policy refusals |
-| `TestErrorTextMatchesInProcessLibrary` | A server failure whose code or text differs from the library called in process |
-| `TestContextCallsMatchOneShot`, `TestParametersApplyToStreamsNotToCompressCCtx`, `TestPledgedSizeIsCheckedByTheLibrary` | State left in a context between calls; parameters that reach or miss the library |
-| `TestHandleLifecycle`, `TestHandleTableLimit` | Use after free, double free, a recycled index with a stale generation, a nil handle, a handle of another session, a full handle table |
-| `TestContextsAreReleasedWhenTheirOwnerGoes` | Contexts that survive an orderly close or a vanished client (resident size of the server; a live session is the control) |
-| `TestStreamRoundTripWithIrregularChunks`, `TestStreamFlushMakesOutputDecodable`, `TestStreamDecompressSmallOutputBuffer`, `TestStreamFramesMatchInProcessLibrary` | Stream calls that lose, duplicate or reorder bytes; chunk boundaries; flush; a decoder that returns before consuming its input |
-| `TestStreamLongSyntheticStreamRunsInConstantMemory` | A 4 GiB stream (64 MiB with `-short`, or `HQQ_ZSTD_STREAM_MIB`) through a compress session and a decompress session with the SHA-256 of both ends compared, and a per-chunk leak in the server or the client (resident size and heap after a 64 MiB warm-up) |
-| `TestPoolGoroutinesShareSessionsWithoutInterference`, `TestPipelinedClientsWithOwnContexts`, `TestWaitInAnyOrder` | Responses delivered to the wrong caller, frames mixed between sessions, buffered responses of futures waited for out of order |
-| `TestServerKilledWhileIdle`, `TestServerKilledWithCallsInFlight`, `TestServerStopClosesSessionsGracefully` | Hangs after a server crash, a call that reports success or a known outcome after one, a session that stays usable |
-| `TestCopyRequestServerProducesTheSameFrames`, `TestSmallFramesAndFewBuffers`, `TestServerMessageLimitIsGrantedAndEnforced` | The copy path differing from the in-place path; flow control with 4 KiB frames and 8 buffers; the granted message limit |
-| `TestPin*`, `TestFetch*` | The fetch script accepting a corrupted or unpinned archive, a drifted license, member names that escape the directory, or an unpack inside the repository |
+| `TestRoundTripSizesAndLevels`, `TestRoundTripIncompressible` | Verifies compression and decompression across sizes `0, 1, 63, 64, 4 KiB, 1 MiB, 64 MiB` and levels `1, 3, 19`, confirming bit-for-bit equality against in-process `cgo`. |
+| `TestDecompress*`, `TestDestinationTooSmall`, `TestSetParameterPolicyAndLibraryBounds`, `TestCompressBoundRefusesImpossibleSize`, `TestFrameContentSizeResultsAreNotFailures`, `TestStreamCallsRejectBadDirective`, `TestLevelsOutsideTheLibraryRangeAreClamped` | Exercises every error code, message string, parameter policy denial, and session recovery path. |
+| `TestErrorTextMatchesInProcessLibrary` | Verifies that server error codes and strings match in-process `cgo` identically. |
+| `TestContextCallsMatchOneShot`, `TestParametersApplyToStreamsNotToCompressCCtx`, `TestPledgedSizeIsCheckedByTheLibrary` | Verifies context reuse, parameter scoping, and pledged source size validation. |
+| `TestHandleLifecycle`, `TestHandleTableLimit` | Rejects use-after-free, double-free, stale handle generations, nil handles, cross-session handles, and handle table overflow. |
+| `TestContextsAreReleasedWhenTheirOwnerGoes` | Confirms server RSS returns to baseline when a client closes or crashes while holding `CCtx` handles. |
+| `TestStreamRoundTripWithIrregularChunks`, `TestStreamFlushMakesOutputDecodable`, `TestStreamDecompressSmallOutputBuffer`, `TestStreamFramesMatchInProcessLibrary` | Verifies streaming compression/decompression across arbitrary chunk boundaries and small output buffers. |
+| `TestStreamLongSyntheticStreamRunsInConstantMemory` | Streams 4 GiB (`64 MiB` under `-short`) through a compress session and a decompress session, verifying end-to-end SHA-256 equality and flat server/client memory usage. |
+| `TestPoolGoroutinesShareSessionsWithoutInterference`, `TestPipelinedClientsWithOwnContexts`, `TestWaitInAnyOrder` | Exercises `rt.Pool` concurrency, pipelined futures, and out-of-order future waits. |
+| `TestServerKilledWhileIdle`, `TestServerKilledWithCallsInFlight`, `TestServerStopClosesSessionsGracefully` | Verifies `SIGKILL` detection and graceful server shutdown. |
+| `TestCopyRequestServerProducesTheSameFrames`, `TestSmallFramesAndFewBuffers`, `TestServerMessageLimitIsGrantedAndEnforced` | Compares `--copy-request` against in-place reads and tests constrained ring geometries (`S = 4 KiB, B = 8`). |
+| `TestPin*`, `TestFetch*` | Verifies `fetch-zstd.sh` digest checking, license verification, and path-traversal rejection. |
 
 ## Benchmarks
+
+Run the cgo vs HQQ comparison benchmarks on a quiet machine:
 
 ```sh
 eval "$(bindgen/examples/zstd/build.sh)"
 go test -tags zstdcgo -run '^$' -bench . -benchtime 1s ./bindgen/examples/zstd/
 ```
 
-`BenchmarkCompress` and `BenchmarkDecompress` run level 1 on text data of 64 B, 256 B, 1 KiB, 4 KiB, 16 KiB, 64 KiB, 256 KiB, 1 MiB, 4 MiB, 16 MiB and 64 MiB; `SetBytes` is the uncompressed size, so MB/s is comparable between the two and between modes. `BenchmarkTrivialCall` is `ZSTD_versionNumber`, which has no payload and no library work.
+`BenchmarkCompress` and `BenchmarkDecompress` sweep payload sizes from `64 B` to `64 MiB` at compression level 1 (`SetBytes` reports uncompressed bytes so `MB/s` is directly comparable across modes). `BenchmarkTrivialCall` measures `ZSTD_versionNumber()`. Setting `HQQ_ZSTD_BENCH_SPIN=1` enables the spin wait policy on both client and server (used for the crossover tables in [`bindgen/README.md`](../../README.md#measured-status)).
 
-| Mode | Meaning |
+| Benchmark Mode | Description |
 | :--- | :--- |
-| `server_sync` | one call at a time on one session |
-| `server_pipelined` | eight calls in flight on one session (up to 1 MiB; above that flow control admits one call, see the table above) |
-| `server_sync_2sessions` | two goroutines with one session each |
-| `server_sync_copyreq`, `server_pipelined_copyreq` | the first two against a server started with `--copy-request`, up to 256 KiB: in-place reads versus a copy of each request |
-| `cgo_sync`, `cgo_2threads` | the library in process on one goroutine and on two |
-
-The crossover payload size is the size at which `server_sync` or `server_pipelined` reaches `cgo_sync`; `cgo_2threads` and `server_sync_2sessions` put both sides on two cores. `HQQ_ZSTD_BENCH_SPIN=1` runs both ends with the spin wait policy, which BINDGEN.md 1.3 uses for pipelining figures. The benchmarks check the length of every result. Run them on a quiet machine: the servers and the client share cores.
+| `server_sync` | Sequential synchronous calls over one HQQ session. |
+| `server_pipelined` | Up to 8 concurrent calls in flight on one HQQ session (up to `1 MiB`). |
+| `server_sync_2sessions` | Two goroutines driving two independent HQQ sessions concurrently. |
+| `server_sync_copyreq`, `server_pipelined_copyreq` | Runs against a server started with `--copy-request` (up to `256 KiB`). |
+| `cgo_sync`, `cgo_2threads` | In-process `cgo` baseline on one goroutine and across two goroutines. |
 
 ## License
 
-Zstandard is dual-licensed under the BSD-3-Clause license and the GPL-2.0-only license, at the user's option. This example uses and distributes it under the BSD-3-Clause license. The source is not committed: it is fetched from the official release and verified against `third_party/zstd/SHA256`. `third_party/zstd/LICENSE` is the BSD text of the pinned release (the script refuses a tarball whose `LICENSE` differs). A binary that contains zstd (`zstd_server`) must reproduce the notice, the conditions and the disclaimer below in its documentation. The files of this directory, including the generated ones, are under the license of the repository ([LICENSE](../../../LICENSE)).
+Zstandard is dual-licensed under BSD-3-Clause and GPL-2.0-only; this example uses Zstandard under the **BSD-3-Clause** license (`third_party/zstd/LICENSE`). The IDL, generated bindings, and Go/C glue in this directory are covered by the repository's [LICENSE](../../../LICENSE).
 
 ```text
 BSD License

@@ -1,59 +1,44 @@
-# Releasing hqq-sqlite-server
+# Releasing `hqq-sqlite-server`
 
-This document covers how a release of the SQLite server binary
-(`hqq-sqlite-server`) is built, signed and published, how the signing keys are
-managed, and how a Go program verifies a downloaded binary. The workflow is
-`.github/workflows/release.yml`.
+This guide covers how release binaries of the C SQLite server (`hqq-sqlite-server`) are built, smoke-tested, signed, and published by `.github/workflows/release.yml`, how ed25519 signing keys are managed, and how Go applications verify downloaded artifacts before executing them.
 
 ## What a release contains
 
-For a tag `vX.Y.Z` the GitHub Release contains:
+For every `vX.Y.Z` tag, the GitHub Release publishes the following assets:
 
 | Asset | Content |
-|---|---|
-| `hqq-sqlite-server_<os>_<arch>[.exe]` | the stripped server, one per platform (table below) |
-| `manifest.json` | version 1 manifest: file names, sizes and SHA-256 digests, licenses |
-| `manifest.json.sig` | detached ed25519 signature over the exact bytes of `manifest.json` |
-| `licenses.tar.gz` | the `licenses/` tree: `LICENSE`, `SQLITE-PUBLIC-DOMAIN.txt`, `NOTICE.md`, `linkage/*.txt` |
-| `SHA256SUMS` | `sha256sum` lines for every asset above except itself |
+| :--- | :--- |
+| `hqq-sqlite-server_<os>_<arch>[.exe]` | Stripped native server binary, one per target platform (listed below). |
+| `manifest.json` | Version 1 release manifest recording filenames, byte sizes, SHA-256 digests, and SPDX license IDs. |
+| `manifest.json.sig` | Detached ed25519 signature over the exact bytes of `manifest.json`. |
+| `licenses.tar.gz` | Archive of the `licenses/` tree: `LICENSE`, `SQLITE-PUBLIC-DOMAIN.txt`, `NOTICE.md`, and `linkage/*.txt`. |
+| `SHA256SUMS` | `sha256sum`-compatible lines covering every release asset except `SHA256SUMS` itself. |
 
-GitHub Releases are flat, so the `licenses/` directory is shipped as
-`licenses.tar.gz`. `SHA256SUMS` is not signed; the binaries are authenticated
-through the signed manifest, and the license files are covered only by
-`SHA256SUMS`.
+Because GitHub Release assets occupy a flat namespace, the `licenses/` directory is packaged as `licenses.tar.gz`. `SHA256SUMS` is provided for human inspection and CLI checks; automated verifiers authenticate binaries through the signed `manifest.json` + `manifest.json.sig` pair.
 
 ### Platforms
 
-| Asset | Runner (native build) | Status |
-|---|---|---|
+| Asset | GitHub Actions Runner (Native Build) | Status |
+| :--- | :--- | :--- |
 | `hqq-sqlite-server_linux_amd64` | `ubuntu-24.04` | published |
 | `hqq-sqlite-server_linux_arm64` | `ubuntu-24.04-arm` | published |
 | `hqq-sqlite-server_darwin_arm64` | `macos-latest` | published |
 | `hqq-sqlite-server_darwin_amd64` | `macos-15-intel` | published |
-| `hqq-sqlite-server_windows_amd64.exe` | `windows-latest`, clang-cl | published |
-| `hqq-sqlite-server_windows_arm64.exe` | `windows-11-arm`, clang-cl | published |
+| `hqq-sqlite-server_windows_amd64.exe` | `windows-latest`, `clang-cl` | published |
+| `hqq-sqlite-server_windows_arm64.exe` | `windows-11-arm`, `clang-cl` | published |
 
-Each binary is built on a runner of its own platform and smoke-tested there
-(the Go end-to-end tests of `sqlite/e2e` run against the stripped binary).
-Cross-compiled binaries are not used, because they could not be run before
-publishing.
+Every binary is compiled natively on a runner of its target architecture and smoke-tested on that same machine by running the `sqlite/e2e` Go test suite against the stripped binary. Cross-compiled binaries are never published without native execution.
 
-Windows binaries (`windows/amd64`, `windows/arm64`, clang-cl, static CRT) are part of every release; a Windows build failure blocks publish. The server's Windows build is described in [`examples/sqlite/server/README.md`](../examples/sqlite/server/README.md).
+Windows binaries (`windows/amd64` and `windows/arm64`, built with `clang-cl` and static CRT linkage) are required release targets: a failure on any platform blocks the `publish` job. Windows build details live in [`examples/sqlite/server/README.md`](../examples/sqlite/server/README.md).
 
-## SQLite
+## SQLite Amalgamation
 
-The release does not vendor SQLite. The pinned amalgamation is recorded in
-`third_party/sqlite/`:
+The repository does not vendor the SQLite C sources in Git. Instead, `third_party/sqlite/` pins the exact amalgamation release:
 
-- `VERSION`: the version, archive name and download URL;
-- `SHA256` and `SHA3-256`: the digests of the archive. SHA3-256 is the value
-  sqlite.org publishes on its download page.
+- `VERSION`: version number, zip archive name, and canonical download URL.
+- `SHA256` and `SHA3-256`: expected cryptographic digests of the archive (`SHA3-256` matches the digest published on `sqlite.org`).
 
-`scripts/release/fetch-sqlite.sh` (POSIX) and `fetch-sqlite.ps1` (Windows)
-download the archive, check both digests (SHA3-256 when the host can compute
-it), refuse unsafe member names, and unpack into a directory outside the
-repository. The directory is passed to CMake as
-`-DHQQ_SQLITE_AMALGAMATION_DIR=...`. Local use:
+`scripts/release/fetch-sqlite.sh` (POSIX) and `scripts/release/fetch-sqlite.ps1` (Windows) download the archive, verify both digests (`SHA3-256` when a local tool supports it), reject archive members with path-traversal names, and unpack the sources into a directory outside the working tree passed to CMake via `-DHQQ_SQLITE_AMALGAMATION_DIR=...`:
 
 ```sh
 dir=$(scripts/release/fetch-sqlite.sh -d /tmp/hqq-sqlite)     # or -a ARCHIVE for a local copy
@@ -62,113 +47,83 @@ cmake -S c -B build -DHQQ_BUILD_SQLITE_SERVER=ON -DHQQ_SQLITE_AMALGAMATION_DIR="
 cmake --build build --target hqq-sqlite-server
 ```
 
-The release build compiles the amalgamation with these definitions, passed
-through `CMAKE_C_FLAGS`:
+Release builds compile `sqlite3.c` with the following hardening flags in `CMAKE_C_FLAGS`:
 
-| Definition | Why |
-|---|---|
-| `SQLITE_DQS=0` | double-quoted strings are identifiers only, not string literals |
-| `SQLITE_OMIT_LOAD_EXTENSION` | the server cannot load extensions; the server checks the option at run time |
-| `SQLITE_DEFAULT_WAL_SYNCHRONOUS=1` | WAL default is `NORMAL`. A power loss can drop the last commits (the database stays consistent). Remove it to keep the stock default `FULL` if durability matters more than write speed |
-| `SQLITE_USE_URI=0` | file names are never interpreted as URIs |
+| Preprocessor Flag | Rationale |
+| :--- | :--- |
+| `SQLITE_DQS=0` | Disables double-quoted string literals so double quotes only quote SQL identifiers. |
+| `SQLITE_OMIT_LOAD_EXTENSION` | Compiles out dynamic extension loading (`sqlite3_load_extension`); the server also verifies this option at startup. |
+| `SQLITE_DEFAULT_WAL_SYNCHRONOUS=1` | Defaults WAL mode to `PRAGMA synchronous = NORMAL` for throughput (remove if power-loss durability of the final commit outweighs write latency). |
+| `SQLITE_USE_URI=0` | Prevents database filenames from being interpreted as SQLite URI strings. |
 
-`SQLITE_THREADSAFE=1` is set by the CMake file. `SQLITE_ENABLE_COLUMN_METADATA`
-is not set: the server uses only `sqlite3_column_decltype` and `sqlite3_column_name`.
+`SQLITE_THREADSAFE=1` is set by `c/CMakeLists.txt`. `SQLITE_ENABLE_COLUMN_METADATA` is not needed because the server relies only on `sqlite3_column_decltype` and `sqlite3_column_name`.
 
-SQLite is in the public domain. `licenses/SQLITE-PUBLIC-DOMAIN.txt` quotes the
-dedication and records the pinned version and digests.
+SQLite is in the public domain; `licenses/SQLITE-PUBLIC-DOMAIN.txt` includes the public-domain dedication alongside the pinned archive version and digests.
 
 ### Updating SQLite
 
-1. Take the new version, archive name, URL and SHA3-256 from
-   <https://www.sqlite.org/download.html> (the `sqlite-amalgamation-*.zip` row).
-2. Download the archive with curl over HTTPS and compute SHA256 with the host
-   tools; check that the SHA3-256 computed locally equals the sqlite.org value.
-3. Update `third_party/sqlite/VERSION`, `SHA256` and `SHA3-256`.
-4. Run `scripts/release/fetch-sqlite.sh -d /tmp/x` and the server build and tests.
+1. Copy the new version string, archive filename, download URL, and `SHA3-256` digest from <https://www.sqlite.org/download.html> (`sqlite-amalgamation-*.zip`).
+2. Download the archive over HTTPS, compute its `SHA256` and `SHA3-256` locally, and confirm the local `SHA3-256` matches `sqlite.org`.
+3. Update `third_party/sqlite/VERSION`, `SHA256`, and `SHA3-256`.
+4. Run `scripts/release/fetch-sqlite.sh -d /tmp/x` followed by the C and Go SQLite test suites.
 
 ## Build and test steps (per platform)
 
-1. Fetch and verify the amalgamation.
-2. `cmake -S c -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DHQQ_WERROR=ON -DHQQ_BUILD_TESTS=ON -DHQQ_BUILD_STRESS=OFF -DHQQ_BUILD_SQLITE_SERVER=ON -DHQQ_SQLITE_AMALGAMATION_DIR=...`
-   (`-static-libgcc` on Linux; `-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded` on Windows).
-3. Build `hqq-sqlite-server` and the C unit tests; run `ctest -R hqqsqlite_server`.
-4. Copy to `dist/hqq-sqlite-server_<goos>_<goarch>[.exe]`, strip (`strip --strip-all`
-   on Linux, `strip -x` plus ad-hoc `codesign` on macOS).
-5. Smoke test: `HQQ_SQLITE_SERVER=<binary> go test ./sqlite/...`, and
-   `./sqlite/e2e/...` alone; any skip there other than the `TestHelper*`
-   re-exec helpers fails the job.
-6. Linkage report (`scripts/release/linkage.sh`): `readelf`/`ldd`, `otool -L`
-   or `dumpbin /DEPENDENTS`.
+Each matrix runner in `.github/workflows/release.yml` executes six steps:
+
+1. Fetch and verify the pinned SQLite amalgamation.
+2. Configure CMake:
+   `cmake -S c -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DHQQ_WERROR=ON -DHQQ_BUILD_TESTS=ON -DHQQ_BUILD_STRESS=OFF -DHQQ_BUILD_SQLITE_SERVER=ON -DHQQ_SQLITE_AMALGAMATION_DIR=...`
+   (adding `-static-libgcc` on Linux and `-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded` on Windows).
+3. Build `hqq-sqlite-server` and the C unit tests, then run `ctest -R hqqsqlite_server`.
+4. Copy the binary to `dist/hqq-sqlite-server_<goos>_<goarch>[.exe]` and strip debug symbols (`strip --strip-all` on Linux, `strip -x` plus ad-hoc `codesign` on macOS).
+5. Smoke-test the stripped binary with `HQQ_SQLITE_SERVER=<binary> go test ./sqlite/...` and `./sqlite/e2e/...` (failing the job if any test other than `TestHelper*` subprocess helpers is skipped).
+6. Record shared-library linkage via `scripts/release/linkage.sh` (`readelf`/`ldd` on Linux, `otool -L` on macOS, `dumpbin /DEPENDENTS` on Windows).
 
 ## Cutting a release
 
-1. Make sure `main` is green (`c.yml`, `sqlite.yml`, `ci.yml`), and that
-   `CHANGELOG.md` has the release notes.
-2. Dry run first: Actions, **Release**, **Run workflow**, keep `dry_run` as
-   `true`. This builds, tests and uploads the artifacts. It does not sign or
-   publish.
-3. Tag the commit and push the tag:
+1. Verify that `main` is green across `ci.yml`, `c.yml`, and `sqlite.yml`, and update `CHANGELOG.md` with the release notes.
+2. Trigger a dry run first: in GitHub Actions, select **Release** -> **Run workflow** with `dry_run` set to `true`. Confirm all six platform binaries build, pass smoke tests, and upload unsigned workflow artifacts.
+3. Create and push an annotated release tag:
 
    ```sh
    git tag -a vX.Y.Z -m "hqq vX.Y.Z"
    git push origin vX.Y.Z
    ```
 
-4. The tag run builds the platforms, then the `publish` job: it writes the
-   license files, generates `manifest.json`, signs it, verifies the signature
-   with the committed public key, checks the tampered-manifest case, writes
-   `SHA256SUMS` and creates the GitHub Release (or uploads with `--clobber` when
-   the release already exists).
-5. Check the release page, then download one binary and run the verification
-   below.
+4. Pushing the tag triggers the full release workflow: once all platform builds succeed, the `publish` job generates `licenses.tar.gz` and `manifest.json`, signs `manifest.json` with `HQQ_RELEASE_SIGNING_KEY`, verifies the signature against the committed `sqlite/launcher/release_public_key.hex` (including a negative tamper check), writes `SHA256SUMS`, and publishes the GitHub Release.
+5. Inspect the published release page, download one platform binary along with `manifest.json` and `manifest.json.sig`, and run the verification check below.
 
-Manual publish of an existing tag: **Run workflow** on that tag with
-`dry_run` set to `false`. The workflow refuses to publish from a branch.
-
-Without the signing secret (forks, dry runs) nothing is signed or published.
-The unsigned `manifest.json`, `licenses.tar.gz` and `SHA256SUMS` are uploaded
-as the `release-unsigned` workflow artifact, and the build artifacts are kept
-in the run.
+To publish an existing tag manually, run the workflow on that tag with `dry_run` set to `false` (the workflow refuses to publish from a branch ref). When `HQQ_RELEASE_SIGNING_KEY` is absent (such as on forks or dry runs), the workflow uploads the unsigned bundle as the `release-unsigned` workflow artifact and skips publishing.
 
 ## Signing keys
 
-The manifest is signed with ed25519 by `cmd/hqq-manifest`.
+Release manifests are signed with ed25519 via `cmd/hqq-manifest`:
 
-- **Public key**: `sqlite/launcher/release_public_key.hex` (one line, 64 hex
-  digits, committed). The release job verifies with this file, and the
-  verifier of consumers embeds a copy of it.
-- **Private key**: the GitHub Actions secret `HQQ_RELEASE_SIGNING_KEY`
-  (repository or environment secret, visible to the `publish` job only). It is
-  never committed. Keep an offline backup, encrypted.
+- **Public key**: committed at `sqlite/launcher/release_public_key.hex` (a single 64-character hex line). Both the CI `publish` job and downstream consumers (`sqlite/launcher`) verify signatures against this key.
+- **Private key**: stored exclusively in the GitHub Actions secret `HQQ_RELEASE_SIGNING_KEY` (scoped to the `publish` job) and backed up in encrypted offline storage. Never commit the private key to the repository.
 
-First-time setup (or key rotation), on a trusted machine:
+To generate the initial signing key pair or rotate keys on a trusted offline machine:
 
 ```sh
 go build -o /tmp/hqq-manifest ./cmd/hqq-manifest
 /tmp/hqq-manifest keygen -priv /tmp/release.key -pub /tmp/release.pub
 # commit /tmp/release.pub as sqlite/launcher/release_public_key.hex (public key only)
 gh secret set HQQ_RELEASE_SIGNING_KEY < /tmp/release.key
-# keep /tmp/release.key in an encrypted backup, then delete the plain copy
+# store /tmp/release.key in encrypted offline backup, then shred/remove the plaintext file
 rm /tmp/release.key
 ```
 
-`keygen` never overwrites an existing file and writes the private key with mode
-0600. The `publish` job fails before it signs or publishes anything when the public key
-file is missing or is not a valid key (the failure message repeats these steps).
+`keygen` writes the private key with mode `0600` and refuses to overwrite existing files. If `sqlite/launcher/release_public_key.hex` is missing or still contains a placeholder, the `publish` job aborts before signing.
 
-Rotation: publish a new public key in the repository and set the new private
-key as the secret. Old releases stay verifiable with the old key, so keep the
-old public key in the repository history and in consumers' builds.
+**Key rotation and compromise recovery**:
 
-If the private key leaks: remove the secret, rotate, and publish a new release
-that supersedes the affected tags. Mark the affected releases in their notes.
+- **Routine rotation**: commit the new public key to `sqlite/launcher/release_public_key.hex` and update `HQQ_RELEASE_SIGNING_KEY`. Keep previous public keys documented in commit history so applications pinned to older releases can continue verifying them.
+- **Compromise recovery**: if the private signing key ever leaks, delete `HQQ_RELEASE_SIGNING_KEY` immediately, generate and commit a replacement key pair, publish a new patch release signed with the new key, and mark affected release tags as revoked in their release notes.
 
 ## Verifying a download (Go)
 
-Embed the public key in your program, then verify the manifest and the binary
-before starting it. `secureexec` checks the digest of the bytes it executes,
-so the file cannot be replaced between the check and the start.
+Embed your trusted copy of `release_public_key.hex` in your Go binary, verify `manifest.json.sig` with `manifest.Verify` (which checks the ed25519 signature before parsing JSON), and launch the binary with `secureexec.Verify`:
 
 ```go
 package main
@@ -192,7 +147,7 @@ import (
 var releasePublicKey []byte
 
 func main() {
-	dir := "hqq-sqlite-release" // the downloaded assets
+	dir := "hqq-sqlite-release" // directory containing downloaded release assets
 
 	pub, err := manifest.ParsePublicKey(releasePublicKey)
 	if err != nil {
@@ -206,7 +161,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	m, err := manifest.Verify(data, sig, pub) // signature first, then parse
+	m, err := manifest.Verify(data, sig, pub) // signature checked before JSON parse
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -230,10 +185,9 @@ func main() {
 }
 ```
 
-Check the manifest against your own copy of the public key, never against a
-key taken from the same download.
+Always supply the public key from your own compiled binary or configuration, never from an untrusted file downloaded alongside the release archive.
 
-Command-line checks with the same tool (from a clone of this repository):
+From a local checkout, you can run the equivalent verification on the command line:
 
 ```sh
 go run ./cmd/hqq-manifest verify -pub release_public_key.hex \
@@ -243,29 +197,18 @@ sha256sum -c SHA256SUMS
 
 ## Reproducibility and limits
 
-- Builds are not bit-for-bit reproducible across runners. The inputs are pinned
-  (SQLite archive digest, Go version in `go.mod`, CMake options), and the
-  compiler is whatever the runner image provides. The build passes
-  `-ffile-prefix-map` to remove the workspace path. Compare a rebuild with the
-  same runner image before you rely on equality of digests.
-- The runner images are not pinned by digest. `ubuntu-24.04`, `macos-latest` and
-  the other labels move over time. The linkage reports record what each build
-  loaded.
-- The manifest is only as trustworthy as the signing key and the committed
-  public key. A compromised secret allows signing of new releases; see
-  "If the private key leaks".
-- `SHA256SUMS` is not signed; the license files are only covered by it.
-- Smoke tests exercise the server through the Go client on the build machine.
-  They do not cover every platform feature.
-- Gatekeeper and other platform trust checks are not part of this process.
-  macOS binaries carry an ad-hoc signature only, and they are not notarized.
-- The Windows build and its tests run only in CI (the `build-windows` jobs of `release.yml`). The PowerShell fetch script `scripts/release/fetch-sqlite.ps1` is checked only there.
+- **Runner toolchain drift**: while source inputs are pinned (SQLite archive digests, Go version in `go.mod`, CMake flags, and `-ffile-prefix-map` to strip build paths), GitHub-hosted runner images (`ubuntu-24.04`, `macos-latest`, `windows-latest`) update their system compilers over time. Builds are therefore not bit-for-bit reproducible across different runner image revisions; each build records its exact dynamic dependencies in `licenses/linkage/*.txt`.
+- **Trust root**: manifest verification relies on the secrecy of `HQQ_RELEASE_SIGNING_KEY` and the integrity of the public key embedded in the verifier.
+- **Unsigned `SHA256SUMS`**: `SHA256SUMS` and `licenses.tar.gz` are not covered by `manifest.json.sig`; binary authenticity comes from `manifest.json` + `manifest.json.sig`.
+- **OS code-signing**: macOS binaries carry only an ad-hoc `codesign` signature (required by arm64 Darwin kernels) and are not Apple-notarized; Windows binaries are not Authenticode-signed. Use `secureexec` + `manifest.Verify` to verify integrity directly.
 
 ## Files
 
-- `.github/workflows/release.yml` — the workflow.
-- `scripts/release/fetch-sqlite.sh`, `fetch-sqlite.ps1` — fetch and verify SQLite.
-- `scripts/release/write-licenses.sh` — `LICENSE`, `SQLITE-PUBLIC-DOMAIN.txt`, `NOTICE.md`.
-- `scripts/release/linkage.sh` — linkage report of one binary.
-- `third_party/sqlite/` — pinned version and digests.
-- `cmd/hqq-manifest` and `secureexec/manifest` — manifest, signing, verification.
+Key files participating in the release pipeline:
+
+- `.github/workflows/release.yml`: GitHub Actions build, smoke-test, signing, and release workflow.
+- `scripts/release/fetch-sqlite.sh` and `scripts/release/fetch-sqlite.ps1`: download and digest verification for the SQLite amalgamation.
+- `scripts/release/write-licenses.sh`: assembles `LICENSE`, `SQLITE-PUBLIC-DOMAIN.txt`, and `NOTICE.md`.
+- `scripts/release/linkage.sh`: generates per-binary shared-library linkage reports.
+- `third_party/sqlite/`: pinned SQLite amalgamation version and `SHA256` / `SHA3-256` digests.
+- `cmd/hqq-manifest` and `secureexec/manifest`: ed25519 manifest generation, signing, and verification.

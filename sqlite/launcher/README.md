@@ -1,220 +1,158 @@
-# sqlite/launcher
+# `sqlite/launcher`: Verified Child-Process Starter for `hqq-sqlite-server`
 
-`gosuda.org/hqq/sqlite/launcher` starts the HQQ SQLite server
-(`examples/sqlite/server`, the `hqq-sqlite-server` binary) as a child process,
-verifies the binary before it runs, ties the server's life to the process that
-started it, and returns a `database/sql` handle for its listener.
+`gosuda.org/hqq/sqlite/launcher` starts the C SQLite server (`hqq-sqlite-server` from [`examples/sqlite/server`](../../examples/sqlite/server/README.md)) as a child process, verifies its SHA-256 digest or ed25519-signed release manifest without a TOCTOU window, attaches a parent lifeline so the server exits if the Go parent dies, and returns a connected `*sql.DB` handle.
 
-The process mechanics (verification, the ready line, the lifeline, stop) are in
-[`gosuda.org/hqq/launch`](../../launch/README.md), which starts any HQQ server.
-This package adds what is specific to `hqq-sqlite-server`: its command line
-(listener, allow directory, aliases, `--max-sessions`, `--perm`), the embedded
-release key, and the `database/sql` handle. `Server`, `StartError` and
-`ReadyTimeoutError` are the types of `launch`, and `ErrConfig`, `ErrManifest`,
-`ErrNoArtifact`, `ErrReadyTimeout` and `ErrStopTimeout` are its values, so
-`errors.Is` matches either spelling.
+The service-agnostic process mechanics (binary verification via `secureexec`, `--parent-stdin` lifeline attachment, waiting for the `ready <listener>` line, and graceful/forced shutdown) live in [`gosuda.org/hqq/launch`](../../launch/README.md). This package layers `hqq-sqlite-server`-specific CLI flag construction (`--allow-dir`, `--alias`, `--max-sessions`, `--perm`), the embedded release public key, and `gosuda.org/hqq/sqlite` `database/sql` handle creation on top of `launch`. `Server`, `StartError`, and `ReadyTimeoutError` are type aliases of the corresponding `launch` types, and `ErrConfig`, `ErrManifest`, `ErrNoArtifact`, `ErrReadyTimeout`, and `ErrStopTimeout` alias the `launch` sentinel errors so `errors.Is` matches either package.
 
 ```go
 m, err := launcher.OpenManaged(ctx, cfg,
-    launcher.WithDatabase("main"),
-    launcher.WithSQLiteConfig(sqlite.Config{Timeout: 5 * time.Second}))
+	launcher.WithDatabase("main"),
+	launcher.WithSQLiteConfig(sqlite.Config{Timeout: 5 * time.Second}))
 if err != nil {
-    return err
+	return err
 }
-defer m.Close() // closes the DB, then stops the server
+defer m.Close() // closes m.DB first, then stops the child server
 rows, err := m.DB.QueryContext(ctx, "SELECT 1")
 ```
 
-Use `Start` when you need the server without a handle, and `Open` when you
-want the `*sql.DB` and the `*Server` separately (close the DB first, then the
-server).
+Call `Start` when you only need the running `*Server` process, `Open` when you want `*sql.DB` and `*Server` returned as separate values (close the DB before stopping the server), or `OpenManaged` to manage both through a single `Close()` call.
 
 ## Usage
 
-Pin the digest of the binary you built or downloaded:
+The launcher supports two verification modes: pinning a 32-byte SHA-256 digest directly or verifying an ed25519-signed release manifest.
+
+### 1. Pinning a binary SHA-256 digest directly
+
+When launching a locally built or pinned server binary, supply its 32-byte SHA-256 digest in `Config.SHA256`:
 
 ```go
-want, err := secureexec.ParseHash("9f86d08...") // 64 hex digits
+want, err := secureexec.ParseHash("9f86d08...") // 64 hex characters
 cfg := launcher.Config{
-    Binary:   "/opt/hqq/bin/hqq-sqlite-server",
-    SHA256:   want,
-    AllowDir: "/var/lib/app/db",           // raw paths allowed inside this directory
-    Aliases:  map[string]string{"main": "/var/lib/app/db/app.sqlite"},
-    MaxSessions: 64,
+	Binary:      "/opt/hqq/bin/hqq-sqlite-server",
+	SHA256:      want,
+	AllowDir:    "/var/lib/app/db", // allow relative database paths inside this directory
+	Aliases:     map[string]string{"main": "/var/lib/app/db/app.sqlite"},
+	MaxSessions: 64,
 }
 srv, err := launcher.Start(ctx, cfg)
 ```
 
-Or verify a signed release manifest (the usual way for releases):
+### 2. Verifying a signed release manifest
+
+When deploying release artifacts (`manifest.json` + `manifest.json.sig` + platform binaries), pass `Config.Manifest`:
 
 ```go
 data, _ := os.ReadFile("/opt/hqq/dist/manifest.json")
 sig, _ := os.ReadFile("/opt/hqq/dist/manifest.json.sig")
 srv, err := launcher.Start(ctx, launcher.Config{
-    Manifest: &launcher.ManifestSource{
-        Data:      data,
-        Signature: sig,
-        PublicKey: pub, // your release key; nil selects the embedded key (below)
-        Dir:       "/opt/hqq/dist",
-    },
-    AllowDir: "/var/lib/app/db",
+	Manifest: &launcher.ManifestSource{
+		Data:      data,
+		Signature: sig,
+		PublicKey: pub, // explicit ed25519 key; nil uses the embedded release key
+		Dir:       "/opt/hqq/dist",
+	},
+	AllowDir: "/var/lib/app/db",
 })
 ```
 
-`Start` checks the signature before it parses the manifest, then selects the
-entry for `runtime.GOOS` and `runtime.GOARCH`, and verifies the file named by that
-entry in `Dir`. A manifest without an entry for this platform fails with
-`ErrNoArtifact`.
+`Start` verifies the ed25519 signature over `Data` before parsing any JSON, looks up the artifact entry matching `runtime.GOOS` and `runtime.GOARCH` (`ErrNoArtifact` if absent), and verifies and executes that binary from `Dir` using `secureexec`.
 
-### Example: a signed manifest with an embedded public key
+### 3. Complete example with an embedded public key
 
-Your program embeds the public key of the release, so the caller passes nothing
-but the files:
+Embed your release public key in your Go binary so callers only need to point at the distribution directory:
 
 ```go
 package myapp
 
 import (
-    _ "embed"
-    "os"
-    "path/filepath"
+	"context"
+	_ "embed"
+	"os"
+	"path/filepath"
 
-    "gosuda.org/hqq/sqlite/launcher"
-    "gosuda.org/hqq/secureexec/manifest"
+	"gosuda.org/hqq/secureexec/manifest"
+	"gosuda.org/hqq/sqlite/launcher"
 )
 
-// releasePub is the hex text from `hqq-manifest keygen -pub release.pub`.
+// releasePub contains the 64-character hex public key from `hqq-manifest keygen -pub release.pub`.
 //
 //go:embed release.pub
 var releasePub []byte
 
 func startDB(ctx context.Context, dist string) (*launcher.Managed, error) {
-    pub, err := manifest.ParsePublicKey(releasePub)
-    if err != nil {
-        return nil, err
-    }
-    data, err := os.ReadFile(filepath.Join(dist, "manifest.json"))
-    if err != nil {
-        return nil, err
-    }
-    sig, err := os.ReadFile(filepath.Join(dist, "manifest.json.sig"))
-    if err != nil {
-        return nil, err
-    }
-    return launcher.OpenManaged(ctx, launcher.Config{
-        Manifest: &launcher.ManifestSource{Data: data, Signature: sig, PublicKey: pub, Dir: dist},
-        AllowDir: "/var/lib/app/db",
-    }, launcher.WithDatabase("main"))
+	pub, err := manifest.ParsePublicKey(releasePub)
+	if err != nil {
+		return nil, err
+	}
+	data, err := os.ReadFile(filepath.Join(dist, "manifest.json"))
+	if err != nil {
+		return nil, err
+	}
+	sig, err := os.ReadFile(filepath.Join(dist, "manifest.json.sig"))
+	if err != nil {
+		return nil, err
+	}
+	return launcher.OpenManaged(ctx, launcher.Config{
+		Manifest: &launcher.ManifestSource{Data: data, Signature: sig, PublicKey: pub, Dir: dist},
+		AllowDir: "/var/lib/app/db",
+	}, launcher.WithDatabase("main"))
 }
 ```
 
-`manifest.Verify` rejects any manifest whose signature does not match `pub`,
-including one that was edited after signing. Rotating the key means shipping a
-new public key with the verifier; old manifests keep verifying with the old key.
+## Embedded release key (`release_public_key.hex`)
 
-## Embedded release key and the placeholder
+The package embeds `release_public_key.hex`, which currently ships with a placeholder value until the first signed release key is generated:
 
-The package embeds `release_public_key.hex`. The repository ships it as a
-placeholder:
-
-```
+```text
 PLACEHOLDER-run-hqq-manifest-keygen-and-commit-the-public-key
 ```
 
-**The maintainer must replace this line with the real 32-byte ed25519 public key
-(64 hex digits) before the first signed release.** Generate it with
-`hqq-manifest keygen -priv release.key -pub release.pub` and commit only
-`release.pub`'s content (the hex text), never the private key. Until then:
+Before cutting the first signed release, generate a production key pair with `hqq-manifest keygen -priv release.key -pub release.pub` and commit the 64-hex-digit public key into `sqlite/launcher/release_public_key.hex` (never commit `release.key`). While the placeholder remains in place:
 
-- `launcher.ReleasePublicKey()` returns `ErrNoReleaseKey`, and never a zero key;
-- a manifest-based `Start` with `Manifest.PublicKey == nil` fails with
-  `ErrNoReleaseKey` and starts nothing;
-- a caller that passes its own `PublicKey` is not affected.
+- `launcher.ReleasePublicKey()` fails closed with `ErrNoReleaseKey`.
+- Calling `Start` with `Manifest.PublicKey == nil` fails with `ErrNoReleaseKey` before starting any process.
+- Callers that pass an explicit `Manifest.PublicKey` or `Config.SHA256` work normally.
 
-The release workflow fails closed when the file is not a valid key.
+## Building and signing a release directory locally
 
-## Getting the binary and the manifest from a release
-
-1. Build the server: `cmake -S c -B build -DHQQ_BUILD_SQLITE_SERVER=ON -DHQQ_WERROR=ON`
-   and `cmake --build build --target hqq-sqlite-server`. The binary is
-   `build/sqlite-server/hqq-sqlite-server`. See `examples/sqlite/server/README.md`.
-2. Name each artifact `hqq-sqlite-server_<os>_<arch>` (optionally `.exe`).
-3. `hqq-manifest gen -dir dist -name hqq-sqlite-server -release vX.Y.Z -license MIT -out dist/manifest.json`
-4. `hqq-manifest sign -key release.key -in dist/manifest.json` (writes `manifest.json.sig`).
-5. Check it: `hqq-manifest verify -pub release.pub -in dist/manifest.json -sig dist/manifest.json.sig -dir dist`.
-6. For a single file without a manifest: `hqq-manifest hash dist/hqq-sqlite-server_linux_amd64`.
-
-Ship `dist/` (binaries, `manifest.json`, `manifest.json.sig`). Verify the
-manifest with the release public key before you use any digest from it.
+1. Build `hqq-sqlite-server`:
+   ```sh
+   cmake -S c -B build -DHQQ_BUILD_SQLITE_SERVER=ON -DHQQ_WERROR=ON
+   cmake --build build --target hqq-sqlite-server
+   ```
+2. Copy the binary into `dist/hqq-sqlite-server_<os>_<arch>[.exe]`.
+3. Generate `manifest.json`:
+   ```sh
+   hqq-manifest gen -dir dist -name hqq-sqlite-server -release vX.Y.Z -license MIT -out dist/manifest.json
+   ```
+4. Sign the manifest:
+   ```sh
+   hqq-manifest sign -key release.key -in dist/manifest.json
+   ```
+5. Verify the signature and binaries:
+   ```sh
+   hqq-manifest verify -pub release.pub -in dist/manifest.json -sig dist/manifest.json.sig -dir dist
+   ```
 
 ## Threat model
 
-The verifier runs as an ordinary user. The attacker is another local process or
-user that can write where the binary is read from. `Start` runs the server only
-after `secureexec.Verify` has hashed the bytes that will be executed: a path swap
-or an in-place overwrite between the check and the exec does not change what
-runs. The mechanism per platform (sealed memfd on Linux, a private 0700 vault
-copy on macOS and other POSIX systems, a share-locked handle on Windows) and its
-limits are in `secureexec/README.md`. Root attackers, kernel compromise and a
-compromised expected digest are out of scope.
+The verifier runs as an unprivileged user against an adversary (another local process or user) with write access to the directory holding the binary. `Start` executes the binary exclusively through `secureexec.Verify` (sealed `memfd` on Linux, `0700` private vault copy on macOS/POSIX, `FILE_SHARE_READ` locked handle on Windows; see [`secureexec/README.md`](../../secureexec/README.md)), eliminating the TOCTOU window between hashing the file and `execve` / `CreateProcess`. Calling `Start` with neither `SHA256` nor `Manifest` fails immediately with `ErrConfig`.
 
-`Start` never runs a binary without an expected digest: `Config` with neither
-`SHA256` nor `Manifest` returns `ErrConfig`.
+## Process lifecycle and limits
 
-## Lifecycle
-
-What follows is the behavior of `launch.Start` for this server.
-
-- `Start` returns when the server prints `ready <listener>` on stdout. The ready
-  line is consumed. Everything else on stdout and stderr goes to `Config.Stdout`
-  and `Config.Stderr`, which are optional; their errors are ignored. The last 2
-  KiB of output appear in error messages.
-- `ctx` bounds only the start. The server keeps running after `Start` returns.
-- `ReadyTimeout` (default 10 s) kills the server and returns `*ReadyTimeoutError`
-  (`errors.Is(err, ErrReadyTimeout)`). A server that exits before it is ready
-  returns `*StartError`.
-- A verification failure returns `*StartError` whose `Err` wraps
-  `secureexec.ErrHashMismatch` (or `ErrNotRegular`, `ErrUnsupported`). No process
-  is started.
-- Unless `DisableLifeline` is set, the server gets `--parent-stdin` and the
-  parent keeps the write end of a pipe on the server's stdin. The server shuts
-  down gracefully (status 0, open transactions roll back) when the parent exits
-  for any reason, including SIGKILL, because the kernel closes the parent's
-  descriptors. `DisableLifeline` omits the flag; `Stop` then sends SIGTERM on Unix (CTRL_BREAK on Windows).
-- `Stop(ctx)` closes the pipe and waits up to `StopTimeout` (default 10 s) for a
-  graceful exit. It returns the exit status error (nil for status 0). After
-  `StopTimeout`, or when `ctx` ends, it kills the server and returns
-  `ErrStopTimeout` (or the context error). `Close` is `Stop` with no caller deadline,
-  and both are idempotent.
-- `Done` closes when the process has exited. `Err` returns the exit status error
-  after that, and nil while the server runs.
-- The verified snapshot is released when the process exits (the same rule as
-  `secureexec.Start`).
-
-### Limits
-
-- A server that is stopped (SIGSTOP, a debugger) rather than dead keeps the pipe
-  open and keeps running. The same holds for any other process that inherits
-  the write end; `os.Pipe` is close-on-exec, so only processes that
-  deliberately inherit it can hold it.
-- The server must not fork and keep running: the lifeline thread does not exist
-  in a fork child (see `examples/sqlite/server/README.md`, "Zombie-free guarantee and its limits").
-- `Stop` and the kill signal target the server process only, not its children.
-- The launcher does not restart the server; the caller does. `Config.SHA256`,
-  `Config.Manifest`, and the lifeline use `secureexec` and `lifeline`, which any parent can use.
-- A `Config.Perm` of zero means the server default (0600), so mode 0000 cannot be
-  requested.
+- **Ready handshake**: `Start` blocks until the child prints `ready <listener>` on stdout, consuming that line and forwarding any subsequent stdout/stderr bytes to `Config.Stdout` and `Config.Stderr` (keeping the last 2 KiB for error diagnostics). If the server does not become ready within `ReadyTimeout` (default `10s`), `Start` kills the child and returns `*ReadyTimeoutError` (`ErrReadyTimeout`).
+- **Startup context**: `ctx` passed to `Start` bounds only startup and verification; the child server continues running after `Start` returns until `Stop` / `Close` is called or the parent process exits.
+- **Parent lifeline**: unless `DisableLifeline` is set, the server is started with `--parent-stdin` connected to a pipe held by the parent. If the parent exits for any reason (including `SIGKILL`), the kernel closes the pipe write descriptor and the server rolls back open transactions and exits with status `0`.
+- **Graceful shutdown (`Stop` / `Close`)**: `Stop(ctx)` closes the lifeline pipe (or sends `SIGTERM` / `CTRL_BREAK_EVENT` when `DisableLifeline` is set) and waits up to `StopTimeout` (default `10s`) before sending `SIGKILL` and returning `ErrStopTimeout`. `Close()` calls `Stop(context.Background())`, and both are idempotent.
+- **Scope**: `sqlite/launcher` starts a single child instance and does not auto-restart crashed servers.
 
 ## Tests
 
-- `go test ./sqlite/launcher/...` runs the unit tests against a stub server (the
-  test binary, re-executed): the SQLite command line, the generated listener,
-  invalid settings, the mapping of `Config` onto `launch.Config` (hash,
-  manifest, timeouts, output writers, `DisableLifeline`), the embedded
-  placeholder key, the shared error values, `Open` and `OpenManaged`. The
-  process mechanics (ready line, stop, lifeline, output tail) are tested in
-  `launch`.
-- The real server: set `HQQ_SQLITE_SERVER` to the built binary. The contract
-  suite runs through the launcher, plus start/query/stop, the wrong-hash
-  refusal, and the parent-kill check (a helper process holds the server and is
-  SIGKILLed; the server must exit). Without the variable these tests skip.
+Run the unit and end-to-end launcher suites from the repository root:
+
+```sh
+go test -race -count=1 ./sqlite/launcher/...
+HQQ_SQLITE_SERVER=/path/to/hqq-sqlite-server go test -count=1 ./sqlite/launcher/...
+```
+
+Without `HQQ_SQLITE_SERVER`, the unit suite tests CLI flag generation, config validation, manifest verification, placeholder key rejection, and `Open` / `OpenManaged` lifecycle against a re-executed stub binary. Setting `HQQ_SQLITE_SERVER` runs the full `database/sql` contract suite through `launcher`, verifies hash-mismatch rejection, and tests `SIGKILL` of a parent helper process to confirm the child server exits automatically.

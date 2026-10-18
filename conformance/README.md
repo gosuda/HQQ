@@ -1,123 +1,134 @@
-# Conformance vectors
+# Conformance Vectors
 
-Golden vectors for the HQQ shared-memory protocol (segment layout 3.0 `HQQ_STL3`, ring layout 2, protocol 1.1) and the tests that check the Go implementation against them. The normative text is in `spec/`; the vectors are its machine-checkable part. Any implementation, in any language, can read the same files.
+This directory contains the machine-checkable golden vectors for the HQQ shared-memory protocol (segment layout 3.0 `HQQ_STL3`, ring layout 2, and protocol version 1.1) along with the test suite that verifies the Go implementation against them. While [`spec/`](../spec/SPEC.md) provides the normative prose specification, `conformance/vectors/` provides the exact byte layouts, state transitions, and frame sequences that every implementation in any language must satisfy.
 
-## What is here
+## Directory Layout and Vector Groups
+
+The files in `conformance/` separate the deterministic generator code from the committed binary and JSON vector artifacts:
 
 | Path | Content |
 | --- | --- |
-| `vectors/manifest.json` | Every vector group except golden sequences (schema: `Manifest` in `generate.go`). |
-| `vectors/images/<page>/<case>.bin` | Superblock state images (G-08) for page families 4096 and 16384. A superblock image is the first page of the segment; a `full` image is the whole segment (rings formatted, buffers zero). |
-| `vectors/rings/<page>/<case>.bin` | Whole-segment ring images (G-07), page families 4096 and 16384. |
-| `vectors/sequences/<page>/` | Golden segment sequence (G-06): six normalized snapshots and `sequence.json`. Host page family only. |
-| `layout.go`, `payload.go` | Shared constants (SPEC 2.1, 3, 7.1) and the deterministic payload (INTEROP_CLI section 5). Code, not vectors. |
-| `generate.go` | The generator (`Generate`) and the manifest schema, documented per field. |
+| `vectors/manifest.json` | Master JSON catalogue containing every vector group except the multi-step golden sequences (schema defined by `Manifest` in [`generate.go`](generate.go)). |
+| `vectors/images/<page>/<case>.bin` | Superblock state images (`G-08`) for page-size families `4096` and `16384`. Standard superblock images contain the first page of the segment; `full` images contain the entire segment with formatted rings and zeroed payload slots. |
+| `vectors/rings/<page>/<case>.bin` | Whole-segment ring state images (`G-07`) for page-size families `4096` and `16384`. |
+| `vectors/sequences/<page>/` | Multi-step golden segment lifecycle sequence (`G-06`): six normalized full-segment snapshots plus `sequence.json` for the host page-size family. |
+| [`layout.go`](layout.go), [`payload.go`](payload.go) | Shared layout constants (`SPEC.md` sections 2.1, 3, and 7.1) and the deterministic SplitMix64 + CRC-32 payload generator ([`INTEROP_CLI.md`](INTEROP_CLI.md) section 5). |
+| [`generate.go`](generate.go) | The deterministic vector generator (`Generate`) and the Go struct definitions that define the `manifest.json` schema. |
 
-Vector groups in `manifest.json` (counts of the committed tree):
+The committed `vectors/manifest.json` and `vectors/sequences/` directories contain the following vector counts across ten test groups:
 
-| Group | Field | Count | Covers |
+| Group | Manifest Field | Count | Coverage |
 | --- | --- | ---: | --- |
-| G-02 packets | `packets` | 16 | the 9 `constants.json` packet vectors and 7 extra frames (OpConnCopy with Request|Meta, abort, response error, 1.1 negotiate and ack, OpCancel) |
-| G-03 layouts | `layouts` | 16 | 12 `constants.json` geometries and 4 extra |
-| G-04 geometry | `geometry` | 12 | valid and invalid buffer counts and sizes |
-| G-05 names | `names` | 24 | SPEC 11.1 rules, macOS 30/31-byte names, Windows kernel-name vectors |
-| G-11 error codes | `error_codes` | 11 | 7 codes of SPEC 12, ShuttingDown (1.1), unknown codes |
-| payloads | `payloads` | 9 | INTEROP_CLI section 5: small payloads in hex, 1 KiB and 64 KiB by SHA-256 |
-| G-08 superblocks | `superblocks` | 31 | 15 states per page family, and the recorded-page-65536 state (family 16384 only); each with the expected outcome of the Creator, Opener and InMemory attach paths |
-| G-07 rings | `rings` | 12 | 6 ring states per page family (formatted, wrapped, wrapped at 2^64, empty at 2^64, full, half-published), with the expected Read and Write results |
-| G-10 frames | `advanced_frames` | 44 | Advanced frame validation matrix (SPEC 10.5, PROTOCOL_1_1 sections 2 and 3), each row with frames, effect, deliveries or error |
-| G-06 sequence | `sequences/<page>/` | 6 steps | Primary ready, Secondary joined, message in flight, consumed, both closed, re-initialized (epoch 2) |
+| `G-02` packets | `packets` | 16 | The 9 base packet vectors from `constants.json` plus 7 additional frames (`OpConnCopy` with `Request\|Meta`, response abort, response error, Protocol 1.1 `OpProtoNegotiate` and `OpProtoAck`, and `OpCancel`). |
+| `G-03` layouts | `layouts` | 16 | The 12 segment geometries from `constants.json` plus 4 extended geometries. |
+| `G-04` geometry | `geometry` | 12 | Valid and invalid `bufferCount` and `bufferSize` combinations. |
+| `G-05` names | `names` | 24 | Segment naming rules (`SPEC.md` section 11.1), macOS 30-byte and 31-byte POSIX shm names, and Windows `Local\hqq_v3_` kernel object paths. |
+| `G-11` error codes | `error_codes` | 11 | The 7 base wire error codes (`SPEC.md` section 12), `ShuttingDown` (`0x08` in Protocol 1.1), and unknown code fallback (`ErrProtocol`). |
+| payloads | `payloads` | 9 | Deterministic payload vectors ([`INTEROP_CLI.md`](INTEROP_CLI.md) section 5): small payloads encoded in hex, and 1 KiB and 64 KiB payloads verified by SHA-256 digest. |
+| `G-08` superblocks | `superblocks` | 31 | 15 superblock states per page family (`4096` and `16384`) plus the `recorded-page-65536` mismatch case in family `16384`, each specifying the expected attach outcome for Creator, Opener, and InMemory callers. |
+| `G-07` rings | `rings` | 12 | 6 ring states per page family (freshly formatted, wrapped around the ring, wrapped across `2^64`, empty at `2^64`, full, and half-published), with expected `Read` and `Write` outcomes. |
+| `G-10` frames | `advanced_frames` | 44 | Advanced frame validation matrix (`SPEC.md` section 10.5 and `PROTOCOL_1_1_DRAFT.md` sections 2 and 3), mapping input frame sequences to state transitions, message deliveries, or protocol errors. |
+| `G-06` sequence | `sequences/<page>/` | 6 steps | Full-segment snapshots across a complete lifecycle: Primary ready, Secondary joined, message in flight, message consumed, both endpoints closed, and segment re-initialized at epoch 2. |
 
-## Manifest
+## Manifest Schema Conventions
 
-The schema is the set of Go types in `generate.go` (`Manifest` and the types it refers to). Each field is documented in its type comment. Notes:
+The JSON schema of `vectors/manifest.json` is defined directly by the Go struct types in [`generate.go`](generate.go) (`Manifest` and its nested element types):
 
-* Files are referenced by slash paths relative to `vectors/`.
-* A 64-bit word that can exceed 2^53 (ring positions) is a `"0x..."` string (`Hex64`), as in `constants.json`.
-* Byte payloads are lowercase hex. Packets are the 64-byte encoding of `internal/protocol`.
-* The output is 2-space indented, with a trailing newline, and the field order is the struct order.
-* `manifest.json` does not depend on the host. Golden sequences do, so they live in their own directory with `page_size` recorded.
+- **Relative paths**: Binary image files are referenced by forward-slash paths relative to `conformance/vectors/`.
+- **64-bit unsigned integers**: Any 64-bit word that can exceed `2^53 - 1` (such as ring sequence counters and tokens) is serialized as a `"0x..."` hexadecimal string (`Hex64`), matching `spec/constants.json`.
+- **Byte slices and packets**: Raw byte payloads are encoded as lowercase hexadecimal strings. Packet vectors are 64-byte wire headers encoded according to `internal/protocol`.
+- **Canonical formatting**: `manifest.json` is formatted with 2-space indentation, struct-declaration field ordering, and a single trailing newline.
+- **Host independence**: `manifest.json`, `images/`, and `rings/` are completely independent of the host OS and CPU architecture. Only `sequences/<page>/` depends on the host page size, so each page family resides in its own subdirectory with `page_size` recorded in `sequence.json`.
 
-## Normalization and page families
+## Snapshot Normalization and Page Families
 
-Images of a live Go run contain random owner tokens, a random creator token and wall-clock values. The generator replaces them so that the bytes are reproducible:
+Live shared-memory segments created by the Go runtime contain cryptographic random owner tokens, random creator tokens, process IDs, and monotonic heartbeat timestamps. To make binary segment snapshots byte-for-byte reproducible across runs, the generator normalizes those fields using fixed sentinel constants:
 
-| Word (SPEC 3.1, 3.2) | Rule |
+| Superblock Word (`SPEC.md` 3.1, 3.2) | Normalization Rule |
 | --- | --- |
-| `endpoints[i].token` | owner token -> `0x1111111111111111` (primary) or `0x2222222222222222` (secondary); 0 and 1 are kept |
-| `endpoints[i].pid` | nonzero -> 0 |
-| `endpoints[i].heartbeat` | nonzero -> 0 |
-| `initToken` | nonzero -> `0x3333333333333333` |
-| `initHeartbeat` | nonzero -> 0 |
-| `creatorToken` | nonzero -> `0x4444444444444444` |
+| `endpoints[i].token` | Live owner token replaced with `0x1111111111111111` (Primary) or `0x2222222222222222` (Secondary); `0` (empty) and `1` (claiming) are preserved unchanged. |
+| `endpoints[i].pid` | Any non-zero PID is replaced with `0`. |
+| `endpoints[i].heartbeat` | Any non-zero timestamp is replaced with `0`. |
+| `initToken` | Any non-zero token is replaced with `0x3333333333333333`. |
+| `initHeartbeat` | Any non-zero timestamp is replaced with `0`. |
+| `creatorToken` | Any non-zero token is replaced with `0x4444444444444444`. |
 
-The rules are listed in `manifest.json` under `normalized`. Each golden step and each superblock case lists the words of its image that carry such values (`normalized`). Model images (superblock and ring cases) are written with the same values, so a port's own image of the same state can be compared byte for byte.
+These rules are recorded in `manifest.json` under the top-level `normalized` field, and each golden sequence step and superblock case lists the exact word offsets normalized in its image. Synthetic model images (`images/` and `rings/`) are constructed directly with these normalized constants so a port's own in-memory segment can be normalized and compared byte for byte.
 
-Page families. Superblock and ring images exist for 4096 and 16384. They are built by the layout model (`ComputeRegions`), which does not depend on the host, so both families are regenerated on any machine. The generator cross-checks the model against the Go implementation: it builds a Primary on caller memory with the host page size, normalizes it, and fails if it differs from the model image. Golden sequences need a Go run, so they exist for the host page family only. The recorded-page-65536 case is a 16384-family image whose superblock records page size 65536; it is never equal to the host page size on any host below 64 KiB.
+Both `4096`-byte and `16384`-byte page families are generated for all `images/` and `rings/` cases on any machine via the pure-computation layout model (`ComputeRegions`). During generation, `Generate` cross-checks the layout model against the live Go implementation by initializing a real Primary endpoint in caller-owned memory at the host page size, normalizing the resulting segment, and verifying that it is byte-identical to the model image. The `recorded-page-65536` test case is stored under the `16384` family with `65536` written into the superblock's `pageSize` field so it triggers a page-size mismatch on both 4 KiB and 16 KiB hosts.
 
-## Regenerating and the byte-identical check
+## Regenerating the Vectors
 
-```text
+To regenerate the conformance vectors from the reference generator, run:
+
+```bash
 go run ./cmd/hqq-interop gen-vectors --out conformance/vectors
 ```
 
-The generator builds every file in memory first, so a failed run leaves the tree untouched. Then it removes only what it owns (`images/`, `rings/`, `sequences/<host page>/` and `manifest.json`), and writes. Nothing outside the output directory is touched, and other sequence families are kept.
+The generator builds every file in memory before touching the filesystem, ensuring that a failed run leaves the working tree unmodified. Once generation succeeds, it replaces `images/`, `rings/`, `sequences/<host-page-size>/`, and `manifest.json` while preserving `sequences/` directories belonging to other host page sizes.
 
-Two tests enforce determinism:
+Two automated tests guard vector reproducibility:
 
-* `TestGenerateDeterministic` generates twice into two temporary directories and requires identical trees.
-* `TestCommittedVectorsCurrent` requires the committed tree to equal a fresh generation. A sequence family that the committed tree does not carry is not compared (it was produced on another host).
+- `TestGenerateDeterministic`: Runs `Generate` twice into separate temporary directories and verifies that every output file is byte-identical.
+- `TestCommittedVectorsCurrent`: Runs `Generate` in memory and verifies that the committed files under `conformance/vectors/` match the fresh output byte for byte.
 
-When the second test fails, regenerate and review the diff. A change that the generator or the spec does not explain is a bug to fix first.
+## Running the Conformance Tests
 
-## Running the tests
+Execute the conformance test suite and the two-process interop matrix from the repository root:
 
-```text
-go test ./conformance/... -count=1      # about 3 s on darwin/arm64 (16 KiB pages)
-go test ./interop/... -count=1          # the two-process matrix (see below)
+```bash
+go test ./conformance/... -count=1      # completes in ~3s on darwin/arm64 (16 KiB pages)
+go test ./interop/... -count=1          # runs the two-process interop matrix
 go run ./cmd/hqq-interop gen-vectors --out conformance/vectors
 ```
 
-| Test | Groups |
+Each test function in `conformance/` validates a specific vector group:
+
+| Test Function | Vector Groups Verified |
 | --- | --- |
-| `TestConstantsMatchSpec` | G-01: `constants.json` against `layout.go` and the internal packages |
-| `TestPacketVectors`, `TestPayloadVectors` | G-02 packets; payloads |
-| `TestLayoutVectors` | G-03 |
-| `TestGeometryLimits` | G-04 |
-| `TestNameVectors` | G-05 (darwin and Windows vectors run only on their platform) |
-| `TestGoldenSequence` | G-06 |
-| `TestRingImages`, `TestRingAttachValidation` | G-07 |
-| `TestSuperblockImages` | G-08 (cases of the other page family are skipped per case) |
-| `TestPeerStateTransitions` | G-09 |
-| `TestAdvancedFrameMatrix` | G-10 |
-| `TestErrorCodeMapping` | G-11 |
-| `TestGenerateDeterministic`, `TestCommittedVectorsCurrent` | determinism and the committed tree |
+| `TestConstantsMatchSpec` | `G-01`: Cross-checks `spec/constants.json` against `layout.go` and `internal/protocol`. |
+| `TestPacketVectors`, `TestPayloadVectors` | `G-02` wire packets and deterministic SplitMix64/CRC-32 payloads. |
+| `TestLayoutVectors` | `G-03` segment region offsets and total segment sizes. |
+| `TestGeometryLimits` | `G-04` valid and invalid buffer counts and sizes. |
+| `TestNameVectors` | `G-05` segment name validation (Darwin and Windows kernel-path vectors run on their respective OS). |
+| `TestGoldenSequence` | `G-06` six-step segment lifecycle snapshots. |
+| `TestRingImages`, `TestRingAttachValidation` | `G-07` ring buffer reads, writes, wrap-around at `2^64`, and attach validation. |
+| `TestSuperblockImages` | `G-08` superblock state machine across Creator, Opener, and InMemory attach paths. |
+| `TestPeerStateTransitions` | `G-09` peer liveness and state transition rules. |
+| `TestAdvancedFrameMatrix` | `G-10` 44-row Advanced protocol frame validation matrix. |
+| `TestErrorCodeMapping` | `G-11` wire error code to sentinel mapping. |
+| `TestGenerateDeterministic`, `TestCommittedVectorsCurrent` | Generator determinism and byte-identity with the committed tree. |
 
-Two known disagreements between the documents are pinned by `TestConstantsMatchSpec` and reported rather than hidden: `constants.json` still describes protocol 1.0 (`protocol_minor` 0, encoded 256) while the code and `spec/ext/PROTOCOL_1_1_DRAFT.md` use 1.1; and `constants.json` `error_codes` lacks `ShuttingDown` (0x08, 1.1 draft).
+Note: `TestConstantsMatchSpec` explicitly pins two known differences between the legacy `spec/constants.json` (which records Protocol 1.0, `protocol_minor: 0`, encoded `256`, and omits error code `0x08`) and the active Protocol 1.1 implementation (`spec/ext/PROTOCOL_1_1_DRAFT.md`, `protocol_minor: 1`, and `ErrCodeShuttingDown = 0x08`).
 
-## Using the vectors in a port
+## Using the Vectors When Porting HQQ
 
-Levels follow `spec/PORTING.md` section 1.
+Port authors bringing up a new language implementation can validate their port incrementally following the conformance levels defined in [`spec/PORTING.md`](../spec/PORTING.md):
 
-| Level | Vector groups |
+| Porting Level | Vector Groups to Verify |
 | --- | --- |
-| L0 Layout | G-01 constants; G-02 packets and payloads; G-03 layouts; G-04 geometry; the field offsets of the superblock and ring images (G-07, G-08) |
-| L1 Standard Opener, simple mode | G-08 rows of the Opener and InMemory-join cases; G-07 Read and Write results; G-09 peer states; G-11 error codes through Read; G-05 names on open |
-| L2 Standard Creator and Primary | G-06 golden sequence (steps 1, 2, 5, 6, with their normalized words); G-08 rows of the Creator and InMemory-initialization cases; G-07 attach validation; G-05 names on create and removal |
-| L3 Parking | no vector; the interop matrix (PORTING.md section 6.2, X-12) and the platform stress tests |
-| L4 Advanced | G-10 every row; the 1.1 frames of G-02; ShuttingDown of G-11; the payloads of 1.1 messages |
+| **L0: Layout** | `G-01` constants, `G-02` packets and payloads, `G-03` layouts, `G-04` geometry limits, and field offsets in `G-07`/`G-08` binary images. |
+| **L1: Standard Opener (spin mode)** | `G-08` Opener and InMemory-join superblock cases, `G-07` ring `Read` and `Write` results, `G-09` peer states, `G-11` error codes on `Read`, and `G-05` name validation on open. |
+| **L2: Standard Creator & Primary** | `G-06` golden lifecycle sequence (steps 1, 2, 5, and 6 with normalization), `G-08` Creator and InMemory-init cases, `G-07` ring attach validation, and `G-05` name creation and safe unlink rules. |
+| **L3: OS Parking** | Verified dynamically via the two-process interop matrix (`PORTING.md` section 6.2, scenario `X-12`) and platform stress suites. |
+| **L4: Advanced Protocol** | All 44 rows of `G-10`, Protocol 1.1 frames in `G-02`, `ShuttingDown` in `G-11`, and Protocol 1.1 metadata payloads. |
 
-A port reads `manifest.json`, then for each group either compares its own parsing or behavior with the expectations. For a superblock case, the port maps the image (the file is the superblock page; bytes beyond it are zero, or the full segment when `full` is set), performs the attach of the role, and compares the result and the write kind (`none`, `join`, `init`) with the expectation. For a frame row, the port feeds the frames to its receive path in order and compares the deliveries, the error kind, or the drop.
+To run the binary image vectors in another language, parse `vectors/manifest.json` and iterate through each group:
 
-## Adding an implementation to the interop matrix
+- **Superblock cases (`superblocks`)**: Copy the `.bin` image into a page-aligned memory buffer (zero-extending to the full segment size unless `full` is `true`), invoke your port's Creator, Opener, or InMemory attach entry point, and verify that the returned status and mutation kind (`none`, `join`, or `init`) match the manifest expectation.
+- **Advanced frame cases (`advanced_frames`)**: Feed the sequence of 64-byte frames to your receive state machine in order and verify that the resulting delivered messages, protocol errors, or silent drops match the manifest row.
 
-1. Implement the helper contract in `conformance/INTEROP_CLI.md`: flags, the result line, exit codes, barriers, the payload algorithm (check it with the payload vectors first) and the error-kind names.
-2. Build an executable named `hqq-interop` (`hqq-interop.exe` on Windows). Check that `hqq-interop list --impl <label>` prints a catalogue; the driver runs a scenario on a pair only when both helpers list it. The catalogue of the Go helper is in `INTEROP_CLI.md` section 11.
-3. Register the executable in `HQQ_INTEROP_IMPLS`, a comma-separated list of `label=path` pairs with labels matching `[a-z0-9]+`. For example `HQQ_INTEROP_IMPLS="go=,c=build-c/tools/hqq-interop"`. An empty path for `go` builds the Go helper from the module root. Relative paths are relative to the module root.
-4. For soak sizes set `HQQ_INTEROP_LONG=1` (the weekly CI run does).
-5. Add the build to `.github/workflows/interop.yml`: add a build step that produces the executable, then append `,<label>=<path>` to `HQQ_INTEROP_IMPLS` in the "Run interop matrix" step. The comment block at the top of that file lists the steps.
-6. Run the matrix locally:
+## Adding an Implementation to the Interop Matrix
 
-```text
+Once a port passes the static conformance vectors, wire it into the two-process cross-language test driver (`interop/`) in six steps:
+
+1. **Implement the CLI contract**: Build a helper program following [`conformance/INTEROP_CLI.md`](INTEROP_CLI.md), supporting the `list`, `run`, and `version` subcommands, file barriers, deterministic payload generation, and canonical `error_kind` names.
+2. **Verify `list` output**: Produce an executable named `hqq-interop` (`hqq-interop.exe` on Windows) and verify that `hqq-interop list --impl <label>` emits valid JSON matching section 7 of `INTEROP_CLI.md`. The test driver runs a scenario on a pair of implementations whenever both helpers list that scenario ID.
+3. **Register via `HQQ_INTEROP_IMPLS`**: Set `HQQ_INTEROP_IMPLS` to a comma-separated list of `label=path` pairs (where labels match `[a-z0-9]+`), such as `HQQ_INTEROP_IMPLS="go=,c=build-c/tools/hqq-interop"`. Leaving `go=` empty builds the Go reference helper automatically from `./cmd/hqq-interop`.
+4. **Enable soak sizes (optional)**: Set `HQQ_INTEROP_LONG=1` to run the extended message counts used in the scheduled CI soak job.
+5. **Add to CI**: Add a build step for the new helper in `.github/workflows/interop.yml` and append `,<label>=<path>` to `HQQ_INTEROP_IMPLS` in the matrix execution step.
+6. **Run the matrix locally**:
+
+```bash
 HQQ_INTEROP_IMPLS="go=,c=build-c/tools/hqq-interop" go test ./interop/... -count=1 -timeout 30m
 ```

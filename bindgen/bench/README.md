@@ -1,22 +1,22 @@
-# bindgen/bench: the generated client against cgo
+# `bindgen/bench`: Generated IPC Client vs In-Process `cgo`
 
-Benchmarks of `spec/toolchain/BINDGEN.md` 10.5. The same functions of the MIT test library `bindgen/testdata/microlib/microlib.c` are called two ways:
+This package implements the benchmark suite specified in [`spec/toolchain/BINDGEN.md`](../../spec/toolchain/BINDGEN.md) §10.5. It calls the exact same C functions from [`bindgen/testdata/microlib/microlib.c`](../testdata/microlib/microlib.c) across two execution paths:
 
-- **cgo**: `cgobench/cgobench.go` includes `microlib.c` in its cgo preamble (`-O2`) and calls it in process. cgo cannot live in a `_test.go` file, so the wrappers are a regular package with the `cgo` build tag; without cgo the package is empty and `CGO_ENABLED=0 go build ./...` and `go vet ./...` still work.
-- **hqq**: the client generated from `bindgen/testdata/microlib/microbench.idl` (`microbench/`) talks to the generated C server (`server/`, built with CMake, Release flags) over HQQ shared memory. The server runs as a separate process, started once per benchmark binary with `launch.Start` (the binary is verified against its SHA-256) and stopped when the binary exits.
+- **In-process `cgo` (`cgobench/`)**: includes `microlib.c` directly in its cgo preamble (`-O2`) and calls the C functions in-process. Because Go prohibits `import "C"` inside `_test.go` files, the cgo wrappers live in a subpackage guarded by the `cgo` build tag so `CGO_ENABLED=0 go build ./...` and `go vet ./...` continue to succeed without a C toolchain.
+- **Out-of-process HQQ (`microbench/` + `server/`)**: uses the pure-Go client generated from [`bindgen/testdata/microlib/microbench.idl`](../testdata/microlib/microbench.idl) to call the C server (`server/`, compiled with CMake `Release` flags) over HQQ shared memory. `TestMain` starts the C server once per benchmark run via `launch.Start` (verifying its SHA-256 digest and attaching a parent lifeline) and stops it when the binary exits.
 
-| Path | Content |
-| --- | --- |
-| `microbench/` | generated Go client (`microbench_client.go`) and the `go:generate` line |
-| `server/` | generated `microbench_server.{h,c}`; hand-written `microbench_hooks.c` (the `ml_counter_add` interceptor of 9.6), `main.c`, `CMakeLists.txt` |
-| `cgobench/` | the cgo baseline |
-| `bench_test.go` | the benchmarks |
-| `smoke_test.go`, `allocs_test.go` | tests of every benchmarked operation through both paths (below) |
-| `harness_test.go` | environment, server and session startup, `TestMain` |
-| `verify_test.go` | the oracles: `ml_work`, `ml_xor`, the operands of `Add` and the byte checks, written in Go |
-| `benchtable/` | `go run ./bindgen/bench/benchtable`: turns benchmark output into a table |
+| Path | Role |
+| :--- | :--- |
+| `microbench/` | Generated pure-Go client (`microbench_client.go`) and `go:generate` directive. |
+| `server/` | Generated C dispatch glue (`microbench_server.{h,c}`), hand-written `@intercept` hook (`microbench_hooks.c`, implementing §9.6 `ml_counter_add` policy), `main.c`, and `CMakeLists.txt`. |
+| `cgobench/` | In-process `cgo` baseline wrappers. |
+| `bench_test.go` | Comparative benchmark definitions (`BenchmarkAdd`, `BenchmarkWork`, `BenchmarkCounterAdd`, `BenchmarkXor`, `BenchmarkRoundTrip`, `BenchmarkWaitCosts`). |
+| `smoke_test.go`, `allocs_test.go` | Differential correctness and zero-allocation tests across both paths. |
+| `harness_test.go` | Environment parsing, server lifecycle, and `TestMain`. |
+| `verify_test.go` | Pure-Go reference oracles for `ml_work`, `ml_xor`, and wrapping `Add` sums checked inside every benchmark loop. |
+| `benchtable/` | `go run ./bindgen/bench/benchtable`: formats `go test -bench` output into crossover tables. |
 
-Regenerate and check the generated files:
+Regenerate and verify the generated bindings:
 
 ```sh
 go generate ./bindgen/bench/microbench
@@ -25,97 +25,94 @@ go run ./cmd/hqq-bindgen -check -go-out bindgen/bench/microbench -go-strip ml_ -
 
 ## Build
 
+Compile the benchmark C server and the `hqq_echo` baseline helper with CMake and Ninja:
+
 ```sh
 cmake -S bindgen/bench/server -B build/bench -G Ninja -DCMAKE_BUILD_TYPE=Release
-cmake --build build/bench                      # build/bench/microbench_server
+cmake --build build/bench                      # produces build/bench/microbench_server
 cmake -S c -B build/c -G Ninja -DCMAKE_BUILD_TYPE=Release -DHQQ_BUILD_CXX_CHECK=OFF
-cmake --build build/c --target hqq_echo        # build/c/tools/hqq_echo, for BenchmarkRoundTrip/echo
+cmake --build build/c --target hqq_echo        # produces build/c/tools/hqq_echo for BenchmarkRoundTrip/echo
 ```
 
-`bindgen/bench/server/CMakeLists.txt` builds libhqq from `c/` itself when no `hqq` target exists (without its tests), so it needs no option in `c/CMakeLists.txt`. The server is compiled with the CMake Release flags (`-O3`); cgo uses `-O2`, as 10.5 says. `ml_add` and `ml_work` are small enough that this does not matter, but it is the one flag difference between the two sides.
+`bindgen/bench/server/CMakeLists.txt` compiles `libhqq` directly from `c/` when built standalone. The C server builds with CMake `Release` optimization (`-O3`), while `cgobench` uses `-O2` per §10.5.
 
-## Environment
+## Environment variables
 
-| Variable | Meaning |
-| --- | --- |
-| `HQQ_BENCH_SERVER` | path of `microbench_server`. Unset: every test and benchmark that needs the server skips with a message; the cgo-only tests and the cgo leaves still run. |
-| `HQQ_BENCH_WAIT` | `spin` (default) or `adaptive`. It sets `Link.WaitPolicy` of the client and the `--spin` flag of the server together. 10.5 pins the pipelining numbers to `spin`; an `adaptive` run is a separate, labeled run. |
-| `HQQ_BENCH_ECHO` | path of `hqq_echo` (`c/tools/hqq_echo.c`). Unset: `BenchmarkRoundTrip/echo` and `TestEchoRoundTrip` skip. The harness starts it with `--create NAME --server --count 64 --size 16384 --wait <mode>` and opens the link as `rt` does (same wait policy, `PeerTimeout` of 2 s). |
-| `HQQ_BENCH_SERVER_CPU` | Linux only: pin the server to this CPU with `taskset -a -p -c`. macOS has no affinity API, so on Apple silicon the "server on another core" of 10.5 is up to the scheduler; setting the variable there is an error. Pin the client by running the whole command under `taskset -c N`. |
+Configure the benchmark suite through the following environment variables:
 
-`ML_TRACE` is removed from the environment of the benchmark binary and of the server: with it set the library appends a line to a file on every call.
+| Variable | Effect |
+| :--- | :--- |
+| `HQQ_BENCH_SERVER` | Path to the compiled `microbench_server` binary. When unset, server-dependent tests and benchmark leaves skip with a diagnostic while `cgo`-only tests and leaves still run. |
+| `HQQ_BENCH_WAIT` | `spin` (default) or `adaptive`. Configures both the client's `Link.WaitPolicy` and the server's `--spin` flag. Section 10.5 pins pipelining crossover measurements to `spin`; run `adaptive` as a separate labeled pass. |
+| `HQQ_BENCH_ECHO` | Path to `hqq_echo` (`c/tools/hqq_echo.c`). When unset, `BenchmarkRoundTrip/echo` and `TestEchoRoundTrip` skip. The test runner launches it with `--create NAME --server --count 64 --size 16384 --wait <mode>`. |
+| `HQQ_BENCH_SERVER_CPU` | Linux only: pins the server process to the specified CPU core via `taskset -a -p -c`. Because macOS provides no CPU affinity API, setting this variable on Darwin fails fast; pin the client on Linux by wrapping `go test` in `taskset -c N`. |
 
-Each binary prints `key: value` lines before the results, which benchfmt (and so benchstat) takes as file-level configuration: `hqq-wait: spin|adaptive`, `hqq-server-sha256: ...` and, if set, `hqq-server-cpu: ...`. A spin file and an adaptive file therefore carry their label.
+The test runner strips `ML_TRACE` from the environment of both the test process and the child server so file-tracing hooks inside `microlib.c` cannot perturb measurements. Before running benchmarks, `TestMain` emits `benchfmt` configuration headers (`hqq-wait: spin|adaptive`, `hqq-server-sha256: ...`, and optional `hqq-server-cpu: ...`) so `benchstat` preserves run metadata.
 
-## Commands for the measurement run
+## Running the measurements
 
-On a quiet machine, from the repository root, after the build above:
+On an idle machine from the repository root, after building both C binaries:
 
 ```sh
 export HQQ_BENCH_SERVER=$PWD/build/bench/microbench_server
 export HQQ_BENCH_ECHO=$PWD/build/c/tools/hqq_echo
 
-# 10.5: the pinned-spin run
+# Section 10.5 pinned-spin run
 go test -run '^$' -bench . -benchtime 2s -count 5 ./bindgen/bench | tee spin.txt
-# the separate, labeled run with the adaptive wait policy
+
+# Separate labeled run with the adaptive wait policy
 HQQ_BENCH_WAIT=adaptive go test -run '^$' -bench . -benchtime 2s -count 5 ./bindgen/bench | tee adaptive.txt
 
-# Linux, server and client on different cores
+# Linux: pin server and client to distinct physical cores
 HQQ_BENCH_SERVER_CPU=3 taskset -c 2 go test -run '^$' -bench . -benchtime 2s -count 5 ./bindgen/bench | tee spin.txt
 ```
 
-`-bench .` is 102 leaves; at `-benchtime 2s -count 5` that is about 20 minutes. A benchmark can be run alone, for example `-bench 'Work/'` or `-bench 'Xor/64KiB/'`.
+Running all 102 benchmark leaves at `-benchtime 2s -count 5` takes roughly 20 minutes. Filter individual groups with `-bench 'Work/'` or `-bench 'Xor/64KiB/'`.
 
-Smoke runs, which prove that every loop works and verifies, and say nothing about speed:
+To run a fast functional verification of every benchmark loop and test oracle without waiting for full timing:
 
 ```sh
 go test -run '^$' -bench . -benchtime 1x ./bindgen/bench
-go test -count=1 ./bindgen/bench          # the tests below; add -race for the race detector
+go test -count=1 ./bindgen/bench          # add -race to run under the race detector
 ```
 
-## Output
+## Formatting the output
 
-`go test -bench` prints one line per leaf with `ns/op` and the custom metric `calls/s`; `B/op`, `allocs/op` (every leaf calls `ReportAllocs`) and `MB/s` (Xor) are standard. The files are benchstat input as they are (`benchstat spin.txt adaptive.txt`).
-
-For the layout of 10.5, rows by size or loop count and columns by implementation, use the table printer. It shows the median over `-count` runs of one metric:
+Each benchmark leaf reports `ns/op`, the custom `calls/s` metric, `B/op`, `allocs/op`, and (for `BenchmarkXor`) `MB/s`. Feed the raw output directly to `benchstat` (`benchstat spin.txt adaptive.txt`) or format it into a Markdown/ASCII crossover table with `benchtable` (which computes the median across `-count` runs):
 
 ```sh
-go run ./bindgen/bench/benchtable spin.txt                       # ns/op of everything
-go run ./bindgen/bench/benchtable -match '^Work/' spin.txt       # the crossover table
+go run ./bindgen/bench/benchtable spin.txt                       # median ns/op across all leaves
+go run ./bindgen/bench/benchtable -match '^Work/' spin.txt       # ml_work crossover table
 go run ./bindgen/bench/benchtable -metric calls/s -match '^Add/' spin.txt
 go test -run '^$' -bench Xor -benchtime 2s ./bindgen/bench | go run ./bindgen/bench/benchtable -match '^Xor/'
 ```
 
 ## What each benchmark measures
 
-One iteration is one call. Every loop compares every result with an oracle written in Go (`verify_test.go`), in the timed region and for both implementations, so a wrong fast path fails instead of looking fast. A pipelined leaf waits for the calls still in flight after the loop with the timer running, so its elapsed time covers all calls.
+Every benchmark iteration executes one call and validates the returned value against the Go reference oracle (`verify_test.go`) inside the timed loop on both `cgo` and `hqq`, ensuring a broken fast path fails immediately. Pipelined leaves drain all in-flight futures before stopping the benchmark timer.
 
-- **`BenchmarkAdd/{cgo,hqq-sync,hqq-pipe-8,hqq-pipe-32,hqq-pipe-64}`**: a trivial call. `hqq-pipe-N` keeps N calls in flight. Operands differ in every call and the sum wraps, so a stale or misrouted response is a wrong value.
-- **`BenchmarkWork/iters=I/{cgo,hqq-sync,hqq-pipe-1,hqq-pipe-4,hqq-pipe-16,hqq-pipe-64}`**: `ml_work(I)`, a serial dependency chain of known cost, for I in 0, 8, 16, 32, 64, 128, 256, 512, 1024 and 2048. This is the crossover sweep: the row where a `hqq-pipe` cell drops below the `cgo` cell is the break-even. The leaves are named by `I`, not by nanoseconds, so names stay the same between machines and benchstat can match them. Read `w` for a row as the `cgo` cell of that row minus the `cgo` cell of `iters=0`. 10.5 lists `w` of 50 to 1000 ns; pick the rows nearest to those values on the measured machine. All calls of a leaf have the same `I`, so the oracle value is constant; pipeline order is verified by `Add` and `CounterAdd`, and `smoke_test.go` runs `Work` with distinct `I` pipelined.
-- **`BenchmarkCounterAdd/{cgo,hqq-sync,hqq-pipe-8,hqq-pipe-64}`**: handle, out parameter and interceptor. The interceptor (refuse negative deltas, clamp above 1,000,000) is `server/microbench_hooks.c`; `cgobench.Counter.Add` applies the same rule in Go so both sides compute the same totals. The running total of the library is the oracle, so a lost, repeated or reordered call is detected.
-- **`BenchmarkXor/{64B,1KiB,16KiB,64KiB}/...`**: `ml_xor` with a source and a destination of that size. The key changes with every call, so a destination that keeps an earlier result is wrong. Each call checks the length and eight bytes spread over the result; the first, the last and every 1024th call compare every byte. cgo passes the Go slices to C in place. The hqq columns:
-  - `hqq-sync`, `hqq-pipe-8`: the default session, `S = 16384`, server without `--copy-request`. 64 B and 1 KiB are one frame; 16 KiB and 64 KiB are chunked (4.8).
-  - `hqq-sync-bigbuf`: a session with `S = 256 KiB` and `B = 8`, so every size is one frame in place (the zero-copy path against the chunked one).
-  - `...-copyreq`: the same with a second server started with `--copy-request` (7.2), which copies the request body before the library call. This is the data for the open item of 12.2 ("`copy_request` default"): compare `hqq-sync` with `hqq-sync-copyreq` and `hqq-sync-bigbuf` with `hqq-sync-bigbuf-copyreq`. The client copies the request into the ring and the response out of it in every column; `copy_request` only adds the server-side copy.
-- **`BenchmarkRoundTrip/{echo,hqq-sync}`**: a 64-byte round trip to `hqq_echo` through the Standard link (`ReserveWrite`, `Commit`, `ReserveRead`, `Release`, the reply compared with the message), next to the generated synchronous `Add`. The difference is the per-call path of the generated code and `rt`, without the link.
-- **`BenchmarkWaitCosts/{in-order,out-of-order,callTimeout}`**: batches of 8 `Add` calls issued together and then waited for. `in-order` is the baseline; `out-of-order` waits in reverse, so the first `Wait` buffers the responses of the earlier calls (the copy of 8.3); `callTimeout` is the baseline on a session with `CallTimeout` set, which adds a `SetReadDeadline` to every `Wait` (6.3).
+- **`BenchmarkAdd/{cgo,hqq-sync,hqq-pipe-8,hqq-pipe-32,hqq-pipe-64}`**: scalar `ml_add(a, b)` with zero library work. `hqq-pipe-N` maintains `N` concurrent futures in flight. Operands vary on every iteration with wrapping arithmetic so stale or misrouted responses fail the oracle check.
+- **`BenchmarkWork/iters=I/{cgo,hqq-sync,hqq-pipe-1,hqq-pipe-4,hqq-pipe-16,hqq-pipe-64}`**: `ml_work(I)`, executing a serial dependency chain of $I \in \{0, 8, 16, 32, 64, 128, 256, 512, 1024, 2048\}$ steps. This sweep identifies the crossover point where pipelined IPC (`hqq-pipe-N`) matches or beats sequential in-process `cgo`. Leaf names are keyed by iteration count $I$ rather than nanoseconds so `benchstat` can compare runs across machines; pure work time $w$ for row $I$ equals `cgo(iters=I) - cgo(iters=0)`.
+- **`BenchmarkCounterAdd/{cgo,hqq-sync,hqq-pipe-8,hqq-pipe-64}`**: exercises a session handle, an output parameter, and a server-side `@intercept` hook (`server/microbench_hooks.c` rejects negative deltas and clamps deltas above `1,000,000`; `cgobench.Counter.Add` applies the identical rule in Go). Validates the running total on every call to catch dropped, duplicated, or reordered executions.
+- **`BenchmarkXor/{64B,1KiB,16KiB,64KiB}/...`**: runs `ml_xor` from a source slice into an equal-sized destination slice with a per-call varying key, verifying length and eight sampled byte offsets on every call plus a full byte-by-byte check on the first, last, and every 1,024th call:
+  - `hqq-sync`, `hqq-pipe-8`: default geometry (`S = 16384`, no `--copy-request`). `64 B` and `1 KiB` fit in a single frame; `16 KiB` and `64 KiB` use multi-frame `CONT` chunking (§4.8).
+  - `hqq-sync-bigbuf`: geometry with `S = 256 KiB` and `B = 8`, allowing even `64 KiB` payloads to travel in a single in-place frame.
+  - `...-copyreq`: pairs against a second server started with `--copy-request` (§7.2), measuring the exact cost of copying single-frame request buffers into private server memory prior to calling C (§12.2).
+- **`BenchmarkRoundTrip/{echo,hqq-sync}`**: compares a raw 64-byte `StandardLink` round trip against `hqq_echo` (`ReserveWrite` / `Commit` / `ReserveRead` / `Release`) next to a synchronous generated `Add` call, isolating the framing and runtime overhead of `hqq-bindgen` above the raw ring.
+- **`BenchmarkWaitCosts/{in-order,out-of-order,callTimeout}`**: issues batches of 8 `AddAsync` calls and awaits them in FIFO order (`in-order`), reverse order (`out-of-order`, triggering out-of-order response buffering per §8.3), or on a session configured with `CallTimeout` (adding `SetReadDeadline` per wait per §6.3).
 
-## Tests
+## Verification tests
 
-`go test ./bindgen/bench` needs `HQQ_BENCH_SERVER`; without it the tests that use the server skip.
+Running `go test ./bindgen/bench` verifies the benchmark oracles, wire equivalence, and zero-allocation invariants:
 
-| Test | Bug it catches |
-| --- | --- |
-| `TestRefWorkMatchesCgo`, `TestCgoXorMatchesReference` | an oracle that disagrees with the library, which would make a benchmark fail for the wrong reason (no server needed) |
-| `TestCheckXorRejectsWrongResults` | a result check that accepts a stale buffer, a short result or a wrong first or last byte |
-| `TestAddAgreesOnBothPaths`, `TestWorkAgreesOnBothPaths` | a client that encodes or decodes a scalar differently from cgo, including the wrapping sum |
-| `TestCounterAddAgreesOnBothPaths` | handle, out parameter, interceptor denial (`StatusError` 5), clamp, and the overflow failure (`LibError` -1 with its detail) differing between the paths; the counter must be unchanged after a refused call |
-| `TestXorAgreesOnBothPaths` | in-place, chunked, `copy_request` and big-buffer sessions disagreeing with each other or with the reference, for sizes 0 to 64 KiB and a destination one byte short |
-| `TestPipelinedCallsKeepTheirResults` | responses attached to the wrong call at depths 1, 8 and 64, out-of-order waits, running-total order, pipelined chunked `Xor` |
-| `TestCallTimeoutSessionAgrees` | the `callTimeout` session answering differently |
-| `TestEchoRoundTrip` | the echo harness failing to start or to compare (needs `HQQ_BENCH_ECHO`) |
-| `TestHotPathAllocs` | an allocation on the in-order hot path (`Add`, `Work`, `CounterAdd`, 64 B `Xor`, 8 pipelined `Add`) with `CallTimeout == 0`; excluded from `-race` builds, where the detector allocates |
-
-cgo and `-race` work together on macOS arm64 with the default toolchain; the race run covers the tests (a benchmark under `-race` measures the detector, not the code).
-
-Fault injection, run once by hand: a server built from a copy of `microlib.c` with `ml_add` off by one at `a == 5000`, with `ml_xor` not writing its last byte, and with `ml_work` dropping an iteration made `BenchmarkAdd/hqq-sync`, `hqq-pipe-64` and `WaitCosts/out-of-order`, `BenchmarkXor/64B/hqq-sync` and `1KiB/hqq-pipe-8`, and `BenchmarkWork/iters=64/hqq-sync` fail with the first wrong value.
+| Test | What it verifies |
+| :--- | :--- |
+| `TestRefWorkMatchesCgo`, `TestCgoXorMatchesReference` | Confirms the pure-Go oracle functions match `microlib.c` bit-for-bit (runs even without `HQQ_BENCH_SERVER`). |
+| `TestCheckXorRejectsWrongResults` | Confirms the sampled XOR verifier catches stale buffers, short lengths, and corrupted boundary bytes. |
+| `TestAddAgreesOnBothPaths`, `TestWorkAgreesOnBothPaths` | Verifies scalar encoding/decoding and wrapping arithmetic between `cgo` and `hqq-bindgen`. |
+| `TestCounterAddAgreesOnBothPaths` | Verifies handle passing, out-parameters, `@intercept` denial (`StatusError` code `5`), clamping, and library overflow errors (`LibError` `-1`), ensuring denied calls leave counter state untouched. |
+| `TestXorAgreesOnBothPaths` | Compares in-place, chunked, `--copy-request`, and big-buffer sessions against `cgo` across payload sizes `0..64 KiB` plus short destination buffers. |
+| `TestPipelinedCallsKeepTheirResults` | Verifies future correlation at pipeline depths `1`, `8`, and `64`, reverse-order waiting, stateful counter ordering, and pipelined chunked `Xor`. |
+| `TestCallTimeoutSessionAgrees` | Confirms sessions with `CallTimeout` enabled produce identical results. |
+| `TestEchoRoundTrip` | Verifies the `hqq_echo` raw-ring benchmark driver (requires `HQQ_BENCH_ECHO`). |
+| `TestHotPathAllocs` | Asserts zero heap allocations (`0 allocs/op`) on the steady-state hot path for `Add`, `Work`, `CounterAdd`, `64 B Xor`, and 8-deep pipelined `Add` with `CallTimeout == 0` (skipped under `-race`). |

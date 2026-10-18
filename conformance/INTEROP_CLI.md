@@ -1,124 +1,129 @@
-# `hqq-interop`: the interoperability helper contract
+# `hqq-interop`: The Interoperability Helper Contract
 
-Status: normative for every helper executable (Go, C, and later Rust, C++). A helper is a program named `hqq-interop` (`hqq-interop.exe` on Windows) that runs **one role of one scenario in one process**. The driver (`interop/`, Go test package) starts one process per role and checks the JSON results. The Go helper is `cmd/hqq-interop`; its code is the reference for every rule below. Where this document and the Go code disagree, this document is the bug to fix first (report it), then the code.
+**Status**: Normative for all cross-language helper executables (Go, C, C++, and Rust).
 
-Scope of the contract: what the helper prints, how it exits, how processes synchronize, what is sent on the wire and in shared memory. Nothing in this document constrains the helper's internal design.
+An interoperability helper is a standalone executable named `hqq-interop` (`hqq-interop.exe` on Windows) that executes **one role of one scenario in a single OS process**. The Go test driver in [`interop/`](../interop) spawns one helper process per role, coordinates multi-step scenarios via filesystem barriers, and validates the structured JSON result lines emitted by each process. The Go helper in [`cmd/hqq-interop`](../cmd/hqq-interop) serves as the reference implementation; if this document and `cmd/hqq-interop` ever diverge, report and fix the discrepancy in this specification first.
 
-Normative keywords follow RFC 2119 (`MUST`, `SHOULD`, `MAY`).
+This contract specifies only external behavior: command-line flags, standard output formatting, process exit codes, inter-process barrier synchronization, and wire/shared-memory payloads. Internal architecture and API shape are left entirely to each language implementation.
+
+Normative keywords (`MUST`, `MUST NOT`, `SHOULD`, `MAY`) follow RFC 2119.
 
 ## 1. Subcommands
 
+Every `hqq-interop` binary implements the following subcommands:
+
 | Command | Purpose |
 | --- | --- |
-| `hqq-interop run [flags]` | Run one role of one scenario (section 2). |
-| `hqq-interop list [--impl LABEL]` | Print the catalogue of scenarios this helper implements, as JSON (section 7). The driver runs a scenario on a pair only if both helpers list it. |
-| `hqq-interop gen-vectors [--out DIR]` | Regenerate the golden vectors under `DIR` (Go helper only; other helpers MAY omit it). See `conformance/README.md`. |
-| `hqq-interop version` | Print a JSON object with `helper`, `impl`, `protocol`, `segment_layout`, `ring_layout`. |
+| `hqq-interop run [flags]` | Execute one role of one scenario step (section 2). |
+| `hqq-interop list [--impl LABEL]` | Print the JSON catalogue of scenarios supported by this helper (section 7). The test driver runs a scenario across a pair of helpers only when both list it. |
+| `hqq-interop gen-vectors [--out DIR]` | Regenerate the golden conformance vectors under `DIR` (required for the Go helper; other helpers `MAY` omit this subcommand). See [`conformance/README.md`](README.md). |
+| `hqq-interop version` | Print a single-line JSON object containing `helper`, `impl`, `protocol`, `segment_layout`, and `ring_layout`. |
 
-Stdout carries machine output only. Diagnostics go to stderr.
+Standard output (`stdout`) carries machine-readable JSON only; all human-readable diagnostics and logs `MUST` be written to standard error (`stderr`).
 
-## 2. `run` flags
+## 2. `run` Flags
 
-Long flags use `--name value` or `--name=value`. Unknown flags are a usage error (exit 2).
+Long options accept either `--name value` or `--name=value`. Unrecognized flags `MUST` cause the helper to exit with status `2` (usage error).
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
-| `--scenario ID` | required | Scenario ID as listed by `list`, for example `X-01` or `X-A04`. |
-| `--variant NAME` | first variant | Variant name from the catalogue (`""` means the first). |
-| `--step N` | `1` | 1-based step of the scenario (see section 7). |
-| `--role ROLE` | required | `creator` (Primary, named create), `opener` (Secondary, named open). `a` is a synonym of `creator`, `b` of `opener`. |
-| `--name NAME` | required | Segment name. The driver chooses it; at most 30 bytes, `[A-Za-z0-9_-]`, unique per run. |
-| `--sync-dir DIR` | required for multi-role steps | Rendezvous directory shared by the processes of one run (section 6). |
-| `--impl LABEL` | `go` | Label of this helper in the result (`go`, `c`, ...). |
-| `--peer-impl LABEL` | empty | Label of the peer helper in the result. Informational. |
-| `--buffer-count N` | `4` | Slots per direction; power of two. |
-| `--buffer-size N` | `256` | Payload bytes per slot; multiple of 8. |
-| `--size N` | `buffer-size` | Message payload size. |
-| `--messages N` | `100` | Number of messages (scenario-specific meaning). |
-| `--seed U64` | `1` | Seed of the deterministic payload generator (section 5). |
-| `--timeout SECONDS` | `20` | Hard deadline of this process, in seconds (decimal allowed). The helper exits 3 when it passes. |
-| `--crash-after POINT` | empty | Crash point: the process SIGKILLs itself at that point (section 8). |
-| `--heartbeat MS` | `0` | Heartbeat interval in ms. `0` = library default (250), negative = heartbeats disabled. |
-| `--peer-timeout MS` | `0` | Peer timeout in ms. `0` = library default (5000). |
-| `--attach-timeout MS` | `0` | Attach timeout in ms. `0` = library default (5000). |
-| `--wait adaptive\|spin` | `adaptive` | Wait policy. `spin` never parks (simple-mode behavior). |
-| `--long` | off | Use the long soak sizes of scenarios that have them (driver sets it with `HQQ_INTEROP_LONG=1`). |
-| `--max-message N` | `0` | Advanced `MaxMessageSize` in bytes. `0` = library default (64 MiB). Params key `max_message`. |
-| `--max-reassembly N` | `0` | Advanced `MaxReassemblyBytes`. `0` = `4 x MaxMessageSize`. Params key `max_reassembly`. |
-| `--queue-size N` | `0` | Advanced `IncomingQueueSize`. `0` = `buffer-count`. Params key `queue_size`. |
+| `--scenario ID` | required | Scenario identifier from `list` (for example `X-01` or `X-A04`). |
+| `--variant NAME` | first variant | Variant name from the scenario's catalogue entry (`""` selects the first variant). |
+| `--step N` | `1` | 1-based step index within the scenario (section 7). |
+| `--role ROLE` | required | `creator` (Primary, named segment creation) or `opener` (Secondary, named segment open). `a` is an alias for `creator`, and `b` is an alias for `opener`. |
+| `--name NAME` | required | Shared-memory segment name chosen by the driver (`<= 30` ASCII bytes matching `[A-Za-z0-9_-]`, unique per test run). |
+| `--sync-dir DIR` | required for multi-role steps | Shared directory used for inter-process barrier files during a test run (section 6). |
+| `--impl LABEL` | `go` | Implementation label echoed in the JSON result line (`go`, `c`, `cpp`, `rust`, etc.). |
+| `--peer-impl LABEL` | empty | Implementation label of the peer process echoed in the JSON result line (informational). |
+| `--buffer-count N` | `4` | Ring slots per direction (power of two). |
+| `--buffer-size N` | `256` | Payload capacity per slot in bytes (multiple of 8). |
+| `--size N` | `buffer-size` | Application message payload size in bytes. |
+| `--messages N` | `100` | Number of messages to exchange (exact semantics depend on the scenario). |
+| `--seed U64` | `1` | 64-bit seed for the deterministic SplitMix64 payload generator (section 5). |
+| `--timeout SECONDS` | `20` | Hard per-process execution deadline in seconds (floating-point values permitted). Exceeding this deadline exits with status `3`. |
+| `--crash-after POINT` | empty | Self-injected crash point: the helper kills itself with `SIGKILL` / `TerminateProcess` upon reaching `POINT` (section 8). |
+| `--heartbeat MS` | `0` | Heartbeat interval in milliseconds (`0` uses the library default of `250`, negative disables heartbeats). |
+| `--peer-timeout MS` | `0` | Peer liveness timeout in milliseconds (`0` uses the library default of `5000`). |
+| `--attach-timeout MS` | `0` | Segment attach timeout in milliseconds (`0` uses the library default of `5000`). |
+| `--wait adaptive\|spin` | `adaptive` | Ring wait policy (`spin` disables OS futex/semaphore parking to test spin-only peers). |
+| `--long` | off | Enable extended soak message counts for scenarios that define them (set by the driver when `HQQ_INTEROP_LONG=1`). |
+| `--max-message N` | `0` | Advanced `MaxMessageSize` in bytes (`0` uses the library default of 64 MiB; catalogue param key `max_message`). |
+| `--max-reassembly N` | `0` | Advanced `MaxReassemblyBytes` (`0` uses `4 * MaxMessageSize`; catalogue param key `max_reassembly`). |
+| `--queue-size N` | `0` | Advanced `IncomingQueueSize` (`0` uses `buffer-count`; catalogue param key `queue_size`). |
 
-Variant `params` in the catalogue (section 7) are applied by the driver as the flags above, so the helper's defaults only matter when a caller runs the helper by hand.
+Because the test driver expands variant `params` from the catalogue (section 7) into explicit command-line flags when invoking `hqq-interop run`, flag defaults only take effect when a developer runs a helper manually or when a variant omits a parameter key.
 
-## 3. Exit codes
+## 3. Process Exit Codes
 
-| Code | Meaning | Result line |
+A helper process communicates its final disposition through its exit code and its single-line JSON result object:
+
+| Exit Code | Meaning | JSON Result Line Requirement |
 | ---: | --- | --- |
-| 0 | Role passed (`ok=true`). | required |
-| 1 | Role failed: a check failed or an unexpected error occurred. | required, `ok=false` |
-| 2 | Usage error: bad flag, unknown scenario/variant/step, missing `--sync-dir`. | none required (message on stderr) |
-| 3 | Process deadline passed (`--timeout`). | required, `error_kind="HarnessTimeout"` |
-| 4 | Skipped: the scenario does not apply here (platform, or the helper lacks a feature it is asked for). | required, `skipped=true`, `ok=true` |
-| 5 | Internal helper error (bug, out of memory). | optional |
-| killed | Self-injected crash (section 8): the process dies by SIGKILL (TerminateProcess on Windows). | the result line was printed **before** the kill, with `crashed=true`, `ok=true` |
+| `0` | Role passed all checks (`ok=true`). | Required |
+| `1` | Role failed a check or encountered an unexpected error (`ok=false`). | Required (`ok=false`) |
+| `2` | Command-line usage error (unknown flag, unknown scenario/variant/step, or missing `--sync-dir`). | None required (diagnostic on `stderr`) |
+| `3` | Process execution deadline expired (`--timeout`). | Required (`error_kind="HarnessTimeout"`) |
+| `4` | Scenario skipped on this platform or unsupported optional feature. | Required (`skipped=true`, `ok=true`) |
+| `5` | Internal helper failure (panic, assertion bug, or out-of-memory). | Optional |
+| killed | Self-injected crash (section 8) via `SIGKILL` or `TerminateProcess`. | Required **before** self-kill (`crashed=true`, `ok=true`) |
 
-A helper MUST print the result line before it exits with 0, 1, 3 or 4. It MUST flush stdout before a self-injected crash.
+A helper `MUST` write and flush its JSON result line to `stdout` before exiting with code `0`, `1`, `3`, or `4`, and before triggering a self-injected crash.
 
-## 4. Result line
+## 4. Result Line Format
 
-Exactly one JSON object per process, on one line, last thing on stdout. Field names are fixed:
+Each `hqq-interop run` invocation `MUST` emit exactly one single-line JSON object as the final line on `stdout`:
 
 ```json
-{"scenario":"X-01","variant":"","step":1,"role":"creator","impl":"go","peer_impl":"c",
- "ok":true,"skipped":false,"crashed":false,
- "error_kind":"","error":"",
- "checks":[{"name":"opener sees the message","ok":true,"detail":""}],
- "sent":1,"received":1,"elapsed_ms":42,"meta":{}}
+{"scenario":"X-01","variant":"","step":1,"role":"creator","impl":"go","peer_impl":"c","ok":true,"skipped":false,"crashed":false,"error_kind":"","error":"","checks":[{"name":"opener sees the message","ok":true,"detail":""}],"sent":1,"received":1,"elapsed_ms":42,"meta":{}}
 ```
 
-* `ok` is true only when every check passed and no error occurred.
-* `checks` is the list of named assertions the role made; an empty list is allowed.
-* `error_kind` is empty on success. On failure it is the canonical name below. `error` is free text (diagnostic only; drivers never match on it).
-* `sent`/`received` count messages of the scenario in this role (meaning per scenario).
-* `meta` is optional and diagnostic (for example `{"epoch":2,"creator_token":"0x..."}`).
+Field semantics:
 
-### 4.1 Canonical `error_kind` names
+- `ok`: `true` if and only if every assertion in `checks` passed and no unexpected error occurred.
+- `checks`: Ordered list of named assertions evaluated by this role (`[]` is permitted when the role only serves a peer).
+- `error_kind`: Empty string `""` when `ok` is `true`; otherwise set to one of the canonical error identifiers in section 4.1.
+- `error`: Free-form human-readable diagnostic string; the driver never matches against this text.
+- `sent` and `received`: Number of scenario messages sent and received by this role.
+- `meta`: Optional map of diagnostic key-value pairs (such as `{"epoch":2,"creator_token":"0x..."}` or `{"status":42}`).
 
-These are the names of SPEC section 12 (Go sentinels). A helper MUST report the **most specific** category that matches the error it received. The Go mapping is `cmd/hqq-interop/errors.go`; a port maps its own error codes to these names.
+### 4.1 Canonical `error_kind` Identifiers
 
-| `error_kind` | Condition (SPEC 12) |
+When a scenario verifies an error condition (or fails unexpectedly), the helper `MUST` map its native library error to the **most specific** canonical identifier from `SPEC.md` section 12:
+
+| `error_kind` | Condition (`SPEC.md` Section 12) |
 | --- | --- |
-| `EOF` | graceful peer close, buffered messages consumed (`io.EOF`) |
-| `ErrPeerClosed` | peer detached gracefully (matches `EOF`) |
-| `ErrPeerGone` | peer stopped heartbeating, was replaced, or the segment was re-initialized |
-| `ErrClosed` | local link or stream closed |
-| `ErrTimeout` | deadline passed |
-| `ErrLinkBusy` | live endpoint present (matches `ErrFailedInit`) |
-| `ErrIncompatibleLayout` | foreign magic, other layout major, unknown required feature, unknown state, non-zero page of an Empty segment, ring header mismatch (matches `ErrFailedInit`) |
-| `ErrFailedInit` | initialization failures, including the transient ones (`errSegmentNotReady`, `errInitContended`, `errNoLiveEndpoint`) |
-| `ErrNotExist` | the name does not exist |
-| `ErrInvalidSize` | invalid geometry, too-small existing object, geometry mismatch (`GeometryError`), invalid `DataSize` or chunk bounds |
-| `ErrInvalidName` | bad name (on Linux also a non-regular file) |
-| `ErrBufferOverflow` | payload larger than `bufferSize` (Standard) or `MaxMessageSize` (Advanced) |
-| `ErrInvalidOp` | base of protocol-state errors |
-| `ErrNotNegotiated`, `ErrAlreadyNegotiated`, `ErrNegotiationFailed`, `ErrNegotiationRejected`, `ErrUnexpectedPacket`, `ErrProtocol` | negotiation and protocol-state violations (match `ErrInvalidOp`) |
-| `ErrMessageAborted` | the peer abandoned a response mid-transfer (matches `ErrProtocol`) |
-| `ErrIncomingOverflow`, `ErrReassemblyLimit` | queue overflow under `OverflowFail`; response refused by the reassembly limit (match `ErrBufferOverflow`) |
-| `ErrConnNotFound` | stream or connection not found |
-| `ErrMemoryAlign`, `ErrMemorySmall` | caller-owned memory not aligned / too small |
-| `ErrListenerBusy`, `ErrListenerGone`, `ErrListenerClosed`, `ErrAcceptorClosed`, `ErrNotListening`, `ErrAlreadyListening` | acceptor and listener states (`LISTENER_DRAFT.md`) |
-| `ErrShuttingDown` | the peer refused a request during graceful shutdown (status 8) |
-| `ResponseError` | an application error response (`ResponseError{Status, Payload}`; the status is in `meta.status`) |
-| `CheckFailed` | an assertion of the scenario failed (the check is listed in `checks`) |
-| `HarnessTimeout` | exit 3 (section 3) |
-| `Unknown` | anything else; a helper that prints it is reporting a gap in its mapping |
+| `EOF` | Graceful peer close after all buffered messages have been consumed (`io.EOF`). |
+| `ErrPeerClosed` | Peer detached gracefully (matches `EOF`). |
+| `ErrPeerGone` | Peer stopped heartbeating, was replaced by a new process, or the segment was re-initialized. |
+| `ErrClosed` | Local link or stream was already closed. |
+| `ErrTimeout` | Operation deadline expired. |
+| `ErrLinkBusy` | A live endpoint already occupies the requested slot (matches `ErrFailedInit`). |
+| `ErrIncompatibleLayout` | Unrecognized magic word, incompatible layout major version, unknown required feature bit, invalid state value, non-zero page size in an `Empty` segment, or ring header mismatch (matches `ErrFailedInit`). |
+| `ErrFailedInit` | Segment initialization failure, including transient contention (`errSegmentNotReady`, `errInitContended`, `errNoLiveEndpoint`). |
+| `ErrNotExist` | Named shared-memory segment does not exist. |
+| `ErrInvalidSize` | Invalid ring geometry, existing backing file too small, geometry mismatch (`GeometryError`), or invalid `DataSize` / chunk bounds. |
+| `ErrInvalidName` | Malformed segment name (or non-regular backing file on Linux). |
+| `ErrBufferOverflow` | Payload exceeds `bufferSize` (Standard link) or `MaxMessageSize` (Advanced link). |
+| `ErrInvalidOp` | Base category for protocol state violations. |
+| `ErrNotNegotiated`, `ErrAlreadyNegotiated`, `ErrNegotiationFailed`, `ErrNegotiationRejected`, `ErrUnexpectedPacket`, `ErrProtocol` | Protocol handshake and frame-ordering violations (subtypes of `ErrInvalidOp`). |
+| `ErrMessageAborted` | Peer aborted a multi-packet response mid-transfer (subtype of `ErrProtocol`). |
+| `ErrIncomingOverflow`, `ErrReassemblyLimit` | Incoming queue full under `OverflowFail`, or response rejected by `MaxReassemblyBytes` (subtypes of `ErrBufferOverflow`). |
+| `ErrConnNotFound` | Target stream or connection ID does not exist. |
+| `ErrMemoryAlign`, `ErrMemorySmall` | Caller-supplied memory buffer is insufficiently aligned or smaller than required. |
+| `ErrListenerBusy`, `ErrListenerGone`, `ErrListenerClosed`, `ErrAcceptorClosed`, `ErrNotListening`, `ErrAlreadyListening` | Multi-client acceptor and listener errors (`spec/ext/LISTENER_DRAFT.md`). |
+| `ErrShuttingDown` | Peer rejected a new request during graceful shutdown (Protocol 1.1 status `8`). |
+| `ResponseError` | Application-level RPC error response (`ResponseError{Status, Payload}`, with the numeric status recorded in `meta.status`). |
+| `CheckFailed` | A scenario assertion failed (details recorded in `checks`). |
+| `HarnessTimeout` | Per-process `--timeout` watchdog expired (exit code `3`). |
+| `Unknown` | Fallback when an implementation has not mapped an internal error code (indicates a bug in the helper). |
 
-The C helper's error codes map to the same names: `ErrCodeInvalidSize` is `ErrInvalidSize` on the wire, `ErrCodeConnNotFound` is `ErrConnNotFound`, and an unknown code is `ErrProtocol` (SPEC 12).
+Wire error codes carried in `OpError` packets map to the same canonical names: `ErrCodeInvalidSize` maps to `ErrInvalidSize`, `ErrCodeConnNotFound` maps to `ErrConnNotFound`, and any unrecognized wire error code maps to `ErrProtocol`.
 
-## 5. Deterministic payloads
+## 5. Deterministic Payload Generation
 
-Both sides of a scenario generate and verify message bodies from `(seed, seq, size)`. The algorithm is exact; `conformance.Payload` and `conformance.VerifyPayload` are its Go reference, and `conformance/vectors/manifest.json` carries golden outputs.
+Both endpoints in a test scenario generate and verify message bodies deterministically from `(seed, seq, size)` without exchanging out-of-band test fixtures. Reference implementations live in [`conformance/payload.go`](payload.go) (`Payload` and `VerifyPayload`), and golden outputs are pinned in `conformance/vectors/manifest.json`.
 
-Let `M = 2^64`. SplitMix64 stream for `(seed, seq)`:
+Given modulus `M = 2^64`, initialize the SplitMix64 stream for `(seed, seq)` as follows:
 
 ```text
 s  = (seed XOR (seq * 0xD1B54A32D192ED03)) mod M
@@ -128,103 +133,119 @@ next():
   z = ((z XOR (z >> 30)) * 0xBF58476D1CE4E5B9) mod M
   z = ((z XOR (z >> 27)) * 0x94D049BB133111EB) mod M
   return z XOR (z >> 31)
-body(n) = the first n bytes of the concatenation of next() words, each written little-endian
+body(n) = the first n bytes of the concatenation of next() words, each serialized in little-endian order
 ```
 
-Payload of `size` bytes:
+Construct a payload of `size` bytes according to three size regimes:
 
-* `size == 0`: empty.
-* `1 <= size <= 15`: `body(size)`.
-* `size >= 16`: `seq` as u64 LE (8 bytes) | `crc32-IEEE(body)` as u32 LE (4 bytes) | `body(size - 12)`.
+- `size == 0`: Empty byte slice.
+- `1 <= size <= 15`: `body(size)`.
+- `size >= 16`: `seq` as 8-byte little-endian `uint64` `||` `crc32-IEEE(body(size - 12))` as 4-byte little-endian `uint32` `||` `body(size - 12)`.
 
-Golden values (seed 1, seq 0): `size 1` = `c1`; `size 8` = `c15c0289ec2d0a91`; `size 16` = `0000000000000000 add8412c c15c0289`. Seed `0xdeadbeef`, seq 7, size 40 = `0700000000000000 47a0b112 7536cc3826b6b2d2c8375c13ebdfc0ab9ca7d35f20744cb4782227b3`. (Both the Go and an independent Python implementation produce these bytes.)
+Golden verification values:
 
-A receiver verifies a message of index `i` (the i-th message of the scenario's stream, 0-based) by checking `payload == Payload(seed, i, len)`. Scenarios that send several streams use a distinct seed per stream (`seed + stream-index`, documented per scenario).
+- `seed = 1, seq = 0, size = 1`: `c1`
+- `seed = 1, seq = 0, size = 8`: `c15c0289ec2d0a91`
+- `seed = 1, seq = 0, size = 16`: `0000000000000000 add8412c c15c0289`
+- `seed = 0xdeadbeef, seq = 7, size = 40`: `0700000000000000 47a0b112 7536cc3826b6b2d2c8375c13ebdfc0ab9ca7d35f20744cb4782227b3`
 
-## 6. Rendezvous and synchronization
+A receiver validates the `i`-th message (`0`-based) on a stream by checking `payload == Payload(seed, i, len(payload))`. Scenarios that open multiple concurrent streams derive a per-stream seed `seed + stream_index` as documented in the scenario definition.
 
-The processes of one run share (a) the segment named by `--name` and (b) the directory `--sync-dir`. The driver creates the directory per run and removes it afterwards.
+## 6. Rendezvous and Barrier Synchronization
 
-**Barrier.** `barrier(phase)` for role `R` with peer role `P`, in step `N`:
+Processes participating in the same test run share two resources managed by the driver: the shared-memory segment name (`--name`) and a temporary synchronization directory (`--sync-dir`).
 
-1. create the file `<sync-dir>/s<N>-<phase>.<R>` if it does not exist (empty; creating it again is harmless);
-2. poll every 2 ms until `<sync-dir>/s<N>-<phase>.<P>` exists;
-3. fail with `ErrTimeout` if the process deadline passes first.
+To execute `barrier(phase)` in step `N`, a process playing role `R` with peer role `P` performs three steps:
 
-Phase names are scenario-defined ASCII identifiers. Barriers are the only inter-process ordering a scenario uses besides the shared segment itself; a scenario that needs an ordering MUST use a barrier, never a sleep alone (sleeps are allowed for timing *assertions*, for example waiting for a heartbeat to age).
+1. Create the empty marker file `<sync-dir>/s<N>-<phase>.<R>` if it does not already exist.
+2. Poll every `2 ms` until the peer marker file `<sync-dir>/s<N>-<phase>.<P>` appears.
+3. Return `ErrTimeout` if the process deadline expires before the peer marker file appears.
 
-**Segment readiness.** A creator's barrier after `CreateStandardLink` (or the Advanced equivalent) is what makes the segment openable. An opener MUST NOT rely on retry alone unless the scenario is about transient errors (`ErrFailedInit`, `ErrNotExist`).
+Phase names are scenario-specific ASCII identifiers. Helpers `MUST` use filesystem barriers rather than `sleep` delays whenever one role depends on another role reaching a protocol state (for example, waiting for the creator to finish `CreateStandardLink` before the opener calls `OpenStandardLink`, except in scenarios that explicitly test `ErrNotExist` or `ErrFailedInit`).
 
-## 7. Catalogue, variants and steps (`list`)
+## 7. Scenario Catalogue Schema (`list`)
 
-`list` prints:
+Running `hqq-interop list` prints a single JSON document describing all scenarios and variants implemented by the helper:
 
 ```json
-{"helper":"hqq-interop","impl":"go","protocol":"1.1","layout":"HQQ_STL3","runtime":"...",
- "scenarios":[
-  {"id":"X-01","title":"create, open, exchange, close","kind":"standard",
-   "platforms":["any"],"timeout_s":30,
-   "variants":[
-     {"name":"creator-closes-first",
-      "params":{"buffer_size":256,"messages":1},
-      "steps":[{"roles":["creator","opener"],"expect":{"creator":"ok","opener":"ok"}}]}
-   ]}
- ]}
+{
+  "helper": "hqq-interop",
+  "impl": "go",
+  "protocol": "1.1",
+  "layout": "HQQ_STL3",
+  "runtime": "go1.27",
+  "scenarios": [
+    {
+      "id": "X-01",
+      "title": "create, open, exchange, close",
+      "kind": "standard",
+      "platforms": ["any"],
+      "timeout_s": 30,
+      "variants": [
+        {
+          "name": "creator-closes-first",
+          "params": {"buffer_size": 256, "messages": 1},
+          "steps": [
+            {
+              "roles": ["creator", "opener"],
+              "expect": {"creator": "ok", "opener": "ok"}
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
 ```
 
-* `kind`: `standard` (SPEC 9), `advanced` (SPEC 10 and `ext/PROTOCOL_1_1_DRAFT.md`), `acceptor` (`ext/LISTENER_DRAFT.md`).
-* `platforms`: `any`, or GOOS names (`windows`, `linux`, `darwin`). The helper exits 4 elsewhere; the driver does not start it. A name of a shared-memory segment lives only while a handle to it is open on Windows (on POSIX until it is unlinked), so a scenario that needs a dead segment's name to persist lists only the POSIX platforms.
-* `variants[].params`: the flags to pass (`buffer_count`, `buffer_size`, `size`, `messages`, `seed`, `heartbeat_ms`, `peer_timeout_ms`, `attach_timeout_ms`). Absent keys keep the helper defaults.
-* `steps`: executed in order. Each step starts one process per listed role, with the same `--name`, `--sync-dir`, and the params of the variant. `args` (optional, per role) adds flags such as `--crash-after`.
-* `expect` per role: `ok` (exit 0 and `ok=true`), `crash` (killed at a crash point, with `crashed=true` printed), `ok|crash` (either), `skip` (exit 4). A step passes when every role meets its expectation.
+Catalogue field rules:
 
-The driver runs the cross product of: scenarios listed by both helpers, variants, step order, and role assignments (see section 9).
+- `kind`: One of `"standard"` (`SPEC.md` section 9), `"advanced"` (`SPEC.md` section 10 and `PROTOCOL_1_1_DRAFT.md`), or `"acceptor"` (`LISTENER_DRAFT.md`).
+- `platforms`: `["any"]` or a list of `GOOS` identifiers (`"linux"`, `"darwin"`, `"freebsd"`, `"windows"`). Because Windows kernel shared-memory mappings disappear as soon as the last open handle closes (whereas POSIX `shm_open` segments persist until unlinked), scenarios that test attachment to a dead segment after all processes exit list only POSIX platforms.
+- `variants[].params`: Per-variant flag overrides (`buffer_count`, `buffer_size`, `size`, `messages`, `seed`, `heartbeat_ms`, `peer_timeout_ms`, `attach_timeout_ms`, `max_message`, `max_reassembly`, `queue_size`). Omitted keys use the helper's default flag values.
+- `steps`: Executed sequentially by the driver. Each step spawns one process per role in `roles` with the shared `--name` and `--sync-dir`, plus optional per-role `args` (such as `["--crash-after=claim"]`).
+- `expect`: Per-role outcome expectation: `"ok"` (exit `0` with `ok=true`), `"crash"` (killed at a crash point after printing `crashed=true, ok=true`), `"ok|crash"` (either), or `"skip"` (exit `4`).
+- **Unique variant names**: Every scenario with more than one variant `MUST` assign each variant a unique, non-empty `name`.
 
-Variant rules: a scenario with more than one variant MUST give each variant a unique, non-empty name (an empty `--variant` selects the first variant, so an empty name would be ambiguous).
+## 8. Self-Injected Crash Points
 
-## 8. Crash points
+Passing `--crash-after POINT` instructs the helper to terminate itself abruptly (`SIGKILL` on POSIX, `TerminateProcess(GetCurrentProcess(), 137)` on Windows) the moment execution reaches `POINT`. Immediately before terminating, the helper `MUST` print its JSON result line with `"crashed":true,"ok":true` and flush `stdout`:
 
-`--crash-after POINT` makes the helper kill itself (SIGKILL; TerminateProcess on Windows) when it reaches `POINT`. Before the kill the helper prints its result line with `crashed=true, ok=true` and flushes stdout. Points are scenario-defined, from this vocabulary:
-
-| Point | Meaning |
+| Crash Point | Execution Point |
 | --- | --- |
-| `msgs:N` | after N messages have been successfully sent or received by this role |
-| `blocked` | just before a blocking receive on an empty ring (the process is about to park) |
-| `claim` | after an initialization claim (superblock `Empty -> Initializing`, `initToken` set) and before any further write |
-| `format` | after the rings were formatted, before publish |
-| `publish` | after the superblock stamps and before the commit CAS |
-| `zeroing` | while zeroing payload buffers during initialization |
-| `exit` | after the scenario's last check, before the link is closed (no graceful close) |
+| `msgs:N` | Immediately after this role has sent or received `N` messages. |
+| `blocked` | Immediately before parking on an empty ring in a blocking receive call. |
+| `claim` | After claiming initialization (`Empty -> Initializing` and setting `initToken`), before formatting rings. |
+| `format` | After formatting the ring headers, before publishing superblock geometry. |
+| `publish` | After writing superblock geometry stamps, before the final `Initializing -> Ready` CAS commit. |
+| `zeroing` | Midway through zeroing payload buffers during segment initialization. |
+| `exit` | After completing all scenario assertions, before calling `Close()` on the link (simulating an ungraceful exit). |
 
-A helper that does not implement a point MUST exit 4 for that step (the driver then reports `skipped`, not a pass). The raw points (`claim`, `format`, `publish`, `zeroing`) are implemented by writing the superblock and ring words directly with the protocol of SPEC 5 and 7, so the helper crashes in a state the public API cannot reach.
+If a helper does not implement a requested crash point, it `MUST` exit with code `4` (`skipped=true`) so the driver records a skip rather than a false pass. The mid-initialization crash points (`claim`, `format`, `publish`, `zeroing`) manipulate the mapped superblock and ring words directly according to `SPEC.md` sections 5 and 7 to leave the segment in states unreachable through normal public API calls.
 
-The driver never sends a signal to a helper. Victims of a crash are identified by the `crashed` flag of their result line, not by their exit status.
+## 9. Role Pairings Across Implementations
 
-A crash expectation is met only by a process that printed `crashed=true` and then died by signal or with a non-zero status.
+For every two-role scenario and variant supported by a pair of helpers `(A, B)`, the test driver executes both directions:
 
-## 9. Role assignments
+1. `creator = A`, `opener = B`
+2. `creator = B`, `opener = A` (omitted when `A == B`, since both runs are identical)
 
-Named scenarios have one creator and one opener. For a pair of helpers `(A, B)` the driver runs, per scenario and variant:
+Single-role scenarios run once per registered implementation. In Advanced protocol scenarios, `creator` acts as the Primary endpoint (sending `OpProtoNegotiate` first) and `opener` acts as the Secondary endpoint.
 
-1. `creator=A, opener=B`;
-2. `creator=B, opener=A` (skipped when `A == B`, since the two runs are identical).
+## 10. Checklist for Implementing a New Helper
 
-Scenarios whose steps list only one role run that role once per implementation. Advanced scenarios use the same mapping: the creator is the Primary (it sends `OpProtoNegotiate` first); the opener is the Secondary.
+To bring up an `hqq-interop` helper in a new language or binding:
 
-The driver passes `--peer-impl` as the label of the other helper and `--impl` as its own label.
+1. Implement command-line parsing for all flags in section 2, exiting with code `2` on unknown flags.
+2. Implement `list` returning the subset of scenarios your helper supports (the driver automatically intersects scenario lists across pairs).
+3. Implement `Payload` and `VerifyPayload` from section 5 and verify them against the golden hex values before testing live links.
+4. Map your library's error types to the canonical `error_kind` names in section 4.1.
+5. Implement `run` for each supported scenario using the file barriers in section 6, emitting the single-line JSON result from section 4 and exiting with the codes in section 3.
+6. Register the compiled binary in `.github/workflows/interop.yml` and test locally via `HQQ_INTEROP_IMPLS`.
 
-## 10. Implementing the contract in another language
+## 11. Scenario Catalogue
 
-1. Parse the flags of section 2 (unknown flags exit 2).
-2. Implement `list` from the catalogue you support (a subset is fine; the driver intersects lists).
-3. Implement `run` for each scenario you list: map the segment (SPEC 11), do the role's operations, call barriers (section 6), print one result line (section 4), exit per section 3.
-4. Implement `Payload` (section 5) and verify with the golden values before anything else.
-5. Map your errors to `error_kind` names (section 4.1).
-6. Add your helper's build to `.github/workflows/interop.yml` (see the comment block there) and register the executable path in `HQQ_INTEROP_IMPLS`, as described in "Adding an implementation" in `conformance/README.md`.
-
-## 11. Scenario catalogue
-
-The authoritative catalogue is the output of `hqq-interop list` of the Go helper. Each scenario's pass criteria are the checks its role makes (listed in its result line); the mapping to the PORTING.md matrix IDs is given in the "Ref" column.
+The authoritative scenario list is generated by `hqq-interop list` in the Go reference helper (`cmd/hqq-interop`). Each scenario maps to the conformance test IDs defined in [`spec/PORTING.md`](../spec/PORTING.md).
 
 <!-- CATALOGUE:BEGIN -->
 

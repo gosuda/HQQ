@@ -1,380 +1,260 @@
-# HQQ Advanced Protocol 1.1 — extension draft
+# HQQ Advanced Protocol 1.1 Specification
 
-Status: draft, implemented by the Go library (`gosuda.org/hqq`, M2).
-Baseline: HQQ Advanced Protocol 1.0 as implemented by v0.5.0 (`PROTOCOL.md`).
-This document describes only what 1.1 adds. Everything not mentioned here is
-unchanged from 1.0, in particular:
+**Status**: Active specification, implemented by the Go library (`gosuda.org/hqq`), the C11 reference library (`libhqq`), and the C++17 and Rust bindings.
 
-* the shared-memory layout (superblock layout v3, rings, payload buffers);
-* the 64-byte packet ABI: eight little-endian `uint64` words, word 0 = opcode
-  in the low byte (remaining bytes zero), words 1-7 = operands 0-6;
-* the `OpConnCopy` operand assignment (0 connection ID, 1 message ID,
-  2 total size, 3 chunk offset, 4 chunk size, 5 flags, 6 aux) and all 1.0
-  validation rules;
-* the semantics of streams, chunking, reassembly limits and abort.
+**Baseline**: HQQ Advanced Protocol 1.0 as defined in [`SPEC.md`](../SPEC.md) and [`PROTOCOL.md`](../../PROTOCOL.md). This specification defines the additions introduced in Protocol 1.1; all other aspects of the protocol remain unchanged from 1.0, including:
 
-All 1.1 behavior is negotiated through feature bits. A link on which a feature
-was not negotiated behaves exactly as in 1.0 with respect to that feature, and
-a peer that receives a frame belonging to a feature that was not negotiated
-reacts as it does to any unknown frame of 1.0 (see 7).
+- The shared-memory segment layout (`HQQ_STL3` v3.0, MPMC ring layout v2, and page-aligned payload pools).
+- The 64-byte packet ABI (eight little-endian `uint64` words: word 0 carries the opcode in bits `0..7` with bits `8..63` zero, and words 1-7 carry operands 0-6).
+- The `OpConnCopy` operand layout (operand 0 connection ID, operand 1 message ID, operand 2 total size, operand 3 chunk offset, operand 4 chunk size, operand 5 flags, operand 6 aux) and all 1.0 bounds and state checks.
+- Multiplexed stream lifecycle, multi-chunk reassembly budgets, and mid-transfer `AdvFlagAbort` handling.
 
-Conventions: "MUST", "SHOULD", "MAY" as in RFC 2119. All multi-byte integers
-are little-endian. "Requester" is the endpoint that sends a request
-(`Call`); "responder" is the endpoint that receives it (`Serve`). Roles are
-per request, not per endpoint.
+All Protocol 1.1 capabilities are gated by negotiated feature bits. When a 1.1 feature bit is not negotiated on a link, that link behaves identically to Protocol 1.0 with respect to that feature, and receiving an unnegotiated 1.1 frame or flag triggers the same protocol error as an unknown opcode or flag in 1.0 (section 7).
 
-## 1. Version and negotiation
+Normative keywords (`MUST`, `MUST NOT`, `SHOULD`, `MAY`) follow RFC 2119. All multi-byte integers are little-endian. In RPC interactions, **requester** denotes the endpoint calling `Call`, and **responder** denotes the endpoint running `Serve` (roles are per-request, as both endpoints on a link may issue and serve requests concurrently).
 
-| Item | 1.0 | 1.1 |
-|---|---|---|
-| Protocol version in `OpProtoNegotiate` / `OpProtoAck` operand 0 | `0x0100` | `0x0101` (`major << 8 \| minor`) |
-| Feature bits | `FeatureMessages = 1<<0`, `FeatureRequestResponse = 1<<1` | adds `FeatureCancel = 1<<2`, `FeatureMetadata = 1<<3` |
+## 1. Version Encoding and Feature Negotiation
 
-The negotiation frames are unchanged (operand 0 version, operand 1 features,
-operand 2 capability word, always 0).
+Protocol 1.1 bumps the minor version in `OpProtoNegotiate` and `OpProtoAck` from `0` to `1` and introduces two additional feature bits:
 
-* The initiator (Primary) sends `OpProtoNegotiate` with its version and the
-  features it requests. An implementation of 1.1 requests all four bits by
-  default.
-* The responder answers `OpProtoAck` with `version = (requested.major,
-  min(requested.minor, 1))` and `features = requested & supported & allowed`.
-  A responder MUST clear `FeatureCancel` and `FeatureMetadata` when the
-  negotiated minor version is 0.
-* The initiator accepts an ack whose major is 1, minor is at most its own
-  minor, and whose features are a subset of what it requested and supports.
-* Result: the negotiated feature set is the intersection. Each feature bit is
-  independent: `FeatureCancel` and `FeatureMetadata` do not depend on each
-  other, but both are only meaningful together with `FeatureRequestResponse`.
+| Parameter | Protocol 1.0 | Protocol 1.1 |
+| --- | --- | --- |
+| Encoded version in `OpProtoNegotiate` / `OpProtoAck` operand 0 | `0x0100` (`major=1, minor=0`) | `0x0101` (`(major << 8) \| minor`) |
+| Feature bitmask in operand 1 | `FeatureMessages = 1 << 0` (`0x01`), `FeatureRequestResponse = 1 << 1` (`0x02`) | Adds `FeatureCancel = 1 << 2` (`0x04`) and `FeatureMetadata = 1 << 3` (`0x08`) |
 
-Example (both endpoints 1.1, all features):
+The 64-byte negotiation packet layout is unchanged (operand 0 version, operand 1 features, operand 2 reserved `0`):
 
-```
+- **Initiator (`OpProtoNegotiate`)**: Sends its supported protocol version (`0x0101`) and requested feature mask (all four bits `0x0f` by default in a 1.1 implementation).
+- **Responder (`OpProtoAck`)**: Replies with `version = (requested.major, min(requested.minor, 1))` and `features = requested & supported & allowed`. A responder `MUST` clear `FeatureCancel` and `FeatureMetadata` whenever the negotiated minor version is `0`.
+- **Validation**: The initiator accepts `OpProtoAck` if and only if `ack.major == 1`, `ack.minor <= requested.minor`, and `ack.features` is a subset of `requested.features`.
+- **Feature independence**: `FeatureCancel` and `FeatureMetadata` can be negotiated independently of each other, and both apply to RPC requests (`FeatureRequestResponse`).
+
+Example 64-byte negotiation exchange when both endpoints support Protocol 1.1 and all four features (`0x0f`):
+
+```text
 OpProtoNegotiate: 05000000 00000000 | 0101000000000000 | 0f00000000000000 | 0000000000000000 | ...
 OpProtoAck:       06000000 00000000 | 0101000000000000 | 0f00000000000000 | 0000000000000000 | ...
 ```
 
-(each packet is 64 bytes; the unused operands 3-6 are zero.)
+Version and feature interoperability matrix:
 
-Compatibility matrix (initiator → responder, negotiated result):
+| Initiator Request | Responder Capability | Negotiated Result |
+| --- | --- | --- |
+| `1.1`, features `0x0f` | `1.1`, features `0x0f` | Version `1.1` (`0x0101`), features `0x0f` |
+| `1.1`, features `0x0f` | `1.0` (`0x0100`, features `0x03`) | Version `1.0` (`0x0100`), features `0x03` |
+| `1.0`, features `0x03` | `1.1` (`0x0101`, features `0x0f`) | Version `1.0` (`0x0100`), features `0x03` |
+| `1.1`, features `0x0f` | `1.1`, restricted subset (`0x03`, `0x07`, or `0x0b`) | Version `1.1` (`0x0101`), intersection of requested and allowed bits |
 
-| Initiator | Responder | Result |
-|---|---|---|
-| 1.1, all | 1.1, all | version 1.1, features `0x0f` |
-| 1.1, all | 1.0 (v0.5.0) | the 1.0 responder acks `0x0100` and `features & 0x03`; result 1.0, `0x03` |
-| 1.0 (v0.5.0) | 1.1 | request `0x0100`, `0x03`; result 1.0, `0x03` |
-| 1.1, `0x0f` | 1.1, `0x03` or `0x0b` or `0x07` (restricted by option) | the intersection |
+## 2. Request Cancellation (`OpCancel`, Opcode `0x07`)
 
-## 2. `OpCancel` (opcode `0x07`)
+`OpCancel` is valid on the wire only when `FeatureCancel` was negotiated:
 
-Valid only if `FeatureCancel` was negotiated.
+| Packet Word | Content |
+| --- | --- |
+| Word 0 (opcode) | `0x07` (`OpCancel`) |
+| Word 1 (operand 0) | Connection (stream) ID of the target request (`0` for the default link stream) |
+| Word 2 (operand 1) | Message ID of the target request |
+| Words 3-7 (operands 2-6) | Reserved: `MUST` be written as `0` by senders and ignored by receivers |
 
-| Word | Content |
-|---|---|
-| 0 | `0x07` |
-| 1 (operand 0) | connection (stream) ID of the request; 0 for the link-level stream |
-| 2 (operand 1) | message ID of the request |
-| 3-7 (operands 2-6) | reserved: written as zero, ignored by the receiver |
+Example 64-byte `OpCancel` frame canceling request message `1` on stream `0`:
 
-Example, cancel of request message 1 on stream 0 (64 bytes):
-
-```
-07000000 00000000  0000000000000000  0100000000000000  00..00 (32 bytes of zero)
+```text
+07000000 00000000  0000000000000000  0100000000000000  00..00 (40 bytes of zero)
 ```
 
-Semantics:
+Wire and behavioral semantics:
 
-* `OpCancel` is sent by the requester, advisory, and has no reply.
-* The key `(operand 0, operand 1)` names a request that the sender sent
-  earlier on that stream. A receiver looks it up among the requests it has
-  received and not yet answered (queued or being handled). If found, the
-  request is canceled (see 4.3). If not found (never seen, dropped, already
-  answered) the packet is ignored. Receiving the same cancel twice is
-  harmless.
-* When to send: when a `Call` stops waiting because its own context ended
-  (cancellation or deadline) after the request was completely sent. It MUST
-  NOT be sent when the request was not completely sent (an aborted multi-chunk
-  request is not a request, see 4.1), when the call ended because the stream
-  or the link closed, or when the response was already received.
-* The requester MUST send `OpCancel` best effort and MUST NOT block its
-  receive path or its caller on it: implementations queue it on the same
-  bounded control queue that carries other replies generated by the receive
-  path. A cancel that does not fit is dropped (the Go implementation counts it
-  in `DroppedMessages`). A requester MUST be prepared for the response to
-  arrive anyway and discard it (the set of abandoned calls of 1.0).
-* Order: `OpCancel` follows the last chunk of the request in the same ring,
-  so a receiver always finds the request complete when it processes the
-  cancel. (A request that is assembled but not yet queued is impossible: the
-  message is routed before the next packet is processed.)
-* Without `FeatureCancel`, a received `OpCancel` is an unexpected packet (the
-  Go implementation fails the receive path with `ErrUnexpectedPacket`, as for
-  any unknown opcode in 1.0).
+- **Advisory notification**: `OpCancel` is sent by the requester to advise the responder that the requester is no longer waiting for the response to `(streamID, messageID)`. `OpCancel` has no reply frame.
+- **Responder lookup**: Upon receiving `OpCancel(streamID, messageID)`, the responder looks up that key among currently in-flight requests (either queued awaiting a worker or actively executing in a handler). If found, the responder cancels the request's handler context (section 4.2 and section 4.3). If not found (already answered, never seen, or previously dropped), the responder ignores the packet. Duplicate `OpCancel` packets for the same key are harmless.
+- **When `OpCancel` is emitted**: Sent by the requester when a `Call` context is canceled or its deadline expires **after** all chunks of the request have been published to the ring. A requester `MUST NOT` send `OpCancel` if the request itself was aborted mid-send via `AdvFlagAbort` (an aborted transfer is never delivered as a request), if the link or stream closed, or if the response already arrived.
+- **Non-blocking control transmission**: The requester queues `OpCancel` on its bounded outbound control queue on a best-effort basis and `MUST NOT` block the caller or the receive loop if the control queue is full (dropping the `OpCancel` and incrementing `DroppedMessages` if full). Because `OpCancel` and the responder's reply may cross in flight, the requester records the canceled key in its bounded abandoned-call set and silently discards any late response that arrives.
+- **Ordering guarantee**: Because `OpCancel` is published to the same ring after the final chunk of the request, the responder always finishes reassembling and routing the request before processing `OpCancel`.
+- **Unnegotiated reception**: If `FeatureCancel` was not negotiated, receiving opcode `0x07` fails the receive path with `ErrUnexpectedPacket`.
 
-## 3. Request metadata (`FeatureMetadata`, `AdvFlagMeta`)
+## 3. Request Metadata (`FeatureMetadata` and `AdvFlagMeta`)
 
-### 3.1 Flag
+When `FeatureMetadata` is negotiated, requests can carry an optional prefix block encoding a relative time budget, a 64-bit caller ID, and a 128-bit trace ID.
 
-`AdvFlagMeta = 1 << 6 = 0x40` in `OpConnCopy` operand 5. Full flag table:
+### 3.1 `AdvFlagMeta` (`0x40`)
 
-| Bit | Value | Name |
-|---|---|---|
-| 0 | `0x01` | `AdvFlagBegin` |
-| 1 | `0x02` | `AdvFlagEnd` |
-| 2 | `0x04` | `AdvFlagAbort` |
-| 3 | `0x08` | `AdvFlagRequest` |
-| 4 | `0x10` | `AdvFlagResponse` |
-| 5 | `0x20` | `AdvFlagError` |
-| 6 | `0x40` | `AdvFlagMeta` (1.1) |
+Protocol 1.1 assigns bit 6 (`0x40`) of `OpConnCopy` operand 5 to `AdvFlagMeta`:
 
-Rules:
+| Bit | Hex Value | Flag Name |
+| --- | --- | --- |
+| `0` | `0x01` | `AdvFlagBegin` |
+| `1` | `0x02` | `AdvFlagEnd` |
+| `2` | `0x04` | `AdvFlagAbort` |
+| `3` | `0x08` | `AdvFlagRequest` |
+| `4` | `0x10` | `AdvFlagResponse` |
+| `5` | `0x20` | `AdvFlagError` |
+| `6` | `0x40` | `AdvFlagMeta` (Protocol 1.1) |
 
-* `AdvFlagMeta` is valid only on request frames (`AdvFlagRequest` set,
-  including their abort frame) and only if `FeatureMetadata` was negotiated.
-  It is a protocol error (`ErrProtocol`) on any other frame (data message,
-  response) or when the feature is not negotiated. Bits above bit 6 remain
-  protocol errors.
-* The sender sets `AdvFlagMeta` on every frame of the message (like
-  `AdvFlagRequest`). The receiver takes the decision from the `Begin` frame.
-* A sender includes the flag, and the block, only if there is something to
-  send. A request without deadline, caller ID and trace ID has neither flag
-  nor block and is byte-identical to a 1.0 request.
+Validation rules for `AdvFlagMeta`:
 
-### 3.2 Block
+- `AdvFlagMeta` is permitted **only** on request frames (`AdvFlagRequest` set, including request `AdvFlagAbort` frames) and **only** when `FeatureMetadata` was negotiated. Setting `AdvFlagMeta` on a plain message, on a response frame, or when `FeatureMetadata` was not negotiated fails the receive path with `ErrProtocol`. Flag bits above bit 6 (`>= 0x80`) remain `ErrProtocol`.
+- When sending a request with metadata, the requester sets `AdvFlagMeta` on every chunk of that request, and the receiver latches the presence of metadata from the `Begin` chunk.
+- If a request has no deadline, no caller ID (`0`), and no trace ID (all zeros), the requester omits both `AdvFlagMeta` and the metadata block, producing a frame byte-identical to Protocol 1.0.
 
-When `AdvFlagMeta` is set, the payload of the message is
-`block || user payload`. `TotalSize`, `ChunkSize` and `ChunkOffset` of all
-frames count the block as ordinary payload bytes: the block is the first
-bytes of the message and may span chunks. The receiver reassembles the whole
-message first and then removes the block.
+### 3.2 Metadata Block Wire Format
 
-```
-offset  size  field
-0       2     tlvLen    uint16: number of TLV bytes after the 4-byte header
-2       2     reserved  written as 0, ignored by the receiver
-4       ...   TLVs      tlvLen bytes in total
+When `AdvFlagMeta` is set, the message body transmitted across `OpConnCopy` chunks is the concatenation `metadata_block || user_payload`. Frame fields `TotalSize`, `ChunkOffset`, and `ChunkSize` count the combined byte length, and the metadata block may span multiple chunks on small rings. After reassembling the full message buffer, the responder parses and strips `metadata_block` before passing `user_payload` to the handler.
+
+Header layout (4 bytes):
+
+```text
+Offset  Size  Field
+0       2     tlvLen    uint16 (little-endian): total byte length of the TLV sequence following byte 4
+2       2     reserved  uint16: written as 0 by senders, ignored by receivers
+4       ...   TLVs      tlvLen bytes of packed Tag-Length-Value records
 ```
 
-Each TLV:
+Each TLV record inside the `tlvLen` slice has the format:
 
-```
-0       1     tag       uint8
-1       1     length    uint8: number of value bytes
-2       length value
-```
-
-Known tags:
-
-| Tag | Name | Length | Value |
-|---|---|---|---|
-| 1 | time budget | 8 | `uint64` nanoseconds of time left for the request, counted from the moment the block was sent |
-| 2 | caller ID | 8 | `uint64`, application defined; 0 is "none" and not sent |
-| 3 | trace ID | 16 | 16 opaque bytes; all-zero is "none" and not sent |
-
-Rules:
-
-* Unknown tags are skipped (their length is still validated against the
-  block). A tag that appears twice: the last occurrence wins; senders MUST NOT
-  repeat tags.
-* A known tag whose length differs from the table, a TLV that does not fit in
-  `tlvLen`, `4 + tlvLen` larger than the message, or a message shorter than 4
-  bytes is a protocol error (`ErrProtocol`; the 1.0 treatment of a malformed
-  frame: the receive path fails).
-* `tlvLen` is 16 bits; this implementation sends at most 42 bytes (header +
-  tags 1, 2 and 3), and a receiver accepts any block that fits the message and
-  `MaxMessageSize`.
-* The time budget is relative on purpose: there is no dependence on a
-  wall clock shared by the processes. The sender computes the budget as
-  `deadline - now` (monotonic clock) when it builds the request; if it is not
-  positive the call fails locally with a deadline error and nothing is sent.
-  A request whose context has no deadline carries no tag 1.
-* The receiver takes the time `T0` at which the `Begin` frame of the request
-  was dequeued and defines `deadline = T0 + budget`. A budget of 0 means
-  "already expired". A budget larger than `2^63-1` ns is clamped.
-
-### 3.3 Examples
-
-Block with budget 5 s (`5_000_000_000 = 0x12A05F200`), caller
-`0x1122334455667788`, trace `01 00 .. 00` (42 bytes):
-
-```
-26000000                                  tlvLen = 38 (0x26), reserved
-01 08 00f2052a01000000                    tag 1: budget
-02 08 8877665544332211                    tag 2: caller
-03 10 01000000000000000000000000000000    tag 3: trace
+```text
+Offset  Size    Field
+0       1       tag       uint8 identifier
+1       1       length    uint8 value length in bytes
+2       length  value     little-endian integer or raw byte array
 ```
 
-Hex: `26000000010800f2052a0100000002088877665544332211031001000000000000000000000000000000`
+Defined TLV tags:
 
-Block with only a budget of 5 ns: `0a000000` `0108` `0500000000000000`.
+| Tag | Name | Value Length | Encoding and Semantics |
+| --- | --- | --- | --- |
+| `1` | Time budget | `8` bytes | Little-endian `uint64` nanoseconds remaining until the request deadline, measured at the moment the requester builds the request. |
+| `2` | Caller ID | `8` bytes | Little-endian `uint64` application-defined caller identifier (`0` means unset and is omitted). |
+| `3` | Trace ID | `16` bytes | 16-byte opaque trace identifier (all-zero means unset and is omitted). |
 
-Request on stream 0, message 1, method 9, user payload `"abc"`, buffer size
->= 45, so a single chunk: total size `42 + 3 = 45 = 0x2d`, flags
-`Begin|End|Request|Meta = 0x4b`, aux (method) 9.
+Parsing and clock rules:
 
+- **Forward-compatible unknown tags**: Receivers skip unrecognized `tag` values by advancing `2 + length` bytes (still verifying that `2 + length` fits within the remaining `tlvLen` budget). If a known tag appears more than once, the last occurrence wins; senders `MUST NOT` emit duplicate tags.
+- **Malformed metadata blocks**: If the reassembled message is shorter than 4 bytes, if `4 + tlvLen` exceeds the reassembled message length, if a TLV record overflows `tlvLen`, or if a known tag (`1`, `2`, or `3`) has a `length` different from the table above, the receiver fails the receive path with `ErrProtocol`.
+- **Relative monotonic time budget**: Transmitting a relative duration (`budget = deadline - now` on the requester's monotonic clock) avoids any dependency on synchronized wall clocks across processes. If `budget <= 0` when `Call` is invoked, `Call` fails immediately on the requester with `ErrTimeout` (`context.DeadlineExceeded`) without transmitting any frame.
+- **Responder deadline calculation**: The responder records the local monotonic timestamp `T0` when the request's `Begin` frame is dequeued and computes `deadline = T0 + min(budget, 2^63 - 1)`.
+
+### 3.3 Wire Encoding Examples
+
+1. **42-byte metadata block** carrying a 5-second budget (`5,000,000,000 = 0x000000012a05f200`), caller ID `0x1122334455667788`, and trace ID `01 00 .. 00`:
+
+```text
+2600 0000                                 tlvLen = 38 (0x0026), reserved = 0
+01 08 00f2052a01000000                    tag 1 (budget): 5,000,000,000 ns
+02 08 8877665544332211                    tag 2 (caller): 0x1122334455667788
+03 10 01000000000000000000000000000000    tag 3 (trace):  01 00 .. 00
 ```
+
+Combined hex (`42` bytes):
+
+```text
+26000000010800f2052a0100000002088877665544332211031001000000000000000000000000000000
+```
+
+2. **14-byte metadata block** carrying only a 5 ns budget:
+
+```text
+0a000000 0108 0500000000000000
+```
+
+3. **Single-chunk request** on stream `0`, message `1`, method `9`, user payload `"abc"` (`616263`), with the 42-byte metadata block above (`TotalSize = 42 + 3 = 45 = 0x2d`, flags `Begin|End|Request|Meta = 0x4b`, aux `9`):
+
+```text
 packet:  0400000000000000 0000000000000000 0100000000000000 2d00000000000000
          0000000000000000 2d00000000000000 4b00000000000000 0900000000000000
 buffer:  26000000010800f2052a0100000002088877665544332211031001000000000000000000000000000000 616263
 ```
 
-The same request with a 32-byte payload buffer: two chunks. Chunk 0 carries
-the first 32 bytes, chunk 1 the remaining 13 (the block spans both). `aux`
-is non-zero only in chunk 0 (1.0 rule: a chunk with offset > 0 and non-zero
-aux is `ErrInvalidSize`).
+4. **Two-chunk request** with the same 45-byte body over a 32-byte ring buffer (`aux` is `9` in chunk 0 and `0` in chunk 1 per Protocol 1.0 rules):
 
-```
+```text
 chunk 0 packet: 04.. | conn 0 | msg 1 | total 0x2d | offset 0    | size 0x20 | flags 0x49 (Begin|Request|Meta) | aux 9
 chunk 0 buffer: 26000000010800f2052a01000000020888776655443322110310010000000000
 chunk 1 packet: 04.. | conn 0 | msg 1 | total 0x2d | offset 0x20 | size 0x0d | flags 0x4a (End|Request|Meta)   | aux 0
 chunk 1 buffer: 00000000000000000000 616263
 ```
 
-(`T0` is the arrival of chunk 0.)
+## 4. Responder Request Lifecycle
 
-## 4. Request lifecycle at the responder
+On the responder side, Protocol 1.1 extends request handling with in-flight registration, per-request context cancellation, and response suppression for canceled calls.
 
-### 4.1 Arrival
+### 4.1 Reassembly and In-Flight Registration
 
-1. The request is assembled completely (1.0 rules). With `AdvFlagMeta` the
-   block is parsed and removed; `T0` is the arrival of the `Begin` frame. The
-   request payload exposed to the handler does not contain the block.
-   A request aborted by its sender (`AdvFlagAbort`) is dropped as in 1.0 and
-   never becomes a request in the sense of this section.
-2. The responder registers the request as *in flight* under the key
-   `(connection ID, message ID)` before it places it in the request queue, and
-   deregisters it when its handling ends (response sent, request skipped or
-   dropped). Queued requests are in flight.
-3. If the responder is shutting down (section 6) the request is not queued:
-   it is answered with the refusal response and not registered.
-4. If the request queue is full, the 1.0 overflow policies apply (block, drop,
-   fail); a dropped request is not in flight.
+1. The responder reassembles all chunks of the request (`SPEC.md` section 10.5). If `AdvFlagMeta` is set on the `Begin` chunk, the metadata block is validated and stripped, exposing only `user_payload` to the handler.
+2. Before placing the assembled request into the incoming request queue, the responder registers the request as **in flight** under `(connectionID, messageID)` and removes that registration when request processing finishes (whether answered, canceled, or skipped).
+3. If the responder has initiated graceful shutdown (section 6), the arriving request is not queued or registered; instead, the responder immediately queues an error response with status `ErrCodeShuttingDown` (`0x08`).
+4. If the incoming request queue is full, the configured overflow policy (`OverflowBlock`, `OverflowDrop`, or `OverflowFail`) applies.
 
-### 4.2 Handler context
+### 4.2 Per-Request Handler Context
 
-Each request is handled with its own context object (in the Go API a
-`context.Context`). The context is *canceled* when any of these happens, the
-first one decides the reason:
+Each request dispatched to the application's `Serve` handler receives a dedicated context that is canceled as soon as the earliest of the following events occurs:
 
-| Cause | Reason reported to the handler |
-|---|---|
-| `OpCancel` for the request arrived (`FeatureCancel`) | canceled |
-| `deadline = T0 + budget` passed (`FeatureMetadata`) | deadline exceeded |
-| the stream the request arrived on was closed, by either side | canceled |
-| the `Serve` loop of the responder ended (its own context ended, the link failed, `Serve` returned) or the link was closed | canceled |
-| the handler returned (end of the request) | canceled |
+| Trigger Event | Cancellation Cause Reported to Handler |
+| --- | --- |
+| `OpCancel` frame arrives for `(connectionID, messageID)` (`FeatureCancel`) | Canceled (`context.Canceled`) |
+| Request time budget `T0 + budget` expires (`FeatureMetadata`) | Deadline exceeded (`context.DeadlineExceeded`) |
+| The stream carrying the request is closed by either endpoint | Canceled |
+| The responder's `Serve` loop exits or the link is closed | Canceled |
+| The handler function returns | Canceled |
 
-Further rules:
+When a worker dequeues the request to invoke the handler, it computes `remaining = budget - (now - T0)`. If `remaining <= 0` (or if an `OpCancel` arrived while the request was sitting in the queue), the handler is **skipped** entirely (section 4.3).
 
-* Deadline: the responder computes the remaining time when the handler starts:
-  `remaining = budget - (now - T0)`. If it is not positive the handler is not
-  run (see 4.3). Otherwise the context reports `deadline = now + remaining`
-  (and the earlier of that and the deadline of the `Serve` context) and a
-  timer cancels it with "deadline exceeded" when it fires.
-* Value lookups delegate to the context of `Serve`.
-* The context is valid only during the handler call. After the handler returned
-  it is canceled and its resources are recycled; a handler MUST NOT keep it.
-* The handler may allocate a completion channel on demand (Go: `Done()`); an
-  implementation SHOULD NOT allocate per request when the handler only polls
-  the state.
+### 4.3 Skipping Canceled Requests and Suppressing Stale Responses
 
-### 4.3 Skipping and responses
+- **Pre-handler skip**: If a queued request is canceled or its deadline expires before a handler worker starts executing it, the responder does not invoke the handler and sends no response frame.
+- **Post-handler response suppression**: If the handler returns after its request context was canceled specifically by `OpCancel` or by request deadline expiration (`T0 + budget`), the responder suppresses the response frame (because the requester has already abandoned the call). For other termination causes (such as `Serve` shutdown while a handler finishes), the responder still attempts to transmit the handler's response.
 
-* A request that is canceled (any reason of 4.2 except "the handler
-  returned") before its handler started is not handed to the handler, and no
-  response is sent.
-* When the handler returns and the context had ended because of `OpCancel` or
-  the deadline, the response is not sent: the requester has already given up
-  (its deadline is never later than the responder's, because the budget is
-  relative to an earlier moment). In every other case (including stream close
-  and `Serve` end) the responder still tries to send the response; sending to
-  a closed stream or link simply fails.
-* If a response is sent anyway, the requester discards it when the call is in
-  its abandoned set (1.0 rule); the abandoned set is bounded (4096 keys in
-  the Go implementation).
+## 5. Requester `Call` Procedure
 
-## 5. Requester behavior
+When the application invokes `Call(ctx, method, payload [, CallOptions])`:
 
-`Call(ctx, method, payload [, options])`:
+1. **Metadata prefix construction**: If `FeatureMetadata` is negotiated, inspect `ctx` for a deadline (`budget = deadline - now`, failing locally if `<= 0`) and inspect `CallOptions` for non-zero `CallerID` and `TraceID`. If any of the three is present, prepend the 4-byte header + TLV block to `payload` and set `AdvFlagMeta` on every outgoing chunk (`MaxMessageSize` applies to `len(block) + len(payload)`).
+2. **Chunk transmission**: Register the pending call under `(streamID, messageID)` and publish the request chunks. If transmission fails after at least one chunk was published, emit an `OpConnCopy` frame with `AdvFlagAbort` (`SPEC.md` section 10.4) and do not send `OpCancel`.
+3. **Response wait and cancellation**: Block awaiting the response frame or `ctx.Done()`. If `ctx` ends first, move `(streamID, messageID)` into the bounded abandoned-call set, queue `OpCancel(streamID, messageID)` on the control sender if `FeatureCancel` is negotiated, and return `ctx.Err()`.
 
-1. If `FeatureMetadata` is negotiated: `budget = deadline(ctx) - now` if ctx
-   has a deadline (fail locally if `<= 0`); build the block from the budget
-   and the options (caller ID, trace ID). If the block is not empty, set
-   `AdvFlagMeta` on every frame and send `block || payload` as the message
-   (the 1.0 size limit `MaxMessageSize` applies to the sum).
-2. Register the pending call, send the chunks.
-   If sending fails (context ended, ring error) after at least one chunk was
-   sent, send the abort frame with `AdvFlagAbort` (1.0 rule). No `OpCancel`.
-3. Wait for the response. If ctx ends while waiting: remove the pending call,
-   remember its key in the abandoned set, return the context error, and, if
-   `FeatureCancel` is negotiated, queue `OpCancel(streamID, messageID)`
-   through the control queue.
-4. Without `FeatureMetadata` options are ignored and no block is sent.
-   Without `FeatureCancel` nothing is sent when the call is abandoned.
+## 6. Graceful Responder Shutdown (`ErrCodeShuttingDown = 0x08`)
 
-No ordering is guaranteed between `OpCancel` and a response that the
-responder emitted concurrently; both orders are valid.
+Graceful shutdown (`AdvancedLink.Shutdown(ctx)` in Go, `hqq_adv_shutdown` in C) allows a server to stop accepting new RPC requests while draining all requests already in flight:
 
-## 6. Graceful shutdown
+- **Wire error status `0x08`**: Protocol 1.1 defines `ErrCodeShuttingDown = 0x08`.
+- **Refusal of new requests**: Once shutdown begins on a responder, every newly assembled request is immediately answered with an error response frame (`flags = Begin|End|Response|Error = 0x33`, `TotalSize = 0`, `aux = 0x08`) via the outbound control queue, causing the requester's `Call` to return `ErrShuttingDown` (`ResponseError{Status: 8}`).
 
-Shutdown is a local operation of the responder (`AdvancedLink.Shutdown(ctx)`
-in Go). It adds one wire element: an error status.
+Example 64-byte refusal response for request message `2` on stream `0`:
 
-* `ErrCodeShuttingDown = 0x08`.
-* From the moment shutdown starts, every request that arrives is answered
-  with an error response (flags `Begin|End|Response|Error = 0x33`, total size
-  0, aux = `0x08`) instead of being handled. The response is queued on the
-  control queue (best effort, like the refusal of an over-limit request in
-  1.0, which uses status `0x07`). The requester's `Call` fails with an error
-  response with status 8.
-
-Example refusal of request message 2 on stream 0:
-
-```
+```text
 0400000000000000 0000000000000000 0200000000000000 0000000000000000
 0000000000000000 0000000000000000 3300000000000000 0800000000000000
 ```
 
-* Requests accepted before shutdown started (queued or running) are handled
-  and answered normally. Shutdown completes when none is in flight, or when the
-  caller's context ends (the refusals continue until the link is closed).
-* After shutdown completed, the request loop returns without error. The link
-  itself stays usable: shutdown does not close streams, does not send
-  `OpConnClose`, and does not stop the requester role of the endpoint.
-  `Close` ends everything and cancels all handler contexts.
-* Shutdown does not use any new opcode or flag; the peer learns about it only
-  through the refusals.
+- **Draining in-flight requests**: Requests that were registered before shutdown began (whether queued or actively running in a handler) run to completion and send their normal responses. `Shutdown(ctx)` blocks until the in-flight request count reaches zero or `ctx` expires, after which `Serve` returns cleanly (`nil` / `HQQ_OK`).
+- **Link usability after shutdown**: Completing `Shutdown` stops only the responder role; open streams, plain messaging, and outbound `Call` requests from this endpoint remain usable until `Close()` is called.
 
-## 7. Error and validation summary
+## 7. Wire Error and Validation Summary
 
-| Situation | Reaction |
-|---|---|
-| `AdvFlagMeta` set but `FeatureMetadata` not negotiated | `ErrProtocol` (receive path fails, as for any unknown flag in 1.0) |
-| `AdvFlagMeta` without `AdvFlagRequest` | `ErrProtocol` |
-| flag bits above bit 6 | `ErrProtocol` |
-| malformed metadata block (3.2) | `ErrProtocol` |
-| `OpCancel` without `FeatureCancel` | `ErrUnexpectedPacket` |
-| `OpCancel` for an unknown key | ignored |
-| request refused by shutdown | error response, status `0x08` |
-| request refused by the reassembly limit | error response, status `0x07` (1.0) |
+| Wire Condition | Receiver Action |
+| --- | --- |
+| `AdvFlagMeta` set when `FeatureMetadata` was not negotiated | Fail receive path with `ErrProtocol` |
+| `AdvFlagMeta` set on a frame without `AdvFlagRequest` | Fail receive path with `ErrProtocol` |
+| Any flag bit above bit 6 (`flags & ~0x7f != 0`) | Fail receive path with `ErrProtocol` |
+| Malformed metadata header or TLV record (section 3.2) | Fail receive path with `ErrProtocol` |
+| `OpCancel` (`0x07`) received when `FeatureCancel` was not negotiated | Fail receive path with `ErrUnexpectedPacket` |
+| `OpCancel` received for an unknown or completed `(streamID, messageID)` | Silently ignore |
+| Request arrives while responder is shutting down | Reply with error response (`flags = 0x33`, `aux = 0x08`) |
+| Request exceeds `MaxReassemblyBytes` | Reply with error response (`flags = 0x33`, `aux = 0x07`) |
 
-Error codes (`ErrorCode`, carried in `OpError` operand 1 and as the aux of an
-error response): `0x01` memory align, `0x02` invalid size, `0x03` memory too
-small, `0x04` failed init, `0x05` connection not found, `0x06` invalid
-operation, `0x07` buffer overflow, `0x08` shutting down (1.1).
+Complete wire `ErrorCode` table (`OpError` operand 1 and error-response `aux`):
 
-## 8. Implementation notes (non-normative)
+- `0x01`: `ErrCodeMemoryAlign` (`ErrMemoryAlign`)
+- `0x02`: `ErrCodeInvalidSize` (`ErrInvalidSize`)
+- `0x03`: `ErrCodeMemorySmall` (`ErrMemorySmall`)
+- `0x04`: `ErrCodeFailedInit` (`ErrFailedInit`)
+- `0x05`: `ErrCodeConnNotFound` (`ErrConnNotFound`)
+- `0x06`: `ErrCodeInvalidOp` (`ErrInvalidOp`)
+- `0x07`: `ErrCodeBufferOverflow` (`ErrBufferOverflow`)
+- `0x08`: `ErrCodeShuttingDown` (`ErrShuttingDown`, Protocol 1.1)
 
-The Go implementation (`advanced_request.go`):
+## 8. Non-Normative Implementation Notes
 
-* attaches a pooled request context to every request when it is routed, so
-  that `OpCancel`, stream close and shutdown can find it while it still waits
-  in the request queue; the registry is a map `(stream, message) -> context`
-  under one mutex;
-* uses a pooled deadline timer per context (`time.AfterFunc`, reset per
-  request, waited for when it already fired before the context is reused);
-* allocates the completion channel only when the handler asks for it, and does
-  not recycle such a context;
-* sends `OpCancel` through the control-sender goroutine, never from the
-  receive path.
+In the Go reference implementation (`advanced_request.go`):
 
-A C implementation can use any equivalent structure; only the observable
-behavior of sections 2-6 is normative.
+- Every incoming request is assigned a pooled request context before entering the request queue, indexed in a mutex-guarded `(streamID, messageID)` map so `OpCancel`, stream close, or link close can cancel it while still queued.
+- Per-request deadline timers (`time.AfterFunc`) are pooled and reset across requests, and completion channels (`ctx.Done()`) are allocated lazily only if the handler calls `Done()`.
+- Outbound `OpCancel` packets and shutdown refusal responses are transmitted asynchronously through the bounded control-sender goroutine so the receive loop never blocks on the TX ring.

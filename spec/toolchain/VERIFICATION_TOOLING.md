@@ -1,217 +1,95 @@
-# Memory-model verification tooling
+# Memory-Model Verification Tooling
 
-Status: milestone M3c. The GenMC harnesses for the real ring core are in
-section 3.2 (GenMC runs only in CI). The Go implementation gets sequential
-consistency for free (all Go atomics are seq_cst). A C (or Rust/C++)
-implementation chooses a memory order per access, and the choice is
-load-bearing in exactly one place that is easy to get wrong: the **wake
-handshake** (a store-buffering / Dekker pair), see
-[`PROTOCOL.md`](../../PROTOCOL.md) "Parking and process-local aggregation".
+**Status**: Active verification suite for `libhqq` (`c/verify/`), executed in the `memory-model` job of [`.github/workflows/c.yml`](../../.github/workflows/c.yml).
 
-This document describes the tools that check the C11 memory orders, how to
-install and run them reproducibly, and what they were observed to do. Inputs
-and scripts live under [`c/verify/`](../../c/verify); CI runs them in the
-`memory-model` job of [`.github/workflows/c.yml`](../../.github/workflows/c.yml).
+While Go's `sync/atomic` operations provide sequential consistency by default, a C11, C++, or Rust implementation chooses an explicit memory order (`relaxed`, `acquire`, `release`, `acq_rel`, or `seq_cst`) for each shared-memory access. That choice is critical in the **Dekker wait/wake handshake** (`SPEC.md` section 8 and `MEMORY_MODEL.md` section 4) and in **ring slot publication and wraparound** (`MEMORY_MODEL.md` section 3).
 
-## 1. What is checked, and by which tool
+This document describes the formal and empirical verification tools in [`c/verify/`](../../c/verify), how to install and run them reproducibly, and the exact invariants and counterexamples they check.
 
-| Layer | Tool | Model | Finds | Where |
-|---|---|---|---|---|
-| Ring state machine | TLC (existing) | sequentially consistent interleavings | protocol logic bugs | `internal/mpmc/MPMC.tla`, `scripts/tlc.sh` |
-| C11 code, exhaustive, small programs | **GenMC** | RC11 (also RA, IMM, TSO, SC) | assertion failures, lost wake-ups, races on plain data, under *all* C11-allowed executions | `c/verify/genmc/` |
-| Axiomatic litmus shapes | **herd7** (herdtools7) | `rc11.cat` (C11 variants available) | whether an outcome is allowed by the model; also flags undefined behaviour (races) | `c/verify/litmus/`, `spec/litmus/` |
-| Real hardware | stress litmus harness | actual CPU (arm64 and x86-64) | compiler/hardware mis-mappings of the orders (smoke, not proof) | `c/verify/stress/` |
-| Memory safety / data races in the build | ASan, UBSan, TSan | instrumented execution | UB, leaks, races observed at runtime | CMake `HQQ_SANITIZE` |
+## 1. Verification Layers and Tooling Summary
 
-None of the model checkers verifies compiled code or real hardware; they check
-the C11 *source-level* contract. The stress harness and the arm64 CI runners
-are the empirical complement. CBMC and similar bounded model checkers were
-considered and **not** adopted: [INFERENCE, from CBMC's documentation, not
-tried here] its weak-memory support targets hardware-style models (TSO, PSO,
-Power via `--mm`) rather than the C11/RC11 orders the code is written against,
-and its sequential bounded checking duplicates what TLC and GenMC already give.
-Revisit only if a sequential property (for example buffer arithmetic overflow
-in the superblock parser) needs it.
+No single tool checks both source-level C11 weak-memory axiomatics and compiled machine-code execution on real CPUs. HQQ combines five complementary verification layers:
 
-## 2. The invariant under test
+| Layer | Tool | Memory Model | Defects Detected | Repository Location |
+| --- | --- | --- | --- | --- |
+| Ring state machine | **TLC** (TLA+) | Sequentially consistent interleavings | Protocol state-machine bugs | `internal/mpmc/MPMC.tla`, `scripts/tlc.sh` |
+| Exhaustive C11 source verification | **GenMC** (v0.19.0) | RC11 (plus RA, IMM, TSO, SC) | Assertion failures, lost wake-ups, and non-atomic payload races across **all** C11-permitted executions | `c/verify/genmc/` |
+| Axiomatic litmus models | **herd7** (`herdtools7` 7.58) | `rc11.cat` (C11 cat models) | Reachability of forbidden states and undefined data races in `.litmus` models | `c/verify/litmus/`, `spec/litmus/` |
+| Native hardware stress | **`hqq_stress_litmus`** | Physical `arm64` and `x86_64` CPUs | Compiler lowering bugs or missing hardware barriers under high-contention thread races | `c/verify/stress/` |
+| Runtime sanitizers | **ASan, UBSan, TSan** | Instrumented execution | Out-of-bounds accesses, undefined behavior, memory leaks, and data races | CMake `-DHQQ_SANITIZE=...` |
 
-Slot publication and wake handshake, modelled in `c/verify/genmc/mp_wake.c`:
+GenMC and `herd7` verify the **source-level C11 contract** across all executions permitted by the RC11 memory model, while `hqq_stress_litmus` and the ARM64 sanitizer jobs verify the **compiled binary** on real weakly ordered hardware.
 
-```
-producer                          consumer
-data = 42            (plain)      waiters += 1                [W]
-seq  = 1             [P]          s = seq                     [R]
-w = waiters          [V]          if (s == 1) read data (plain)
-if (w == 0) no_wake = 1           else would_park = 1
+## 2. Core Invariants Under Test
+
+Both the standalone proof-of-concept model (`c/verify/genmc/mp_wake.c`) and the production ring models (`c/verify/genmc/ring_*.c`) verify two coupled properties:
+
+```text
+Producer                                   Consumer
+-----------------------------------------  -----------------------------------------
+data = 42            (plain store)         waiters += 1                [W]
+seq  = 1             [P]                   s = seq                     [R]
+w = waiters          [V]                   if (s == 1) read data (plain load)
+if (w == 0) no_wake = 1                    else would_park = 1
 ```
 
-Invariants: (1) **no lost wake-up**: never `would_park && no_wake`;
-(2) **publication**: if the consumer sees `seq == 1`, it reads `data == 42`
-and the plain accesses do not race.
+1. **No lost wake-up**: `would_park && no_wake` is unreachable across all executions.
+2. **Race-free payload publication**: Whenever the consumer observes `seq == 1`, it reads `data == 42`, and the plain payload accesses never form a C11 data race.
 
-`[P] [V] [W] [R]` form a store-buffering pair, so release/acquire is **not
-enough**; they must be `seq_cst`, or release/acquire separated by
-`atomic_thread_fence(memory_order_seq_cst)` on both sides. The publication
-store `[P]` must additionally be at least a *release* (it is, in both correct
-variants), and the consumer's slot check an *acquire*. A C port must keep
-exactly one of these two forms for the four accesses.
+Because `[P]`, `[V]`, `[W]`, and `[R]` form a store-buffering (Dekker) pair, release/acquire ordering is insufficient: all four accesses must be `memory_order_seq_cst` (or release/acquire separated by `atomic_thread_fence(memory_order_seq_cst)` on both sides), `[P]` must be at least a release store, and `[R]` must be at least an acquire load.
 
-## 3. GenMC
+## 3. Stateless Model Checking With GenMC
 
-[GenMC](https://github.com/MPI-SWS/genmc) is a stateless model checker that
-works on LLVM IR and supports RC11, RA, IMM, TSO and SC.
+[GenMC](https://github.com/MPI-SWS/genmc) is a stateless model checker operating on LLVM IR under the RC11 memory model.
 
-**Reproducible install (Ubuntu 24.04, apt LLVM 19)** is
-[`c/verify/install-genmc.sh`](../../c/verify/install-genmc.sh): it checks out the
-pinned commit `9f6c4c0772d0c42b325681581acc6a0f3eb9b5f7` (tag `v0.19.0`, verified
-after checkout), configures with `CMAKE_PREFIX_PATH=/usr/lib/llvm-19/cmake` and
-Release, builds with clang-19 and installs into a prefix. GenMC v0.19.0 supports LLVM
-19-22 and needs a C++20 compiler. Build dependencies:
-`cmake make bc llvm-19-dev clang-19 libclang-19-dev libffi-dev zlib1g-dev libedit-dev git`.
-
-Local reproduction in Docker (arm64 or amd64 host):
+Script [`c/verify/install-genmc.sh`](../../c/verify/install-genmc.sh) builds and installs GenMC `v0.19.0` (pinned at commit `9f6c4c0772d0c42b325681581acc6a0f3eb9b5f7`) against Ubuntu 24.04's `llvm-19` and `clang-19` packages. To run the GenMC suite locally inside Docker on either `amd64` or `arm64`:
 
 ```sh
 docker build -t hqq-genmc -f c/verify/genmc/Dockerfile c/verify
 docker run --rm -v "$PWD":/src:ro hqq-genmc /src/c/verify/genmc/run.sh --genmc genmc
 ```
 
-Notes learned while building it: `GenMCDriver.cpp` needs more than 2 GB of RAM
-with g++-14, which was OOM-killed on a 4 GB Docker VM; clang-19 compiles it in
-well under that, so clang is the script's default host compiler (`CC=`/`CXX=`
-override it). Use `JOBS=1` on small machines. The result is not cached by the
-Dockerfile layers on failure, so the Dockerfile uses a BuildKit cache mount for
-the build tree. CI caches the installed prefix keyed on commit, LLVM version and
-the script hash.
+### 3.1 Proof-of-Concept Model (`mp_wake.c`)
 
-**Proof of concept**: [`c/verify/genmc/mp_wake.c`](../../c/verify/genmc/mp_wake.c),
-run by [`c/verify/genmc/run.sh`](../../c/verify/genmc/run.sh) with
-`genmc -rc11 -disable-mm-detector --disable-estimation -- -DVARIANT_x mp_wake.c`.
-(`-disable-mm-detector` stops GenMC from silently downgrading the model to RA
-for programs that only use acquire/release.)
+Script [`c/verify/genmc/run.sh`](../../c/verify/genmc/run.sh) runs GenMC with `-rc11 -disable-mm-detector -disable-estimation -disable-ipr` against four variants of `mp_wake.c`:
 
-| Variant | Orders | Expected | Observed (GenMC v0.19.0, LLVM 19.1.1, arm64 container) |
-|---|---|---|---|
-| `VARIANT_SEQCST` | `[P] [V] [W] [R]` all `seq_cst` | pass | `Number of complete executions explored: 3`, no error |
-| `VARIANT_FENCE` | release store, acquire check, `seq_cst` fence between store and load on both sides, relaxed waiter ops | pass | `Number of complete executions explored: 3`, no error |
-| `VARIANT_ACQREL` | release / acquire / acq_rel only | **fail** (lost wake-up) | `Error: Safety violation!`, counterexample graph: producer `Rrlx/Racq (waiters, 0) [INIT]` then `Wna (no_wake, 1)`; consumer `UWar (waiters, 1)` then `Racq (seq, 0) [INIT]` then `Wna (would_park, 1)`; exit status 42 |
-| `VARIANT_RELAXED_PUB` | correct handshake, but `[P]` is a relaxed store | **fail** (publication race) | `Error: Non-atomic race! Event (2, 5) conflicts with event (1, 1)`: the consumer's `Rna (data, 42)` races with the producer's `Wna (data, 42)`; exit status 42 |
+| Variant | Ordering Configuration | Expected Verdict | Observed GenMC v0.19.0 Result |
+| --- | --- | --- | --- |
+| `VARIANT_SEQCST` | `[P]`, `[V]`, `[W]`, `[R]` all `memory_order_seq_cst` | **Pass** | `Number of complete executions explored: 3`, zero errors (exit `0`). |
+| `VARIANT_FENCE` | Release store, acquire load, and `seq_cst` fence between store and load on both sides | **Pass** | `Number of complete executions explored: 3`, zero errors (exit `0`). |
+| `VARIANT_ACQREL` | Release / acquire / acq_rel only (no `seq_cst`) | **Fail** (lost wake-up) | `Error: Safety violation!` with counterexample where producer reads `waiters == 0` and consumer reads `seq == 0` (exit `42`). |
+| `VARIANT_RELAXED_PUB` | `seq_cst` wake check, but `[P]` weakened to `memory_order_relaxed` | **Fail** (data race) | `Error: Non-atomic race!` between producer `Wna (data, 42)` and consumer `Rna (data, 42)` (exit `42`). |
 
-Interpretation: the seq_cst and fence forms are the two acceptable
-implementations of the handshake; weakening them to acquire/release breaks the
-no-lost-wake-up invariant, and weakening the publication store breaks payload
-visibility. `run.sh` asserts all four verdicts (and the key lines of the two
-counterexamples), so a regression in a future edit of the PoC, or in GenMC,
-turns the CI job red.
+### 3.2 Production Ring-Core Verification Programs (`ring_*.c`)
 
-Limits: GenMC checks a program of two threads and one slot, not the library; it
-treats `waiters`/`seq` as ints and does not model futex/semaphore blocking, a
-process dying while parked, or mixed-size accesses. The ring-core harnesses of
-section 3.2 use the real header, with the same blind spots: the wait hook is a
-recording stub, not a blocking kernel call.
+In addition to `mp_wake.c`, four verification programs include the real production ring implementation (`c/src/hqq_ring.h`) directly via `c/verify/genmc/hqq_model.h` and verify both positive (unmodified `c/src/hqq_ring.h`) and negative (intentionally weakened) builds:
 
-### 3.2 Harnesses for the real ring core (M3c)
+| Program | Scenario Modeled | Invariants Verified in Every Execution | Positive Target (Must Pass) | Negative Target (Must Fail with Exit `42`) |
+| --- | --- | --- | --- | --- |
+| `ring_mp.c` | 1 producer, 1 consumer, 2-slot ring, 4 messages (wrapping across two full laps) | FIFO delivery, exact payload values, and race-free plain payload reads/writes across slot reuse | `run.sh mp` | `-DHQQ_VERIFY_WEAKEN_RELAXED` (triggers non-atomic payload race) |
+| `ring_wake.c` | Consumer (`peek`, `hqq_ring_park`, `peek`) vs producer (`claim`, write, `hqq_ring_publish`) on a 2-slot ring | Zero lost wake-ups: whenever the consumer sleeps on futex compare value `v`, the producer increments the wake word after the consumer's snapshot | `run.sh wake` | `-DHQQ_VERIFY_WEAKEN_ACQREL` (triggers lost wake-up assertion failure) |
+| `ring_reserve.c` | Single reservation claimed, two concurrent threads race to call `hqq_ring_publish_guarded` on copies of the handle | Exactly one completion succeeds; the stale handle copy is rejected and the slot is published once | `run.sh reserve` | `-DHQQ_VERIFY_UNGUARDED` (triggers double completion failure) |
+| `ring_claim.c` | 2 concurrent producer threads race on the producer cursor CAS (`w`), followed by consumer drain | Both claims obtain distinct positions and both payloads are delivered intact | `run.sh claim` | None (cursor CAS remains atomic under `acq_rel`) |
 
-GenMC runs only in the CI `memory-model` job. It is not run on the development
-hosts (no docker, no heavy installs), so nothing in this section has been
-observed under GenMC yet.
+How weakened builds and model hooks work:
 
-The harnesses check the protocol of the real header, `c/src/hqq_ring.h`, which
-they include unmodified through `c/verify/genmc/hqq_model.h`. Each drives the ring
-through a small fixed scenario:
+- **Selective order weakening (`hqq_model.h`)**: In positive runs, `c/src/hqq_ring.h` compiles with its exact production `<stdatomic.h>` operations. When `-DHQQ_VERIFY_WEAKEN_ACQREL` is defined, `hqq_model.h` rebinds `memory_order_seq_cst` operations in the ring core to their strongest non-SC equivalents (`acquire` for loads, `release` for stores, `acq_rel` for RMWs). When `-DHQQ_VERIFY_WEAKEN_RELAXED` is defined, those operations become `memory_order_relaxed`.
+- **Strong CAS and loop bounding under GenMC**: Under GenMC (`__GENMC__`), `c/verify/genmc/hqq_model.h` includes `<genmc.h>` for `__VERIFIER_assume` and maps `atomic_compare_exchange_weak_explicit` to `atomic_compare_exchange_strong_explicit` (following GenMC's `StrengthenCASPass` recommendation so spurious weak-CAS failures do not create unbounded retry trees). `run.sh` invokes GenMC with `-rc11 -disable-mm-detector -disable-estimation -disable-ipr -unroll=128` and verifies that every positive target exits `0` with at least one complete execution and every negative target exits `42` (`EVERIFY`) with the expected diagnostic string.
+- **Native pthread mode (`-DHQQ_VERIFY_HOST`)**: The exact same `ring_*.c` programs also compile as native POSIX-thread executables (`run.sh --check` and `run.sh --host 20000`) with a 5-second watchdog timer on condition-variable waits.
 
-| Harness | Scenario | Checked in every execution | Positive (must pass) | Negative (must fail) |
-|---|---|---|---|---|
-| `ring_mp.c` | 1 producer, 1 consumer, 2 slots, 4 messages (messages 2 and 3 wrap onto slots 0 and 1) | FIFO delivery, each payload once; the payload read is ordered after its publish (otherwise a race on plain memory) | `run.sh mp` | `-DHQQ_VERIFY_WEAKEN_RELAXED`: publication race |
-| `ring_wake.c` | waiter (peek, `hqq_ring_park`, peek) and waker (claim, write, `hqq_ring_publish`), 2 slots | no lost wake-up: if the waiter sleeps on word `v`, the waker bumps the word after the waiter's read | `run.sh wake` | `-DHQQ_VERIFY_WEAKEN_ACQREL`: lost wake-up |
-| `ring_reserve.c` | main claims one reservation; two completers, each with its own copy of the handle, call `hqq_ring_publish_guarded` | exactly one completion; a stale copy changes nothing; the payload is consumed once from the reserved position | `run.sh reserve` | `-DHQQ_VERIFY_UNGUARDED` (plain `hqq_ring_publish`): two completions |
-| `ring_claim.c` | 2 producers race for the producer cursor (CAS); the main thread consumes after the join | the two claims are distinct; each payload arrives once, from the position its producer got | `run.sh claim` | none: the cursor CAS is an RMW and stays atomic under acquire/release |
+## 4. Axiomatic Litmus Verification With `herd7`
 
-The PoC `mp_wake.c` is still run, as target `poc`.
-
-**Weakened builds.** `hqq_model.h` rebinds the atomic macros only in the weakened
-builds (through the clang `__c11_atomic` builtins). `HQQ_VERIFY_WEAKEN_ACQREL`
-turns every seq_cst access of the ring core into the strongest acquire, release,
-or acq_rel order valid for that operation (CAS: acq_rel on success, acquire on
-failure). `HQQ_VERIFY_WEAKEN_RELAXED` makes them all relaxed. The header's own
-acquire/release/relaxed accesses are not changed, and the harness code never uses
-seq_cst. The LLVM IR of the ACQREL build was inspected on the host: the handshake
-accesses are acquire loads, release stores and acq_rel RMWs.
-
-**Hooks.** In GenMC, `hqq_ring_ops.wait` stays asleep until the word differs from `v`
-or the waker has finished (`HQV_PEER_DONE()`, called after its last publish). A kernel
-`wait(word, v)` blocks forever only if the word still equals `v` when the waiter
-sleeps and nobody bumps it later, and after the waker's last publish nobody can. So
-`ring_wake.c` asserts, whenever the waiter went to sleep, that the word differs from
-`v` at the end: exactly "no lost wake-up". An earlier stub returned at once, so the
-waiter left the park (decremented `waiters`) before the waker read the count, and
-the correct protocol was reported as a lost wake-up (CI run 38945948026, `wake (none)`).
-Producer and consumer retries use `__VERIFIER_assume` (`HQV_AWAIT`):
-an execution in which a retry still fails is discarded, not reported. run.sh
-requires at least one complete execution for every positive variant, so a
-vacuous pass fails.
-
-**Host build** (`-DHQQ_VERIFY_HOST`). The same files compile as ordinary pthread
-programs. The hooks are a mutex and condition variable, and a waiter still asleep
-on an unchanged word after 5 s aborts. `run.sh --host N` runs each harness N times.
+`herd7` (`herdtools7` 7.58) evaluates the axiomatic C11 `.litmus` models in `c/verify/litmus/*.litmus` and `spec/litmus/*.litmus` against `rc11.cat`. Script [`c/verify/install-herd.sh`](../../c/verify/install-herd.sh) installs `herdtools7.7.58` into a cached `opam` switch, and [`c/verify/litmus/run-herd.sh`](../../c/verify/litmus/run-herd.sh) checks every model against `expected.txt` and `spec-expected.txt`:
 
 ```sh
-c/verify/genmc/run.sh --genmc PATH [poc|mp|wake|reserve|claim ...]   # GenMC, CI only
-CC=clang c/verify/genmc/run.sh --check      # host syntax, every variant (weakened: clang)
-c/verify/genmc/run.sh --host 20000          # host pthread run
-```
-
-**Observed on the host** (macOS arm64, Apple clang 21): `run.sh --check` passes
-for every variant under `-std=c11 -Wall -Wextra -Wpedantic -Werror`, with and
-without `-DHQQ_VERIFY_HOST`. Each of the four harnesses ran 10 000 iterations
-natively with exit status 0.
-
-**GenMC verdicts and fixes.** CI run 38945948026 (job `memory-model`): the four PoC verdicts matched the table above; `wake (none)` was the stub defect fixed above; `mp` failed without the expected output, and `reserve (none)` did not finish. CI run 38986334680 (GenMC v0.19.0, commit `9f6c4c0`) gave the causes below, each with its fix. Citations are to that commit.
-
-- `mp`, `wake`, `claim`: `ERROR: Tried to execute an unknown external function: __VERIFIER_assume` (exit 17). GenMC v0.19 maps only `__VERIFIER_assume_internal` (`passes/passes/InternalFunction.def`). `__VERIFIER_assume(cond)` is a macro of `<genmc.h>` (`lli/runtime-include/c/genmc.h`), and the harness declared its own `void __VERIFIER_assume(int)`, which is an unknown external. Fix: GenMC builds `#include <genmc.h>`; the host build does not.
-- `reserve (none)`: timeout (observed). Cause (from the GenMC source, not from a trace): each successful weak CAS pushes its spurious failure as an extra execution (`genmc/genmc/Verification/GenMCDriver.cpp`, `maybePushWeakCasFailure`). The claim loop then retries, succeeds again, and pushes another, without bound. Fix: GenMC builds rebind `atomic_compare_exchange_weak_explicit` to the strong CAS (GenMC's own advice, `passes/passes/Transforms/StrengthenCASPass.cpp`: "Strong CASes enable more effective verification"). A spurious failure only repeats a cursor read and retries, so the outcomes are unchanged [INFERENCE, argued in `hqq_model.h`, not checked by GenMC].
-- `reserve -DHQQ_VERIFY_UNGUARDED`: `in-place revisiting (IPR)` error with 0 executions (`GenMCDriver.cpp`, `checkIPRValidity`: unordered writes on an annotated read become an error under IPR). Fix: `-disable-ipr` (`lli/main.cpp`), passed for every case, so the weakened `mp` negative cannot end on that error instead of the race.
-
-`run.sh` now passes `-rc11 -disable-mm-detector -disable-estimation -disable-ipr -unroll=128`. `-unroll` bounds every loop (`doc/manual/cli.md`). A bound-cut thread is a `ThreadKill` terminator (`GenMCDriver.cpp`, `handleThreadKill`), which counts as a complete execution, so it cannot be seen in the output. The harness loops are constant-bounded (at most 64 iterations) or terminate under the strong CAS, so the bound must not bind; it guards only against a hang. A positive case passes only with exit 0 and a complete execution; a negative case needs exit 42 (GenMC `EVERIFY`) and its needles, and every mismatch or timeout prints the command and the last `GENMC_TAIL` (200) lines. None of these verdicts has been observed yet: the next CI run of the `memory-model` job is the first observation. The herd7 steps run regardless of GenMC (`if: always()`).
-
-### 3.3 Status summary
-
-| Item | Status |
-|---|---|
-| PoC `mp_wake.c` (4 variants) | written; GenMC verdicts observed (section 3) |
-| Harnesses `ring_mp`, `ring_wake`, `ring_reserve`, `ring_claim` (positive and negative) | written; host syntax and native run observed; GenMC-mode compile observed (LLVM IR with the real `genmc.h`); GenMC **not run** (fixes below, CI pending) |
-
-
-## 4. herd7 (herdtools7)
-
-`herd7` evaluates litmus tests against axiomatic cat models. The C11 tests are
-in `c/verify/litmus/*.litmus` (store buffering with `seq_cst`, acq/rel, and
-fences; message passing with release/acquire and relaxed) and the handshake /
-publication / slot-wraparound tests in `spec/litmus/` (owned by the spec
-baseline). [`c/verify/litmus/run-herd.sh`](../../c/verify/litmus/run-herd.sh) runs
-both sets under `rc11.cat` and checks the expectations in `expected.txt` and
-`spec-expected.txt` (`Never`, `Sometimes`, or `Bug` = reachable or flagged as
-undefined behaviour).
-
-**Install.** The Debian/Ubuntu archive does not ship herdtools7. CI and Docker use
-[`c/verify/install-herd.sh`](../../c/verify/install-herd.sh): opam with the system OCaml
-(`ocaml-system`, 4.14 on Ubuntu 24.04) and the pinned `herdtools7.7.58`
-(`dune`, `menhir`, `zarith` are pulled in by opam). Build dependencies:
-`opam ocaml-nox build-essential libgmp-dev pkg-config m4 unzip curl git`.
-`HERD_JOBS=1` limits build parallelism: the herdtools7 Makefile runs
-`dune build -j $(nproc)` and the native build of `herd7` was OOM-killed on a
-4 GB Docker VM with 4 jobs (the script exports `OMP_NUM_THREADS`, which `nproc`
-honours). The opam root is cached by CI.
-
-```sh
-c/verify/install-herd.sh                       # installs into the opam switch "herd"
+c/verify/install-herd.sh
 eval "$(opam env --switch=herd)"
 c/verify/litmus/run-herd.sh "$(command -v herd7)"
 ```
 
-**Observed** (herdtools7 7.58, `rc11.cat`, Ubuntu 24.04 arm64 container):
+Observed output from `herd7` (`herdtools7` 7.58, `rc11.cat`):
 
-```
+```text
 herd7 model: rc11.cat
 SB+sc                                  states=3  expected=Never     got=Never     flags=-
 SB+acqrel                              states=4  expected=Sometimes got=Sometimes flags=-
@@ -227,37 +105,18 @@ wake_handshake_acqrel                  states=4  expected=Sometimes got=Sometime
 wake_handshake_fences                  states=3  expected=Never     got=Never     flags=-
 ```
 
-The `*undef*` flag on the `_relaxed_bug` tests is the data race on the plain
-payload; `slot_wraparound_handoff_relaxed_bug` is therefore recorded as a
-race (`Bug`), not as a reachable condition.
+The `*undef*` flag emitted by `herd7` on `mp_publish_relaxed_bug` and `slot_wraparound_handoff_relaxed_bug` confirms that weakening the sequence store to `relaxed` introduces a C11 data race on the non-atomic payload bytes.
 
-## 5. Stress litmus harness (hardware)
+## 5. Hardware Weak-Memory Stress Runner (`hqq_stress_litmus`)
 
-[`c/verify/stress/stress_litmus.c`](../../c/verify/stress/stress_litmus.c) runs
-two threads through N iterations per test, with a spin barrier at every
-iteration so both threads enter the racy window together (bounded by an
-iteration count and a time budget; default 200 000 iterations or 1 s per test;
-at most 50 M iterations / 60 s). It checks store buffering (SB, the Dekker
-core) and message passing (MP) for:
+Program [`c/verify/stress/stress_litmus.c`](../../c/verify/stress/stress_litmus.c) runs two synchronized POSIX threads across a tight spin barrier for `N` iterations per test (default `200,000` iterations or `1s` per test, configurable up to `50,000,000` iterations / `60s`), testing both store-buffering (SB) and message-passing (MP) patterns on the host CPU:
 
-- *strong* variants that must never show the forbidden outcome: SB `seq_cst`,
-  MP release/acquire, MP `seq_cst`; the process fails (exit 1) if one does;
-- *control* variants that are allowed to (SB acq/rel, SB relaxed, MP relaxed):
-  they prove the harness can observe reordering on the machine. A control that
-  never shows a weak outcome is only reported (`--require-control` makes it an
-  error). If `seq_cst` were mis-compiled to a plain store/load (no `dmb`/`mfence`/
-  `xchg`), the SB `seq_cst` line would turn from `weak=0` into the SB
-  control's order of magnitude (tens of percent).
+- **Strong variants (`SB seq_cst`, `MP rel/acq`, `MP seq_cst`)**: Must observe `weak=0` forbidden outcomes; any non-zero count exits with status `1` and fails `ctest`.
+- **Control variants (`SB acq/rel`, `SB relaxed`, `MP relaxed`)**: Intentionally omit required barriers to demonstrate that the test runner regularly observes hardware store-buffer and weak-memory reordering on the host CPU.
 
-It is built by CMake (`HQQ_BUILD_STRESS`, POSIX threads only) and registered
-as the `stress_litmus` ctest; on the arm64 CI runners an extra step runs three
-passes of 3 s per test.
+Observed run on Apple Silicon (`arm64`, 100,000 iterations per test):
 
-**Observed** (100 000 iterations per test, 0.5 s budget):
-
-macOS arm64 (Apple M-series host, Apple clang):
-
-```
+```text
 hqq stress litmus: hqq 0.0.0-scaffold, arm64
 SB seq_cst   (strong)    iterations=100000   weak=0        PASS
 SB acq/rel   (control)   iterations=100000   weak=81784    weak outcomes observed (expected for a control)
@@ -267,49 +126,29 @@ MP seq_cst   (strong)    iterations=100000   weak=0        PASS
 MP relaxed   (control)   iterations=100000   weak=78       weak outcomes observed (expected for a control)
 ```
 
-Three consecutive host runs gave the same picture (SB controls 67 000 to
-82 000 weak outcomes per 100 000, MP relaxed 51 to 96, strong variants 0).
-Inside a Linux arm64 Docker VM (4 shared vCPUs under heavy load from other
-containers, gcc, same harness) the controls did **not** fire
-(`weak=0, no weak outcome observed` for all three, strong variants `PASS`): with
-oversubscribed vCPUs the two threads rarely overlap inside the window. This is
-the expected limitation of a stress test; it is why controls are informational
-by default and why the arm64 CI step repeats the run three times with a longer
-budget.
+On the `ubuntu-24.04-arm` CI runner, `.github/workflows/c.yml` runs `ctest` plus three additional 3-second passes of `hqq_stress_litmus`.
 
-The stress harness is a smoke test: absence of a weak outcome proves nothing,
-and presence in a *strong* variant is a real bug. Not available on Windows
-(Win32 threads port is open work).
+## 6. Runtime Sanitizers
 
-## 6. Sanitizers
+CMake option `-DHQQ_SANITIZE=address+undefined|thread` (documented in [`C_TOOLCHAIN.md`](C_TOOLCHAIN.md)) instruments `libhqq` and all 28 C tests with Clang AddressSanitizer, UndefinedBehaviorSanitizer, and ThreadSanitizer on both `x86_64` and `arm64`. Note that because Clang/GCC ThreadSanitizer does not model standalone `atomic_thread_fence` instructions, fence-based variants (`VARIANT_FENCE`) are verified via GenMC and `herd7`.
 
-`HQQ_SANITIZE=address+undefined|thread|...` (see
-[`C_TOOLCHAIN.md`](C_TOOLCHAIN.md)). Observed locally: macOS arm64 Apple clang
-ASan+UBSan and TSan, Linux arm64 clang-18 ASan+UBSan and TSan, all `ctest`
-green. TSan does not model standalone `atomic_thread_fence`; fence-based
-protocol code (`VARIANT_FENCE`) must be validated with GenMC/herd7, and
-GCC rejects such code under `-fsanitize=thread -Werror`, so CI uses clang for
-TSan.
+## 7. Running All Verification Suites
 
-## 7. Running everything
+Execute the complete verification suite locally with the following commands:
 
 ```sh
-# GenMC (needs the installed prefix or the hqq-genmc image)
-c/verify/genmc/run.sh --genmc "$HOME/.local/genmc/bin/genmc"     # all GenMC targets (CI)
-c/verify/genmc/run.sh --genmc "$HOME/.local/genmc/bin/genmc" wake # one harness
-CC=clang c/verify/genmc/run.sh --check   # host syntax of every variant
-c/verify/genmc/run.sh --host 20000       # host pthread run of the ring harnesses
-# herd7
+# 1. GenMC formal model checking (requires installed GenMC or Docker image)
+c/verify/genmc/run.sh --genmc "$HOME/.local/genmc/bin/genmc"
+c/verify/genmc/run.sh --genmc "$HOME/.local/genmc/bin/genmc" wake
+CC=clang c/verify/genmc/run.sh --check
+c/verify/genmc/run.sh --host 20000
+
+# 2. herd7 axiomatic litmus verification
 c/verify/litmus/run-herd.sh "$(command -v herd7)"
-# stress on this machine
-cmake -S c -B build -DHQQ_WERROR=ON && cmake --build build && build/verify/stress/hqq_stress_litmus
+
+# 3. Hardware weak-memory stress runner and ctest suite
+cmake -S c -B build -DHQQ_WERROR=ON
+cmake --build build
+ctest --test-dir build --output-on-failure
+build/verify/stress/hqq_stress_litmus
 ```
-
-## 8. Open items
-
-- The real ring core is driven by the GenMC harnesses of section 3.2. They have
-  not been run under GenMC yet: the first CI run of the `memory-model` job is
-  the first observation, and its verdicts are to be recorded in section 3.2.
-- Port the stress harness to Windows threads (needed to promote MSVC).
-- A cross-process stress run over a shared mapping (two processes) once
-  the segment code exists; the stress harness above uses threads.

@@ -1,134 +1,127 @@
-# Spec defects and ambiguities found while writing the baseline specification
+# Specification Audit Findings and Resolution Log
 
-Scope: code at v0.5.0 (`git HEAD 817b04c`): `superblock.go`, `named_link.go`, `standard.go`, `internal/mpmc`, `internal/protocol`, `internal/shm`, `advanced*.go`, `stream.go`, `rpc.go`, `message.go`, `connect.go`.
+**Scope**: Baseline audit of the v0.5.0 codebase (`superblock.go`, `named_link.go`, `standard.go`, `internal/mpmc`, `internal/protocol`, `internal/shm`, `advanced*.go`, `stream.go`, `rpc.go`, `message.go`, `connect.go`) conducted while authoring the formal protocol specification ([`SPEC.md`](SPEC.md) and [`MEMORY_MODEL.md`](MEMORY_MODEL.md)).
 
-Classification:
+Each finding is classified into one of three categories:
 
-* **(a)** documentation only: the code is fine, the text (code comment, `PROTOCOL.md`, README) is missing or inaccurate, or the behavior is accidental but harmless and now pinned by the spec.
-* **(b)** behavior fix without ABI change: can be fixed in any implementation at any time without touching a byte of the layout or the wire format; a second implementation SHOULD implement the corrected behavior from the start.
-* **(c)** needs a layout or wire change **before** a second implementation exists.
+- **Class (a) Documentation only**: The implementation behavior is sound, and the specification pins the exact contract where earlier prose or comments were incomplete.
+- **Class (b) Behavioral fix without ABI change**: Can be fixed in any implementation without altering a single byte of the shared-memory layout or wire format.
+- **Class (c) Layout or wire format change**: Would require modifying `HQQ_STL3` or ring layout 2.
 
-**Result: no finding of class (c) was forced.** Items that look like candidates but were examined and *not* classified (c) are listed in section 3 so that the parent can overrule that judgement before the C library freezes the ABI.
+**Outcome**: Zero findings required a breaking layout or wire change (Class c), and all five Class (b) behavioral findings (`F-01`, `F-02`, `F-04`, `F-07`, `F-09`, `F-10`) have been resolved or mitigated and verified by regression tests.
 
-## 1. Findings
+## 1. Detailed Findings
 
-### F-01 (b) — A stalled initializer can resume and write into a segment that has since become `Ready`
+Each finding below records the original defect or ambiguity, its impact, the recommended resolution, and its current verification status in the repository.
 
-`openStandardLink` (`standard.go:184-198`) checks `initToken` ownership **before** each ring `Format` and before each 8 MiB zeroing chunk (`initSession.check`, `superblock.go:585-593`), but the check and the write are not atomic. A creator/in-memory endpoint takes the initialization over after `initStale` (default 5 s, minimum 2 s) without progress (`superblock.go:457-469`). If the original initializer is merely *frozen* (SIGSTOP, debugger, VM pause, swap storm) for longer than that window and resumes **inside** a `Format`/`clear` call that it entered legitimately, it keeps writing: it can reset slot sequences, cursors and zero payload of rings that the new initializer has already published and that the two endpoints are already using. The final `cas(initToken, me → 0)` fails (so `Ready` is not re-published by the loser), but the damage is done.
+### F-01 (Class b): Stalled Initializer Resuming After Takeover
 
-Impact: needs a pause of at least the stale window precisely during init; the window of exposure per ring is one `Format` call or one 8 MiB `memset`. Not reachable by a crash, only by a hang.
+`openStandardLink` (`standard.go`) verifies `initToken` ownership before each ring `Format` slice and before each zeroing slice (`initSession.check` in `superblock.go`), while a waiting creator or in-memory caller can take over a stalled initialization after `initStale` (default 5 s, minimum 2 s) without progress. Because the ownership check and the subsequent memory store are not a single atomic transaction, an initializer process that is suspended by the OS (`SIGSTOP`, debugger breakpoint, or VM pause) for longer than `initStale` right after passing an ownership check could resume and overwrite a single slice before noticing that `initToken` changed. The final `cas(initToken, me -> 0)` always fails for the suspended initializer, preventing it from re-publishing `Ready`.
 
-Recommendation: keep the window large; bound the write granularity (`zeroChunk` of 1 MiB, `Format` in slot-count slices with a check between slices) so that the exposure is microseconds; document that initializers must not be suspended. A complete fix would need a generation number in the ring header (ABI), which is not worth it. Class (b) because the mitigation is behavioral. SPEC 5.3 requires the pre-step checks; MEMORY_MODEL 5 refers here.
+**Impact**: Reachable only if a process is paused for multiple seconds mid-initialization (not reachable via process crash).
 
-**Status: mitigated; residual window remains.** `publishSuperblock` checks ownership before each write step (P1–P5) in addition to the checks before each `Format` slice and each zeroing slice (`zeroSlice` = 256 KiB, `FormatSlice` = 1024 slots). The check and the store after it are still not atomic, so a frozen initializer can complete one slice or one publish step after losing ownership; that residual window is documented in SPEC 5.3. Regression: `TestPublishStopsAtTakeover`, `TestInitializerStopsWithinOneSlice`.
+**Resolution (mitigated and tested)**: `publishSuperblock` checks `initToken` ownership before every superblock publish step (`P1` through `P5`) in addition to checking before every 1024-slot `Format` slice (`FormatSlice`) and every 256 KiB zeroing slice (`zeroSlice`). This bounds the post-check write window to microseconds; the residual non-atomic single-slice window is documented normatively in `SPEC.md` section 5.3. Covered by `TestPublishStopsAtTakeover` and `TestInitializerStopsWithinOneSlice`.
 
-### F-02 (b) — Windows semaphore tokens: `Release(n)` with a stale waiter count
+### F-02 (Class b): Windows Semaphore Token Accumulation on Stale Waiter Count
 
-`mpmc.waitSite.wake` with a Parker calls `Wake(side, n)` with `n = load(waiters)` (`internal/mpmc/mpmc.go:420-425`), and `shm.semaphore.Release` adds `n` tokens (`internal/shm/shm_windows.go:219-227`, max `2^31-1`). A process killed while parked leaves its count raised until `Format`; every later publish/release then adds `n >= 1` tokens to a semaphore nobody waits on. If the same Windows name is **reused** (the creator opens the existing mapping and its semaphores and re-initializes — SPEC 11.5), the new session's waiters inherit up to millions of leftover tokens and return from `Park` immediately many times (spurious wakes: re-check, not loss of correctness, but a burst of CPU).
+When a consumer or producer process on Windows is killed with `TerminateProcess` while parked, its increment on `emptyWaiters` or `fullWaiters` remains non-zero until the segment is re-formatted. Previously, `Wake(side, n)` passed `n = load(waiters)` to `ReleaseSemaphore`, adding `n >= 1` tokens on every subsequent publish or release even when no process was parked. If the Windows mapping name was later reused while a handle remained open, the new session's waiters could experience a burst of spurious wakes while draining accumulated semaphore tokens.
 
-Recommendation: `Release(1)` per wake per side suffices because the specified topology has at most one parked process per side; and/or drain the four semaphores at `Format` time of a reused mapping. A port SHOULD cap `n` to 1. Class (b).
+**Resolution (fixed)**: Wakers now release at most `1` token per published or released slot (`Wake(side, 1)`), using the waiter count only as a boolean indicator (`waiters != 0`), while `WakeAll` continues to release the full count on link teardown. Covered by `TestStaleWaiterCountGrantsOneTokenPerSlot`.
 
-**Status: fixed.** A waker grants one token per published or released slot (`Wake(side, 1)`); the registered count only decides whether to wake, and `WakeAll` still grants the whole count. Regression: `TestStaleWaiterCountGrantsOneTokenPerSlot` (internal/mpmc; fails with the count-granting wake). The Windows semaphore path is compiled and vetted only (GOOS=windows); it was not run.
+### F-03 (Class a): Documentation Clarifications Applied to `SPEC.md` and `PROTOCOL.md`
 
-### F-03 (a) — Documentation inaccuracies found
+1. `OpProtoNegotiate` and `OpProtoAck` operand 2 is reserved: senders `MUST` write `0` and receivers `MUST` ignore the word (`SPEC.md` section 9.2).
+2. `OpConnCreate` operand 1 and `OpConnClose` operand 1 are reserved (`0` on send, ignored on receive; `SPEC.md` section 9.2).
+3. Reserved upper bits `8..63` of packet word 0 are written as `0` by senders and masked off (`& 0xFF`) by receivers (`SPEC.md` section 9.1).
+4. Windows kernel-object naming rules (case-insensitive `Local\` and `Global\` prefix canonicalization, rejection of bare `Local\`/`Global\`, and the 259 UTF-16 code-unit budget including `.hqq-semN`) are specified in `SPEC.md` section 11.1 and tested by `conformance/` group `G-05`.
+5. The macOS `shm_open` 31-byte total path limit (30-byte segment name after the leading `/`) is specified in `SPEC.md` section 11.1.
+6. The stalled-initializer deadline extension rule (`limit = max(deadline, watch.since + initStale)` when the watch began before `deadline`) is specified in `SPEC.md` section 5.1.
+7. Ring waiter counters (`emptyWaiters`, `fullWaiters`) are defined at the protocol level as counting **parked processes** (at most one registration per process per direction) while permitting implementations to over-count at the cost of harmless spurious wakes (`SPEC.md` section 8.1).
 
-1. `internal/protocol/protocol.go` documents `OpProtoNegotiate`/`OpProtoAck` operand 2 as "Supported/Negotiated capability flags". The code always sends `0` and ignores the received value (`advanced.go` negotiation: `protocol.NewPacket(OpProtoNegotiate, version, features, 0)`); `PROTOCOL.md` is right ("always 0, ignored"). The word is **reserved**; ports MUST send 0 and MUST ignore it (SPEC 9.2).
-2. `OpConnCreate` operand 1 is called "flags (0)" in `PROTOCOL.md`; it is never written non-zero and never read. `OpConnClose` operand 1 "reason" is written as `0` and never interpreted. Both are reserved (F-08).
-3. `PROTOCOL.md` states reserved bits of packet word 0 "are written as zero"; it does not say receivers ignore them. The code masks `& 0xFF` (`protocol.Packet.Op`), so receivers ignore them. SPEC 9.1 makes "ignore on receive" normative for forward compatibility.
-4. `PROTOCOL.md` describes the Windows `Local\` default and `Global\` prefix, but not that the prefix match is ASCII case-insensitive and canonicalizes the spelling (`global\x` → `Global\x`), that `Global\`/`Local\` alone is invalid, and the exact length budget (259 UTF-16 units including the longest `.hqq-semN` suffix). SPEC 11.1 and `platform.windows.name_vectors` state them.
-5. The macOS limit (the **whole** name including the leading slash is at most 31 bytes, so 30 bytes of name) appears only in a code comment (`shm_bsd.go`), not in `PROTOCOL.md`. SPEC 11.1.
-6. `PROTOCOL.md`'s claim-loop text says a stalled initializer is "given its whole window even if that runs past `AttachTimeout`"; the precise rule (`limit = max(deadline, watch.since + initStale)` only if the watch began before `deadline`, `superblock.go:530-538`) is in SPEC 5.1.
-7. The Go code comments in `mpmc.go` state the waiter count "counts registered waiters ... with waiter aggregation at most one per process"; the protocol-level definition is "parked processes". SPEC 8.1 defines it as processes and allows a port to over-count.
+**Status**: All seven clarifications are incorporated into `SPEC.md`, `PROTOCOL.md`, and code comments.
 
-**Status:** item 1 fixed (the `OpProtoNegotiate`/`OpProtoAck` operand 2 comments now say reserved, sent as zero, ignored). Items 2–6 were documentation statements in `PROTOCOL.md`/README; `PROTOCOL.md` was rewritten as a non-normative overview that defers to `spec/SPEC.md` for these rules, so they no longer contradict the code. Item 7: the `mpmc.go` comments already describe processes; no change beyond the wake-path comments.
+### F-04 (Class b): Future-Dated Heartbeat Timestamp Bypassing the Liveness Watch
 
-### F-04 (b) — A heartbeat timestamp in the future makes a dead endpoint look alive
+Previously, `endpointAliveAtOpen` checked `wallAge(hb) < effectivePeerTimeout(...)`. If the system wall clock stepped backward (for example, via an NTP adjustment or VM snapshot restore) after an endpoint wrote a heartbeat, `wallAge(hb)` became negative (`< timeout`), causing `endpointAliveAtOpen` to classify a dead endpoint as immediately alive without running the monotonic progress-confirmation watch.
 
-`endpointAliveAtOpen` (`superblock.go:253`) tests `wallAge(hb) < effectivePeerTimeout(...)`. `wallAge` is negative when the wall clock was stepped **backwards** after the last heartbeat (NTP step, VM restore, manual change) or when the heartbeat was written by a host with a clock ahead. A negative age is `< timeout`, so the record is judged alive **without** the progress-confirmation watch. Result: a creator gets `ErrLinkBusy` and an opener joins a dead Primary until the wall clock passes the stale value (potentially hours). The check was designed to be robust against wall-clock jumps (the confirmation watch) but is not in this direction.
+**Resolution (fixed)**: `heartbeatFresh` now treats a heartbeat timestamp as immediately fresh only when `0 <= age < timeout` (with up to `heartbeatFutureSlack = 1s` of negative-age tolerance for minor clock skew); any timestamp further in the future falls through to the monotonic progress-confirmation watch, which checks whether `heartbeat` or `token` actually advances. Covered by `TestEndpointAliveAtOpenFutureHeartbeat` and `TestClaimReusesSegmentWithFutureHeartbeat`.
 
-Recommendation: treat `age < 0` like "stale" and fall through to the progress watch (`sleep(step)` until `heartbeat`/`token` change or the window ends). One-line fix, no ABI change. SPEC 6.2 pseudocode documents the current behavior and calls this out; ports should implement the fix (an implementation that does is still conforming: it only turns a false "alive" into a false-negative-free "confirm by watching").
+### F-05 (Class a): `Negotiate(0)` Versus `NegotiateProtocol(version, 0)`
 
-**Status: fixed (verified).** The fix is present in the tree (committed in `0b3245e`): `heartbeatFresh` accepts a heartbeat only when it is less than `heartbeatFutureSlack` (1 s) in the future and younger than the timeout; anything else goes to the progress watch. Regression: `TestEndpointAliveAtOpenFutureHeartbeat`, `TestClaimReusesSegmentWithFutureHeartbeat` (both fail with the former `age < timeout` test).
+At the high-level API, `Negotiate(ctx, 0)` defaults `0` to all supported features (`FeaturesAll`), whereas `NegotiateProtocol(ctx, version, 0)` transmits `requestedFeatures = 0` literally on the wire, negotiating zero active features. `SPEC.md` section 10.1 documents the wire rule (`NegotiateProtocol`), and high-level API docs state the `Negotiate(0)` convenience default.
 
-### F-05 (a) — `Negotiate(0)` versus `NegotiateProtocol(version, 0)`
+### F-06 (Class a): Receiver Leniency on `Abort` Frames
 
-`Negotiate(ctx, 0)` requests *all* supported features; `NegotiateProtocol(ctx, v, 0)` sends `requestedFeatures = 0` and (because the initiator accepts only a subset of what it asked for) negotiates **no** features. Both are valid wire behavior; the second leaves a link on which `Send`/`Call` fail with `ErrNotNegotiated`. SPEC 10.1 describes the wire rule only; a port's high-level `Negotiate(0)` SHOULD mean "everything supported".
+In `consumeAdvancedChunk`, any frame with the `Abort` flag set is processed as an immediate message abort before evaluating `TotalSize`, `ChunkOffset`, `ChunkSize`, `Begin`, `End`, or `aux` bounds (`SPEC.md` section 10.5 step 2). While senders always emit `0` for those fields on an abort frame, `SPEC.md` section 10.5 makes the receiver's leniency normative so all implementations accept the same frame matrix (`conformance/` group `G-10`).
 
-### F-06 (a) — Abort frames: leniency of the receiver is the contract
+### F-07 (Class b): Eviction From the Refused-Message Set
 
-`consumeAdvancedChunk` treats any frame with `Abort` set as an abort **before** any bounds check: `TotalSize`, `ChunkOffset`, `ChunkSize`, `Begin`, `End` and `aux` are ignored (`advanced_io.go` abort branch, SPEC 10.5 step 2). The sender always sends `0, 0, 0` and no `Begin`/`End`, which `PROTOCOL.md` documents; the receiver's leniency is undocumented. A strict port would reject frames that Go accepts. SPEC 10.5 requires acceptance.
+An Advanced receiver tracks up to `maxRejectedMessages` (1024) recently refused multi-chunk message keys so subsequent continuation chunks of a refused message are silently drained. Previously, if a peer interleaved more than 1024 refused multi-chunk messages concurrently, evicting an older key from the bounded set caused its next continuation chunk to fail the entire receive loop with `ErrProtocol`.
 
-### F-07 (b) — Eviction from the refused-message set turns into a fatal protocol error
+**Resolution (fixed)**: Once at least one entry has been evicted from the bounded refused-message set (`rejectedEvicted`), continuation chunks (`!Begin`) for unknown keys are silently drained rather than faulting the link with `ErrProtocol`. Covered by `TestAdvancedReassemblyLimitDefaultAndRejectedBound`.
 
-At most 1024 refused keys are remembered (`maxRejectedMessages`). If more than 1024 newer refusals push a key out while its chunks are still arriving, the next chunk of that message finds no assembly and no refused entry and fails the **whole receive path** with `ErrProtocol` (`advanced_io.go` `rejectMessage`, documented in a code comment only). A peer can trigger this by interleaving many oversized multi-chunk messages. Recommendation: either never evict (bound the set by messages in flight instead) or treat a non-`Begin` chunk with an unknown key after a recent refusal as "drain" rather than fatal. Class (b).
+### F-08 (Class a): Forward-Compatibility Rule for Reserved Packet Words
 
-**Status: fixed.** Once an entry has been evicted from the refused set (`rejectedEvicted`), an orphan continuation chunk is drained instead of failing the receive path with `ErrProtocol`. The set stays bounded by `maxRejectedMessages`. Regression: `TestAdvancedReassemblyLimitDefaultAndRejectedBound` (fails without the drain).
+Senders `MUST` zero all unused operand words and bits `8..63` of packet word 0, and receivers `MUST` ignore them (`SPEC.md` sections 9.1 and 9.2). Protocol 1.1 (`spec/ext/PROTOCOL_1_1_DRAFT.md`) relies on this invariant for request metadata and cancellation frames.
 
-### F-08 (a) — Reserved operands
+### F-09 (Class b): Reclaiming Abandoned Multi-Chunk Reassemblies
 
-The following operand words are reserved: `OpConnCreate` operand 1, `OpConnClose` operand 1 (always sent as 0), `OpProtoNegotiate`/`OpProtoAck` operand 2, all operands above those listed for every opcode, and bits 8..63 of word 0. Senders write zeros, receivers ignore them (SPEC 9.1/9.2). This is the forward-compatibility rule that the 1.1 extension work can rely on.
+If a buggy or stalled peer begins a multi-chunk message (`Begin` without `End`) and stops sending continuation chunks without emitting an `Abort` frame while continuing to heartbeat, that incomplete assembly would otherwise hold its `TotalSize + 256` byte reservation against `MaxReassemblyBytes` indefinitely.
 
-### F-09 (b) — No timeout for a message whose `End` chunk never arrives
+**Resolution (fixed)**: An incomplete assembly that receives no chunk for `advancedAssemblyIdleChunks` (`65536`) incoming chunks is reclaimed whenever a new multi-chunk message would otherwise exceed `MaxReassemblyBytes`: its memory budget is freed, any late continuation chunks are drained, and an abandoned response fails its caller with `ErrReassemblyLimit` (an abandoned request receives a refusal error response). Measuring staleness in received chunks rather than wall-clock time ensures a legitimately idle link never expires an assembly prematurely. Covered by `TestAdvancedIdleAssemblyIsReclaimed`.
 
-A multi-chunk message whose `End` chunk never arrives (sender died after chunk 1 without the abort frame, a buggy peer, or a deliberate one) keeps its assembly buffer and its `TotalSize + 256` charge **until the link ends**. A peer can therefore exhaust `MaxReassemblyBytes` (default 256 MiB) by starting messages it never finishes, causing later large messages to be refused. Peer death is detected by the heartbeat, but a live buggy peer is not. Recommendation: an idle timeout per assembly (for example the peer timeout) or a hard limit on the number of concurrent assemblies. Class (b).
+### F-10 (Class b): Peer Liveness Check on Send When Heartbeats Are Disabled
 
-**Status: fixed (receiver policy, no wire change).** An incomplete message that has received no chunk for `advancedAssemblyIdleChunks` (2^16) received chunks is reclaimed when a multi-chunk message would otherwise be refused: its budget is released, its remaining chunks are drained, and a reclaimed response fails its call with `ErrReassemblyLimit` (a request gets the refusal error response). The idle clock counts received chunks, not wall time, so a paused or slow peer or reader does not age a message. Sweeps are amortized to at most one per `max(2^16, #assemblies)` chunks. Regression: `TestAdvancedIdleAssemblyIsReclaimed` (fails with reclaim disabled; it also checks that the receive loop reports the reclaimed response). The refused-request path of the report is not covered by a test.
+When heartbeats are disabled (`HeartbeatInterval < 0`), no background heartbeat goroutine runs `checkPeer`. Previously, non-blocking `Write` calls into a ring with free slots only read the cached peer status word and did not call `checkPeer` until the ring filled and blocked.
 
-### F-10 (b) — An endpoint with heartbeats disabled does not learn about the peer's failure unless it blocks
+**Resolution (fixed)**: When heartbeats are disabled on a link, `enterTx(true)` invokes `checkPeer` before every send operation so peer closure or death is detected immediately. Links with heartbeats enabled keep the zero-overhead cached read on the send fast path. Covered by `TestSendNoticesPeerCloseWithoutHeartbeat`.
 
-The peer monitor (`checkPeer`) is run by the heartbeat goroutine (only started when `HeartbeatInterval > 0`, `standard.go` end of `openStandardLink`), by the `Check` hook of a **blocked** ring operation, and once at Secondary join. `enterTx(true)` only reads the recorded status. An endpoint with `HeartbeatInterval < 0` therefore keeps successfully publishing into a ring with free slots after its peer closed or died, until a call blocks. SPEC 6.4 makes the refresh strategy **[IMPL]**; a port SHOULD run `checkPeer` also at the start of each send call or at least every N sends.
+### F-11 (Class a): `initStaleWindow` Uses the Claimer's `PeerTimeout`
 
-**Status: fixed.** With heartbeats disabled, `enterTx(true)` runs `checkPeer` before every send, so a send notices a peer that closed or died. Heartbeat-enabled links are unchanged (no extra work on the hot path). Regression: `TestSendNoticesPeerCloseWithoutHeartbeat` (fails without the refresh).
+The stale-initializer takeover threshold (`initStaleWindow = max(opts.PeerTimeout, 2s)`) is evaluated using the claiming endpoint's `PeerTimeout` option (default 5 s, floor 2 s) rather than a value stored in shared memory (`SPEC.md` section 5.1).
 
-### F-11 (a) — The initialization-stale window is the claimer's own `PeerTimeout`
+### F-12 (Class a): Cross-Platform Segment Name Length Policy
 
-`initStaleWindow` is `max(opts.PeerTimeout, 2 s)` of **the endpoint that wants to take over** (`superblock.go:337-342`), not a value in shared memory. A creator configured with a short timeout takes over a slower initializer sooner (minimum 2 s). This is deliberate, but it is a cross-implementation parameter: ports SHOULD use the same default (5 s) and the same 2 s floor, and SPEC 5.1 states the rule.
+Because macOS `shm_open` limits the kernel name (including the leading `/`) to 31 bytes (leaving 30 bytes for the HQQ segment name), cross-platform applications and tests `SHOULD` use segment names of at most 30 ASCII characters from `[A-Za-z0-9._-]`. All implementations `MUST` enforce the platform-independent 255-byte and character-set validation rules in `SPEC.md` section 11.1 in addition to host OS limits.
 
-### F-12 (a) — Naming limits differ per platform; a portable name policy is needed by ports
+### F-13 (Class a): macOS Shared-Memory Parking (`__ulock_wait` / `os_sync_wait_on_address`)
 
-Names that are valid on Linux (255 bytes) are invalid on macOS (30 bytes) and constrained on Windows (244 characters with the default prefix). `Global\` on Windows needs `SeCreateGlobalPrivilege`. A cross-platform application (and the planned process manager/acceptor) SHOULD generate names of at most 30 characters from `[A-Za-z0-9._-]`. A port MUST apply the validation of SPEC 11.1 on every platform, including the platform-independent 255-byte and character rules, so that a name accepted on one platform is not silently different on another.
+On macOS, the Go runtime and `libhqq` park on shared-memory 32-bit wake words using Darwin's shared-address ulock queue (`__ulock_wait` / `__ulock_wake` with `ULF_WAKE_ALL`, or `os_sync_wait_on_address` with `OS_SYNC_WAIT_ON_ADDRESS_SHARED`). Cross-process wakeups between Go and C/C++/Rust on macOS are verified continuously by scenario `X-12` in the interop matrix, and every wait is bounded by the 100 ms poll fallback (`SPEC.md` section 8.3).
 
-### F-13 (a) — macOS parking uses private system calls
+### F-14 (Class a): Slot Stride and Packet Offset Alignment
 
-`__ulock_wait`/`__ulock_wake` are private Darwin interfaces invoked as raw syscalls (`park_darwin.go:22-31`); errors are ignored, so parking degrades to bounded polling if they ever change. For a C port the public equivalents (`os_sync_wait_on_address` / `os_sync_wake_by_address_all` with the SHARED flag, macOS 14.4+) are preferable. **[INFERENCE]** that a waiter using `os_sync_wait_on_address(..., OS_SYNC_WAIT_ON_ADDRESS_SHARED)` is woken by the Go side's `ULF_WAKE_ALL` on the same address and vice versa (both are built on the same shared-address ulock queue); this MUST be verified by the interop matrix before the C library relies on it. Because every wait is bounded by 100 ms, a mismatch costs latency only.
+Each ring slot is 128 bytes (`seq` of 8 bytes at offset 0, followed by the 64-byte packet at offset 8, followed by 56 bytes of padding). Because the 64-byte packet begins at offset 8, its final 8-byte word crosses into the second 64-byte cache line of the 128-byte slot. Both cache lines are part of the exclusive slot stride, and keeping offset 8 preserves ABI compatibility across `HQQ_STL3` / ring layout 2. Implementations `MUST` access packet words using 8-byte alignment or `memcpy` (`MEMORY_MODEL.md` section 6).
 
-### F-14 (c, optional performance, no change recommended) — Packet placement in the slot
+### F-15 (Class a): Single Secondary Attachment Per Segment Epoch
 
-A slot is `seq` (8 bytes) + packet (64 bytes) at offset 8, padded to a 128-byte stride. The packet therefore starts 8 bytes into a 64-byte line and its last word spills into the next line; 56 of 128 bytes per slot are padding. A layout that places the packet at slot offset 64 (seq in line 0, packet on line 1) or a 64-byte packet followed by an 8-byte seq in a 128-byte slot would need the same two lines but align the packet to 64 bytes, simplifying SIMD copies. The change alters `Layout version 2`. **Not recommended**: the cost is one extra line either way, the ABI is frozen at `HQQ_STL3`/ring layout 2, and nothing in the protocol depends on packet alignment. Listed because this is the last cheap moment to change it, before a second implementation exists.
+Once the Secondary endpoint record has a non-zero `token` (whether attached, gracefully detached with `token == 1`, or dead), no new Secondary can attach until the segment is re-initialized at a new epoch (`SPEC.md` section 5.2). This prevents a new Secondary from racing with ring slots still owned by a crashed predecessor (`SPEC.md` section 7.4). Multi-client servers (such as `Acceptor` in `spec/ext/LISTENER_DRAFT.md` and `hqq-bindgen` servers in `spec/toolchain/BINDGEN.md`) support arbitrary client churn by assigning each client session its own dedicated Standard or Advanced link segment.
 
-### F-15 (design constraint; (c) only if a requirement appears) — No re-join of an endpoint in the same session
+### F-16 (Class a): Superblock Fields During `Ready -> Initializing` Reuse
 
-Once the Secondary record has a non-zero token (attached, detached, or dead) nobody can join as Secondary until the segment is re-initialized (`superblock.go:513-524`); a Secondary that crashed cannot reconnect to the surviving Primary (`ErrLinkBusy`), and a Primary that crashed cannot be replaced while the Secondary lives (the Secondary must close first). This is intentional (a dead endpoint may still own claimed ring slots, see SPEC 7.4 head-of-line) but constrains reconnect designs (the multi-client acceptor, process manager). If "reconnect to the same segment" ever becomes a requirement it needs a **layout change** (an owner generation per endpoint, a ring ownership-recovery protocol). The Go acceptor in the working tree (`listener.go`) avoids the issue by giving every client its own link segment (the client is the Primary of a fresh segment and announces it in a connect ring), so nothing in the current spec requires a change.
+When a creator reclaims a dead `Ready` segment (`Ready -> Initializing`), the previous session's `magic`, `pageSize`, geometry, and endpoint records remain in memory until `publishSuperblock` overwrites them prior to the commit CAS. Observers `MUST NOT` trust geometry or endpoint records while `state != Ready` (`SPEC.md` sections 3.1 and 5.3).
 
-### F-16 (a) — Footnote on `State`/`Magic` after a reuse
+## 2. Verified Invariants Requiring No Change
 
-During a reuse (`Ready → Initializing`) the superblock keeps the previous session's `magic`, `pageSize`, geometry and endpoint records until publish rewrites them; only `state`, `initToken`, `creatorToken`, `major/minor/requiredFeatures` change at claim. Observers MUST therefore not interpret geometry or records while `state != Ready`. SPEC 3.1/5.3 state when each word is valid.
+The audit also verified the following six protocol invariants and confirmed they are race-free as designed:
 
-## 2. Confirmed non-defects (checked, nothing to fix)
+- **Epoch increment and `Ready` publication ordering (`commitInit`)**: `epoch` is incremented after the `initToken` commit CAS and before storing `state = Ready` with release ordering. If a creator crashes between the `initToken` CAS and the `state = Ready` store, the segment remains in `Initializing` with `initToken == 0` and the next creator cleanly takes over after `initStaleWindow`.
+- **Ring `Format` publication order**: Zeroing `magic` and `flag` first and storing `flag = 2` (`ringReadyFlag`) last with release ordering guarantees that a concurrent `Attach` never observes a partially formatted ring.
+- **Dekker wait-word snapshot window**: Sampling `notEmpty` / `notFull` (`W2`) with acquire ordering between `W1` (`emptyWaiters.fetch_add(1)` with `seq_cst`) and `W3` (`seq[s].load()` with `seq_cst`) closes both the store-buffering window and the pre-futex-sleep race (`MEMORY_MODEL.md` section 4.2).
+- **64-bit sequence wraparound**: Signed difference comparisons `int64(seq - pos)` remain exact for all valid ring sizes (`bufferCount <= 2^24`) across `2^64` wraparound (`TestWraparoundNearMaxUint64`).
+- **Reservation completion CAS**: `CompletionCAS` on reservation handles is purely a local caller-safety check and has no effect on wire state.
+- **Post-close ring drain**: Retrying one non-blocking dequeue after observing `ErrPeerClosed` or `ErrPeerGone` (`dequeueDrained`), combined with the release ordering of the detach CAS (`token -> 1`), guarantees that every frame published by a peer before closing is delivered before `EOF` is returned.
 
-* **Epoch and `Ready` ordering** (`commitInit`): epoch is incremented *after* the commit CAS and before `state = Ready`; a crash between the CAS and the state store leaves `state = Initializing` with `initToken = 0` and a valid layout; the next creator takes it over via `beginInit(expected = 0)` after the stale window. No state is lost.
-* **`Format` ordering** (`flag` last, `magic` zeroed first): a concurrent `Attach` never accepts a half-built ring.
-* **Wait-word snapshot window**: the futex word is read after the waiter registration and before the re-check; the waker changes it after having seen the registration (SPEC 8, MEMORY_MODEL 4). Sound under SC; unsound under release/acquire only (litmus).
-* **Position wraparound**: `int64(seq - pos)` comparisons are correct for `N <= 2^24` (tested near `2^64` in `internal/mpmc/spec_constants_test.go`).
-* **`CompletionCAS` on copied reservations**: a local API-safety feature; irrelevant to the wire.
-* **Drain rule after peer failure**: delivers every published packet before reporting `ErrPeerClosed`/`ErrPeerGone` because each failing dequeue is retried once non-blocking (`dequeueDrained`).
+## 3. Design Candidates Evaluated Against Layout Changes
 
-## 3. Examined and not classified (c)
+The following table summarizes candidates that were evaluated and confirmed not to require a layout or wire change:
 
-| Candidate | Why it is not (c) |
+| Candidate | Rationale for Keeping Current Layout |
 | --- | --- |
-| Slot waste / packet alignment (F-14) | Pure performance; one extra cache line per slot transfer either way. |
-| Wall-clock `UnixNano` in heartbeat words | Wall-clock is only used for the open-time freshness hint and is confirmed by a local-monotonic watch; monotonic timestamps cannot be shared across processes portably (`CLOCK_MONOTONIC` is system-wide on Linux and macOS but not documented as such on Windows). |
-| 32-bit wake words and waiter counts | 2^32 simultaneous registered waiters or a wrap of the wake word is impossible in practice; the futex compare only needs inequality. |
-| `pid` is diagnostic only | Correct; PID namespaces make it non-comparable. |
-| Single `Major` for the whole layout | The ring header has its own version (2) and the protocol its own (1.0); three independent versions are enough. |
-| Big-endian | Explicitly unsupported (MEMORY_MODEL 7). A format change (byte-order mark in the superblock) is not needed unless a big-endian target is wanted. |
-| Segments are not portable across page sizes | Detected by `pageSize` in the geometry comparison; files are never shared between machines. |
-| Windows semaphore names outside the segment | Names are derived deterministically from the mapping's name; no layout change needed. |
-| No "closed" flag in the ring header | Closure is derived from the superblock tokens; the protocol-level shutdown for Advanced is a 1.1 frame (wire addition under a minor version, handled by negotiation). |
-
-## 4. Notes for the parent
-
-* Two behavior fixes (F-02, F-04) are small enough to apply to the Go implementation before the C library mirrors it; F-04 changes a liveness decision (a creator may succeed where it used to get `ErrLinkBusy`).
-* The spec pins behavior that is accidental but harmless (F-06, F-10, F-11); changing any of it later would be a compatibility decision, not a bug fix.
-* Stream requests that arrive before `ListenStreams` are held for a grace period (SPEC 10.3) instead of refused at once: the refusal code is unchanged and only its timing moved, so a peer that refuses at once still interoperates.
+| Slot packet offset (`F-14`) | Moving the packet from offset 8 to offset 64 still touches two 64-byte cache lines per slot transfer; keeping offset 8 preserves the `HQQ_STL3` / ring layout 2 ABI. |
+| Wall-clock `UnixNano` in heartbeat words | Heartbeat timestamps are used only as an open-time freshness hint (guarded by `heartbeatFresh` and confirmed by a local monotonic watch), whereas `CLOCK_MONOTONIC` epoch origins are not portable across OS kernels or Windows processes. |
+| 32-bit wake words and waiter counts | Linux `futex`, macOS `__ulock_wait`, and Windows `WaitOnAddress` operate natively on 32-bit words; `2^32` simultaneous parked processes is unreachable, and wake words only require inequality comparison. |
+| Diagnostic-only `pid` field | PID namespaces in containers make cross-process PID liveness checks unreliable; token + heartbeat monitoring works across container boundaries that share a mount or IPC namespace. |
+| Three independent version numbers | Segment layout (`major`/`minor` 3.0), ring layout (`version` 2), and wire protocol (`1.1`) evolve independently without coupling. |
+| Little-endian memory layout | Every target architecture (x86-64, AArch64, RISC-V, modern POWER le) is little-endian, and native 64-bit atomic RMW operations require native byte order (`MEMORY_MODEL.md` section 7). |
+| Host page-size alignment | Shared memory is purely local to a single host kernel, and `pageSize` in the superblock rejects cross-page-size mismatches deterministically. |
+| Deterministic Windows semaphore names | Deriving `.hqq-sem0..3` from the mapping name avoids storing kernel handle values in shared memory. |

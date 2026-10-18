@@ -1,39 +1,51 @@
-# HQQ Wire and Memory Protocol — Normative Specification
+# HQQ Wire and Memory Protocol: Normative Specification
 
-Baseline: Go implementation v0.5.0 (segment layout 3.0, magic `HQQ_STL3`; MPMC ring layout 2; protocol 1.0).
-Companion documents: [MEMORY_MODEL.md](MEMORY_MODEL.md) (memory orders), [PORTING.md](PORTING.md) (how to write a port), [FINDINGS.md](FINDINGS.md) (defects and ambiguities), [constants.json](constants.json) (every numeric constant, machine readable and checked against the code by `go test -run Spec`), [litmus/](litmus/) (C11 litmus tests).
+**Baseline**: Segment layout 3.0 (magic `HQQ_STL3`), MPMC ring layout 2, and wire protocol 1.0 (with Protocol 1.1 extensions in [`ext/PROTOCOL_1_1_DRAFT.md`](ext/PROTOCOL_1_1_DRAFT.md) and listener segments in [`ext/LISTENER_DRAFT.md`](ext/LISTENER_DRAFT.md)).
 
-This document was derived from the code, not from `PROTOCOL.md`. Where the two differ, this document and the code win; known differences are listed in FINDINGS.md. It is written so that a second implementation (for example a C library) can be written from it alone and interoperate with the Go implementation in the same segment.
+**Companion documents**:
+- [`MEMORY_MODEL.md`](MEMORY_MODEL.md): Atomic memory orders and happens-before proofs.
+- [`PORTING.md`](PORTING.md): Incremental implementation guide for C, C++, Rust, and other languages.
+- [`FINDINGS.md`](FINDINGS.md): Specification audit findings and edge-case resolutions.
+- [`constants.json`](constants.json): Machine-readable numeric constants verified against the code by `go test ./conformance/...`.
+- [`litmus/`](litmus/): Formal C11 memory-model litmus tests.
+
+This specification defines the complete shared-memory layout and wire protocol so that independent implementations (such as `libhqq` in [`c/`](../c)) can be written from this text alone and interoperate with the Go implementation in the same shared-memory segment.
 
 ## 0. Conventions
 
-The key words **MUST**, **MUST NOT**, **REQUIRED**, **SHOULD**, **SHOULD NOT**, **MAY**, **RECOMMENDED** are used as in RFC 2119.
+Normative keywords (**MUST**, **MUST NOT**, **REQUIRED**, **SHOULD**, **SHOULD NOT**, **MAY**, **RECOMMENDED**) follow RFC 2119.
 
 Every rule carries one of two scope tags:
 
 | Tag | Meaning |
 | --- | --- |
-| **[IOP]** | Interoperability-normative. It affects the bytes in shared memory, the order or atomicity of accesses to them, or behavior another process can observe. Two implementations that differ here can corrupt each other's state or deadlock. |
-| **[IMPL]** | Implementation freedom or recommendation. Local threading, scheduling, caching, API shape, wait strategy and similar. Another process cannot tell the difference (or only through latency). |
+| **[IOP]** | **Interoperability-normative**: Governs the byte layout in shared memory, the ordering or atomicity of shared-memory accesses, or externally observable protocol behavior. Two implementations that diverge on an **[IOP]** rule can corrupt shared state or deadlock. |
+| **[IMPL]** | **Implementation freedom or recommendation**: Governs process-local threading, scheduling, caching, API shape, or wait heuristics that a peer process cannot observe (except via latency). |
 
-Untagged prose is explanatory.
+Notation:
+- `u64` and `u32` denote unsigned 64-bit and 32-bit integers stored in **little-endian** byte order at natural alignment.
+- `load`, `store`, `cas`, and `fetch_add` denote atomic operations with the memory orders specified in [`MEMORY_MODEL.md`](MEMORY_MODEL.md).
+- Subtraction `a - b` on `u64` wraps modulo `2^64`; `int64(x)` reinterprets the 64-bit pattern as signed two's complement.
+- `round_up(x, p)` denotes the smallest multiple of `p` that is `>= x`.
+- Numeric values of all constants are pinned in [`constants.json`](constants.json).
 
-Notation: `u64`/`u32` are unsigned integers of that width stored **little-endian** and naturally aligned. `load`, `store`, `cas`, `fetch_add` are atomic accesses of the stated word with the memory order given in MEMORY_MODEL.md. `a - b` on `u64` wraps modulo 2^64; `int64(x)` reinterprets the bits as two's complement. `round_up(x, p)` is the smallest multiple of `p` that is `>= x`. `⌊ ⌋` is not used; all divisions are exact or stated.
+## 1. Terminology and Topology
 
-Numeric values of constants are in [constants.json](constants.json). When this text and the JSON disagree, the JSON (which is tested) wins and this text is a bug.
+An HQQ link operates over the following structural elements:
 
-## 1. Terminology and topology
+- **Segment**: One contiguous region of shared memory (a POSIX `shm_open` / `/dev/shm` file, a Windows named file mapping, or caller-owned memory such as an anonymous `MAP_SHARED` region) carrying one link.
+- **Link**: A bidirectional connection between two **endpoints**: the **Primary** (endpoint index `0`) and the **Secondary** (endpoint index `1`).
+- **Direction 0**: Carries Primary -> Secondary traffic over `ring 0` and `buffer pool 0`.
+- **Direction 1**: Carries Secondary -> Primary traffic over `ring 1` and `buffer pool 1`. Each direction comprises one bounded Vyukov MPMC **ring** of 64-byte packets and one **buffer pool** of `bufferCount` fixed-size payload buffers, where ring slot `i` exclusively owns payload buffer `i`.
+- **Process**: The unit of cross-process sharing. All threads within one OS process operating on one side of a ring act as a single party.
+- **Position (`pos`)**: A monotonically increasing `u64` counter tracking claims on a ring cursor. Position `pos` maps to slot index `pos & mask` (where `mask = size - 1`) and lap `pos / size`.
+- **Attach roles** (section 4): **Creator** (creates or reclaims a named segment), **Opener** (attaches to an existing named segment as Secondary), and **InMemory** (attaches to caller-supplied memory).
 
-* **Segment**: one contiguous block of shared memory (a named POSIX shared-memory object, a Windows named file mapping, or caller-owned memory such as a `MAP_SHARED` mapping) that carries one link.
-* **Link**: a bidirectional connection between exactly two **endpoints**: the **Primary** (endpoint index 0) and the **Secondary** (endpoint index 1).
-* **Direction 0** carries Primary → Secondary traffic (ring 0, buffer pool 0); **direction 1** carries Secondary → Primary traffic (ring 1, buffer pool 1). Each direction is one **ring** (a bounded Vyukov MPMC queue of 64-byte packets) plus one **buffer pool** of `bufferCount` fixed-size payload buffers; slot `i` of the ring owns buffer `i` of the pool.
-* A **process** is the unit of sharing: all threads of one process on one side of a ring are one party.
-* **Position** (`pos`): a `u64` that counts claims on a ring cursor; the slot of position `pos` is `pos & mask` with `mask = size - 1`. A **lap** is `pos / size`.
-* **Roles** of an endpoint when it reaches a segment (section 4): **Creator** (created or recreated the name), **Opener** (attaches to an existing name), **InMemory** (caller-owned memory).
+**[IOP] Cross-process topology**: For every directional ring there is at most **one producer process and one consumer process**: on `ring 0`, the Primary is the producer and the Secondary is the consumer; on `ring 1`, the Secondary is the producer and the Primary is the consumer. A third endpoint is never admitted (section 5.5). Within a single process, multiple threads `MAY` produce or consume concurrently provided the process as a whole obeys the shared-word protocol (see section 7.6 for single-producer/single-consumer local serialization).
 
-**[IOP] Cross-process topology.** For every ring there is exactly **one producer process and one consumer process**: ring 0 has the Primary as producer and the Secondary as consumer, ring 1 the other way round. A third endpoint is never admitted (section 5.5). Within one process any number of threads MAY produce or consume, provided the process as a whole behaves as one producer / one consumer with respect to the shared words (see 7.6, "SPSC mode").
+## 2. Segment Memory Layout
 
-## 2. Segment memory layout
+An HQQ link segment is divided into five page-aligned regions whose offsets are a pure function of `(pageSize, bufferCount, bufferSize)`.
 
 ### 2.1 Regions **[IOP]**
 
@@ -51,7 +63,7 @@ buf1                    BUFFERS 1    direction 1
 total
 ```
 
-With `page = system page size` (`sysconf(_SC_PAGESIZE)`, `GetSystemInfo().dwPageSize`; a power of two, at least 4096), `count = bufferCount`, `size = bufferSize`:
+Given `page = system page size` (`sysconf(_SC_PAGESIZE)` on POSIX, `GetSystemInfo().dwPageSize` on Windows; a power of two `>= 4096`), `count = bufferCount`, and `size = bufferSize`:
 
 ```text
 ringBytes = 512 + 128 * count                  (header 512 bytes, slot stride 128 bytes)
@@ -63,71 +75,73 @@ buf1      = round_up(ring1 + ringBytes, page)
 total     = round_up(buf1  + bufBytes,  page)
 ```
 
-All offsets are from the start of the segment, which MUST be page aligned. `total` is the value stored in the superblock field `layoutSize` and the minimum size of the shared-memory object. Reference vectors for page sizes 4096, 16384 and 65536 are in `constants.json` (`segment.layout_vectors`); tests assert them.
+All offsets are measured from the start of the segment, which `MUST` be page-aligned. `total` is recorded in the superblock's `layoutSize` field and defines the minimum byte size of the backing shared-memory object. Reference layout vectors for page sizes `4096`, `16384`, and `65536` are pinned in `constants.json` (`segment.layout_vectors`).
 
-Buffer `i` of pool `d` starts at `buf_d + i * size`. It is owned by ring slot `i` of ring `d` (section 9.4). Pools are plain memory; no word of the pool is ever accessed atomically by the protocol.
+Payload buffer `i` of pool `d` begins at byte offset `buf_d + i * size` and is owned exclusively by ring slot `i` of ring `d` (section 9.4). Payload pools are plain memory and are never accessed with atomic instructions by the protocol.
 
-**[IOP] The region offsets are always computed from the geometry the endpoint was configured with and its own page size; the geometry stored in the superblock is only compared, never used for addressing** (the Go implementation never reads the recorded geometry to address memory). A port MAY offer a discovery extension that reads the recorded geometry of a `Ready` segment first and then opens with it (SPEC 13.2).
+**[IOP] Addressing from caller geometry**: Region offsets are always computed from the caller's configured `(bufferCount, bufferSize)` and the host's runtime `pageSize`; the geometry words stored in the superblock are used strictly for validation comparisons, never for pointer arithmetic. An implementation `MAY` offer a separate discovery helper that peeks a `Ready` superblock first and then opens the segment using the discovered geometry (section 13.2).
 
-**[IOP] Page-size dependence.** The offsets depend on the page size. Endpoints with different page sizes cannot share a segment; the recorded `pageSize` makes the mismatch visible as a geometry mismatch (5.5). In practice all endpoints of one segment run on one kernel and agree.
+**[IOP] Page-size agreement**: Because region offsets depend on `page`, endpoints with different OS page sizes cannot share a segment; comparing `pageSize` in the superblock surfaces any mismatch as `GeometryError` (section 5.5).
 
-### 2.2 Geometry limits **[IOP]**
+### 2.2 Geometry Limits **[IOP]**
 
-| Parameter | Rule |
+| Parameter | Validation Rule |
 | --- | --- |
-| `bufferCount` | power of two, `2 <= bufferCount <= 2^24`. One slot is not allowed: with a single slot the "published" value `pos+1` and the "free for the next lap" value `pos+mask+1` coincide, and a second producer could overwrite an unconsumed packet. |
-| `bufferSize` | multiple of 8, `8 <= bufferSize <= 2^30`. |
-| total size | `total` MUST be representable (no overflow of the platform's address or file-size type; relevant for 32-bit hosts). |
+| `bufferCount` | Power of two, `2 <= bufferCount <= 2^24` (`16,777,216`). A 1-slot ring is forbidden because with `N = 1` (`mask = 0`) the published sequence value `pos + 1` and the next-lap free value `pos + mask + 1` would be identical. |
+| `bufferSize` | Multiple of 8, `8 <= bufferSize <= 2^30` (`1 GiB`). |
+| `total` | Must not overflow the platform's signed or unsigned address/file-offset representation. |
 
-A configuration outside these bounds is invalid: size computation yields 0 and no segment may be created or opened with it (`ErrInvalidSize`).
+Any configuration outside these bounds is rejected before touching shared memory (`SizeStandardLink` returns `0`, and link creation/open returns `ErrInvalidSize`).
 
-## 3. The superblock
+## 3. The Superblock
 
-### 3.1 Layout **[IOP]**
+The superblock occupies the first page (`page` bytes) of the segment and holds layout metadata, initialization state, and the two endpoint records.
 
-The superblock is the first `page` bytes of the segment. Offsets and sizes are fixed (`segment.superblock_fields`). Every field is a `u64` accessed **atomically** (see MEMORY_MODEL.md); the fields are:
+### 3.1 Superblock Fields **[IOP]**
 
-| Off | Field | Writer(s) | Meaning |
+Every superblock field is an 8-byte aligned `u64` accessed **atomically** (see [`MEMORY_MODEL.md`](MEMORY_MODEL.md)):
+
+| Offset | Field | Writer(s) | Meaning |
 | ---: | --- | --- | --- |
-| 0 | `magic` | initializer, at publish | `0x4851515F53544C33` (ASCII `HQQ_STL3` when written big-endian). Because words are little-endian the bytes in memory read `3 L T S _ Q Q H`. Written only at publish (step P5 in 5.3); an `Initializing` segment may still carry `0`. |
-| 8 | `state` | claimers, initializer | `0` Empty, `1` Initializing, `2` Ready. Any other value is `ErrIncompatibleLayout`. |
-| 16 | `major` | initializer | Layout major version, `3`. Written when an initializer claims the segment and again at publish. A different major is incompatible. |
-| 24 | `minor` | initializer | Layout minor version, `0`; informational. |
-| 32 | `pageSize` | initializer, at publish | Page size used to compute the regions. |
-| 40 | `bufferCount` | initializer, at publish | Configured slots/buffers per direction. |
-| 48 | `bufferSize` | initializer, at publish | Configured bytes per buffer. |
-| 56 | `layoutSize` | initializer, at publish | `total` of section 2.1. |
-| 64 | `epoch` | initializer, at commit | Generation counter: incremented (`fetch_add`) exactly once per successful (re)initialization, just before `state` becomes `Ready`. The first initialization of a zeroed segment produces `1`. |
-| 72 | `initToken` | claimers | Session token of the endpoint currently (re)initializing the segment; `0` when nobody is. Ownership register of the initialization (5.2). |
-| 80 | `initHeartbeat` | initializer | Wall-clock `UnixNano` of the initializer's last progress. Used only as an opaque progress marker. |
-| 88 | `requiredFeatures` | initializer | Bit set of layout features a reader must understand. None are defined; a reader that sees any set bit fails with `ErrIncompatibleLayout`. Written as `0`. |
-| 96 | `creatorToken` | initializer, right after winning `initToken` | Identity of the *instance that owns the name*: the random token of a Creator endpoint, or `0` when the segment was initialized by an InMemory endpoint. Replaced by **every** initialization. Openers never write it. |
-| 104..127 | reserved | — | Three words, zero. |
-| 128..255 | `endpoints[0]` | | Primary record (3.2). |
-| 256..383 | `endpoints[1]` | | Secondary record (3.2). |
-| 384..page-1 | unused | — | Zero. **The all-zero test of 5.1 covers the whole page**, so a port MUST NOT store anything there. |
+| `0` | `magic` | Initializer, at publish | `0x4851515F53544C33` (ASCII `"HQQ_STL3"` in big-endian; bytes in little-endian memory read `33 4c 54 53 5f 51 51 48`, `"3LTS_QQH"`). Written at publish step `P5` (section 5.3); an `Initializing` segment may still hold `0`. |
+| `8` | `state` | Claimers, initializer | `0` (`Empty`), `1` (`Initializing`), or `2` (`Ready`). Any other value fails with `ErrIncompatibleLayout`. |
+| `16` | `major` | Initializer | Layout major version (`3`). Stamped when claiming initialization and again at publish. Any other major version is incompatible. |
+| `24` | `minor` | Initializer | Layout minor version (`0`, informational). |
+| `32` | `pageSize` | Initializer, at publish | Host page size used to compute region offsets. |
+| `40` | `bufferCount` | Initializer, at publish | Configured slots/buffers per direction. |
+| `48` | `bufferSize` | Initializer, at publish | Configured payload bytes per buffer. |
+| `56` | `layoutSize` | Initializer, at publish | Total segment size `total` from section 2.1. |
+| `64` | `epoch` | Initializer, at commit | Generation counter incremented via `fetch_add(1)` once per successful (re)initialization immediately before `state` becomes `Ready` (`1` on first initialization). |
+| `72` | `initToken` | Claimers | Session token of the endpoint currently initializing the segment (`0` when not initializing). Serves as the initialization ownership lock (section 5.2). |
+| `80` | `initHeartbeat` | Initializer | Wall-clock `UnixNano` of the initializer's last progress step (used as an opaque change marker). |
+| `88` | `requiredFeatures` | Initializer | Bitmask of required layout features (`0` in layout 3.0). Readers observing any set bit `MUST` fail with `ErrIncompatibleLayout`. |
+| `96` | `creatorToken` | Initializer, right after winning `initToken` | Instance identity of the segment creator: a fresh random token for a `Creator` endpoint, or `0` for an `InMemory` endpoint. Replaced on every initialization; never written by `Opener` endpoints. |
+| `104..127` | `reserved` | None | Three 64-bit words, always `0`. |
+| `128..255` | `endpoints[0]` | Primary, initializer | Primary endpoint record (128 bytes, section 3.2). |
+| `256..383` | `endpoints[1]` | Secondary, initializer | Secondary endpoint record (128 bytes, section 3.2). |
+| `384..page-1` | `unused` | None | Zero. **The `firstPageZero` check in section 5.1 inspects the entire first page**, so implementations `MUST NOT` store data in bytes `384..page-1`. |
 
-`sizeof(superblock) = 384 <= 4096`, so it fits the smallest page.
+Because `sizeof(superblock) == 384 <= 4096`, the superblock always fits within a single page.
 
-### 3.2 Endpoint record (128 bytes) **[IOP]**
+### 3.2 Endpoint Record (`128` Bytes) **[IOP]**
 
-| Off | Field | Meaning |
+| Relative Offset | Field | Meaning |
 | ---: | --- | --- |
-| +0 | `token` | `0` = never used since the last initialization; `1` = the owner closed gracefully (**detachedToken**); any other value = random session token of the attached owner (an **owner token**: neither `0` nor `1`). |
-| +8 | `pid` | OS process id of the owner; diagnostic only (PIDs are not comparable across PID namespaces). |
-| +16 | `heartbeat` | Last heartbeat, wall-clock `UnixNano`; `0` = none written yet. |
-| +24 | `interval` | The owner's heartbeat interval in nanoseconds; `0` = heartbeats disabled (the endpoint is then always considered alive). |
-| +32..+127 | reserved | Twelve words, zero. |
+| `+0` | `token` | `0` = unused since the last initialization; `1` = owner detached gracefully (`detachedToken`); any other value = random 64-bit session token of the attached owner (an **owner token**, never `0` or `1`). |
+| `+8` | `pid` | OS process ID of the owner (diagnostic only; not comparable across PID namespaces). |
+| `+16` | `heartbeat` | Most recent heartbeat timestamp in wall-clock `UnixNano` (`0` = none written yet). |
+| `+24` | `interval` | Owner's configured heartbeat interval in nanoseconds (`0` = heartbeats disabled, treated as permanently alive). |
+| `+32..+127` | `reserved` | Twelve 64-bit words, always `0`. |
 
-**[IOP] Tokens.** An owner generates its token with a source of randomness good enough to avoid collisions between distinct sessions (the Go implementation uses a random 64-bit value, redrawn while it is `0` or `1`). A token MUST NOT be `0` or `1`.
+**[IOP] Owner token generation**: Each endpoint draws its owner token from a CSPRNG, redrawing if the value is `0` or `1`.
 
-**[IOP] Detach.** Closing an endpoint is `cas(record.token, myToken, 1)`. A failed CAS (the record was re-initialized or replaced) is not an error and MUST NOT be retried or overwritten. The value `1` persists until the segment is re-initialized, so a peer that attached and detached before the other side looked is still reported as closed, and nobody can join a session that already ended.
+**[IOP] Graceful detach**: Closing an endpoint executes `cas(record.token, myToken, 1)`. If the CAS fails (because the segment was re-initialized or taken over), the close succeeds locally without retrying or overwriting `record.token`. Keeping `token == 1` until the next re-initialization ensures that a peer attaching or polling later observes `ErrPeerClosed` (`io.EOF`) and prevents a third party from reusing a closed Secondary slot in the same epoch.
 
-### 3.3 Atomicity **[IOP]**
+### 3.3 Atomic Access Requirement **[IOP]**
 
-All superblock words are 64-bit, 8-byte aligned, and MUST be accessed with lock-free 64-bit atomic operations (no tearing, no process-local locks). Plain reads of a superblock word are permitted only through a read-only mapping that nobody else uses to establish ordering (the Go `peekSuperblock`, 11.4). See MEMORY_MODEL.md section 2 for the order of each access.
+All superblock words are 8-byte aligned 64-bit words and `MUST` be accessed using hardware lock-free 64-bit atomic operations. See [`MEMORY_MODEL.md`](MEMORY_MODEL.md) section 2 for the exact memory order of each field.
 
-### 3.4 Superblock state machine **[IOP]**
+### 3.4 Superblock State Machine **[IOP]**
 
 ```text
             claim CAS                       commit (after CAS initToken: me -> 0)
@@ -140,39 +154,47 @@ All superblock words are 64-bit, 8-byte aligned, and MUST be accessed with lock-
                          reuse: CAS state Ready -> Initializing, both endpoints dead
 ```
 
-Transitions are made only by the claim loop (5.1) and by the initializer (5.3). `Empty` is the state of a zero page and is never re-entered by a protocol action. A port MUST NOT transition a segment to `Empty`.
+State transitions are performed exclusively by the claim loop (section 5.1) and the initializer commit step (section 5.3). `Empty` (`0`) is the initial state of a freshly zeroed segment and is never re-entered.
 
-## 4. Roles and entry points
+## 4. Attach Roles and Entry Points
 
-How an endpoint reaches a segment determines its **role** (the code calls it `attachRole`). The role is a property of the call, not stored in memory.
+How a caller reaches a segment determines its **role** (`attachRole`):
 
-| Role | Entry points (Go) | Purpose |
+| Role | Go Entry Points | Behavior |
 | --- | --- | --- |
-| **Creator** | `CreateStandardLink`, `CreateAdvancedLink`, `Listen` | Created the name, or reuses a name whose endpoints are all gone. Initializes, re-initializes, takes over; never joins a live segment. |
-| **Opener** | `OpenStandardLink`, `OpenAdvancedLink`, `Dial` | Attaches to an existing name as the Secondary. **Never initializes, re-initializes or takes over a segment**, so an opener can never end up as a Primary nobody will join. |
-| **InMemory** | `NewStandardLink`, `NewAdvancedLink` | Caller-owned memory. Initializes an empty segment, re-initializes a dead one, takes over, or joins a live one as Secondary. |
+| **Creator** | `CreateStandardLink`, `CreateAdvancedLink`, `Listen` | Creates a new named segment or reclaims an existing named segment whose endpoints are both dead. Initializes, re-initializes, and takes over stalled initializations; **never joins a live segment**. |
+| **Opener** | `OpenStandardLink`, `OpenAdvancedLink`, `Dial` | Attaches to an existing named segment as the Secondary endpoint. **Never initializes, re-initializes, or takes over a segment**. |
+| **InMemory** | `NewStandardLink`, `NewAdvancedLink` | Operates on caller-supplied memory. Initializes an `Empty` segment, re-initializes a dead `Ready` segment, takes over a stalled `Initializing` segment, or joins a live `Ready` segment as Secondary. |
 
-Decision table (what the claim loop does; `AT` = `AttachTimeout`, see 5.1 for exact timing):
+Claim-loop decision matrix (`AT` = `AttachTimeout`, default `5s`):
 
-| Segment state | Creator | Opener | InMemory |
+| Observed Segment State | Creator | Opener | InMemory |
 | --- | --- | --- | --- |
-| Empty, page not all zero | `ErrIncompatibleLayout`, nothing written | same | same |
-| Empty, page zero | claim (become Primary) | wait up to `AT` for a creator, then transient `errSegmentNotReady`; segment untouched | claim (become Primary) |
-| Initializing | wait; take over a stalled initializer | wait up to `AT`, then transient `errInitContended`; never take over | wait; take over a stalled initializer |
-| Ready, layout incompatible | `ErrIncompatibleLayout` | same | same |
-| Ready, both endpoints dead | re-initialize (become Primary) | transient `errNoLiveEndpoint`, immediately | re-initialize (become Primary) |
-| Ready, a live endpoint | `ErrLinkBusy` | join as Secondary (or `ErrLinkBusy`/`GeometryError`) | join as Secondary (or `ErrLinkBusy`/`GeometryError`) |
-| any other `state` value | `ErrIncompatibleLayout` | same | same |
+| `Empty`, first page not all zero | Fail with `ErrIncompatibleLayout` (write nothing) | Fail with `ErrIncompatibleLayout` (write nothing) | Fail with `ErrIncompatibleLayout` (write nothing) |
+| `Empty`, first page all zero | Claim (`Empty -> Initializing`, become Primary) | Wait up to `AT` for a creator, then return transient `errSegmentNotReady` (write nothing) | Claim (`Empty -> Initializing`, become Primary) |
+| `Initializing` | Wait; take over if initializer stalls for `initStale` | Wait up to `AT`, then return transient `errInitContended` (never take over) | Wait; take over if initializer stalls for `initStale` |
+| `Ready`, incompatible layout | Fail with `ErrIncompatibleLayout` | Fail with `ErrIncompatibleLayout` | Fail with `ErrIncompatibleLayout` |
+| `Ready`, both endpoints dead | Re-initialize (`Ready -> Initializing`, become Primary) | Return transient `errNoLiveEndpoint` immediately | Re-initialize (`Ready -> Initializing`, become Primary) |
+| `Ready`, at least one live endpoint | Fail with `ErrLinkBusy` | Join as Secondary if Primary alive and `endpoints[1].token == 0` (else `ErrLinkBusy` or `GeometryError`) | Join as Secondary if Primary alive and `endpoints[1].token == 0` (else `ErrLinkBusy` or `GeometryError`) |
+| Any other `state` value | Fail with `ErrIncompatibleLayout` | Fail with `ErrIncompatibleLayout` | Fail with `ErrIncompatibleLayout` |
 
-"Transient" errors (`errSegmentNotReady`, `errInitContended`, `errNoLiveEndpoint`) all match the base error `ErrFailedInit`; a retrying opener (the Go `Dial`) retries on exactly these three and on a missing name (`ErrNotExist`), with a backoff doubling from 1 ms to 100 ms **[IMPL]**. Every other error is permanent.
+The three transient errors (`errSegmentNotReady`, `errInitContended`, and `errNoLiveEndpoint`) all wrap `ErrFailedInit`. High-level dialing helpers (`Dial`) retry on `ErrFailedInit` (when not `ErrLinkBusy` or `ErrIncompatibleLayout`) and `ErrNotExist` with exponential backoff from `1 ms` to `100 ms` **[IMPL]**.
 
-## 5. Initialization, claim, takeover, reuse, publish, attach
+## 5. Initialization, Claim, Takeover, Reuse, Publish, and Attach
 
-### 5.1 Claim loop **[IOP]**
+This section defines the exact atomic state transitions for claiming, formatting, publishing, and attaching to a segment.
 
-Inputs: the caller's geometry (`count`, `size`, `layoutSize` computed per 2.1), its fresh `token` (an owner token), `role`, `AttachTimeout` (`AT`, default 5 s), `PeerTimeout`, `HeartbeatInterval`, and for Creators a fresh `creatorToken`. `initStale = max(PeerTimeout, 2 s)` (the window an initializer may show no progress). `poll = 200 µs`. The loop is bounded by a cancellation context if the caller has one: **every iteration first checks the context and fails with its error**, and every sleep is interruptible.
+### 5.1 Claim Loop **[IOP]**
 
-State kept by the loop: `deadline = now + AT` (from entry); `watch = {active, tok, hb, since}` (what was last seen of an initializer, on the **local monotonic clock**); `emptySince` (monotonic).
+Inputs:
+- Caller geometry `(count, size, layoutSize)` computed per section 2.1.
+- Fresh random owner `token` (`!= 0 && != 1`).
+- Caller `role` (`Creator`, `Opener`, or `InMemory`).
+- `AttachTimeout` (`AT`, default `5s`), `PeerTimeout` (default `5s`), and `HeartbeatInterval` (default `250ms`).
+- For `Creator` calls, a fresh random `creatorToken` (`!= 0 && != 1`).
+- `initStale = max(PeerTimeout, 2s)` and poll step `poll = 200 us`.
+
+Local state tracked across iterations: `deadline = now + AT`, `watch = {active, tok, hb, since}` measured on the **local monotonic clock**, and `emptySince` on the local monotonic clock:
 
 ```text
 loop:
@@ -186,33 +208,32 @@ loop:
 
   case Empty:
       if not firstPageZero(sb):                 # all page/8 words == 0, each read atomically
-          if load(sb.state) != Empty: continue  # somebody claimed it meanwhile
-          return ErrIncompatibleLayout          # foreign data; write NOTHING, for every role
+          if load(sb.state) != Empty: continue  # claimed concurrently while scanning
+          return ErrIncompatibleLayout          # foreign data; write NOTHING
       if role == Opener:
           if emptySince unset: emptySince = now
           if now - emptySince >= AT: return errSegmentNotReady   # segment untouched
-          emptyWait = true                      # fall through to sleep; deadline is not enforced
+          emptyWait = true                      # fall through to sleep
       else:
           if cas(sb.state, Empty -> Initializing):
               if not beginInit(expected = load(sb.initToken)): return errInitContended
               return (Primary, mustInit = true)
-          # CAS lost: somebody else claimed; fall through to sleep/limit check
 
   case Initializing:
       tok = load(sb.initToken); hb = load(sb.initHeartbeat)
       if checkLayoutCompat(initializing = true) fails: return ErrIncompatibleLayout
-      if role == Opener: pass                   # only waits; limit check below
+      if role == Opener: pass                   # waits up to deadline
       else:
           if not watch.active or watch.tok != tok or watch.hb != hb:
-              watch = {active, tok, hb, since = now}          # progress seen: restart window
+              watch = {active, tok, hb, since = now}          # progress observed: reset window
           else if now - watch.since >= initStale:
               if beginInit(expected = tok): return (Primary, mustInit = true)   # TAKEOVER
-              watch.active = false                              # somebody else moved first
+              watch.active = false                              # another claimer won the CAS
           stalling = true
 
   case Ready:
       if checkLayoutCompat(initializing = false) fails: return ErrIncompatibleLayout
-      primaryAlive   = endpointAliveAtOpen(endpoints[0])        # may sleep up to ~2 s (6.2)
+      primaryAlive   = endpointAliveAtOpen(endpoints[0])        # section 6.2
       secondaryAlive = endpointAliveAtOpen(endpoints[1])
       if not primaryAlive and not secondaryAlive:
           if role == Opener: return errNoLiveEndpoint           # state untouched
@@ -220,706 +241,621 @@ loop:
               if not beginInit(expected = load(sb.initToken)): return errInitContended
               return (Primary, mustInit = true)
           continue
-      if role == Creator: return ErrLinkBusy                    # a creator never joins
+      if role == Creator: return ErrLinkBusy                    # Creator never joins a live segment
       got  = (load bufferCount, bufferSize, layoutSize, pageSize)
       want = (count, size, layoutSize, localPageSize)
-      if got != want: return GeometryError(want, got)           # wraps ErrInvalidSize
+      if got != want: return GeometryError(want, got)           # matches ErrInvalidSize
       if primaryAlive and load(endpoints[1].token) == 0:
           if cas(endpoints[1].token, 0 -> token):               # JOIN as Secondary
-              fillEndpoint(endpoints[1])                        # pid, interval, heartbeat (6.1)
+              fillEndpoint(endpoints[1])                        # pid, interval, heartbeat (section 6.1)
               return (Secondary, mustInit = false)
           continue
       return ErrLinkBusy      # both alive, or the live endpoint's earlier peer already left
 
   default: return ErrIncompatibleLayout
 
-  # reached by Empty(creator, lost CAS), Empty(opener), Initializing, never by Ready/default
   limit = deadline
-  if stalling and watch.active and watch.since < deadline: limit = max(deadline, watch.since + initStale)
+  if stalling and watch.active and watch.since < deadline:
+      limit = max(deadline, watch.since + initStale)
   if not emptyWait and now > limit: return errInitContended
-  sleep(poll)                                    # interruptible
+  sleep(poll)
 ```
 
-`firstPageZero` reads **every** 8-byte word of the first page (`pageSize` bytes, not 384) atomically. A freshly created zero-filled object passes it; any foreign byte anywhere in the first page makes the segment foreign.
+Helper `firstPageZero(sb)` atomically loads every 8-byte word across the entire first page (`pageSize / 8` words, not just the first 384 bytes). Any non-zero word on page 0 while `state == Empty` causes immediate rejection with `ErrIncompatibleLayout`.
 
-`checkLayoutCompat(sb, initializing)`:
+Helper `checkLayoutCompat(sb, initializing)`:
 
 ```text
 if load(requiredFeatures) & ~knownRequiredFeatures(=0) != 0: return ErrIncompatibleLayout
 magic = load(sb.magic); major = load(sb.major)
 if not initializing:
-    if magic != MAGIC or major != 3: return ErrIncompatibleLayout        # includes "HQQ_STL2"
+    if magic != MAGIC or major != 3: return ErrIncompatibleLayout        # rejects "HQQ_STL2"
     return ok
-# initializing: the initializer may have died right after claiming; layout words may be missing
+# When initializing == true, the previous initializer may have crashed before writing magic/major:
 if magic != 0 and magic != MAGIC: return ErrIncompatibleLayout
 if major != 3 and (major != 0 or load(initToken) != 0): return ErrIncompatibleLayout
 return ok
 ```
 
-Properties that a port MUST preserve (each is observable by another process or protects foreign data):
+Mandatory **[IOP]** invariants of the claim loop:
 
-1. **[IOP] Foreign data is never written**: nothing is stored to a segment whose state is `Empty` with a non-zero page, nor to one whose layout check fails.
-2. **[IOP] Openers never write `state`, `initToken` or `creatorToken` and never take over.**
-3. **[IOP] The Initializing watch uses the local monotonic clock and compares `(initToken, initHeartbeat)` for change only.** There is no fast path from a stale wall-clock `initHeartbeat` to takeover: a slow initializer is always given its whole `initStale` window, even if that runs past `AttachTimeout`.
-4. **[IOP] Takeover and reuse are exactly the CAS sequences above.** In particular the reuse CAS is `Ready -> Initializing` on `state`, followed by the `initToken` CAS in `beginInit`.
-5. **[IMPL]** The poll interval (200 µs), the cancellation mechanism and sleeping strategy are free.
+1. **Zero mutation of foreign data**: Never write to an `Empty` segment with a non-zero word on page 0 or to any segment failing `checkLayoutCompat`.
+2. **Read-only Openers before join**: An `Opener` never modifies `state`, `initToken`, or `creatorToken`, and never takes over an initialization.
+3. **Monotonic-clock takeover watch**: The `Initializing` watch measures elapsed time without progress on the caller's local monotonic clock, never by subtracting wall-clock `initHeartbeat` from `now`. If a stalled-initializer watch begins before `deadline`, the loop extends `limit` to `max(deadline, watch.since + initStale)` so takeover can complete.
+4. **Exact CAS transitions**: Takeover and reuse use the exact `state` and `initToken` CAS sequence above.
 
-### 5.2 `beginInit` **[IOP]**
+### 5.2 Claiming `initToken` (`beginInit`) **[IOP]**
 
 ```text
 beginInit(token, expected):
     store(major = 3); store(minor = 0); store(requiredFeatures = 0)     # stampLayout
-    if not cas(initToken, expected -> token): return false               # another endpoint took over
+    if not cas(initToken, expected -> token): return false               # another endpoint won
     store(creatorToken = creatorTokenOfThisCall)    # 0 for InMemory; fresh random for Creator
     store(initHeartbeat = nowUnixNanos())
     return true
 ```
 
-`expected` is the `initToken` value the claimer saw: `0` for a fresh claim or a reuse, the dead initializer's token for a takeover. `beginInit` makes the caller the **initializer**; from now on the **ownership check** is `load(initToken) == token`.
+Once `beginInit` returns `true`, the caller is the active **initializer**, and its ownership predicate is `load(initToken) == token`.
 
-### 5.3 Initialization sequence and publish **[IOP]**
+### 5.3 Initialization Sequence and Superblock Publication **[IOP]**
 
-A winner of `beginInit` MUST, in this order, **checking before every step that the context is alive and that it still owns `initToken`** (if it lost ownership it MUST fail with `errInitContended` and MUST NOT touch the segment any more):
+The winner of `beginInit` `MUST` execute the following steps in order, **verifying before every slice and every publish step that its context is still active and `load(initToken) == token`** (returning `errInitContended` and halting all writes immediately if ownership was lost):
 
-1. For each ring in order `ring0`, `ring1`: check; `Format(ring)` (7.2); then **progress** (below).
-2. Zero `buf0` in chunks of at most 8 MiB: before each chunk check ownership; after each chunk progress. Then the same for `buf1`.
-3. **Publish** (`publishSuperblock`):
-   * **P0** check `load(initToken) == token`, else `errInitContended`.
-   * **P1** `stampLayout` again: `major=3, minor=0, requiredFeatures=0`.
-   * **P2** `pageSize`, `bufferCount`, `bufferSize`, `layoutSize` (stores).
-   * **P3** clear the Secondary record: `token=0`, `pid=0`, `heartbeat=0`, `interval=0`.
-   * **P4** write the Primary record: `token = token`, then `pid`, `interval = HeartbeatInterval ns (0 if disabled)`, `heartbeat = nowUnixNanos()`.
-   * **P5** `store(magic = MAGIC)`.
-   * **Commit** `cas(initToken, token -> 0)`. **Only if the CAS succeeds**: `epoch = fetch_add(epoch, 1) + 1`, then `store(state = Ready)`. A failed CAS returns `errInitContended` and leaves the segment as it is.
-4. Attach to both rings (5.4).
+1. **Format both rings**: Format `ring0` in slices of at most `1024` slots (section 7.2), checking ownership before each slice and updating `initHeartbeat` after completion; repeat for `ring1`.
+2. **Zero both payload pools**: Zero `buf0` in slices (at most `8 MiB` per slice; the Go and C implementations use `256 KiB` slices), checking `load(initToken) == token` before each slice and updating `initHeartbeat` after each slice; repeat for `buf1`.
+3. **Publish superblock (`publishSuperblock`)**:
+   - **P0**: Check `load(initToken) == token`, else return `errInitContended`.
+   - **P1**: Check ownership, then store `major = 3`, `minor = 0`, `requiredFeatures = 0`.
+   - **P2**: Check ownership, then store `pageSize`, `bufferCount`, `bufferSize`, `layoutSize`.
+   - **P3**: Check ownership, then zero the Secondary record (`endpoints[1]`: `token = 0`, `pid = 0`, `heartbeat = 0`, `interval = 0`).
+   - **P4**: Check ownership, then populate the Primary record (`endpoints[0]`: `token = myToken`, `pid = getpid()`, `interval = HeartbeatInterval`, `heartbeat = nowUnixNanos()`).
+   - **P5**: Check ownership, then store `magic = 0x4851515F53544C33`.
+   - **Commit**: Execute `cas(initToken, myToken -> 0)` (`acq_rel`). **If and only if the CAS succeeds**: increment `epoch` via `fetch_add(epoch, 1)` (`acq_rel`) and store `state = Ready` (`2`) with release (`REL` or `SC`) ordering. If the CAS fails, return `errInitContended` without touching `epoch` or `state`.
+4. **Attach to both rings** (section 5.4).
 
-**Progress** = `if load(initToken) == token: store(initHeartbeat = nowUnixNanos())`; it keeps a slow but live initializer from being taken over. Every write step of publish (P1–P5 below) and every slice of the zeroing and formatting first checks ownership; a check and the store after it are not atomic, so an initializer suspended between them can still complete that one store (FINDINGS F-01).
+The `state = Ready` release store is the publication point for the entire segment initialization: every preceding write to the rings, payload pools, and superblock fields happens-before any endpoint whose acquire load observes `state == Ready` ([`MEMORY_MODEL.md`](MEMORY_MODEL.md) section 3).
 
-The `state = Ready` store is the **release point** of the whole initialization: every earlier store (rings formatted, buffers zeroed, superblock fields, records) happens-before any endpoint that observes `state == Ready` with an acquire load (MEMORY_MODEL.md 3.1).
+### 5.4 Attaching the Rings **[IOP]**
 
-**[IOP] Ordering within publish.** P1–P5 MUST precede the commit CAS; the commit CAS MUST precede the `epoch` increment and the `state` store. Readers observe `Ready` only after `epoch` is updated.
+After claiming its role (and publishing if Primary), the endpoint calls `Attach` (section 7.3) on `ring0` and `ring1`, polling for up to `AttachTimeout` if a ring header is not yet marked ready. If either ring has an incompatible magic, version, stride, or size (`!= bufferCount`), the endpoint detaches (`cas(record.token, myToken, 1)`) and fails with `ErrIncompatibleLayout`.
 
-### 5.4 Attaching the rings **[IOP]**
+If a `Creator` fails after creating a new named shared-memory object, it unlinks the name if it still owns the instance (section 11.4).
 
-After claim (and, for the initializer, publish) an endpoint attaches to ring 0 and ring 1: it polls `Attach` (7.3) until the ring header validates, waiting at most `AttachTimeout` in total (the Go implementation polls in 10 ms slices and checks cancellation between slices). A ring that is missing (not initialized), or has a different magic, layout version, stride or size, or whose size differs from `bufferCount`, makes the endpoint **detach** (`cas(record.token, mine, 1)`) and fail with `ErrIncompatibleLayout` (or with the context error if cancelled).
+### 5.5 Secondary Join, Geometry Validation, and Third-Endpoint Refusal **[IOP]**
 
-If setting up a freshly created named object (section 11.3) fails, the name is removed again, provided it still refers to this instance.
+- **Geometry comparison**: A joining `Opener` or `InMemory` endpoint compares the superblock's `(bufferCount, bufferSize, layoutSize, pageSize)` against its own configuration; any mismatch returns `GeometryError` (wrapping `ErrInvalidSize`).
+- **Secondary join**: Joins as Secondary if and only if the Primary is alive **and** `endpoints[1].token == 0`, executing `cas(endpoints[1].token, 0 -> myToken)` followed by `fillEndpoint(endpoints[1])`.
+- **Single Secondary per epoch**: In every other case on a live segment (both endpoints alive, or `endpoints[1].token != 0` because a previous Secondary already closed or died), the joiner fails with `ErrLinkBusy`.
+- **Epoch capture**: Immediately after winning the join CAS, the Secondary loads `myEpoch = load(sb.epoch)` and starts monitoring the Primary (section 6.3).
 
-### 5.5 Joining, third endpoint, geometry **[IOP]**
+### 5.6 Setup Failure Rules **[IOP]**
 
-* A joiner (Opener or InMemory on a `Ready` segment with a live endpoint) compares `(bufferCount, bufferSize, layoutSize, pageSize)` with its own; any difference is `GeometryError`, which matches `ErrInvalidSize` and carries both geometries.
-* It joins as Secondary only if the Primary is alive **and** `endpoints[1].token == 0`, via `cas(endpoints[1].token, 0, token)` followed by writing `pid`, `interval`, `heartbeat` (in that or any order; readers tolerate a record with a token and `interval == 0`/`heartbeat == 0`, 6.2).
-* In every other live case — both endpoints alive, or the live endpoint's earlier peer already closed or died (a dead endpoint may still own ring slots) — the result is `ErrLinkBusy`. The segment can only be reused after the surviving endpoint closes.
-* After joining, a Secondary reads `epoch` (that value identifies its session) and starts monitoring the Primary immediately (6.3).
+- If an endpoint fails during local setup after writing its `token` into `endpoints[i].token`, it `MUST` execute `cas(endpoints[i].token, myToken, 1)` before returning.
+- If an initializer fails before committing `publishSuperblock`, the segment stays in `Initializing` and the next `Creator` or `InMemory` caller takes over once `initStale` elapses.
 
-### 5.6 Failure rules **[IOP]**
+## 6. Liveness, Heartbeats, Peer State, and Error Mapping
 
-* After an endpoint has claimed a role, any later failure of its own setup (ring attach etc.) writes `detachedToken` into its own record (CAS from its token) before returning.
-* An initializer that returns an error before publishing leaves the segment `Initializing`; the next Creator/InMemory endpoint takes it over after `initStale` without progress.
-* After a successful publish the Primary is `Ready`; if it dies before anybody joins, a later Creator reuses the segment once its heartbeat stops (6.2), and an Opener gets `errNoLiveEndpoint` meanwhile only when no endpoint is alive.
+Endpoints track peer liveness through periodic wall-clock heartbeats paired with local monotonic progress watches.
 
-## 6. Liveness, heartbeat, peer state, error mapping
+### 6.1 Heartbeat Updates **[IOP for words, IMPL for scheduling]**
 
-### 6.1 Heartbeat **[IOP for the words, IMPL for scheduling]**
+An endpoint configured with `HeartbeatInterval > 0` (default `250 ms`) stores `own.heartbeat = nowUnixNanos()` every interval **only while `load(own.token) == myToken`**. If heartbeats are disabled (`HeartbeatInterval < 0`), the endpoint writes `interval = 0` and a single initial `heartbeat = nowUnixNanos()` at attach time; peers and openers then treat it as permanently alive.
 
-An endpoint with `HeartbeatInterval > 0` writes `store(own.heartbeat = nowUnixNanos())` every interval, **only while `load(own.token) == myToken`** (it never revives a record that was re-initialized). It keeps heartbeating after a peer failure; it stays attached until it is closed. Its `interval` field holds the interval in nanoseconds. With heartbeats disabled (`HeartbeatInterval < 0`) the endpoint writes `interval = 0`, still writes one `heartbeat` when it fills its record, and is **always considered alive** by openers. Default interval: 250 ms (`timing_ns.default_heartbeat_interval`).
+### 6.2 Open-Time Liveness Check (`endpointAliveAtOpen`) **[IOP]**
 
-`fillEndpoint(rec)` = `pid = getpid()`, `interval`, `heartbeat = now`.
-
-Timestamps are wall-clock Unix nanoseconds (`CLOCK_REALTIME`). A reader MUST NOT rely on them for anything but (a) the open-time freshness fast path (6.2) and (b) change detection.
-
-### 6.2 Liveness at open (`endpointAliveAtOpen`) **[IOP]**
-
-Used by the claim loop on a `Ready` segment. For one endpoint record:
+When the claim loop inspects a `Ready` segment, it evaluates each endpoint record as follows:
 
 ```text
 tok = load(token)
-if tok == 0 or tok == 1:            return dead                    # unused, or detached
+if tok == 0 or tok == 1:            return dead                    # unused or gracefully detached
 interval = load(interval)
 if interval == 0:                   return alive                   # heartbeats disabled
 hb = load(heartbeat)
-if hb == 0:                         return alive                   # attached a moment ago
+if hb == 0:                         return alive                   # just attached
 timeout = max(callerPeerTimeout, 4 * interval)                      # callerPeerTimeout default 5 s
-if -1 s < wallAge(hb) < timeout:   return alive                   # a heartbeat more than 1 s in the future is not trusted: confirm by the watch (FINDINGS F-04)
+if -1 s < wallAge(hb) < timeout:   return alive                   # fresh within 1 s future-skew tolerance (FINDINGS F-04)
 window = min(3 * interval, 2 s);  step = max(interval / 4, 1 ms)
-for until now + window:                                             # confirm by watching for progress
+for until now + window:                                             # monotonic confirmation watch
     sleep(step)
     if load(heartbeat) != hb or load(token) != tok:
         return isOwnerToken(load(token))
 return dead
 ```
 
-The watch uses the caller's clock only to bound the window; it is therefore robust against wall-clock jumps that make a live heartbeat look stale.
+Because the confirmation watch measures elapsed time on the caller's local monotonic clock and checks only whether `heartbeat` or `token` changes, a backward or forward wall-clock jump cannot cause a live endpoint with active heartbeats to be misclassified as dead.
 
-### 6.3 Peer monitor (`checkPeer`) **[IOP for the derivation, IMPL for scheduling]**
+### 6.3 Continuous Peer Monitor (`checkPeer`) **[IOP for derivation, IMPL for scheduling]**
 
-Each endpoint tracks its peer's record with the **local monotonic clock**. State per link: `status` (`NotConnected`=0, `Connected`=1, `Closed`=2, `Gone`=3), `token` (peer token first seen, `0` = none), `lastHB`, `lastChange`. Terminal states: once `status` is `Closed` or `Gone` it never changes. The check runs from the heartbeat tick (every interval), from the `Check` hook of a blocked ring operation (at most every 50 ms, 8.4), and once right after a Secondary joined.
+Each attached endpoint tracks its peer using its **local monotonic clock** and four state variables: `status` (`NotConnected = 0`, `Connected = 1`, `Closed = 2`, `Gone = 3`), `peer.token` (`0` until first seen), `lastHB`, and `lastChange`:
 
 ```text
 checkPeer():
-    if status is Closed/Gone: return its error
+    if status is Closed or Gone: return its error
     if load(sb.epoch) != myEpoch or load(endpoints[self].token) != myToken:
-        status = Gone; return ErrPeerGone         # re-initialized under us, or we were replaced
+        status = Gone; return ErrPeerGone         # segment re-initialized or local slot replaced
     rec = endpoints[1 - self]
     tok = load(rec.token); now = monotonic()
     if tok == 1:                       status = Closed; return ErrPeerClosed
-    if peer.token == 0:                                # peer not seen yet
-        if tok != 0: peer.token = tok; lastHB = load(rec.heartbeat); lastChange = now; status = Connected
+    if peer.token == 0:                                # peer has not attached yet
+        if tok != 0:
+            peer.token = tok; lastHB = load(rec.heartbeat); lastChange = now; status = Connected
         return nil
-    if tok != peer.token:              status = Gone; return ErrPeerGone    # replaced
+    if tok != peer.token:              status = Gone; return ErrPeerGone    # peer replaced
     interval = load(rec.interval)
-    if interval == 0:                  return nil                           # heartbeats disabled: assume alive
+    if interval == 0:                  return nil                           # heartbeats disabled
     hb = load(rec.heartbeat)
     if hb != lastHB:                   lastHB = hb; lastChange = now; return nil
-    if now - lastChange > max(myPeerTimeout, 4 * interval): status = Gone; return ErrPeerGone
+    if now - lastChange > max(myPeerTimeout, 4 * interval):
+        status = Gone; return ErrPeerGone
     return nil
 ```
 
-`myEpoch` is `epoch` as read when the endpoint started (Primary: the value returned by publish; Secondary: `load(epoch)` after joining). `myPeerTimeout` is the endpoint's own `PeerTimeout` (default 5 s).
+### 6.4 Effect on I/O and Post-Close Drain Rule **[IOP]**
 
-### 6.4 Effect on I/O and error mapping **[IOP]**
-
-| Condition | Observable result |
+| Peer / Link Condition | Returned Error |
 | --- | --- |
-| Peer detached (`token == 1`) | `ErrPeerClosed` (matches `io.EOF`). `StandardLink.Read`/`ReadFrom` return plain `io.EOF` instead. |
-| Peer stopped heartbeating longer than the timeout, its token changed, or the segment was re-initialized under this endpoint | `ErrPeerGone` (matches `ErrConnNotFound`). |
-| Local close | `ErrClosed` (matches `net.ErrClosed`). |
-| Deadline | `ErrTimeout` (matches `os.ErrDeadlineExceeded`, `net.Error.Timeout() == true`). |
+| Peer detached gracefully (`token == 1`) | `ErrPeerClosed` (matches `io.EOF`; `StandardLink.Read` and `ReadFrom` return `io.EOF` directly). |
+| Peer heartbeat stalled past `max(PeerTimeout, 4 * interval)`, peer token changed, or `epoch` changed | `ErrPeerGone` (matches `ErrConnNotFound`). |
+| Local endpoint closed | `ErrClosed` (matches `net.ErrClosed`). |
+| Operation deadline expired | `ErrTimeout` (matches `os.ErrDeadlineExceeded`). |
 
-**[IOP] Receivers drain before reporting failure.** When a read fails because the peer closed or died, the receiver MUST make one more non-blocking attempt to dequeue and deliver a packet that was published before the failure; it reports the failure only when the ring is empty. (Data is consumed from the ring first; peer state is consulted only when the ring is empty or a write would block.)
+**[IOP] Drain before reporting peer closure or death**: Whenever a receive call observes `ErrPeerClosed` or `ErrPeerGone`, it `MUST` perform one final non-blocking dequeue attempt on the receive ring and deliver any published packet before surfacing the error. Because a closing peer publishes all packets before executing `cas(token, myToken -> 1)` with release ordering, this drain rule guarantees zero lost messages on graceful close.
 
-**[IOP] Writes after failure.** A send call first checks the recorded peer status and returns the corresponding error without publishing if the peer is already known to be `Closed` or `Gone`; while blocked on a full ring it re-checks at least every 50 ms.
+**[IOP] Failing sends after peer loss**: Before claiming a TX slot, a send operation checks the recorded peer status (and calls `checkPeer()` first if local heartbeats are disabled; `FINDINGS.md` F-10), failing immediately with `ErrPeerClosed` or `ErrPeerGone` if the peer has already left. While blocked on a full ring, the sender re-evaluates `checkPeer()` at least every `50 ms`.
 
-**[IMPL]** Whether the status is refreshed by a heartbeat thread, lazily by blocked calls, or both. An endpoint without a heartbeat thread refreshes it at the start of each send (FINDINGS F-10).
+## 7. The MPMC Ring Protocol (Layout Version 2)
 
-**[IMPL] Close.** `Close` sets a local closed flag, wakes blocked calls, waits for in-flight calls, stops the heartbeat, `cas(own.token, mine, 1)`, then wakes both rings once more so that a peer blocked on a ring notices promptly. The final wake is RECOMMENDED; the peer notices anyway within one check interval.
+Each directional ring is a bounded Vyukov MPMC queue stored in shared memory using ring layout version `2`.
 
-## 7. The ring protocol
-
-A ring is a bounded Vyukov MPMC queue in shared memory. Ring layout version **2**.
-
-### 7.1 Memory image **[IOP]**
+### 7.1 Ring Memory Image **[IOP]**
 
 ```text
-offset   size  field          meaning
-  0        8   magic          0xC9D8C1D43F096702                       } line 0: immutable after Format
-  8        8   size           number of slots N (power of two, >= 2)
- 16        8   flag           bit0 reserved (0), bit1 = initialized (value 2)
- 24        8   stride         slot stride in bytes (128)
- 32        8   version        ring layout version (2)
- 40..127                      padding (zero)
-128        8   r              consumer cursor (position)               } line 1
-136..255                      padding
-256        8   w              producer cursor (position)               } line 2
-264..383                      padding
-384        4   notEmpty       wake word, bumped by producers           } line 3
-388        4   emptyWaiters   number of parked processes waiting for data
-392        4   notFull        wake word, bumped by consumers
-396        4   fullWaiters    number of parked processes waiting for space
-400..511                      padding
-512 ...        slots[0..N-1]
+Offset    Size  Field          Description
+   0         8  magic          0xC9D8C1D43F096702                       } Line 0 (immutable after Format)
+   8         8  size           Number of slots N (power of two, >= 2)
+  16         8  flag           Bit 0 reserved (0), bit 1 initialized (2)
+  24         8  stride         Slot stride in bytes (128)
+  32         8  version        Ring layout version (2)
+  40..127       padding        Zero
+ 128         8  r              Consumer cursor (position)               } Line 1
+ 136..255       padding        Zero
+ 256         8  w              Producer cursor (position)               } Line 2
+ 264..383       padding        Zero
+ 384         4  notEmpty       Wake word incremented by producers       } Line 3
+ 388         4  emptyWaiters   Count of parked consumer processes
+ 392         4  notFull        Wake word incremented by consumers
+ 396         4  fullWaiters    Count of parked producer processes
+ 400..511       padding        Zero
+ 512 ...        slots[0..N-1]  N slots of 128 bytes each
 ```
 
-`HeaderSize = 512`. Each of the four lines is 128 bytes so that independently written words never share a line on machines with 64- or 128-byte lines. A slot is:
+Each 128-byte slot at byte offset `ring + 512 + 128 * i` has the layout:
 
 ```text
-slot offset   size   field
-  0            8     seq       u64, the slot sequence number
-  8           64     packet    the 64-byte HQQ packet (section 9.1)
- 72..127              padding  (stride 128 = round_up(8 + 64, 64))
+Slot Offset  Size  Field
+   0            8  seq       u64 atomic slot sequence number
+   8           64  packet    64-byte HQQ packet (plain memory, section 9.1)
+  72..127      56  padding   Zero padding to 128-byte stride
 ```
 
-Slot `i` is at `ring + 512 + 128*i`. `stride = round_up(8 + sizeof(payload), 64)`; HQQ rings always carry the 64-byte packet, so the stride is 128. Ring bytes = `512 + 128*N`.
+### 7.2 Formatting a Ring (`Format`) **[IOP]**
 
-**[IOP]** The packet bytes are plain memory (not atomics), written only by the slot's current producer and read only by its current consumer (MEMORY_MODEL.md 3).
-
-### 7.2 Format **[IOP]**
-
-`Format(ring, N)` runs in the sole presence of the initializer (nobody else uses the memory) and MUST produce exactly this image, storing the fields in this order so that a concurrent `Attach` never accepts a half-built ring:
+`Format(ring, N)` runs exclusively under `initToken` ownership and `MUST` write fields in the following order so a concurrent `Attach` never observes a half-formatted ring:
 
 ```text
-store(flag = 0); store(magic = 0)                           # invalidate first
+store(flag = 0); store(magic = 0)                           # invalidate header first
 for i in 0..N-1:  packet[i] = zeros;  store(seq[i] = i)
 store(r = 0); store(w = 0)
-store(notEmpty = 0); store(emptyWaiters = 0); store(notFull = 0); store(fullWaiters = 0)   # clears stale waiter counts
+store(notEmpty = 0); store(emptyWaiters = 0); store(notFull = 0); store(fullWaiters = 0)
 store(size = N); store(stride = 128); store(version = 2)
-store(magic = MAGIC_RING)                                  # then
-store(flag = 2)                                            # LAST (release)
+store(magic = 0xC9D8C1D43F096702)
+store(flag = 2)                                            # release store LAST
 ```
 
-Format MUST zero the wait words and both waiter counts: a process killed while parked never decremented its count, and re-initialization is the only point where the count is reset. `N` MUST be a power of two `>= 2`; anything else is a programming error (Go panics).
-
-### 7.3 Attach **[IOP]**
+### 7.3 Attaching to a Ring (`Attach`) **[IOP]**
 
 ```text
 Attach(ring, timeout):
   loop:
-     if load(magic) == MAGIC_RING and load(flag) & 2 != 0:
-         if load(stride) != 128 or load(version) != 2 or not (N = load(size) is a power of two >= 2): return INCOMPATIBLE   # immediately
-         return handle(N, mask = N - 1)
+     if load_acq(magic) == 0xC9D8C1D43F096702 and (load_acq(flag) & 2) != 0:
+         if load(stride) != 128 or load(version) != 2 or not isPowerOfTwoGe2(load(size)):
+             return INCOMPATIBLE
+         return handle(N = load(size), mask = N - 1)
      if timeout != 0 and elapsed >= timeout: return NOT_READY
-     sleep(100 µs)
+     sleep(100 us)
 ```
 
-An incompatible header is rejected at once (no waiting); a header that is not yet initialized is awaited. The loads of `magic` then `flag` MUST be acquire (7.2 releases with `flag`), so that the slot images are visible once the ring is accepted. A handle caches only `N`, `mask`, and the slot base; **cursors are always read from shared memory**.
+### 7.4 Slot Claim, Publish, and Release **[IOP]**
 
-### 7.4 Claim, publish, release **[IOP]**
+All positions `pos`, cursors `r` and `w`, and slot sequence numbers `seq` are unsigned 64-bit integers wrapping modulo `2^64`, with slot index `s = pos & mask`:
 
-Positions are `u64` counters modulo 2^64; `mask = N - 1`; slot index is `pos & mask`. Four protocol steps; the slot sequence `seq` is the only synchronization word between producer and consumer:
-
-| Step | Precondition (read of `seq[pos&mask]`) | Action | Effect on `seq` |
+| Operation | Precondition on `seq[pos & mask]` | Cursor Action | Sequence Store (`seq_cst`) |
 | --- | --- | --- | --- |
-| **producer claim** | `int64(seq - pos) == 0` | claim position `pos`: `cas(w, pos -> pos+1)` | none |
-| **publish** | the caller owns `pos` | write packet and payload (plain), then `store(seq = pos + 1)` | `pos → pos+1` ("published") |
-| **consumer claim** | `int64(seq - (pos+1)) == 0` | claim: `cas(r, pos -> pos+1)` | none |
-| **release** | the caller owns `pos` | read packet and payload (plain), then `store(seq = pos + mask + 1)` | `pos+1 → pos+N` ("free for the next lap") |
+| **Producer claim** | `int64(load_acq(seq) - pos) == 0` | `cas(w, pos -> pos + 1)` | None |
+| **Producer publish** | Caller owns `pos` | Write payload buffer `s` and 64-byte packet | `store_sc(seq, pos + 1)` |
+| **Consumer claim** | `int64(load_acq(seq) - (pos + 1)) == 0` | `cas(r, pos -> pos + 1)` | None |
+| **Consumer release** | Caller owns `pos` | Read 64-byte packet and payload buffer `s` | `store_sc(seq, pos + mask + 1)` |
 
-Claim loops:
+Producer and consumer claim loops:
 
 ```text
 claimProducer():                              claimConsumer():
   pos = load(w)                                 pos = load(r)
   loop:                                         loop:
-    d = int64(load(seq[pos&mask]) - pos)          d = int64(load(seq[pos&mask]) - (pos+1))
+    d = int64(load_acq(seq[pos&mask]) - pos)      d = int64(load_acq(seq[pos&mask]) - (pos+1))
     d == 0: if cas(w, pos, pos+1): return pos     d == 0: if cas(r, pos, pos+1): return pos
             pos = load(w)                                 pos = load(r)
-    d  > 0: pos = load(w)    # another producer       d  > 0: pos = load(r)    # another consumer
-            # already took pos; catch up                      # already took pos
+    d  > 0: pos = load(w)                         d  > 0: pos = load(r)
     d  < 0: ring is FULL: wait (section 8)        d  < 0: ring is EMPTY: wait (section 8)
 ```
 
-* A slot's life per lap: `seq = pos` (free for the producer of `pos`) → `pos+1` (published, owned by the consumer of `pos`) → `pos+N` (= `(pos+N)`, free for the producer of position `pos+N`, the next lap).
-* Because the claimant of a position is its **only writer** until it completes the slot, completion is a plain atomic store; it cannot fail. (The Go API additionally completes handles that callers may *copy* with `cas(seq, pos -> pos+1)` / `cas(seq, pos+1 -> pos+N)` so that a stale copy of an already completed reservation fails the swap and neither modifies the ring nor wakes anyone. That is a local API-safety measure; **[IMPL]**.)
-* **Wraparound.** `pos`, `r`, `w` and `seq` are all modulo 2^64. The comparisons are the signed differences `int64(seq - pos)` above; they are correct because `N <= 2^24`, far below `2^63`, so a slot's `seq` is never more than `N` positions away from any `pos` that can legitimately reach it. Arithmetic on positions MUST be done in `u64` with wrap (in C `uint64_t`; in Rust `wrapping_add`/`wrapping_sub`). Slot index is `pos & mask`.
-* **Invariants (quiescent):** `w - r` ∈ `[0, N]`; `seq[i]` is `i` (never used), or `pos+1`/`pos+N` for the last position `pos` that used slot `i`. The number of published-but-unreleased slots is at most `N`. A producer that has claimed but not published (or a consumer that has claimed but not released) holds its slot **and blocks the ring behind it** (head-of-line): positions are consumed strictly in order of their position even when completed out of order, so a stalled claimant stalls the whole direction. There is no timeout or recovery for a claimant that dies between claim and completion; its peer observes the death through heartbeats and the link is abandoned.
-* **FIFO.** Packets are delivered in position order.
+### 7.5 Full and Empty Ring Conditions **[IOP]**
 
-### 7.5 What a full or empty ring means **[IOP]**
+When `d < 0` in `claimProducer`, slot `pos & mask` has not yet been released from lap `(pos - N) / N` (the ring is **full**). When `d < 0` in `claimConsumer`, position `pos` has not yet been published by the producer (the ring is **empty**). Non-blocking calls (`TryWrite`, `TryRead`) return immediately without modifying any shared word; blocking calls enter the wait/wake protocol in section 8.
 
-`d < 0` for the producer means the slot's previous occupant (position `pos - N`) has not been released: the ring is full. `d < 0` for the consumer means position `pos` has not been published: the ring is empty. A non-blocking operation fails at that point without changing any shared word. A blocking operation waits as specified in section 8.
+### 7.6 Local SPSC Serialization Mode **[IMPL with IOP constraints]**
 
-### 7.6 SPSC mode (local serialization) **[IMPL]** with **[IOP]** constraints
+Because at most one OS process produces and at most one OS process consumes on each ring, an implementation that serializes its own local threads with a process-local mutex (or is single-threaded per direction) `MAY` update `w` and `r` using plain atomic stores (`store_rlx(w, pos + 1)`) instead of `cas`, provided it:
 
-Because the cross-process topology is one producer process and one consumer process per ring, an implementation MAY serialize its own producers (and its own consumers) with a process-local lock, or restrict itself to one producer and one consumer thread, and then use plain atomic **stores** instead of CAS on the cursor:
+1. Follows the exact `seq[s]` ordering rules of section 7.4 and [`MEMORY_MODEL.md`](MEMORY_MODEL.md).
+2. Initializes its local view of `r` and `w` by reading the shared-memory cursors at `Attach` time.
+3. Stores `w = pos + 1` (or `r = pos + 1`) **before** storing `seq = pos + 1` (or `seq = pos + mask + 1`) so the shared-memory cursors remain canonical at all times.
 
-```text
-SPSC producer:  pos = w (load, owned by this party);  if int64(load(seq[pos&mask]) - pos) < 0: FULL
-                store(w = pos + 1);  write packet/payload;  store(seq = pos + 1)
-SPSC consumer:  pos = r;                if int64(load(seq[pos&mask]) - (pos+1)) < 0: EMPTY
-                store(r = pos + 1);  read packet/payload;  store(seq = pos + mask + 1)
-```
+## 8. Wait / Wake Protocol (Dekker Handshake)
 
-Constraints (mandatory):
+Kernel parking is optional for correctness (a spin-plus-sleep implementation is valid), but any implementation that parks or wakes peers `MUST` follow the Dekker handshake below so wakeups are never lost.
 
-1. The **slot sequence protocol** (the table in 7.4, the memory orders of MEMORY_MODEL.md) is followed exactly; the cursor words are not read by the other side, but they MUST still be maintained (`w` = number of producer claims, `r` = number of consumer claims, modulo 2^64) so that the memory image is canonical and a process using CAS (the Go implementation) can later take over the same side in a **new session** after re-initialization, and so that debugging tools agree.
-2. Cursors are **read from shared memory at attach** (always 0 at the first attach of a role in a session; the Secondary may find ring 0 already carrying packets that the Primary published before it attached).
-3. The cursor store happens **before** the publish/release store of `seq` (it is the "claim" of the CAS protocol).
-4. Exactly one process acts as producer and one as consumer per ring: a second process on the same side is never admitted by the superblock protocol, so SPSC mode is sound **only because** of 5.5.
+### 8.1 Wait Words and Process Counters **[IOP]**
 
-CAS-based and store-based implementations interoperate on the same ring (the Go implementation is CAS-based).
-
-## 8. Wait / wake protocol
-
-Blocking is optional for correctness: **a port that never parks is valid** (spin plus bounded sleep backoff, "simple mode" in PORTING.md). Parking exists to save CPU. This section specifies the **cross-process handshake that parking implementations MUST follow** so that a wake-up is never lost, and the duty of **wakers**, which every implementation that wants other processes to sleep efficiently SHOULD honor.
-
-### 8.1 Words **[IOP]**
-
-Per ring, two sides:
-
-| Side | Awaited by | Condition | Wake word | Waiter count | Signaled by |
+| Direction | Awaited By | Target Condition | Wake Word | Waiter Counter | Signaled By |
 | --- | --- | --- | --- | --- | --- |
-| `NotEmpty` (0) | consumer | slot at position `r` is published | `notEmpty` (u32 @384) | `emptyWaiters` (u32 @388) | producer after publish; |
-| `NotFull` (1) | producer | slot at position `w` is free | `notFull` (u32 @392) | `fullWaiters` (u32 @396) | consumer after release |
+| `NotEmpty` (`0`) | Consumer | `seq[r & mask] == r + 1` | `notEmpty` (`u32 @384`) | `emptyWaiters` (`u32 @388`) | Producer after publish |
+| `NotFull` (`1`) | Producer | `seq[w & mask] == w` | `notFull` (`u32 @392`) | `fullWaiters` (`u32 @396`) | Consumer after release |
 
-**[IOP] The waiter count counts parked PROCESSES, not threads.** Aggregating all blocked threads of one process into one registered "leader" is a process-local implementation choice (the Go implementation does it so that N blocked goroutines pin one OS thread). A port MAY register once per parked thread instead; counts then over-count, which only costs superfluous wake calls. A count MUST never be decremented below the number of live parkers (do not under-count: that would lose wake-ups). In the specified topology each side has at most one parked process, so a count is `0` or `1` plus residue of dead processes.
+**[IOP] Waiter counters count parked processes**: Each process registers at most once per direction (or once per parked thread if it does not aggregate locally; over-counting only causes extra wake syscalls, whereas under-counting is forbidden).
 
-### 8.2 Waiter protocol **[IOP]**
+### 8.2 Waiter Sequence **[IOP]**
 
-A thread (or the process leader) that found the ring full/empty and wants to park until `seq[pos&mask]` reaches `target` (`pos` for the producer, `pos+1` for the consumer; compared as `int64(seq - target) < 0`) does, for the side's `(word, waiters)`:
+When `claimConsumer` (with `target = pos + 1`) or `claimProducer` (with `target = pos`) observes `int64(seq - target) < 0` and decides to park on `(word, waiters)`:
 
 ```text
-W1  fetch_add(waiters, 1)                       # register       (seq_cst)
-W2  v = load(word)                              # snapshot       (seq_cst; acquire is the minimum)
-W3  if int64(load(seq[pos&mask]) - target) < 0 and not cancelled:    # re-check  (seq_cst)
-        park(word, v, timeout)                  # futex_wait(word, v) / ulock wait / semaphore wait
-W4  fetch_sub(waiters, 1)                       # deregister
+W1  fetch_add_sc(waiters, 1)                    # register waiter (MUST be seq_cst)
+W2  v = load_acq(word)                          # snapshot futex word (acquire or seq_cst)
+W3  if int64(load_sc(seq[pos&mask]) - target) < 0 and not cancelled:   # re-check (MUST be seq_cst)
+        park(word, v, timeout)                  # futex_wait / ulock_wait / semaphore wait (<= 100 ms)
+W4  fetch_sub_rel(waiters, 1)                   # deregister waiter
     re-run the claim loop
 ```
 
-### 8.3 Waker protocol **[IOP]**
+### 8.3 Waker Sequence **[IOP]**
 
-After `publish` (resp. `release`):
+Immediately after publishing (`store_sc(seq, pos + 1)`) or releasing (`store_sc(seq, pos + mask + 1)`):
 
 ```text
-K1  store(seq = ...)                            # (seq_cst)
-K2  n = load(waiters of the opposite side)      # (seq_cst)
-K3  if n != 0:  fetch_add(word, 1)  then  wake_all(word)        # with a Parker: Wake(side, 1) per slot; WakeAll: Wake(side, n)
+K1  store_sc(seq, ...)                          # publish or release (MUST be seq_cst)
+K2  n = load_sc(waiters of opposite side)       # read waiter count (MUST be seq_cst)
+K3  if n != 0:
+        fetch_add_rel(word, 1)
+        wake_all(word)                          # on Windows semaphores: ReleaseSemaphore(sem, 1, NULL)
 ```
 
-`word` is the NotEmpty word after a publish, the NotFull word after a release.
+**[IOP] Sequential consistency requirement**: Operations `W1`, `W3`, `K1`, and `K2` form a Dekker store-buffering pair and **`MUST` be sequentially consistent** (or use `seq_cst` fences between `W1`/`W3` and `K1`/`K2`). See [`MEMORY_MODEL.md`](MEMORY_MODEL.md) section 4.2 for the formal proof.
 
-**[IOP] The four accesses W1, W3, K1, K2 form a store-buffering (Dekker) pattern and MUST be sequentially consistent** (or be separated by `seq_cst` fences); release/acquire is **insufficient** (MEMORY_MODEL.md 4 with the failing interleaving and `litmus/wake_handshake_*.litmus`). Without it the waker may read `waiters == 0` while the waiter reads the old `seq`: the waiter parks and nobody wakes it.
+**[IOP] Bounded park timeout**: Every kernel `park` call `MUST` be bounded by at most `100 ms` (and shortened to the caller's deadline and the `50 ms` peer-liveness check interval).
 
-**[IOP] The wake-word protocol with a futex-style primitive.** The waiter snapshots the word at W2 and the kernel compares it atomically at park time; the waker changes the word (K3, `fetch_add`) **after** having seen `n != 0`. Hence a wake between W3 and the kernel wait is not lost: the kernel sees a changed word and returns at once. `wake_all` wakes every waiter of the word (`FUTEX_WAKE` with `INT_MAX`; `ULF_WAKE_ALL`).
+### 8.4 Adaptive Backoff Schedule **[IMPL]**
 
-**[IOP] Bounded park.** Every park MUST be bounded by a timeout so that a lost or never-sent wake costs bounded latency, not a hang. The Go implementation parks at most `100 ms`, and shortens it to the remaining deadline and to the next peer-liveness check (at most `50 ms` apart). A port SHOULD use the same bounds.
+Before parking in the kernel, the reference implementations escalate through three phases:
 
-**[IOP] `WakeAll`** (used on close and when the peer state changes) bumps **both** wake words and wakes unconditionally (not gated by the counts); with a Parker, it releases `n` tokens only if the count is non-zero.
+1. **Spin**: ~4-6 us of pause/spin reads (`256` 4-read iterations in Go, `1024` single-read iterations in C).
+2. **Yield**: `256` iterations of `runtime.Gosched()` / `sched_yield()`, checking deadlines and peer liveness every 16 iterations.
+3. **Kernel park**: `park(word, v, min(100ms, timeToDeadline, 50ms))`.
 
-**[IOP] Stale counts.** A process killed while parked never runs W4, so its count stays raised until the ring is re-formatted (7.2). Consequences: one superfluous wake per publish/release. Correctness is not affected because the count is only a hint to wake. A waker therefore grants one token per slot, never the stale count (FINDINGS F-02).
+### 8.5 Platform Wait/Wake Primitives **[IOP]**
 
-### 8.4 Backoff schedule **[IMPL]** (Go defaults, RECOMMENDED)
+- **Linux**: `futex(addr, FUTEX_WAIT = 0, v, timespec)` and `futex(addr, FUTEX_WAKE = 1, INT_MAX)` **without** `FUTEX_PRIVATE_FLAG` (shared across processes via physical page address).
+- **macOS**: Shared-address ulock wait/wake via `__ulock_wait(UL_COMPARE_AND_WAIT_SHARED = 3, addr, v, timeout_us)` and `__ulock_wake(UL_COMPARE_AND_WAIT_SHARED | ULF_WAKE_ALL, addr, 0)` (or `os_sync_wait_on_address` / `os_sync_wake_by_address_all` with `OS_SYNC_WAIT_ON_ADDRESS_SHARED` on macOS 14.4+).
+- **Windows (named segments)**: Uses the four per-segment named kernel semaphores (`.hqq-sem0..3`, section 11.5). Waiters execute `W1`, `W3`, and `WaitForSingleObject(sem, timeout_ms)`; wakers execute `K1`, `K2`, and (when `n != 0`) `ReleaseSemaphore(sem, 1, NULL)`.
 
-A blocked operation escalates through three phases, re-checking the slot sequence each iteration:
+### 8.6 Process-Local Waiter Aggregation **[IMPL]**
 
-1. spin: 256 iterations (no syscall). A Go iteration re-reads the slot 4 times, about 24 ns, so the window is about 6 µs; an implementation with a cheaper step uses proportionally more iterations (the C library: 1024 single-read steps, about 4 µs). The window must cover the reply of a peer that spends a few microseconds per request; a window of about 1.5 µs measurably slowed such calls (the Go yield phase wakes another thread per `runtime.Gosched`);
-2. yield: 256 iterations of `sched_yield`/`runtime.Gosched` (deadline and liveness checks every 16th iteration);
-3. park for `min(100 ms, time to deadline, time to next liveness check)`; liveness (`Check`) runs once when leaving the spin phase and then at most every 50 ms.
+An implementation `MAY` aggregate concurrent waiting threads/goroutines within the same process so that only one leader thread executes `W1..W4` per direction while follower threads wait on a process-private condition variable or channel.
 
-`WaitSpin` never parks: it re-checks forever, yielding and running the slow checks every 64th iteration.
+## 9. Standard Protocol (`OpCopy`, `OpTombstone`, `OpError`)
 
-### 8.5 Platform primitives
+The Standard protocol provides low-level message framing over the two directional rings.
 
-* **Linux [IOP]**: `futex(addr, FUTEX_WAIT = 0, v, timespec)` / `futex(addr, FUTEX_WAKE = 1, INT_MAX)` on the 32-bit wake word, **shared** (no `FUTEX_PRIVATE_FLAG`), because the word lives in a `MAP_SHARED` mapping and waiters are in different processes.
-* **macOS [IOP]**: `__ulock_wait(UL_COMPARE_AND_WAIT_SHARED = 3, addr, v, timeout_us)` (syscall 515) and `__ulock_wake(UL_COMPARE_AND_WAIT_SHARED | ULF_WAKE_ALL, addr, 0)` (syscall 516, `ULF_WAKE_ALL = 0x100`). These are private Darwin interfaces; errors are ignored and parking then degrades to bounded polling. The public alternative is `os_sync_wait_on_address`/`os_sync_wake_by_address_all` (macOS 14.4+, `OS_SYNC_WAIT_ON_ADDRESS_SHARED`); a port MAY use it. Both operate on the same 32-bit wake words and are interoperable at the protocol level because only the *word value* and the *waiter count* are shared state.
-* **Windows, named segments [IOP]**: Windows has no cross-process compare-and-wait on a shared-memory word (`WaitOnAddress`/`WakeByAddressAll` only match waiters and wakers of the same process). Each segment therefore has **four named kernel semaphores** (11.5): ring 0 notEmpty, ring 0 notFull, ring 1 notEmpty, ring 1 notFull. Protocol: the waiter registers (W1), re-checks (W3), and `WaitForSingleObject(sem, timeout)`; the waker, after publishing and seeing `n = load(waiters) != 0`, calls `ReleaseSemaphore(sem, 1)` per published or released slot (`ReleaseSemaphore(sem, min(n, INT_MAX))` only for `WakeAll`; errors, including `ERROR_TOO_MANY_POSTS`, are ignored). The wake word is **not** used. Because tokens persist, a wake that runs between the waiter's re-check and its wait is not lost; tokens left for waiters that already gave up only cause one spurious return, after which waiters re-check. Each semaphore is created with initial count 0 and maximum count `2^31-1`.
-* **Windows, unnamed memory** and **other platforms [IMPL]**: the Go implementation uses `WaitOnAddress`/`WakeByAddressAll` (same-process only) bounded by an exponential backoff `20 µs → 2 ms`, or bare exponential sleep `20 µs → 2 ms`, so a wake from another process is noticed within one backoff step.
+### 9.1 64-Byte Packet ABI **[IOP]**
 
-### 8.6 Process-local aggregation **[IMPL]**
+Every ring slot carries a **64-byte packet** composed of eight little-endian `u64` words:
 
-All blocked operations of one process on the same wake word form a group; the first to park is the leader and alone runs W1–W4; the others wait on a process-local primitive and re-check when the leader returns (one of them then becomes the next leader). A follower checks its condition *before* joining the group, and all waiters of a side wait for the same slot, so a publish either finds the leader registered and wakes it, or precedes its registration and is seen by its re-check. This adds nothing to the shared memory.
-
-## 9. Standard protocol (packet, copy, tombstone, error)
-
-### 9.1 Packet ABI **[IOP]**
-
-A packet is **64 bytes: eight little-endian `u64` words**.
-
-| Word | Offset | Content |
+| Word | Byte Offset | Content |
 | ---: | ---: | --- |
-| 0 | 0 | opcode in the low byte; bits 8..63 reserved |
-| 1..7 | 8, 16, …, 56 | operands 0..6 |
+| `0` | `0` | Opcode in bits `0..7`; bits `8..63` are reserved (`0`). |
+| `1..7` | `8, 16, ..., 56` | Operands `0..6`. |
 
-**[IOP]** The reserved bits of word 0 and every operand word that the opcode does not define MUST be zero in a published packet. A sender MAY skip the store of a word that is already zero: operands 3..6 (words 4..7) of a Standard ring are defined by no Standard opcode and are zeroed by `Format` (7.2), so a Standard sender that never writes them satisfies the rule, and an implementation relies on this only for rings it formatted or attached under the rules of 7.2 and 7.3. A sender that writes into a slot that held a packet of another layer MUST clear the words itself. **[IOP]** Receivers MUST read the opcode as `word0 & 0xFF` and MUST ignore bits 8..63 of word 0 (forward compatibility). Operand words not defined for an opcode are ignored by receivers.
+**[IOP]** Senders `MUST` write `0` to bits `8..63` of word 0 and to all unused operand words (for a newly formatted Standard-only ring where words `4..7` are already `0`, a Standard sender may omit re-zeroing words `4..7`). Receivers `MUST` extract the opcode as `word0 & 0xFF` and `MUST` ignore bits `8..63` of word 0 and any unused operand words.
 
-### 9.2 Opcodes and operands **[IOP]**
+### 9.2 Opcodes and Operands **[IOP]**
 
-| Opcode | Value | Layer | Operands (index: meaning) |
+| Opcode | Hex | Layer | Operands (`0..6`) |
 | --- | ---: | --- | --- |
-| `OpError` | `0x00` | both | 0: ContextID (connection, copy or request id); 1: ErrorCode (section 12) |
-| `OpConnCreate` | `0x01` | Advanced | 0: ConnectionID (operand 1 reserved, sent as 0) |
-| `OpConnAccept` | `0x02` | Advanced | 0: ConnectionID |
-| `OpConnClose` | `0x03` | Advanced | 0: ConnectionID; 1: reason (sent as 0) |
-| `OpConnCopy` | `0x04` | Advanced | 0: ConnectionID (0 = link-level stream); 1: MessageID; 2: TotalSize; 3: ChunkOffset; 4: ChunkSize; 5: frame flags; 6: aux (MethodID / status) |
-| `OpProtoNegotiate` | `0x05` | Advanced | 0: version `(major<<8)|minor`; 1: requested features; 2: capability word (sent as 0, ignored) |
-| `OpProtoAck` | `0x06` | Advanced | 0: version; 1: negotiated features; 2: capability word (sent as 0, ignored) |
-| `OpStandardLinkTombstone` | `0xFE` | Standard | 0: CopyID / reservation id; 1: slot index (diagnostic mirror); 2: reason code (ErrorCode) |
-| `OpStandardLinkCopy` | `0xFF` | Standard | 0: CopyID; 1: slot index (diagnostic mirror); 2: DataSize |
+| `OpError` | `0x00` | Both | `0`: `ContextID`; `1`: `ErrorCode` (section 12) |
+| `OpConnCreate` | `0x01` | Advanced | `0`: `ConnectionID`; `1`: reserved (`0`) |
+| `OpConnAccept` | `0x02` | Advanced | `0`: `ConnectionID` |
+| `OpConnClose` | `0x03` | Advanced | `0`: `ConnectionID`; `1`: reserved (`0`) |
+| `OpConnCopy` | `0x04` | Advanced | `0`: `ConnectionID` (`0` = default stream); `1`: `MessageID`; `2`: `TotalSize`; `3`: `ChunkOffset`; `4`: `ChunkSize`; `5`: `Flags`; `6`: `Aux` (`MethodID` or status) |
+| `OpProtoNegotiate` | `0x05` | Advanced | `0`: encoded version `(major << 8) \| minor`; `1`: requested features; `2`: reserved (`0`) |
+| `OpProtoAck` | `0x06` | Advanced | `0`: encoded version; `1`: negotiated features; `2`: reserved (`0`) |
+| `OpCancel` | `0x07` | Advanced (1.1) | `0`: `ConnectionID`; `1`: `MessageID` (`PROTOCOL_1_1_DRAFT.md` section 2) |
+| `OpStandardLinkTombstone` | `0xFE` | Standard | `0`: `CopyID`; `1`: slot index (diagnostic); `2`: `ErrorCode` |
+| `OpStandardLinkCopy` | `0xFF` | Standard | `0`: `CopyID`; `1`: slot index (diagnostic); `2`: `DataSize` |
 
-Golden byte vectors for each opcode are in `constants.json` (`packet_vectors`) and asserted by tests. An unknown opcode on a path that expects defined opcodes is a protocol violation of that path (below). Packets of opcodes `0x01..0x06` carry **no payload** (their slot's buffer is unused).
+### 9.3 Standard Send Path **[IOP]**
 
-### 9.3 Send path **[IOP]**
+1. Claim producer position `pos` (`slot s = pos & mask`) on the outbound ring.
+2. Copy `DataSize` bytes (`1 <= DataSize <= bufferSize`) into payload buffer `s` using plain memory writes.
+3. Write the 64-byte packet at slot `s`: `OpStandardLinkCopy` with `Operand0 = CopyID`, `Operand1 = s`, and `Operand2 = DataSize`. If a reservation or zero-copy callback is aborted after claiming `pos`, the sender **`MUST` still publish the slot** using `OpStandardLinkTombstone` (`0xFE`) so the ring does not stall at `pos`.
+4. Publish `store_sc(seq[s], pos + 1)` and run the waker check (section 8.3).
 
-1. Claim a producer slot `s` on the sender's transmit ring (direction 0 for the Primary, 1 for the Secondary).
-2. Write the payload into buffer `s` of the sender's pool (plain stores), `1 <= DataSize <= bufferSize`.
-3. Store the packet into the slot: `OpStandardLinkCopy` with `CopyID`, `Operand1 = s`, `DataSize`; if the write must be abandoned after the claim (a reservation aborted, a zero-copy callback that fails, panics or returns an invalid size), store `OpStandardLinkTombstone` with `Operand2 = ErrorCode` (`ErrCodeInvalidOp` if none, `ErrCodeInvalidSize` for a size `<= 0`, `ErrCodeBufferOverflow` for a size `> bufferSize`) instead. **A claimed slot MUST always be published** (a tombstone if nothing else) or the ring stalls.
-4. Publish (`store(seq = pos + 1)`) and wake (8.3).
+Empty writes (`DataSize == 0`) are no-ops and do not claim or publish a slot. Payloads exceeding `bufferSize` return `ErrBufferOverflow` locally without claiming a slot.
 
-`CopyID` is a per-endpoint counter starting at 1 (the first packet carries 1), shared by all copy and tombstone packets of that endpoint, increasing by 1 per claim; it is diagnostic. Empty writes (`len == 0`) do not publish a packet. Standard `Write` of more than `bufferSize` bytes is refused locally (`ErrBufferOverflow`); larger messages require the Advanced layer.
+### 9.4 Standard Receive Path and Buffer Ownership **[IOP]**
 
-### 9.4 Receive path and buffer ownership **[IOP]**
+Ring slot `i` exclusively owns payload buffer `i`:
 
-Each direction starts with every slot available. **Slot `i` owns buffer `i` of its pool, and ownership of the buffer is exactly ownership of the slot**: a producer may write buffer `i` only between claiming and publishing slot `i`, a consumer may read it only between claiming and releasing slot `i`. A payload buffer is recycled only after the receiver releases the owning slot.
+1. Claim consumer position `pos` and compute `slot = pos & mask` (**never** read the buffer index from `Operand1`).
+2. Dispatch on `opcode = word0 & 0xFF`:
+   - `OpStandardLinkTombstone` (`0xFE`): Release slot `pos` and loop to claim the next slot.
+   - `OpStandardLinkCopy` (`0xFF`): Let `size = Operand2`. If `size == 0 || size > bufferSize`, release the slot and return `ErrInvalidSize`; otherwise copy or expose `size` bytes from payload buffer `slot`, then release the slot.
+   - `OpError` (`0x00`): Release the slot and return the error mapped from `Operand1` (section 12).
+   - Any other opcode: Release the slot and return `ErrUnexpectedPacket`.
+3. Always release the slot (`store_sc(seq[slot], pos + mask + 1)`) and run the `NotFull` waker check (section 8.3), even if the reader's buffer or callback fails.
 
-1. Claim a consumer slot; the slot index is derived from the claimed **position** (`pos & mask`), **never from packet operand 1** (which is a diagnostic mirror).
-2. Classify the packet by opcode:
+## 10. Advanced Protocol
 
-   | Opcode | Standard receive action |
-   | --- | --- |
-   | `OpStandardLinkTombstone` | skip; release the slot; take the next packet |
-   | `OpStandardLinkCopy` | `size = Operand2`; if `size == 0` or `size > bufferSize`: release the slot and fail with `ErrInvalidSize`; else deliver `size` bytes of buffer `slot` (before release) |
-   | `OpError` | release the slot; fail with the error of `Operand1` (12) |
-   | anything else (including Advanced frames on a raw Standard reader) | release the slot; fail with `ErrUnexpectedPacket` |
+The Advanced protocol layers feature negotiation, arbitrary-size chunked messages, request/response RPC, and multiplexed streams over the same segment and ring layout. Protocol 1.1 extensions (`OpCancel`, `AdvFlagMeta`, and `ErrCodeShuttingDown`) are specified in [`ext/PROTOCOL_1_1_DRAFT.md`](ext/PROTOCOL_1_1_DRAFT.md).
 
-3. Release the slot (`store(seq = pos + mask + 1)`) **promptly**, after the callback/copy, even if the delivery failed or panicked, and wake producers (8.3).
+### 10.1 Handshake Negotiation **[IOP]**
 
-A closed or dead peer does not lose messages: see the draining rule in 6.4.
+Baseline features: `FeatureMessages = 1 << 0` (`0x01`) and `FeatureRequestResponse = 1 << 1` (`0x02`), plus Protocol 1.1 `FeatureCancel = 1 << 2` (`0x04`) and `FeatureMetadata = 1 << 3` (`0x08`).
 
-**[IMPL] Partial reads, tails and datagram semantics** (the Go `Read` leaving the unread tail of a message queued per endpoint, `ReadFrom` truncating) are local API behavior and not part of the wire protocol.
+- **Role-driven handshake**: The **Primary** sends `OpProtoNegotiate(version, requestedFeatures, 0)` and reads frames (skipping tombstones) until `OpProtoAck` arrives. The **Secondary** reads frames (skipping tombstones) until `OpProtoNegotiate` arrives, then replies with `OpProtoAck`.
+- **Responder rules**: If `major != 1`, send `OpError(0, ErrCodeInvalidOp)` and transition to terminal state `Failed` (`ErrNegotiationRejected`). Otherwise compute `minor = min(requestedMinor, ownMinor)` and `features = requestedFeatures & supportedFeatures & allowedFeatures` (clearing bits `2..3` if `minor == 0`), send `OpProtoAck((1 << 8) | minor, features, 0)`, and enter `Negotiated`.
+- **Simultaneous initiation**: If the Secondary also sent `OpProtoNegotiate`, the Primary ignores the incoming `OpProtoNegotiate` and waits for `OpProtoAck`, while the Secondary answers the Primary's `OpProtoNegotiate` using `request.features & supported & ownRequestedFeatures`.
+- **Terminal failure**: If negotiation fails for any reason, the link enters terminal state `Failed` and all subsequent `Negotiate` calls return `ErrNegotiationFailed`.
 
-## 10. Advanced protocol
+### 10.2 Stream and Message Identifiers **[IOP]**
 
-The Advanced protocol is an overlay on the Standard protocol: same segment, same rings, same packet ABI, same slot-owned buffers. Once negotiation of a link starts, **the Advanced receive path owns the receive direction of that link**; raw Standard reads on it are no longer meaningful. Protocol version 1.0.
-
-### 10.1 Negotiation **[IOP]**
-
-Features: `FeatureMessages = 1<<0` (plain messages: `OpConnCopy` without request/response flags), `FeatureRequestResponse = 1<<1`. Version word `(major<<8)|minor`; baseline `0x0100`.
-
-* The **Primary initiates**: it sends `OpProtoNegotiate(version, requestedFeatures, 0)` and then reads packets until an ack arrives, skipping tombstones. The **Secondary responds**: it reads packets (skipping tombstones) until `OpProtoNegotiate`, then sends `OpProtoAck`. A role-agnostic `Negotiate(features)` does this automatically; `features = 0` requests everything supported.
-* **Answer rules** (responder): if `major(version) != 1`, send `OpError(0, ErrCodeInvalidOp)` and fail (`ErrNegotiationRejected` locally). Otherwise `minor = min(requestedMinor, ownMinor)` (own minor is `0` in the baseline); `features = requestedFeatures & supportedFeatures & allowedFeatures`; send `OpProtoAck(version = (1<<8)|minor, features, 0)`; become negotiated with these values.
-* **Initiator checks the ack**: reject (`ErrNegotiationRejected`, state `Failed`) if `ack.major != 1`, `ack.minor > ownMinor`, or `ack.features` contains a bit outside `requestedFeatures & supportedFeatures`. Otherwise negotiated.
-* **Initiator receives `OpProtoNegotiate`** (the Secondary also initiated): if it is the Secondary, it **answers** it (the Primary's request wins) with `features = request.features & supported & ownRequestedFeatures`; if it is the Primary, it ignores it and keeps waiting for its ack.
-* An `OpError` while waiting fails negotiation with `ErrNegotiationRejected`; any other opcode with `ErrUnexpectedPacket`.
-* **Negotiation state** (local, not in shared memory): `None → Negotiating → Negotiated`, or `→ Failed`. **`Failed` is terminal**: every later negotiate call returns `ErrNegotiationFailed` (frames of the failed attempt may still be in flight; close the link and open a new one). `ErrAlreadyNegotiated` while `Negotiating`/`Negotiated`. Any error during an attempt (rejection, invalid packet, cancelled context, closed link) moves to `Failed`.
-* Advanced calls before success fail with `ErrNotNegotiated`; `Send/Recv` require `FeatureMessages`, `Call/Serve` require `FeatureRequestResponse` (otherwise `ErrNotNegotiated`).
-
-Negotiation packets carry no payload.
-
-### 10.2 Identifiers and parity **[IOP]**
-
-| ID | Scope | Rule |
+| Identifier | Scope | Allocation Rule |
 | --- | --- | --- |
-| `ConnectionID` (stream id) | per link | `0` is the link-level stream (always open, cannot be closed). Non-zero ids are allocated **by parity**: the Primary allocates even ids `2, 4, 6, …` (`n << 1`), the Secondary odd ids `1, 3, 5, …` (`2n - 1`). Ids are never reused on a link. |
-| `MessageID` | per sender | Identifies one logical message; starts at 1 and increases by 1 per message (data, request) across **all streams** of the sender; never `0` (a counter wrap skips `0`). A response carries the **request's** `MessageID`. |
-| `MethodID` | application | Selector in a request's `aux` (operand 6) on its first chunk. |
+| `ConnectionID` (stream ID) | Per link | `0` is the permanent link-level stream. Positive stream IDs are allocated by parity: **Primary allocates even IDs (`2, 4, 6, ...`)**, and **Secondary allocates odd IDs (`1, 3, 5, ...`)**. Stream IDs are never reused on a link. |
+| `MessageID` | Per sender | Starts at `1` and increments by `1` for each outbound data message or request across all streams (skipping `0` on wrap). Responses reuse the request's `MessageID`. |
+| `MethodID` | Per request | Carried in `aux` (operand 6) of the first chunk (`ChunkOffset == 0`) of a request. |
 
-The receiving side identifies a message by `(ConnectionID, MessageID, kind)` with `kind ∈ {data, request, response}` taken from the Request/Response flags. Because each sender uses one counter for data and requests and a response reuses the request's id, keys of different kinds never collide.
+### 10.3 Stream Multiplexing (`OpConnCreate`, `OpConnAccept`, `OpConnClose`) **[IOP]**
 
-### 10.3 Stream control **[IOP]**
+- **Opening a stream**: The initiator allocates a `ConnectionID` of its own parity, registers the pending stream, and sends `OpConnCreate(connectionID, 0)`. The responder replies with `OpConnAccept(connectionID)` on success, or `OpError(connectionID, code)` on refusal:
+  - `ErrCodeConnNotFound` (`0x05`): Responder is not listening for streams (`ListenStreams` not called) and the pre-listen grace period (`StreamListenGrace`, default `2s`, holding up to `IncomingQueueSize` requests) has expired or is disabled.
+  - `ErrCodeInvalidOp` (`0x06`): `connectionID == 0`, wrong parity for the sender's role, or duplicate `connectionID`.
+  - `ErrCodeBufferOverflow` (`0x07`): Accept queue is full under `OverflowDrop`.
+- **Closing a stream**: `Stream.Close` marks the stream closed locally, discards unread queued messages, and sends `OpConnClose(connectionID, 0)` unless the peer already closed it. Stream `0` cannot be closed (`ErrInvalidOp`).
+- **Non-blocking control replies**: The receive loop `MUST NEVER` block waiting for space on the TX ring when sending `OpConnAccept` or error replies; all control replies are queued on a bounded asynchronous control queue so bidirectional floods cannot deadlock.
 
-* `OpConnCreate(connectionID)`: the opener of a stream allocates an id of its own parity, registers the stream as pending and sends it. The peer validates and replies: `OpConnAccept(connectionID)` if accepted, otherwise `OpError(connectionID, code)`:
+### 10.4 Chunking and Frame Flags (`OpConnCopy`) **[IOP]**
 
-  | Refusal | Code |
-  | --- | --- |
-  | not listening (`ListenStreams` not called), once the request cannot be held or its grace period has passed (below) | `ErrCodeConnNotFound` (5) |
-  | id `0`, wrong parity for the sender's role (the peer allocates `peerOwnsConnectionID`: odd ids belong to the Secondary, non-zero even ids to the Primary), or already registered (the existing stream is left untouched) | `ErrCodeInvalidOp` (6) |
-  | accept queue full under `OverflowDrop` | `ErrCodeBufferOverflow` (7) |
+`OpConnCopy` operand 5 carries a bitmask of frame flags:
+- `Begin = 1 << 0` (`0x01`)
+- `End = 1 << 1` (`0x02`)
+- `Abort = 1 << 2` (`0x04`)
+- `Request = 1 << 3` (`0x08`)
+- `Response = 1 << 4` (`0x10`)
+- `Error = 1 << 5` (`0x20`)
+- `Meta = 1 << 6` (`0x40`, Protocol 1.1)
 
-  Under `OverflowFail` a full accept queue fails the receive path (`ErrIncomingOverflow`) instead of replying. An `OpError` whose `Operand0` matches no pending `OpenStream` fails the receiving link with the error of its code (an unknown code matches `ErrProtocol`).
-* **Requests before `ListenStreams` [IOP for the rule, IMPL for the bound and timers]:** an `OpConnCreate` that arrives while the link is not listening is **held** for a grace period `G` instead of being refused at once. `G` is an endpoint option (Go `AdvancedOptions.StreamListenGrace`, C `hqq_adv_options.stream_listen_grace_ns`); the default is 2 s, and a negative value disables holding. At most `Q` requests are held at once, where `Q` is the incoming queue size (`IncomingQueueSize`, default `bufferCount`), and the held requests plus the accept slots in use (streams not yet returned by `AcceptStream`) MUST NOT exceed `Q`. A request that finds the bound reached, or that arrives while `G` is negative, is refused at once with `ErrCodeConnNotFound`. Holding only queues the request; the receive path never waits for it. When `ListenStreams` runs, the held requests are processed in arrival order exactly as if they had just arrived: the parity and duplicate checks, the slot reservation and the `OpConnAccept` reply are the same. A request still held when `G` has passed is refused with `ErrCodeConnNotFound`, and so is every held request when the link fails (its receive path ends). The refusal is queued like any other reply, so it can follow the expiry by the scheduling delay of the control sender. Close discards the held requests without a reply (the Go `Shutdown` refuses them at once, as an API convenience); a peer whose request is discarded sees its own context end or the link end.
-* `OpConnClose(connectionID, 0)`: the receiver unregisters the stream and marks it closed by the peer; an unknown id, or one whose open is still pending, is ignored. `Stream.Close` marks the stream closed locally first (a second close returns `ErrClosed`), unregisters it, discards its queued messages, and then sends `OpConnClose` unless the peer closed first. Closing stream 0 returns `ErrInvalidOp`.
-* **Accept ordering [IOP]:** an incoming stream is registered at once, but becomes visible to `AcceptStream` only after its `OpConnAccept` was enqueued on the tx ring, so data the acceptor sends on the stream cannot overtake the accept on the wire.
-* **The receive path never waits for the tx ring [IOP for the property, IMPL for the mechanism]:** if two peers flood each other, both tx rings fill, and a receiver waiting for its tx ring would wait for a peer that no longer drains. Replies generated by the receive path (`OpConnAccept`, refusals, refusal responses) are queued on a bounded control queue (`max(bufferCount, 16)` jobs) drained by a separate sender; a full queue drops the reply and counts it. A port MUST ensure that its receive loop cannot deadlock in this way.
-
-### 10.4 `OpConnCopy`: chunking and flags **[IOP]**
-
-Operands: `0 ConnectionID`, `1 MessageID`, `2 TotalSize`, `3 ChunkOffset`, `4 ChunkSize`, `5 flags`, `6 aux`.
-
-Flags (operand 5): `Begin = 1<<0`, `End = 1<<1`, `Abort = 1<<2`, `Request = 1<<3`, `Response = 1<<4`, `Error = 1<<5` (known mask `0x3F`).
-
-**Sender** (`sendAdvancedPayload`): a message of `len` bytes, `len <= MaxMessageSize` (default 64 MiB; larger is refused locally with `ErrBufferOverflow`, nothing sent), is sent as chunks in order on the transmit ring, each chunk in its own ring slot with its payload in that slot's buffer:
+Messages of length `0 <= len <= MaxMessageSize` (default `64 MiB`) are segmented into chunks of at most `bufferSize` bytes:
 
 ```text
-if len == 0: one frame: TotalSize = 0, ChunkOffset = 0, ChunkSize = 0, flags = Begin|End|base, aux
-else: for offset = 0; offset < len; offset += bufferSize:
-         end = min(offset + bufferSize, len)
-         flags = base | (offset == 0 ? Begin : 0) | (end == len ? End : 0)
-         aux   = (offset == 0) ? aux : 0            # aux only in the first chunk
-         send OpConnCopy(conn, msgID, len, offset, end - offset, flags, aux) with payload[offset:end] in the slot buffer
+if len == 0:
+    send one frame: TotalSize = 0, ChunkOffset = 0, ChunkSize = 0, flags = Begin|End|base, aux
+else:
+    for offset = 0; offset < len; offset += bufferSize:
+        end = min(offset + bufferSize, len)
+        flags = base | (offset == 0 ? Begin : 0) | (end == len ? End : 0)
+        chunkAux = (offset == 0) ? aux : 0
+        send OpConnCopy(conn, msgID, len, offset, end - offset, flags, chunkAux)
 ```
 
-`base` is `0` for data, `Request` for a request (aux = MethodID), `Response` for a response (aux = status, 0 on success), `Response|Error` for an error response (aux = status code, payload = error payload). **Chunks of a message are never interleaved with another message's chunks by the same sender thread, but chunks of different messages of one sender (different threads) may interleave on the ring**; the receiver reassembles by key. Every chunk except the last carries `bufferSize` payload bytes in the Go implementation, but receivers MUST NOT rely on this (they accept any `ChunkSize >= 1`, see below).
+If sending fails after at least one chunk (`offset > 0`) was published, the sender makes a best-effort attempt (100 ms timeout) to publish an abort frame: `OpConnCopy(conn, msgID, 0, 0, 0, Abort | base, 0)`.
 
-**Abort.** If sending chunk `offset > 0` fails (for example the context ended), the sender makes a best effort to send an **abort frame** with an independent short deadline (100 ms): `OpConnCopy(conn, msgID, 0, 0, 0, Abort | base, 0)` (no `Begin`/`End`). A failure on the very first chunk sends nothing.
+### 10.5 Receiver Frame Validation and Reassembly **[IOP]**
 
-### 10.5 Receiver validation and reassembly **[IOP]**
-
-For each `OpConnCopy` the receiver, holding the slot, validates and acts in this order. "Fail" means the **receive path fails** with the stated error (the link's Advanced receive loop stops and the error is returned to pending and future calls); the partial message is dropped first.
+The receiver evaluates each `OpConnCopy` frame in strict step order:
 
 ```text
-1. if flags & ~0x3F != 0                       -> FAIL ErrProtocol
-   if Request and Response both set            -> FAIL ErrProtocol
-   if Error set and Response not set           -> FAIL ErrProtocol
+1. Flag validity:
+   if (flags & ~knownMask) != 0               -> FAIL ErrProtocol (knownMask is 0x3F in 1.0, 0x7F with FeatureMetadata in 1.1)
+   if Request and Response both set           -> FAIL ErrProtocol
+   if Error set and Response not set          -> FAIL ErrProtocol
+   if Meta set and (not Request or not FeatureMetadata) -> FAIL ErrProtocol
    kind = flags & (Request | Response); key = (conn, msgID, kind)
 
-2. if Abort set:                                # accepted whatever the other operands are
-       drop assembly[key] if any
-       if key was in the "refused" set: forget it, silently done      # already surfaced at refusal
-       else outcome = ABORTED(header)           # a response fails the waiting call (ErrMessageAborted);
-                                                # an aborted request or data message is dropped silently
-       done (no further checks)
+2. Abort handling (evaluated BEFORE size/offset bounds):
+   if Abort set:
+       drop assembly[key] if present
+       if key in refusedSet: remove from refusedSet, done
+       else if kind == Response: fail waiting Call with ErrMessageAborted
+       done
 
-3. validate (each failure drops assembly[key], forgets the refused entry, and FAILS the path):
-       ChunkSize > bufferSize, or ChunkOffset > TotalSize, or ChunkSize > TotalSize - ChunkOffset   -> ErrInvalidSize
-       TotalSize > MaxMessageSize                                                                     -> ErrBufferOverflow
-       TotalSize == 0 and (ChunkOffset != 0 or ChunkSize != 0 or flags & (Begin|End) != Begin|End)    -> ErrInvalidSize
-       TotalSize > 0 and ChunkSize == 0                                                               -> ErrInvalidSize
-       ChunkOffset != 0 and aux != 0                                                                  -> ErrInvalidSize
-       TotalSize > INT_MAX of the platform                                                            -> ErrBufferOverflow
+3. Bounds validation (any failure drops assembly[key] and FAILS the receive path):
+   if ChunkSize > bufferSize or ChunkOffset > TotalSize or ChunkSize > TotalSize - ChunkOffset -> ErrInvalidSize
+   if TotalSize > MaxMessageSize or TotalSize > INT_MAX                                        -> ErrBufferOverflow
+   if TotalSize == 0 and (ChunkOffset != 0 or ChunkSize != 0 or (flags & (Begin|End)) != (Begin|End)) -> ErrInvalidSize
+   if TotalSize > 0 and ChunkSize == 0                                                         -> ErrInvalidSize
+   if ChunkOffset != 0 and aux != 0                                                            -> ErrInvalidSize
 
-4. if Begin set:
-       if ChunkOffset != 0, or assembly[key] exists, or key is in the refused set -> ErrInvalidSize
+4. Begin chunk:
+   if Begin set:
+       if ChunkOffset != 0 or assembly[key] exists or key in refusedSet                        -> ErrInvalidSize
        if End set (single-chunk message):
-            if ChunkSize != TotalSize                                             -> ErrInvalidSize
-            complete: message = payload[0:ChunkSize] with header (conn, msgID, flags, aux); route it (10.7)
-       else (multi-chunk):
-            charge = TotalSize + 256
-            if charge > MaxReassemblyBytes or assemblyBytes > MaxReassemblyBytes - charge:
-                 REFUSE: remember key in the refused set (at most 1024 keys; oldest evicted);
-                         outcome = REFUSED(header with Abort flag); this chunk is consumed, done   # see below
-            else: create assembly[key] = {hdr = flags minus (Begin|End), aux, size = TotalSize, next = 0}
-                  assemblyBytes += charge
+           if ChunkSize != TotalSize                                                           -> ErrInvalidSize
+           deliver complete message (conn, msgID, flags, aux, payload[0:ChunkSize])
+       else (multi-chunk message):
+           charge = TotalSize + 256
+           if charge > MaxReassemblyBytes or assemblyBytes > MaxReassemblyBytes - charge:
+               record key in refusedSet (bounded to 1024 keys)
+               if kind == Request: queue error response (aux = ErrCodeBufferOverflow = 0x07)
+               else if kind == Response: fail waiting Call with ErrReassemblyLimit
+               done
+           create assembly[key] = {flags, aux, size = TotalSize, next = ChunkSize}
+           assemblyBytes += charge
 
-5. now an assembly must exist:
-       if none: if key in the refused set: (drain) if End set, forget the key; discard this chunk and continue
-                else, when no refused entry was ever evicted (FINDINGS F-07)     -> FAIL ErrProtocol
-       if ChunkOffset != assembly.next or assembly.size != TotalSize         -> ErrInvalidSize
-       append payload[0:ChunkSize] at ChunkOffset; assembly.next += ChunkSize
-       if End not set: done (partial)
-       if assembly.next != TotalSize                                          -> ErrInvalidSize
-       complete: message with header (conn, msgID, assembly flags | Begin | End, aux of the first chunk);
-                 assemblyBytes -= charge; drop assembly; route it
+5. Continuation / End chunk (Begin not set):
+   if assembly[key] does not exist:
+       if key in refusedSet:
+           if End set: remove key from refusedSet
+           done (drain refused message)
+       if refusedEvicted: done (drain orphan chunk after refusedSet eviction, FINDINGS F-07)
+       FAIL ErrProtocol
+   if ChunkOffset != assembly.next or TotalSize != assembly.size                               -> ErrInvalidSize
+   append payload[0:ChunkSize]; assembly.next += ChunkSize
+   if End set:
+       if assembly.next != TotalSize                                                           -> ErrInvalidSize
+       assemblyBytes -= charge; remove assembly[key]; deliver complete message
 ```
 
-* **Reassembly limits [IOP]**: `MaxMessageSize` (default `64 MiB`) bounds `TotalSize`; `MaxReassemblyBytes` (default `4 × MaxMessageSize`, saturating) bounds the sum of `TotalSize + 256` over all incomplete multi-chunk messages; single-chunk messages are not charged. The memory actually held may exceed the charge (buffers are rounded up to a power of two) — that is an implementation matter. A port MUST NOT accept a multi-chunk message that would exceed the budget; it MUST drain the remaining chunks of a refused message (until its `End` chunk) instead of failing the path. Receiver policy, not wire behavior: an incomplete message whose last chunk is at least `2^16` received chunks old may be reclaimed when a multi-chunk message needs its budget; it is then treated as refused (a response fails with `ErrReassemblyLimit`, a request is answered as below) and its remaining chunks are drained (FINDINGS F-09).
-* **Refusal handling [IOP]**: a refused **request** is answered with an error response: `OpConnCopy(conn, msgID, 0, 0, 0, Begin|End|Response|Error, aux = ErrCodeBufferOverflow)` (best effort; only if `FeatureRequestResponse` was negotiated; queued on the control sender); a refused **response** fails the waiting call with `ErrReassemblyLimit`; a refused **data** message is dropped. All refusals are counted.
-* **Frame validity [IOP]**: a non-`Begin` chunk with no assembly and no refused entry is `ErrProtocol`, unless an entry was ever evicted from the refused set (at most 1024 keys), after which such chunks are drained (FINDINGS F-07). Later chunks continue exactly at the previous end (`ChunkOffset == next`), use the announced `TotalSize`, and the `End` chunk completes `TotalSize` exactly. A message whose `End` never arrives is reclaimed as described above (FINDINGS F-09).
+### 10.6 Request / Response Correlation **[IOP]**
 
-### 10.6 Request / response correlation **[IOP]**
+- `Call(stream, method, request)` allocates `msgID = nextMessageID()`, registers a pending waiter under `(streamID, msgID)`, and sends the request (`Request` flag, `aux = method`).
+- Responses (`Response` flag) are matched by `(ConnectionID, MessageID)`. If `Error` is set on the response, `Call` returns `ResponseError{Status: aux, Payload: body}`.
 
-`Call(stream, method, request)`: `messageID = nextMessageID()`; register a pending call under `key = (streamID, messageID)`; send the request message (`Request`, aux = method); wait for the response. Responses may arrive in any order; many calls may be outstanding.
+### 10.7 Message Routing and Queue Overflow **[IOP for destinations, IMPL for queueing]**
 
-A complete **response** (`Response` set) is delivered to the pending call registered under `(ConnectionID, MessageID)`. A response without a waiting call is dropped and counted, **unless** its call was cancelled: when a call times out, its context ends, or its stream is closed while it waits, the key is recorded in a bounded set of abandoned calls (4096 entries, oldest evicted) and the late response is discarded and counted as abandoned. If `Error` is set the call fails with a `ResponseError{Status = aux, Payload}`; an aborted response fails the call with `ErrMessageAborted`; one refused by the local reassembly limit with `ErrReassemblyLimit`. The responder sends the response on the stream the request arrived on, with the request's `MessageID`.
+Completed messages are routed in arrival order:
+- **Responses**: Delivered directly to the pending `Call` registered for `(ConnectionID, MessageID)`.
+- **Requests**: Routed to the link's incoming request queue (consumed by `Serve`).
+- **Plain data messages**: Routed to the receive queue of stream `ConnectionID` (dropped if the stream is unknown or closed).
 
-### 10.7 Routing and overflow **[IOP for destinations, IMPL for queueing]**
+### 10.8 Wire Error Propagation **[IOP]**
 
-After the receive path assembled a message it routes it **in arrival order**:
+When a receiver encounters a protocol violation (`ErrProtocol`, `ErrInvalidSize`, `ErrBufferOverflow`, `ErrUnexpectedPacket`), it terminates its local receive loop and fails pending operations.
 
-| Message | Destination |
-| --- | --- |
-| response (`Response`) | the pending call with the same `(ConnectionID, MessageID)` |
-| request (`Request`) | the link's request queue (consumed only by `Serve`), for every stream; the request is *not* dropped because its stream is unknown |
-| data (neither) | the queue of stream `ConnectionID`; data for an unknown or closed stream is dropped and counted |
+## 11. Platform Naming, Object Creation, and Safe Unlinking
 
-Each destination queue holds `IncomingQueueSize` messages (default `bufferCount`); when full, the **overflow policy** applies: `OverflowBlock` (default): the receive path waits for the consumer (backpressure propagates into the ring; nothing else is routed meanwhile, not even responses); `OverflowDrop`: drop the message (stream creation is refused with `ErrCodeBufferOverflow`); `OverflowFail`: fail the receive path with `ErrIncomingOverflow`. These are **[IMPL]** policies; the wire effect is only the refusal code above.
+Shared-memory backing objects are mapped and unlinked using platform-specific primitives that prevent symlink traversal, `SIGBUS` faults, and accidental unlinking of a replacement segment.
 
-### 10.8 Advanced errors on the wire **[IOP]**
+### 11.1 Segment Name Validation **[IOP]**
 
-Protocol violations of the peer fail the local receive path; nothing is sent back except the `OpError` cases listed (negotiation rejection, stream refusal). The sender of a violating frame learns about the failure only through the link ending or its pending operations failing.
+After stripping at most one leading `/`, the base name `base` `MUST` be non-empty, `MUST NOT` be `"."` or `".."`, `MUST NOT` contain `/`, `\`, or NUL (`\x00`), and `MUST NOT` exceed `255` bytes (otherwise return `ErrInvalidName`):
 
-## 11. Platform naming, creation and unlinking
-
-### 11.1 Name validation **[IOP]**
-
-A name is a string. One leading `/` is removed; the remainder `base` MUST be non-empty, MUST NOT be `"."` or `".."`, MUST NOT contain `/`, `\` or NUL, and MUST NOT exceed 255 bytes (`ErrInvalidName` otherwise). Vectors: `constants.json` `platform.name_validation.invalid_vectors`.
-
-| Platform | Object | Extra limit |
+| Platform | Kernel Backing Object | Platform Length Limit |
 | --- | --- | --- |
-| Linux | regular file `/dev/shm/<base>` | none beyond 255 |
-| macOS | `shm_open("/<base>")` | **the whole string including the leading slash is at most 31 bytes (`PSHMNAMLEN`)**, so `base` has at most 30 bytes |
-| FreeBSD | `shm_open("/<base>")` | at most 1023 bytes including the slash |
-| Windows | file mapping `Local\<base>` (default) | the kernel object name plus the longest semaphore suffix (`.hqq-sem0`, 9 chars) must fit 259 UTF-16 units |
+| Linux | Regular file `/dev/shm/<base>` | `<= 255` bytes |
+| macOS | `shm_open("/<base>")` | **Total path including leading `/` `<= 31` bytes (`PSHMNAMLEN`)**, so `base` is at most **`30` bytes** |
+| FreeBSD | `shm_open("/<base>")` | Total path `<= 1023` bytes |
+| Windows | File mapping `Local\hqq_v3_<base>` (or `Global\` / `Local\`) | Kernel name plus `.hqq-sem0` (9 chars) `<= 259` UTF-16 code units |
 
-On Windows a name that starts with `Global\` or `Local\` (ASCII case-insensitive, and followed by at least one more character) keeps that namespace prefix (normalized to the canonical spelling) and the rest is validated as `base`; any other name gets `Local\`. `Global\` or `Local\` alone is invalid: the whole string is then validated as a base name and the backslash is forbidden. Vectors: `platform.windows.name_vectors`.
+### 11.2 Linux `/dev/shm` Object Handling **[IOP]**
 
-### 11.2 Linux object handling **[IOP]**
+- Open with `O_RDWR | O_CLOEXEC | O_NOFOLLOW` (plus `O_CREAT | O_EXCL` on creation) and verify via `fstat` that the descriptor refers to a **regular file** (else return `ErrInvalidName` without modifying it).
+- Allocate backing pages with `fallocate(fd, 0, 0, size)` (falling back to `ftruncate` only on `EOPNOTSUPP` / `ENOSYS`) so tmpfs exhaustion fails at creation time rather than raising `SIGBUS` during ring writes.
+- Map with `mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0)`.
 
-* Open flags: `O_RDWR`, `O_CLOEXEC`, `O_NOFOLLOW`, plus `O_CREAT|O_EXCL` when creating. After opening, `fstat` MUST show a **regular file**; otherwise `ErrInvalidName` and nothing is modified (`/dev/shm` is typically world-writable: names can be planted).
-* A created object is allocated with `fallocate(fd, 0, 0, size)` (retry on `EINTR`; fall back to `ftruncate` only on `EOPNOTSUPP`/`ENOSYS`) so that a full tmpfs fails at creation and not with `SIGBUS` later. A failed creation removes the object again.
-* Mapping: `mmap(NULL, size, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0)`; the result MUST be page aligned.
-* Default permission when creating through the high-level `Listen`: `0600`.
+### 11.3 Creation and Existing-Object Rules **[IOP]**
 
-### 11.3 Create, open, existing names **[IOP]**
+- **Creators (`Create` / `Listen`)**: Attempt exclusive creation (`O_CREAT | O_EXCL`). If the name already exists, open the existing object (`O_RDWR`) without truncating:
+  - Size `0` returns transient `errSegmentNotReady`; size `< total` returns `ErrInvalidSize` (never resized or modified); size `>= total` maps the first `total` bytes and enters the Creator claim loop (section 5.1).
+- **Openers (`Open` / `Dial`)**: Open existing objects with `O_RDWR` (never `O_CREAT`), check `st_size` **before** mapping (`0` -> `errSegmentNotReady`, `< total` -> `ErrInvalidSize`), map the first `total` bytes, and enter the Opener claim loop.
 
-* `Create`/`Listen` create the object **exclusively** (`O_EXCL`). If the name exists they open the existing object (`O_RDWR`, not creating, with up to three retries if it vanished between the two calls) and apply the Creator rules of section 4:
-  * an object **smaller** than the requested segment returns `ErrInvalidSize`, a **zero-size** object the transient `errSegmentNotReady` (neither is resized or modified); a larger object is used as is (the first `total` bytes are mapped);
-  * a segment without live endpoints is re-initialized and owned by the caller (new `creatorToken`);
-  * a segment with a live endpoint returns `ErrLinkBusy`;
-  * a foreign object or other layout version returns `ErrIncompatibleLayout` and is not modified;
-  * Linux only: a name that is not a regular file returns `ErrInvalidName`.
-* `Open`/`Dial` never create and never initialize: a missing name is `ErrNotExist`; a zero-size object is the transient `errSegmentNotReady`; a smaller object is `ErrInvalidSize`; an empty or initializing segment and a segment without live endpoints fail with the transient errors of section 4.
-* **Creator sizes the object right after creating it.** An opener that sees size 0 treats it as "creator has not finished"; touching a mapping beyond the end of the object would raise `SIGBUS`, so an opener MUST check the object size **before** mapping.
-* A created object's **`CreatorToken`** is stored by the initializer at claim (5.2) and identifies the instance.
+### 11.4 Instance Ownership and Safe Unlinking **[IOP]**
 
-### 11.4 Name ownership and safe unlink **[IOP]**
+Closing a `Creator` endpoint (or calling `Unlink`) removes the POSIX shared-memory name **if and only if the name still refers to the segment instance with matching `creatorToken`**:
 
-A Creator owns the name: closing a Creator removes the name automatically; closing an Opener never does. `Unlink` (any endpoint of the instance) and the Creator's `Close` remove the name **only if it still refers to this endpoint's instance**; a missing or replaced name is a no-op returning success. The *instance identity* is the object plus the `creatorToken` in its superblock: a Creator's own token; an Opener's is the `creatorToken` it read from the segment right after joining.
-
-| Platform | Identity test before `unlink` |
+| Platform | Pre-Unlink Identity Check |
 | --- | --- |
-| Linux | `fstat` of the open descriptor has the same `(st_dev, st_ino)` as `lstat` of the path **and** the `creatorToken` in the mapping equals the endpoint's instance token (`creatorToken != 0`), or (for a freshly created, never claimed object) the superblock state is still `Empty` |
-| macOS, FreeBSD (no inode identity for shm names) | re-open the name read-only (`shm_open(..., O_RDONLY)`), `fstat` it (size must be at least one page), map the first page read-only and compare its `creatorToken` (`!= 0` and equal to the endpoint's instance token) or `state == Empty` for a fresh object; a name that cannot be opened or is too small is "not ours" |
-| Windows | never anything to remove: names disappear with their last handle; `Unlink` is a no-op |
+| Linux | `fstat(open_fd)` matches `lstat("/dev/shm/<base>")` (`st_dev` and `st_ino`) **and** `load(sb.creatorToken) == myInstanceToken` (or `state == Empty` for an unclaimed fresh file). |
+| macOS, FreeBSD | Re-open `shm_open("/<base>", O_RDONLY)`, verify `st_size >= pageSize`, map page 0 read-only, and verify `load(sb.creatorToken) == myInstanceToken` (or `state == Empty`). |
+| Windows | No-op: kernel file mappings and semaphores disappear automatically when their last handle closes. |
 
-The decision is made **while the mapping and descriptor are still open**; the name is removed after the descriptor is closed.
+### 11.5 Windows File Mappings and Named Semaphores **[IOP]**
 
-### 11.5 Windows names and semaphores **[IOP]**
+Each named segment on Windows is accompanied by four named kernel semaphores created **before** the file mapping:
 
-Per segment there are `SemaphoreCount = 4` named kernel semaphores whose names are the mapping's kernel object name plus a suffix:
-
-| Index | Suffix | Role |
+| Index | Suffix | Purpose |
 | ---: | --- | --- |
-| 0 | `.hqq-sem0` | ring 0 notEmpty (waiters: Secondary consumer; waker: Primary producer) |
-| 1 | `.hqq-sem1` | ring 0 notFull |
-| 2 | `.hqq-sem2` | ring 1 notEmpty |
-| 3 | `.hqq-sem3` | ring 1 notFull |
+| `0` | `.hqq-sem0` | `ring 0` `notEmpty` |
+| `1` | `.hqq-sem1` | `ring 0` `notFull` |
+| `2` | `.hqq-sem2` | `ring 1` `notEmpty` |
+| `3` | `.hqq-sem3` | `ring 1` `notFull` |
 
-* **Creation order**: the creator makes the four semaphores **before** the mapping, so every endpoint that can open the mapping finds the semaphores. With `O_EXCL` semantics, creation fails with "exists" if any of the semaphore names or the mapping name already exists (closing the handles it opened). An existing name always means a live handle somewhere (Windows names vanish with their last handle), so a creator that finds an existing name opens it and follows the Creator rules (a live segment gives `ErrLinkBusy`).
-* **Open order**: open the mapping (`FILE_MAP_READ|FILE_MAP_WRITE|SECTION_QUERY`, the latter to learn the size with `NtQuerySection` and refuse a too-small mapping), then open the four semaphores (`SYNCHRONIZE|SEMAPHORE_MODIFY_STATE`).
-* **Size**: the mapping is created with `CreateFileMapping(INVALID_HANDLE_VALUE, sa, PAGE_READWRITE, size, name)` (paging-file backed). A fresh section is zero-filled.
-* Semaphores: initial count 0, maximum `2^31 - 1`. `Wait(timeout)`: `WaitForSingleObject` with the timeout rounded up to whole milliseconds, at least 1 ms. `Release(n)`: `ReleaseSemaphore(h, n, NULL)` with `n` clamped to `2^31 - 1`, errors ignored.
-* Security: the creator's `mode` is translated to a DACL (owner bits to the creating user, "other" bits to Everyone, SYSTEM always full; group bits ignored); the same DACL is applied to the semaphores (read allows waiting, write allows releasing). **[IMPL]** for ports; a port SHOULD provide equivalent least-privilege defaults.
+## 12. Wire Error Codes and Error Hierarchy **[IOP]**
 
-## 12. Error codes and error mapping **[IOP for codes on the wire]**
+Wire `ErrorCode` values carried in `OpError.Operand1`, `OpStandardLinkTombstone.Operand2`, and Advanced error-response `aux`:
 
-`ErrorCode` values carried in `OpError.Operand1`, tombstone `Operand2`, and Advanced error-response `aux`:
-
-| Code | Name | Maps to |
+| Code | Constant | Mapped Sentinel |
 | ---: | --- | --- |
-| 0x01 | `ErrCodeMemoryAlign` | `ErrMemoryAlign` |
-| 0x02 | `ErrCodeInvalidSize` | `ErrInvalidSize` |
-| 0x03 | `ErrCodeMemorySmall` | `ErrMemorySmall` |
-| 0x04 | `ErrCodeFailedInit` | `ErrFailedInit` |
-| 0x05 | `ErrCodeConnNotFound` | `ErrConnNotFound` |
-| 0x06 | `ErrCodeInvalidOp` | `ErrInvalidOp` |
-| 0x07 | `ErrCodeBufferOverflow` | `ErrBufferOverflow` |
-| other | — | an error matching `ErrProtocol` ("peer reported unknown error code") |
+| `0x01` | `ErrCodeMemoryAlign` | `ErrMemoryAlign` |
+| `0x02` | `ErrCodeInvalidSize` | `ErrInvalidSize` |
+| `0x03` | `ErrCodeMemorySmall` | `ErrMemorySmall` |
+| `0x04` | `ErrCodeFailedInit` | `ErrFailedInit` |
+| `0x05` | `ErrCodeConnNotFound` | `ErrConnNotFound` |
+| `0x06` | `ErrCodeInvalidOp` | `ErrInvalidOp` |
+| `0x07` | `ErrCodeBufferOverflow` | `ErrBufferOverflow` |
+| `0x08` | `ErrCodeShuttingDown` | `ErrShuttingDown` (Protocol 1.1) |
+| other | Unrecognized wire code | Matches `ErrProtocol` (`ErrInvalidOp`) |
 
-An application status in an Advanced error response (`Response|Error`, `aux`) is **not restricted to this table**: handlers may send any non-zero `u64` status (a zero status is sent as `ErrCodeInvalidOp`). The receiver exposes it as `ResponseError{Status, Payload}`.
+Public error hierarchy (`errors.Is` wrapping relations):
 
-Error taxonomy (names are those of the Go API; a port SHOULD provide the equivalent categories). Every public error matches itself and the base it wraps:
-
-| Sentinel | Wraps | When |
+| Sentinel | Wraps | Condition |
 | --- | --- | --- |
-| `io.EOF` | — | `StandardLink.Read/ReadFrom` after a graceful peer close once buffered messages are consumed |
-| `ErrClosed` | `net.ErrClosed` | local link or stream closed |
-| `ErrPeerClosed` | `io.EOF` | peer detached gracefully; peer closed the stream |
-| `ErrPeerGone` | `ErrConnNotFound` | peer stopped heartbeating, was replaced, or the segment was re-initialized |
-| `ErrTimeout` | `os.ErrDeadlineExceeded` | deadline passed |
-| `ErrLinkBusy` | `ErrFailedInit` | segment has a live endpoint for a creator; two live endpoints for a joiner; the live endpoint's earlier peer already left |
-| `ErrIncompatibleLayout` | `ErrFailedInit` | foreign magic, other layout major (including `HQQ_STL2`), unknown `requiredFeatures` bit, unknown `state`, non-zero page of an `Empty` segment, ring header that does not match |
-| `ErrInvalidSize` | — | invalid geometry or size bounds; an existing smaller object; geometry mismatch (`GeometryError`); invalid `DataSize`/chunk bounds |
-| `ErrMemoryAlign` / `ErrMemorySmall` | — | caller-owned memory not page-aligned / too small |
-| `ErrFailedInit` | — | base of initialization failures, including the transient ones |
-| `ErrInvalidName` | — | bad name; on Linux also not a regular file |
-| `ErrBufferOverflow` | — | payload larger than `bufferSize` (Standard) or `MaxMessageSize` (Advanced) |
-| `ErrInvalidOp` | — | base of protocol-state errors |
-| `ErrNotNegotiated`, `ErrAlreadyNegotiated`, `ErrNegotiationFailed`, `ErrNegotiationRejected`, `ErrUnexpectedPacket`, `ErrProtocol` | `ErrInvalidOp` | negotiation and protocol-state violations |
-| `ErrMessageAborted` | `ErrProtocol` | the peer abandoned a response mid-transfer |
-| `ErrIncomingOverflow`, `ErrReassemblyLimit` | `ErrBufferOverflow` | queue overflow under `OverflowFail`; response refused by the reassembly limit |
+| `io.EOF` | None | `StandardLink.Read` / `ReadFrom` after graceful peer close and ring drain |
+| `ErrClosed` | `net.ErrClosed` | Local link or stream closed |
+| `ErrPeerClosed` | `io.EOF` | Peer detached gracefully (`token == 1`) or closed stream |
+| `ErrPeerGone` | `ErrConnNotFound` | Peer heartbeat timed out, token replaced, or segment re-initialized |
+| `ErrTimeout` | `os.ErrDeadlineExceeded` | Operation deadline expired |
+| `ErrLinkBusy` | `ErrFailedInit` | Live endpoint already occupies the requested slot |
+| `ErrIncompatibleLayout` | `ErrFailedInit` | Foreign magic, wrong major version, unknown `requiredFeatures`, non-zero `Empty` page, or invalid ring header |
+| `ErrInvalidSize` | None | Invalid geometry, smaller existing file, `GeometryError`, or out-of-bounds chunk/payload size |
+| `ErrMemoryAlign` / `ErrMemorySmall` | None | Caller-supplied memory not page-aligned or smaller than `total` |
+| `ErrFailedInit` | None | Base error for initialization and transient attach failures |
+| `ErrInvalidName` | None | Malformed segment name or non-regular file in `/dev/shm` |
+| `ErrBufferOverflow` | None | Payload exceeds `bufferSize` (Standard) or `MaxMessageSize` (Advanced) |
+| `ErrInvalidOp` | None | Base error for protocol state violations |
+| `ErrNotNegotiated`, `ErrAlreadyNegotiated`, `ErrNegotiationFailed`, `ErrNegotiationRejected`, `ErrUnexpectedPacket`, `ErrProtocol` | `ErrInvalidOp` | Handshake and frame-validation errors |
+| `ErrMessageAborted` | `ErrProtocol` | Peer aborted an in-flight response via `AdvFlagAbort` |
+| `ErrIncomingOverflow`, `ErrReassemblyLimit` | `ErrBufferOverflow` | Queue overflow under `OverflowFail` or response exceeding `MaxReassemblyBytes` |
 
-## 13. Interoperability summary
+## 13. Interoperability Summary
 
-### 13.1 What is normative for interoperability
+The rules below separate the mandatory cross-process contract from local implementation choices.
 
-All **[IOP]**-tagged rules. Summary of the contract two processes of different implementations share:
+### 13.1 Normative Cross-Process Contract (`[IOP]`)
 
-1. The segment layout (2), the superblock, endpoint record and tokens (3), including the page size and geometry rules.
-2. The claim/init/takeover/reuse/publish/join state machines on the superblock words, with their CAS operations and store order (5), and the liveness/heartbeat/peer-state derivation (6) — any implementation may *observe* these words, so they must mean the same thing.
-3. The ring memory image, Format, Attach and the slot sequence protocol (7), with the memory orders of MEMORY_MODEL.md.
-4. The waiter/waker handshake and counters (8.2, 8.3), and the platform primitives on which processes of different implementations meet (8.5): futex on Linux, ulock on macOS, the four named semaphores on Windows.
-5. Packet ABI, opcodes, operands, Standard copy/tombstone/error semantics, slot-owned buffers (9).
-6. The Advanced wire protocol: negotiation, ids and parity, stream control, chunking, flags, abort, validation, reassembly limits, request/response correlation, refusal responses (10).
-7. Name mapping and safe-unlink rules (11), error codes on the wire (12).
+Two implementations in different languages interoperate safely when both adhere to:
+1. Page-aligned region offsets (section 2) and superblock/endpoint record layouts (section 3).
+2. Superblock claim, takeover, reuse, and ordered publication state machines (section 5) and heartbeat/liveness rules (section 6).
+3. Ring layout v2 formatting, attachment, and `seq[s]` synchronization (section 7) with the atomic orders of [`MEMORY_MODEL.md`](MEMORY_MODEL.md).
+4. The Dekker waiter/waker handshake (`W1..W4`, `K1..K3`) and OS wait primitives (section 8).
+5. The 64-byte packet ABI and slot-owned payload buffer discipline (section 9).
+6. Advanced negotiation, stream parity, chunk reassembly, and Protocol 1.1 extensions (section 10 and `PROTOCOL_1_1_DRAFT.md`).
+7. Platform naming, creation, and safe-unlink verification (section 11) and wire error codes (section 12).
 
-### 13.2 What is implementation freedom
+### 13.2 Local Implementation Freedom (`[IMPL]`)
 
-* Threading model, process-local locks and the SPSC mode of 7.6 (as long as the shared-word protocol is followed).
-* **Simple mode:** no parking at all (spin plus bounded sleep backoff). Valid; cost is CPU or latency. A simple-mode implementation never registers as a waiter; peers that park on it are woken by their bounded park timeout (at most 100 ms) unless the simple-mode side also performs the waker duty (8.3), which is RECOMMENDED (it is two cheap accesses).
-* Process-local waiter aggregation (8.6), backoff constants (8.4), heartbeat scheduling, deadlines API, `Read` tails / datagram truncation, zero-copy and reservation APIs, pooled `Message` buffers, queueing and overflow policies, control-queue sizing, `Serve` execution model.
-* A **geometry-discovery** extension: an Opener MAY first peek at a `Ready` superblock (read-only mapping, plain reads of `state`, `pageSize`, `bufferCount`, `bufferSize`, `layoutSize`, `creatorToken`) and then open with the recorded geometry, as long as all validation rules of 5.5 still run on the real mapping.
-* Additional API surface (listeners, acceptors) built on the same words, provided it does not change the meaning of a superblock/ring word (changes to the protocol itself are versioned through `Major`/`ring layout version`/protocol version).
+Each implementation is free to choose its own concurrency model, SPSC local locking (section 7.6), spin-only simple mode (section 8), process-local waiter aggregation (section 8.6), backoff constants, buffer pooling, and API surface.
 
-### 13.3 Unsupported platforms **[IOP]**
+### 13.3 Unsupported Target Architectures **[IOP]**
 
-Lock-free 64-bit atomics that are **atomic across processes** are required. 32-bit MIPS and ARM before ARMv7 (where 64-bit atomics are emulated with process-local locks) are unsupported. **Big-endian hosts are unsupported** (all words are little-endian and the code does not byte-swap shared words). Details in MEMORY_MODEL.md section 7.
+HQQ requires little-endian byte order and hardware address-free lock-free 32-bit and 64-bit atomics. Big-endian targets and 32-bit targets without lock-free 64-bit atomics (`mips`, `mipsle`, pre-ARMv7 `arm`) are unsupported and `MUST` be rejected at compile time ([`MEMORY_MODEL.md`](MEMORY_MODEL.md) sections 6 and 7).
 
-## 14. Reference vectors
+## 14. Reference Golden Vectors
 
-* Packet bytes: `constants.json` → `packet_vectors` (9 vectors; the hex strings are 64 bytes).
-* Region offsets for three page sizes and four geometries: `segment.layout_vectors`.
-* A minimal conforming image (after a Primary `Ready` on caller-owned memory, `count = 4`, `size = 64`, 16 KiB pages, heartbeats disabled), checked by `TestSpecSegmentImage`: `magic = 0x4851515F53544C33`, `state = 2`, `major = 3`, `minor = 0`, `pageSize = 16384`, `bufferCount = 4`, `bufferSize = 64`, `layoutSize = 81920` (`ring0 = 16384`, `buf0 = 32768`, `ring1 = 49152`, `buf1 = 65536`), `epoch = 1`, `initToken = 0`, `requiredFeatures = 0`, `creatorToken = 0` (caller-owned memory), `endpoints[0] = {owner token, pid, heartbeat, 0}`, `endpoints[1] = {0,0,0,0}`; both rings: `magic = 0xC9D8C1D43F096702`, `size = 4`, `flag = 2`, `stride = 128`, `version = 2`, `r = w = 0`, `seq[i] = i`, packets zero.
+Machine-readable golden vectors verifying this specification live in [`spec/constants.json`](constants.json) and [`conformance/vectors/`](../conformance/README.md):
 
-## 15. Defects and ambiguities
+- **Packet byte vectors**: `constants.json` (`packet_vectors`) and `conformance/vectors/manifest.json` (`packets`).
+- **Region offset vectors**: `constants.json` (`segment.layout_vectors`) and `conformance/vectors/manifest.json` (`layouts`).
+- **Minimal `Ready` segment image** (checked by `TestSpecSegmentImage` and `conformance/` group `G-06` for `count = 4`, `size = 64`, 16 KiB pages, heartbeats disabled): `magic = 0x4851515F53544C33`, `state = 2`, `major = 3`, `minor = 0`, `pageSize = 16384`, `bufferCount = 4`, `bufferSize = 64`, `layoutSize = 81920` (`ring0 = 16384`, `buf0 = 32768`, `ring1 = 49152`, `buf1 = 65536`), `epoch = 1`, `initToken = 0`, `requiredFeatures = 0`, `creatorToken = 0`, `endpoints[0] = {ownerToken, pid, heartbeat, 0}`, `endpoints[1] = {0, 0, 0, 0}`; both rings have `magic = 0xC9D8C1D43F096702`, `size = 4`, `flag = 2`, `stride = 128`, `version = 2`, `r = w = 0`, `seq[i] = i`, and zeroed packets.
 
-See [FINDINGS.md](FINDINGS.md). Each finding is classified (a) documentation only, (b) behavior fix without ABI change, (c) needs a layout/wire change before a second implementation exists.
+## 15. Audit Findings and Edge-Case Resolutions
+
+See [`FINDINGS.md`](FINDINGS.md) for the complete log of specification audit findings (`F-01` through `F-16`) and their regression tests.

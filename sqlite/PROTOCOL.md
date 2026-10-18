@@ -1,171 +1,126 @@
-# hqq-sqlite wire protocol, version 1.0
+# `hqq-sqlite` Wire Protocol, Version 1.0
 
-This document is the contract between the Go client (`gosuda.org/hqq/sqlite`,
-driver name `hqq-sqlite`), the Go fake server (`sqlite/internal/fakeserver`),
-and the C server (`examples/sqlite/server`, built on libhqq and SQLite, system
-library or amalgamation). The Go encoder and decoder in `sqlite/internal/wire` implement
-exactly the byte layouts below. A C implementer needs nothing else.
+This specification defines the binary wire contract between the Go `database/sql` client (`gosuda.org/hqq/sqlite`, driver name `"hqq-sqlite"`), the in-memory Go fake server (`sqlite/internal/fakeserver`), and the C11 production server (`examples/sqlite/server`, built on `libhqq` and SQLite). The Go codecs in `sqlite/internal/wire` implement the exact byte layouts specified below.
 
-Key words MUST, MUST NOT, SHOULD, and MAY are used as in RFC 2119.
+The key words `MUST`, `MUST NOT`, `SHOULD`, and `MAY` in this document are to be interpreted as described in RFC 2119.
 
 ## 1. Overview
 
-A SQLite service runs as its own process. Clients attach to it through one
-HQQ listener (the service name). Every `database/sql` connection is one HQQ
-**stream** of a shared link. The server runs each stream as one **session**
-with its own SQLite connection, its own transaction state, and its own
-statement and cursor tables. Sessions never share state. Sessions opened on the
-same database file share the data through SQLite's normal locking.
+An `hqq-sqlite` service runs in its own OS process and accepts client connections through a single HQQ listener name. Every `database/sql` connection (`driver.Conn`) maps to one logical HQQ **stream** multiplexed over a shared `AdvancedLink`. The server runs each stream as an isolated **session** with its own `sqlite3` database connection, transaction state, prepared statement table, and open cursor table. Sessions never share in-memory protocol state; sessions that open the same underlying database file coordinate through standard SQLite file/WAL locking.
 
-Each request is one HQQ request message on a stream. Each request gets exactly
-one response: a success response with a body, or an error response
-(`ResponseError`). Requests on one stream are sent one at a time by the client:
-the client MUST NOT send a request on a stream while a previous request on that
-stream is unanswered, except for the cancel path in section 9.
+Each operation travels as one HQQ request message on a session stream and receives one response message (either a success response carrying a binary payload or an error response carrying a status code and UTF-8 message). Requests on a single stream are strictly sequential: a client `MUST NOT` send a new request on a stream while a prior request on that stream remains unanswered, except for transmitting an `OpCancel` frame as described in §9.
 
 ## 2. Transport (HQQ)
 
-| Item | Requirement |
-|---|---|
-| Listener | One acceptor per service name. Clients connect with `hqq.Connect(ctx, name, cfg)`. |
-| Link features | The link MUST negotiate `FeatureRequestResponse` and `FeatureCancel`. `FeatureMetadata` is optional and carries the caller's remaining deadline (section 9). |
-| Message size | Both endpoints MUST set `AdvancedOptions.MaxMessageSize` to at least 16 MiB (`MaxMessageBytes`, section 11). |
-| Streams | The client opens one stream per `driver.Conn` (`OpenStream`). The server accepts each one with `AcceptStream` and registers a session. The server MUST call `ListenStreams` on each accepted link. A client may open a stream before the server calls `ListenStreams`. The request then waits until `ListenStreams` runs, so `OpenStream` simply completes later (bounded by its context). A server that never calls `ListenStreams` refuses the open with `ConnNotFound`. That is a configuration error, and the client does not retry it. |
-| Requests | Request message: `AdvFlagRequest` set, `aux` = method id (section 6), payload = request body. |
-| Responses | Response message: `aux` = status (0 for success; section 7), payload = response body (success) or UTF-8 error message (error). |
-| Ordering | Requests and responses on one stream are in order. Different streams have no ordering relation. |
-| Stream 0 | The link-level stream 0 carries no session. The server MUST answer every request on stream 0 with `NO_SESSION`. |
-| Stream close | Either side may close a stream. Closing it ends the session (section 8.3). |
+The SQLite wire protocol layers on top of an HQQ `Acceptor` and negotiated `AdvancedLink` streams:
 
-Message chunking (larger than the link buffer size) is internal to HQQ. The
-protocol never sees chunks.
+| Transport Aspect | Requirement |
+| :--- | :--- |
+| Listener | One HQQ acceptor (`HQQ_LSN1`) per service name. Clients connect via `hqq.Connect(ctx, name, cfg)`. |
+| Negotiated features | Both endpoints `MUST` negotiate `FeatureRequestResponse` and `FeatureCancel`. `FeatureMetadata` is optional and propagates the caller's remaining context deadline (§9). |
+| Maximum message size | Both endpoints `MUST` configure `AdvancedOptions.MaxMessageSize` to at least `16 MiB` (`MaxMessageBytes`, §11). |
+| Streams | The client opens one stream per `driver.Conn` (`OpenStream`). The server calls `ListenStreams` on every accepted link, accepts each stream with `AcceptStream`, and registers a session. Stream open requests arriving before `ListenStreams` are held during `StreamListenGrace`; a server that never calls `ListenStreams` refuses the open with `ErrConnNotFound`. |
+| Requests | Advanced request message (`AdvFlagRequest` set), `aux` = method ID (§6), payload = binary request body. |
+| Responses | Advanced response message (`AdvFlagResponse` set), `aux` = `0` on success or non-zero status on error (§7), payload = binary response body (success) or unprefixed UTF-8 error text (error). |
+| Ordering | Requests and responses on the same stream execute in FIFO order. Separate streams are independent and unordered relative to each other. |
+| Stream `0` | Stream `0` (the link-level stream) carries no session. The server `MUST` reject every request on stream `0` with `NO_SESSION`. |
+| Stream close | Either peer may close a stream with `OpConnClose`, which terminates the session and triggers teardown (§8.3). |
+
+Multi-chunk message fragmentation and reassembly across ring slots are handled transparently by the HQQ `AdvancedLink` layer.
 
 ## 3. Primitive encodings
 
-All integers are fixed width and little-endian. There is no padding and no
-alignment. Every body is a concatenation of the layouts below.
+All integer fields are fixed-width little-endian values packed tightly without padding or alignment bytes. Every request and response body is a contiguous concatenation of the primitive and composite types below:
 
-| Type | Layout |
-|---|---|
-| `u8`, `u16`, `u32`, `u64` | unsigned integers, 1, 2, 4, 8 bytes |
-| `i64` | two's complement, 8 bytes |
-| `f64` | IEEE 754 binary64 bit pattern, 8 bytes. NaN is never sent (SQLite stores NaN as NULL). |
-| `string` | `u32 n` followed by `n` bytes. No terminator. SQL text and names are UTF-8. `n` MAY be 0. |
-| `Value` | `u8 tag` followed by a payload selected by the tag (table below). |
+| Type | Byte Layout |
+| :--- | :--- |
+| `u8`, `u16`, `u32`, `u64` | Unsigned little-endian integers of 1, 2, 4, and 8 bytes. |
+| `i64` | Two's-complement signed little-endian integer, 8 bytes. |
+| `f64` | IEEE-754 binary64 little-endian bit pattern, 8 bytes. `NaN` is never transmitted (SQLite converts `NaN` to `NULL`). |
+| `string` | `u32 n` byte length followed by `n` raw bytes (no NUL terminator). SQL text and identifiers are UTF-8; `n` `MAY` be `0`. |
+| `Value` | `u8 tag` followed by the tag-specific payload defined below. |
 | `Param` | `u32 ordinal`, `string name`, `Value`. |
-| `Params` | `u32 count`, then `count` × `Param`. |
-| `Column` | `string name`, `string decltype`. `decltype` is empty when SQLite has none. |
-| `Columns` | `u32 count`, then `count` × `Column`. |
-| `Batch` | `u32 nrows`, then `nrows` rows. Each row is `ncols` × `Value`, in column order. `ncols` is the column count of the cursor's `Columns`. |
+| `Params` | `u32 count` followed by `count` consecutive `Param` records. |
+| `Column` | `string name`, `string decltype` (`decltype` is empty when `sqlite3_column_decltype` returns `NULL`). |
+| `Columns` | `u32 count` followed by `count` consecutive `Column` records. |
+| `Batch` | `u32 nrows` followed by `nrows` consecutive rows, where each row consists of `ncols` consecutive `Value` records in column order. |
 
-Value tags are the SQLite fundamental type codes, so a C server can pass
-`sqlite3_column_type()` straight through:
+`Value` tags match SQLite's fundamental storage-class constants (`SQLITE_INTEGER` through `SQLITE_NULL`), allowing a C server to pass `sqlite3_column_type()` directly as the wire tag:
 
-| Tag | Type | Payload |
-|---|---|---|
-| 1 | INTEGER | `i64` |
-| 2 | FLOAT | `f64` |
-| 3 | TEXT | `string` (UTF-8 bytes; the server sends the `sqlite3_column_text()` bytes) |
-| 4 | BLOB | `string`-shaped: `u32 n` followed by `n` raw bytes |
-| 5 | NULL | no payload |
+| Tag | Storage Class | Payload Layout |
+| ---: | :--- | :--- |
+| `1` | `INTEGER` | `i64` |
+| `2` | `FLOAT` | `f64` |
+| `3` | `TEXT` | `string` (UTF-8 bytes from `sqlite3_column_text()`) |
+| `4` | `BLOB` | `u32 n` followed by `n` raw bytes |
+| `5` | `NULL` | 0 bytes (no payload) |
 
-Any other tag is `BAD_REQUEST`.
+Any other tag value is rejected with `BAD_REQUEST`.
 
-Parameter `ordinal` is the 1-based position of the argument in the argument
-list, as `database/sql` numbers it. `name` is the parameter name **without**
-its prefix character (for `:id` the name is `id`), or empty for a positional
-argument. Section 4 defines binding.
+In `Param`, `ordinal` is the 1-based argument position assigned by `database/sql`, and `name` is the parameter name stripped of its prefix character (`:id`, `@id`, or `$id` is transmitted as `"id"`), or `""` for positional parameters.
 
 ## 4. Parameter binding
 
-For each `Param` in a request, in the order sent:
+For each `Param` in a request's `Params` list, evaluated in wire order:
 
-1. If `name` is empty, bind at index `ordinal` (`sqlite3_bind_*(stmt, ordinal, ...)`).
-   If `ordinal` is greater than the statement's parameter count, fail with
-   `SQLITE_RANGE` (25), message `"parameter index out of range"`.
-2. If `name` is not empty, look up the index with `sqlite3_bind_parameter_index`
-   for `":" + name`, then `"@" + name`, then `"$" + name`, taking the first
-   non-zero result. If none matches, fail with `SQLITE_RANGE` (25), message
-   `"no such parameter: " + name`. The `ordinal` of a named param is ignored
-   except that it MUST be unique within the request.
-3. Parameters not sent are NULL (SQLite default).
+1. **Positional parameter (`name == ""`)**: bind at 1-based index `ordinal` via `sqlite3_bind_*(stmt, ordinal, ...)`. If `ordinal` exceeds `sqlite3_bind_parameter_count(stmt)`, fail with `SQLITE_RANGE` (`25`) and message `"parameter index out of range"`.
+2. **Named parameter (`name != ""`)**: look up the parameter index with `sqlite3_bind_parameter_index` in the order `":" + name`, `"@" + name`, `"$" + name`, selecting the first non-zero index. If all three return `0`, fail with `SQLITE_RANGE` (`25`) and message `"no such parameter: " + name`. The `ordinal` field of a named parameter is ignored for binding but `MUST` still be unique within the request and within `1..MaxParams`.
+3. **Unbound parameters**: any statement parameter not bound by the request remains `NULL` (SQLite's default after `sqlite3_reset` / `sqlite3_clear_bindings`).
 
-Binding by type:
+C API calls by `Value` tag:
 
-| Tag | Call |
-|---|---|
-| INTEGER | `sqlite3_bind_int64` |
-| FLOAT | `sqlite3_bind_double` |
-| TEXT | `sqlite3_bind_text64(stmt, i, bytes, n, SQLITE_TRANSIENT, SQLITE_UTF8)` |
-| BLOB | `sqlite3_bind_blob64(stmt, i, bytes, n, SQLITE_TRANSIENT)`; for `n == 0` use `sqlite3_bind_zeroblob64(stmt, i, 0)` |
-| NULL | `sqlite3_bind_null` |
+| Tag | SQLite C Binding Call |
+| :--- | :--- |
+| `INTEGER` | `sqlite3_bind_int64(stmt, i, val)` |
+| `FLOAT` | `sqlite3_bind_double(stmt, i, val)` |
+| `TEXT` | `sqlite3_bind_text64(stmt, i, bytes, n, SQLITE_TRANSIENT, SQLITE_UTF8)` |
+| `BLOB` | `sqlite3_bind_blob64(stmt, i, bytes, n, SQLITE_TRANSIENT)` (or `sqlite3_bind_zeroblob64(stmt, i, 0)` when `n == 0`) |
+| `NULL` | `sqlite3_bind_null(stmt, i)` |
 
-Duplicate `ordinal` values in one request are `BAD_REQUEST`. `ordinal` MUST be
-in `1..MaxParams` (`BAD_REQUEST` otherwise). `count` MUST be at most
-`MaxParams`.
+Duplicate `ordinal` values within a request, `ordinal == 0`, `ordinal > MaxParams`, or `count > MaxParams` are rejected with `BAD_REQUEST` or `LIMIT`.
 
 ## 5. Results: columns, cursors, batches
 
-A query returns its column metadata once, then its rows in batches.
+A query returns its column metadata once in the `Query` / `QueryStmt` response alongside the first row batch, and subsequent rows are pulled via `Fetch`:
 
-- `Columns` come from `sqlite3_column_count`, `sqlite3_column_name`, and
-  `sqlite3_column_decltype` (NULL decltype is sent as the empty string).
-- A **batch** holds at most `n` rows, where `n` is the effective fetch size
-  (section 6, `Query` and `Fetch`).
-- A batch also stops, before stepping the next row, when the batch's encoded
-  size (its 4-byte row count plus its rows) is at least `MaxBatchBytes`. The
-  first row of a batch is always included.
-- Rows come from `sqlite3_step()`, one at a time, and the server steps only
-  when the batch needs another row. A batch that has reached its row count or
-  its byte budget stops without stepping again. The server never reads ahead of
-  the rows it returns, so a cursor holds no buffered rows.
-- `more = 1` means the cursor is still open on the server. It is set when the
-  batch stopped because it was full (row count or byte budget) and the
-  statement was not yet at `SQLITE_DONE`. A final batch MAY be empty
-  (`nrows = 0`) with `more = 0`.
-- `more = 0` means `SQLITE_DONE` was reached. The server then finalizes or
-  resets the statement and releases the cursor id. The client MUST NOT send
-  `CloseCursor` for a cursor that answered `more = 0`.
-- A statement that returns no columns (INSERT, UPDATE, DELETE, DDL) is run to
-  completion by the first step. Its `Query` response has `cursor = 0`, zero
-  columns, `more = 0`, and an empty batch.
-- `Exec` steps the statement to `SQLITE_DONE` and discards any rows.
-- A cursor id is non-zero if and only if the response has `more = 1`.
-
-Encoding one row: each value is encoded in column order. The encoder MUST check
-that the response payload stays within `MaxMessageBytes`. If one row alone
-would exceed it, the request fails with `SQLITE_TOOBIG` (18), message
-`"row exceeds message size limit"`, and the cursor is released.
+- **`Columns`**: populated from `sqlite3_column_count`, `sqlite3_column_name`, and `sqlite3_column_decltype` (`NULL` declared types are encoded as `""`).
+- **Row count bound**: a batch contains at most `n` rows, where `n` is the effective fetch count (`Query.fetch` or `Fetch.nrows`, clamped to `1..MaxFetchRows`, with `0` selecting `DefaultFetchRows = 256`).
+- **Byte budget (`MaxBatchBytes`)**: a batch also stops before stepping the next row once its encoded byte length (the 4-byte `nrows` counter plus encoded rows) reaches or exceeds `MaxBatchBytes` (`1 MiB`). At least one row is always included in a non-empty batch if that row fits within `MaxMessageBytes`.
+- **On-demand stepping**: the server calls `sqlite3_step()` one row at a time as it fills the response batch and stops stepping as soon as the row limit or byte budget is reached, without reading ahead.
+- **`more = 1`**: indicates that the cursor remains open on the server because the batch filled before `sqlite3_step()` returned `SQLITE_DONE`. Because the server does not look ahead after a full batch, a query whose total rows are an exact multiple of the batch size returns a final batch with `nrows = 0` and `more = 0` on the next `Fetch`.
+- **`more = 0`**: indicates `SQLITE_DONE` was reached. The server resets or finalizes the statement and releases the cursor ID automatically; the client `MUST NOT` send `CloseCursor` when `more == 0`.
+- **Column-less statements**: a statement with `sqlite3_column_count == 0` (`INSERT`, `UPDATE`, `DELETE`, DDL) sent via `Query` steps once to completion and returns `cursor = 0`, `0` columns, `more = 0`, and `nrows = 0`.
+- **Cursor ID invariant**: `cursor != 0` in a `Query` / `QueryStmt` response if and only if `more == 1`.
+- **Oversize rows**: if a single row would cause the response payload to exceed `MaxMessageBytes` (`16 MiB`), the request fails with `SQLITE_TOOBIG` (`18`, `"row exceeds message size limit"`) and the cursor is released.
 
 ## 6. Methods
 
-Method ids are carried in the request's `aux`. Method 0 and any id not listed
-are `UNKNOWN_METHOD`.
+The request method ID is carried in the HQQ request's `MethodID` (`aux`) field. Method `0` and any unlisted ID return `UNKNOWN_METHOD`.
 
-| Id | Name | Request body | Response body | Session state |
-|---|---|---|---|---|
-| 1 | Open | section 6.1 | section 6.1 | CLOSED → OPEN |
-| 2 | Exec | `string sql`, `Params` | `i64 rows_affected`, `i64 last_insert_rowid` | OPEN |
-| 3 | Query | `string sql`, `Params`, `u32 fetch` | `u32 cursor`, `Columns`, `u8 more`, `Batch` | OPEN |
-| 4 | Fetch | `u32 cursor`, `u32 nrows` | `u8 more`, `Batch` | OPEN |
-| 5 | CloseCursor | `u32 cursor` | empty | OPEN |
-| 6 | Prepare | `string sql` | `u32 stmt`, `u32 nparams`, `Columns` | OPEN |
-| 7 | ExecStmt | `u32 stmt`, `Params` | `i64 rows_affected`, `i64 last_insert_rowid` | OPEN |
-| 8 | QueryStmt | `u32 stmt`, `Params`, `u32 fetch` | as Query | OPEN |
-| 9 | CloseStmt | `u32 stmt` | empty | OPEN |
-| 10 | Begin | `u8 mode`, `u8 read_only` | empty | OPEN |
-| 11 | Commit | empty | empty | OPEN |
-| 12 | Rollback | empty | empty | OPEN |
-| 13 | Ping | empty | empty | OPEN |
-| 14 | Close | empty | empty | any → CLOSED |
+| ID | Method | Request Body | Response Body | Session State Transition |
+| ---: | :--- | :--- | :--- | :--- |
+| `1` | `Open` | see §6.1 | see §6.1 | `CLOSED` -> `OPEN` |
+| `2` | `Exec` | `string sql`, `Params` | `i64 rows_affected`, `i64 last_insert_rowid` | `OPEN` |
+| `3` | `Query` | `string sql`, `Params`, `u32 fetch` | `u32 cursor`, `Columns`, `u8 more`, `Batch` | `OPEN` |
+| `4` | `Fetch` | `u32 cursor`, `u32 nrows` | `u8 more`, `Batch` | `OPEN` |
+| `5` | `CloseCursor` | `u32 cursor` | empty | `OPEN` |
+| `6` | `Prepare` | `string sql` | `u32 stmt`, `u32 nparams`, `Columns` | `OPEN` |
+| `7` | `ExecStmt` | `u32 stmt`, `Params` | `i64 rows_affected`, `i64 last_insert_rowid` | `OPEN` |
+| `8` | `QueryStmt` | `u32 stmt`, `Params`, `u32 fetch` | same as `Query` | `OPEN` |
+| `9` | `CloseStmt` | `u32 stmt` | empty | `OPEN` |
+| `10` | `Begin` | `u8 mode`, `u8 read_only` | empty | `OPEN` |
+| `11` | `Commit` | empty | empty | `OPEN` |
+| `12` | `Rollback` | empty | empty | `OPEN` |
+| `13` | `Ping` | empty | empty | `OPEN` |
+| `14` | `Close` | empty | empty | any -> `CLOSED` |
 
-A success response has status 0. Error responses are in section 7.
+Successful responses use status `0`; error responses follow §7.
 
 ### 6.1 Open
 
-Request:
+Request layout:
 
-```
+```text
 u16 major          client protocol major (must be 1)
 u16 minor          client protocol minor
 string db          database alias or path, 1..MaxPathBytes bytes
@@ -177,368 +132,203 @@ npragmas times:
   string value     matches [A-Za-z0-9_.+-]{0,255}
 ```
 
-Response:
+Response layout:
 
-```
+```text
 u16 major          server protocol major (1)
 u16 minor          server protocol minor (0)
 u32 max_fetch_rows MaxFetchRows
 u32 max_params     MaxParams
 ```
 
-Checks run in this order, and the first failure is the reply:
+Validation order and rules:
 
-1. The major version: the first two bytes of the body. If `major` is not 1,
-   the reply is `VERSION`. Only these two bytes are read, so a later major
-   version may change the rest of the layout.
-2. The body: any violation of the rules below is `BAD_REQUEST` or `LIMIT`.
-3. The database policy (`FORBIDDEN`), the session limit (`LIMIT`), and the open
-   itself (SQLite codes, for example `SQLITE_CANTOPEN`).
-
-Rules:
-
-- Exactly one of READONLY (0x1) and READWRITE (0x2) MUST be set; otherwise
-  `BAD_REQUEST`. CREATE (0x4) is optional. Other bits are `BAD_REQUEST`.
-- If `major` is not 1, the reply is `VERSION` with the message
-  `"unsupported protocol major version"`, and the session stays CLOSED.
-- The effective minor is `min(client minor, server minor)`. Version 1.0 has no
-  minor-dependent features.
-- The server resolves `db` as an alias from its configuration first. If no alias
-  matches, it uses the value as a path only when the server policy allows raw
-  paths. Otherwise the reply is `FORBIDDEN`.
-- If the resolved database does not exist and CREATE is not set, the reply is
-  SQLite `SQLITE_CANTOPEN` (14).
-- Open applies `busy_ms` with `sqlite3_busy_timeout`. It applies each pragma as
-  `PRAGMA <name> = <value>;`. Pragma names and values are validated before the
-  SQL is built, so no other SQL can be injected.
-- If Open succeeds, the session is OPEN. If it fails, the session stays CLOSED,
-  and the server MUST close the SQLite connection it may have opened.
-- Open in state OPEN is `ALREADY_OPEN`.
+1. **Session state and major version**: if the session is already `OPEN`, fail with `ALREADY_OPEN`. Next, inspect the first two bytes (`major`): if `major != 1`, fail immediately with `VERSION` (`"unsupported protocol major version"`) without parsing the remainder of the body so future major versions can alter the layout freely.
+2. **Body and limits**: exactly one of `READONLY` (`0x1`) or `READWRITE` (`0x2`) `MUST` be set, and `CREATE` (`0x4`) is optional (any other flag combination returns `BAD_REQUEST`). Pragma names and values are validated against their character-set regexes (`BAD_REQUEST` otherwise) and bounded by `MaxPragmas` (`LIMIT` otherwise).
+3. **Database policy and `sqlite3_open_v2`**: the server resolves `db` against configured `--alias` names first, falling back to a relative path inside `--allow-dir` only when `--allow-dir` is enabled (`FORBIDDEN` otherwise). If the file does not exist and `CREATE` is not set, SQLite returns `SQLITE_CANTOPEN` (`14`).
+4. **Session configuration**: applies `sqlite3_busy_timeout(db, busy_ms)` and executes each validated `PRAGMA <name> = <value>;`. If any step fails, the server closes the `sqlite3` handle and keeps the session in state `CLOSED`.
 
 ### 6.2 Exec
 
-`sql` MUST contain exactly one statement. Trailing whitespace and `;` are
-allowed. Any other trailing text is `BAD_REQUEST` with message
-`"multiple statements"`. Text with no statement is `BAD_REQUEST` with message
-`"empty statement"`.
+`sql` `MUST` contain exactly one SQL statement. Trailing whitespace, SQL comments, and a single trailing `;` are allowed; additional statements fail with `BAD_REQUEST` (`"multiple statements"`), and an empty/comment-only string fails with `BAD_REQUEST` (`"empty statement"`).
 
-The server prepares the statement, binds `Params` (section 4), steps to
-`SQLITE_DONE`, and finalizes it. `rows_affected` is `sqlite3_changes64()`
-after the step. `last_insert_rowid` is `sqlite3_last_insert_rowid()`.
+The server prepares the statement, binds `Params` (§4), steps to `SQLITE_DONE` (discarding any result rows), finalizes the statement, and returns `rows_affected = sqlite3_changes64()` and `last_insert_rowid = sqlite3_last_insert_rowid()`.
 
 ### 6.3 Query and QueryStmt
 
-Same rules as Exec for the SQL text. The `fetch` argument is the batch row
-count `n`: 0 means `DefaultFetchRows` (256), and values above `MaxFetchRows`
-are clamped to it. The server then binds, steps, and returns the first batch
-(section 5). For QueryStmt the statement is an existing prepared statement
-(section 8.2). It is reset before binding.
+Enforces the same single-statement rule as `Exec`. `fetch == 0` selects `DefaultFetchRows` (`256`), and values above `MaxFetchRows` (`4096`) are clamped. The server binds `Params`, steps the first batch (§5), and returns `(cursor, Columns, more, Batch)`. For `QueryStmt`, the existing prepared statement `stmt` is reset and cleared before binding, and any previously open cursor on `stmt` is closed first (§8.2).
 
 ### 6.4 Fetch
 
-Returns the next batch of an open cursor. `nrows` is the batch row count: 0 means
-the cursor's fetch size from its Query, values above `MaxFetchRows` are
-clamped. Unknown or released cursor: `NO_CURSOR`. If a step fails, the cursor
-is released and the error is returned.
+Steps and returns the next batch of rows from open cursor `cursor`. `nrows == 0` reuses the fetch size from the originating `Query`, and values above `MaxFetchRows` are clamped. Passing an unknown or already-closed cursor ID returns `NO_CURSOR`. If `sqlite3_step()` returns an error, the cursor is closed and the SQLite error is returned.
 
 ### 6.5 CloseCursor
 
-Releases the cursor: the statement is reset (the internal statement of an
-ad-hoc Query is finalized). An unknown or already released cursor id is
-`NO_CURSOR`.
+Closes an open cursor by resetting its underlying statement (or finalizing the temporary statement of an ad-hoc `Query`). Passing an unknown or already-closed cursor ID returns `NO_CURSOR`.
 
 ### 6.6 Prepare
 
-Prepares one statement (same single-statement rule as Exec). The response
-carries the new statement id, the parameter count
-(`sqlite3_bind_parameter_count`), and the columns. The statement id and cursor
-ids are separate id spaces (section 8.2).
+Prepares a single SQL statement under the same single-statement rule as `Exec` and returns `(stmt, nparams, Columns)`. Statement IDs and cursor IDs occupy independent namespaces (§8.2).
 
 ### 6.7 ExecStmt
 
-Like Exec, for the prepared statement `stmt`. Any open cursor of the statement is
-closed first (section 8.2). The statement is reset before binding.
+Closes any open cursor on `stmt`, resets and clears `stmt`, binds `Params`, steps to `SQLITE_DONE`, resets `stmt`, and returns `(rows_affected, last_insert_rowid)`.
 
 ### 6.8 CloseStmt
 
-Finalizes the statement and closes its open cursor, if any. Unknown id:
-`NO_STATEMENT`.
+Closes any open cursor associated with `stmt` and finalizes `stmt`. Passing an unknown or already-closed statement ID returns `NO_STATEMENT`.
 
 ### 6.9 Begin
 
-`mode`: 0 DEFERRED, 1 IMMEDIATE, 2 EXCLUSIVE. Other values are `BAD_REQUEST`.
-`read_only`: 0 or 1. When `read_only = 1`, `mode` MUST be 0 (otherwise
-`BAD_REQUEST`).
+`mode` selects `0` (`DEFERRED`), `1` (`IMMEDIATE`), or `2` (`EXCLUSIVE`); any other value returns `BAD_REQUEST`. `read_only` is `0` or `1`; when `read_only == 1`, `mode` `MUST` be `0` (`BAD_REQUEST` otherwise).
 
-- Read-write: execute `BEGIN <mode>`.
-- Read-only: remember the current `query_only` value, execute `BEGIN DEFERRED`,
-  then `PRAGMA query_only = 1`. COMMIT and ROLLBACK restore the remembered
-  value. A write inside the transaction then fails with `SQLITE_READONLY` (8).
+- **Read-write (`read_only == 0`)**: executes `BEGIN DEFERRED`, `BEGIN IMMEDIATE`, or `BEGIN EXCLUSIVE`.
+- **Read-only (`read_only == 1`)**: saves the current value of `PRAGMA query_only`, executes `BEGIN DEFERRED`, and sets `PRAGMA query_only = 1`. Subsequent write attempts inside the transaction fail with `SQLITE_READONLY` (`8`), and `Commit` / `Rollback` restore the saved `query_only` setting.
 
-A Begin inside a transaction returns SQLite's error (`SQLITE_ERROR` 1,
-`"cannot start a transaction within a transaction"`).
+Calling `Begin` while a transaction is already active returns `SQLITE_ERROR` (`1`, `"cannot start a transaction within a transaction"`).
 
 ### 6.10 Commit and Rollback
 
-Commit executes `COMMIT`, and Rollback executes `ROLLBACK` when a transaction is
-active. Commit outside a transaction returns SQLite's error
-(`SQLITE_ERROR`, `"cannot commit - no transaction is active"`). Rollback outside
-a transaction is a successful no-op. This is the one place where the protocol
-differs from SQLite's own `ROLLBACK` behavior.
-
-If COMMIT fails with `SQLITE_BUSY`, SQLite keeps the transaction open. The
-client MUST then send Rollback. The server does not do this itself.
-
-Both restore `query_only` if a read-only Begin changed it (section 6.9).
+`Commit` runs `COMMIT` (failing with `SQLITE_ERROR` if no transaction is active). `Rollback` runs `ROLLBACK` when a transaction is active and succeeds as a no-op when already in autocommit mode. If `COMMIT` fails with `SQLITE_BUSY`, SQLite leaves the transaction open; the client `MUST` issue `Rollback` to abort it. Both operations restore `PRAGMA query_only` if modified by a read-only `Begin`.
 
 ### 6.11 Ping
 
-Empty success response. Used to check that the session is alive.
+Returns an empty success response when the session is `OPEN` (`NO_SESSION` when `CLOSED`).
 
 ### 6.12 Close
 
-Ends the session. The server rolls back an active transaction, finalizes all
-statements and cursors, and closes the SQLite connection, then answers success.
-Afterwards the session is CLOSED. Close is idempotent: in state CLOSED it also
-answers success.
+Idempotently tears down the session (§8.3): rolls back any active transaction, finalizes all cursors and prepared statements, closes the `sqlite3` handle, transitions the session to `CLOSED`, and returns an empty success response.
 
 ## 7. Status codes and error responses
 
-An error response carries `status` (the response `aux`) and a payload that is
-the UTF-8 error message (no length prefix; the payload length is the message
-length, and it MAY be empty).
+Error responses carry a non-zero `status` in the HQQ response's `aux` word and an unprefixed UTF-8 error string as the response payload:
 
-| Status | Meaning |
-|---|---|
-| `0x10000` plus `rc` | A SQLite result code `rc`: primary (`SQLITE_BUSY` = 5) or extended (`SQLITE_CONSTRAINT_UNIQUE` = 2067), as returned by SQLite. For example `SQLITE_CONSTRAINT_UNIQUE` is status `0x10813`. The message is `sqlite3_errmsg()`. |
-| `0x20000` plus `code` | A protocol error (table below). |
+| Status Range | Meaning |
+| :--- | :--- |
+| `0x10000 + rc` | SQLite result code `rc` (primary code such as `SQLITE_BUSY = 5`, or extended code such as `SQLITE_CONSTRAINT_UNIQUE = 2067` -> `0x10813`). Payload is `sqlite3_errmsg()`. |
+| `0x20000 + code` | Service protocol error code from the table below. |
 
-All status values below `0x10000` are reserved and MUST NOT be sent. They
-would collide with HQQ's own error statuses.
+Status values below `0x10000` are reserved for HQQ transport-level error codes (`0x01`..`0x08`) and `MUST NOT` be emitted by application handlers.
 
-SQLite codes the server can produce (from `sqlite3.h`): ERROR 1, BUSY 5,
-LOCKED 6, NOMEM 7, READONLY 8, INTERRUPT 9, IOERR 10, CORRUPT 11, NOTFOUND 12,
-FULL 13, CANTOPEN 14, PROTOCOL 15, SCHEMA 17, TOOBIG 18, CONSTRAINT 19,
-MISMATCH 20, MISUSE 21, RANGE 25, NOTADB 26, and their extended forms
-(`SQLITE_BUSY_TIMEOUT` 773, `SQLITE_CONSTRAINT_PRIMARYKEY` 1555,
-`SQLITE_CONSTRAINT_NOTNULL` 1299, `SQLITE_CONSTRAINT_UNIQUE` 2067,
-`SQLITE_CONSTRAINT_CHECK` 275, `SQLITE_CONSTRAINT_FOREIGNKEY` 787, and so on).
-The server sends the code SQLite returned, unchanged.
+Service protocol error codes (`0x20000 + code`):
 
-Protocol errors:
+| Code | Name | Condition |
+| ---: | :--- | :--- |
+| `1` | `BAD_REQUEST` | Malformed request body, trailing bytes, invalid flag/mode, empty or multi-statement SQL, or invalid pragma syntax. |
+| `2` | `UNKNOWN_METHOD` | Request `MethodID` is not in `1..14`. |
+| `3` | `NO_SESSION` | Method other than `Open` or `Close` called while session is `CLOSED`, or any request sent on stream `0`. |
+| `4` | `ALREADY_OPEN` | `Open` called while session is already `OPEN`. |
+| `5` | `NO_STATEMENT` | Unknown or already-closed `stmt` ID. |
+| `6` | `NO_CURSOR` | Unknown or already-released `cursor` ID. |
+| `7` | `LIMIT` | Request or session exceeded a resource bound in §11. |
+| `8` | `VERSION` | Unsupported client protocol major version in `Open`. |
+| `9` | `FORBIDDEN` | Database name rejected by the server's `--alias` / `--allow-dir` policy. |
+| `10` | `INTERNAL` | Non-SQLite server failure (such as server heap allocation failure). |
 
-| Code | Name | Used when |
-|---|---|---|
-| 1 | `BAD_REQUEST` | malformed body, trailing bytes, invalid argument, disallowed SQL shape (multiple or empty statements), invalid pragma name or value |
-| 2 | `UNKNOWN_METHOD` | method id not in the table |
-| 3 | `NO_SESSION` | method other than Open (or Close) in state CLOSED, or request on stream 0 |
-| 4 | `ALREADY_OPEN` | Open in state OPEN |
-| 5 | `NO_STATEMENT` | unknown or closed statement id |
-| 6 | `NO_CURSOR` | unknown or released cursor id |
-| 7 | `LIMIT` | a documented limit was exceeded (section 11) |
-| 8 | `VERSION` | unsupported protocol major version |
-| 9 | `FORBIDDEN` | database alias unknown and raw paths disabled |
-| 10 | `INTERNAL` | server-side failure not covered by SQLite (for example out of memory in the server) |
-
-An error response does not end the session. It does not roll back the
-transaction either, although SQLite may roll back by itself for some errors
-(for example `SQLITE_FULL`); the server reports the error and the client
-decides. A Query or Fetch that fails releases its cursor (sections 6.3 and 6.4).
+Returning an error response leaves the session in state `OPEN` and does not automatically roll back an active transaction (unless SQLite itself rolled back, such as on `SQLITE_FULL`).
 
 ## 8. Session, transaction, statement, and cursor state
 
+Each stream maintains an isolated state machine governing its connection, prepared statements, cursors, and transaction mode.
+
 ### 8.1 Session states
 
-```
+```text
 CLOSED --Open ok--> OPEN
 OPEN   --Close----> CLOSED   (response success, teardown of section 8.3)
 OPEN   --stream closed by either side, link lost--> CLOSED (teardown, no response)
 ```
 
-An Open that fails keeps the session CLOSED. A method other than Open in state
-CLOSED is `NO_SESSION`.
+A failed `Open` leaves the session `CLOSED`. Any method other than `Open` or `Close` in state `CLOSED` returns `NO_SESSION`.
 
 ### 8.2 Statements and cursors
 
-- Statement ids (Prepare) and cursor ids (Query with more = 1) are `u32`
-  values from two separate counters per session. Both start at 1 and increase
-  by one for each allocation. They are never reused within a session. A value
-  of 0 is never a valid id. Exhausting the 2^32 range is `LIMIT`.
-- A session has at most `MaxStatementsPerSession` statements and
-  `MaxCursorsPerSession` open cursors.
-- An ad-hoc Query or Exec (methods 2 and 3) prepares, runs, and finalizes an
-  internal statement. A cursor from Query owns that internal statement, which
-  is finalized when the cursor is released.
-- A statement has at most one open cursor. QueryStmt and ExecStmt on a
-  statement that has an open cursor first release that cursor. A later
-  Fetch on the old cursor id is then `NO_CURSOR`.
-- CloseStmt releases the statement's open cursor, if any.
-- Many statements and cursors may be open at once, on the one connection.
+- Statement IDs (`Prepare`) and cursor IDs (`Query` / `QueryStmt` with `more == 1`) are allocated from two independent per-session monotonic `u32` counters starting at `1`. IDs are never reused within a session, `0` is never valid, and counter exhaustion at $2^{32}-1$ returns `LIMIT`.
+- Each session allows at most `MaxStatementsPerSession` (`256`) open prepared statements and `MaxCursorsPerSession` (`64`) open cursors simultaneously.
+- Ad-hoc `Query` and `Exec` calls prepare an internal statement that is finalized automatically when the call completes (or when the `Query` cursor closes).
+- Each prepared statement supports at most one open cursor at a time: calling `QueryStmt`, `ExecStmt`, or `CloseStmt` on a statement with an open cursor automatically closes that cursor first (causing subsequent `Fetch` calls on the old cursor ID to return `NO_CURSOR`).
 
 ### 8.3 Teardown
 
-Teardown runs on Close, on stream close (by either side), and on link loss. In
-this order:
+Session teardown runs on `Close`, stream closure (`OpConnClose`), or link loss (`ErrPeerGone` / `ErrPeerClosed`) in the following sequence:
 
-1. Stop the running request, if any, by interrupting it (section 9).
-2. If a transaction is active (`sqlite3_get_autocommit() == 0`), roll it back.
-   Restore `query_only` if a read-only Begin changed it.
-3. Finalize all cursors and statements.
-4. Close the SQLite connection with `sqlite3_close_v2`.
+1. Interrupt any currently executing request via `sqlite3_interrupt()` (§9).
+2. Finalize or reset all open cursors and prepared statements.
+3. If a transaction is active (`sqlite3_get_autocommit(db) == 0`), execute `ROLLBACK` and restore `query_only` if modified.
+4. Close the database handle with `sqlite3_close_v2(db)`.
 
-Uncommitted work is never visible to other sessions, because SQLite keeps it
-private until COMMIT. The server MUST complete teardown within PeerTimeout of
-the client going away (section 10).
+The server `MUST` complete teardown within `PeerTimeout` of a client process crash (§10).
 
 ### 8.4 Transaction state
 
-The session is in AUTOCOMMIT or IN TRANSACTION. The state is always the
-SQLite truth, `sqlite3_get_autocommit()`. A transaction may be started by Begin
-or by SQL text (`BEGIN`) and ended by Commit, Rollback, or SQL text
-(`COMMIT`, `END`, `ROLLBACK`). The protocol does not track it separately.
+Transaction state is determined directly by `sqlite3_get_autocommit(db)`, whether started via the `Begin` method or raw `BEGIN` SQL and whether ended via `Commit`/`Rollback` or raw `COMMIT`/`ROLLBACK` SQL.
 
 ## 9. Cancellation and deadlines
 
-Cancellation uses HQQ protocol 1.1 (`FeatureCancel`):
+Mid-flight query cancellation uses HQQ Advanced Protocol 1.1 (`FeatureCancel` and `FeatureMetadata`):
 
-- **Client.** If the caller's context ends while a request waits, the client
-  sends `OpCancel` for that request and returns the context error. After
-  that the client MUST NOT send another request on the stream. It closes
-  the stream, and the server then tears the session down (section 8.3). HQQ
-  discards the response to a canceled request.
-- **Server.** When a request's handler context is canceled, the server MUST:
-  1. call `sqlite3_interrupt()` on the session's connection, so the running
-     `sqlite3_step()` returns `SQLITE_INTERRUPT` (9);
-  2. check the context between steps, so an interrupt that arrives between
-     statements is not lost;
-  3. stop and release any cursor it was filling;
-  4. NOT send a response. HQQ discards it anyway.
-  The request does not end the session or the transaction by itself. The
-  client's stream close does that (section 8.3).
-- A request whose context ended before its handler started is not delivered to
-  the handler at all.
-- **Deadlines.** With `FeatureMetadata` the client sends the remaining time of
-  its context. The handler context then has that deadline and cancels when it
-  passes. Handle it exactly like a cancel. Use `sqlite3_interrupt()` as above.
+- **Client**: when the caller's `ctx` expires while awaiting a response, the client transmits `OpCancel` for the in-flight request, closes the session stream (triggering server teardown per §8.3), and returns `ctx.Err()`.
+- **Server**: when a request handler's context is canceled (either by `OpCancel` or by expiry of the deadline propagated via `FeatureMetadata`), the server `MUST` invoke `sqlite3_interrupt(db)`, check context cancellation between `sqlite3_step()` iterations, release any cursor being populated, and suppress the response frame.
 
 ## 10. Failures
 
-| Event | Client observes | Server does |
-|---|---|---|
-| Client process crashes or hangs | nothing (client is gone) | teardown (section 8.3) within PeerTimeout (`ErrPeerGone`, or `ErrPeerClosed` on stream close). Uncommitted work is rolled back. |
-| Client closes its stream | nothing | teardown, no response |
-| Server crashes | `ErrPeerGone` on the next call or on a call in progress | SQLite recovers its files on next open (hot journal or WAL). Open transactions are lost. |
-| Server closes gracefully | `ErrPeerClosed` | teardown of all sessions |
-| Link lost (heartbeat stops) | `ErrPeerGone` | teardown of all sessions on the link |
+| Failure Event | Client Observation | Server Action |
+| :--- | :--- | :--- |
+| Client process crashes or hangs | None (client terminated) | Detects `ErrPeerGone` (or stream close) within `PeerTimeout` and runs §8.3 teardown, rolling back uncommitted work. |
+| Client closes session stream | None | Runs §8.3 teardown with no response frame. |
+| Server process crashes | `ErrPeerGone` on active or next call | SQLite recovers WAL / rollback journal on next database open; uncommitted transactions are rolled back. |
+| Server shuts down gracefully | `ErrPeerClosed` (or `ErrShuttingDown` during drain) | Drains active requests up to shutdown timeout, then runs §8.3 teardown across all sessions. |
+| Link heartbeat timeout | `ErrPeerGone` | Runs §8.3 teardown across all streams on that link. |
 
-The Go driver maps `ErrPeerGone`, `ErrPeerClosed`, and `ErrClosed` to
-`driver.ErrBadConn` for every call that the protocol treats as safe to retry: Open,
-Prepare, Begin, Query, QueryStmt, Fetch, Ping, Commit, Rollback, and the
-reset of a pooled session. It reconnects the shared link on the next use (see
-`sqlite/README.md`, section "Connection pool").
-
-**Unknown outcome.** If the link is lost while an Exec or ExecStmt is in flight,
-the statement may or may not have run. The driver returns an error that wraps
-its `sqlite.ErrOutcomeUnknown` and does not wrap `driver.ErrBadConn`, so database/sql
-does not retry the statement. If the connection is lost during Commit, the
-transaction may or may not have been committed. The driver reports
-`driver.ErrBadConn` for that Commit, and the caller MUST treat the outcome as
-unknown.
+The Go driver maps `ErrPeerGone`, `ErrPeerClosed`, and `ErrClosed` to `driver.ErrBadConn` on idempotent/read operations (`Open`, `Prepare`, `Begin`, `Query`, `QueryStmt`, `Fetch`, `Ping`, `Commit`, `Rollback`, and session reset), while mapping link loss during `Exec` or `ExecStmt` to `sqlite.ErrOutcomeUnknown` so `database/sql` never blindly re-runs a write whose commit status is unknown.
 
 ## 11. Limits
 
-| Name | Value | Enforced by | Violation |
-|---|---|---|---|
-| `MaxMessageBytes` | 16 MiB (16 777 216) | both (request and response payload) | `LIMIT` (server); the client refuses before sending |
-| `MaxSQLBytes` | 1 MiB (1 048 576) | server | `LIMIT` |
-| `MaxParams` | 32 766 | server (`ordinal`, `count`) | `BAD_REQUEST` / `LIMIT` |
-| `MaxColumns` | 2 000 | server | `LIMIT` |
-| `MaxFetchRows` | 4 096; `DefaultFetchRows` 256 | server (clamps) | clamped, not an error |
-| `MaxBatchBytes` | 1 MiB (1 048 576) | server (batch splitting, section 5) | not an error (batch splits) |
-| `MaxNameBytes` | 1 024 | server (param name, column name) | `LIMIT` |
-| `MaxPathBytes` | 4 096 | server (Open `db`) | `LIMIT` |
-| `MaxPragmas` | 32 | server (Open) | `LIMIT` |
-| `MaxStatementsPerSession` | 256 | server | `LIMIT` |
-| `MaxCursorsPerSession` | 64 | server | `LIMIT` |
-| `MaxSessions` | server policy, default 256 | server (Open) | `LIMIT` |
-
-The server sets `sqlite3_limit()` for `SQLITE_LIMIT_SQL_LENGTH` to `MaxSQLBytes`,
-`SQLITE_LIMIT_VARIABLE_NUMBER` to `MaxParams`, `SQLITE_LIMIT_COLUMN` to
-`MaxColumns`, and `SQLITE_LIMIT_ATTACHED` to 0.
-
-Limits protect the server and are not a security boundary against a hostile
-client (section 12).
+| Limit Name | Value | Enforced By | Violation Behavior |
+| :--- | :--- | :--- | :--- |
+| `MaxMessageBytes` | `16 MiB` (`16,777,216`) | Client and server | `LIMIT` on server; rejected before send on client |
+| `MaxSQLBytes` | `1 MiB` (`1,048,576`) | Server (`SQLITE_LIMIT_SQL_LENGTH`) | `LIMIT` |
+| `MaxParams` | `32,766` | Server (`SQLITE_LIMIT_VARIABLE_NUMBER`) | `BAD_REQUEST` / `LIMIT` |
+| `MaxColumns` | `2,000` | Server (`SQLITE_LIMIT_COLUMN`) | `LIMIT` |
+| `MaxFetchRows` | `4,096` (`DefaultFetchRows = 256`) | Server | Clamped to `4,096` |
+| `MaxBatchBytes` | `1 MiB` (`1,048,576`) | Server (§5 batching) | Splits batch before next step |
+| `MaxNameBytes` | `1,024` | Server (param & column names) | `LIMIT` |
+| `MaxPathBytes` | `4,096` | Server (`Open.db`) | `LIMIT` |
+| `MaxPragmas` | `32` | Server (`Open.npragmas`) | `LIMIT` |
+| `MaxStatementsPerSession` | `256` | Server | `LIMIT` |
+| `MaxCursorsPerSession` | `64` | Server | `LIMIT` |
+| `MaxSessions` | Default `256` (configurable) | Server (`Open`) | `LIMIT` |
 
 ## 12. Trust model
 
-- The service is for **same-host, trusted clients**. Access control is the
-  listener: the acceptor segment's permission (`AcceptorConfig.Perm`, default
-  0600) decides which local users may connect.
-- The protocol does not authenticate individual requests. Any connected client may
-  run any SQL the database allows.
-- The server enforces the database policy: only aliases from its configuration,
-  or raw paths when the policy allows them.
-- The server disables `ATTACH`, `DETACH`, and loadable extensions
-  (`sqlite3_db_config(..., SQLITE_DBCONFIG_ENABLE_LOAD_EXTENSION, 0)` and an
-  authorizer that denies `SQLITE_ATTACH` and `SQLITE_DETACH`). Otherwise a
-  client could open files the policy does not allow.
-- Pragma names and values in Open are validated (section 6.1). No other
-  client text is spliced into SQL.
+- **Same-host trusted clients**: OS access control on the HQQ listener segment (`AcceptorConfig.Perm`, default `0o600`) determines which local users can connect.
+- **Database path sandboxing**: the server opens only configured `--alias` targets and (when `--allow-dir` is set) canonical paths strictly inside `--allow-dir`.
+- **Disabled file/code escapes**: the server disables `sqlite3_load_extension`, sets `SQLITE_LIMIT_ATTACHED` to `0`, and installs a SQLite authorizer that rejects `SQLITE_ATTACH` and `SQLITE_DETACH` so a client cannot open arbitrary files on the host.
+- **Validated pragmas**: pragma names and values in `Open` are restricted to strict alphanumeric patterns (§6.1) to prevent SQL injection.
 
 ## 13. Server implementation notes (C)
 
-- One worker per session is recommended: requests of a session run on that
-  worker in arrival order. Requests of one session are serialized, because the
-  Go client never pipelines. The server MUST NOT run two requests of one session
-  at once.
-- Sessions are independent. The server MAY run many sessions in parallel, and
-  the SQLite connections use `SQLITE_OPEN_FULLMUTEX` or are serialized by the
-  session worker.
-- The cancel path (section 9) needs a callback from the HQQ handler context to
-  `sqlite3_interrupt()`. The C Advanced layer must provide the request context's
-  done notification for this.
-- Every request handler must release (finalize, reset) what it created before
-  returning, on every error path.
+- Dedicate one worker thread per session so requests on a session execute serially in FIFO order while independent sessions run in parallel across cores.
+- Register a cancellation notifier on the HQQ request context that triggers `sqlite3_interrupt(db)` while the session worker is inside `sqlite3_step()`.
+- Release temporary statements and cursors on every error exit path.
 
 ## 14. Versioning
 
-Major version 1 is this document. A change that alters a layout, a method id,
-a status, or a limit's meaning MUST bump the major version. A compatible
-addition (a new method id that old servers answer with `UNKNOWN_METHOD`) bumps
-the minor version. Clients never send methods the negotiated minor version
-does not define.
+This specification defines major version `1`, minor version `0`. Breaking changes to wire layouts, method IDs, or status codes increment `major`; backward-compatible additions increment `minor`.
 
 ## 15. Design notes
 
-- **Rows are pulled, not pushed.** Rows travel in the responses of Query and
-  Fetch (`Stream.Call`), not as messages sent with `Stream.Send`. Under HQQ's
-  default `OverflowBlock` policy, a message queue that is full blocks the link's
-  receive path, and nothing else on the link is routed while it waits, not even
-  responses to other streams' calls. A pushing server would therefore let one
-  slow reader stall every session on the link. With Fetch, the client sets the
-  pace, the server holds no buffered rows, and the client holds at most two
-  batches (the one it reads and the one it prefetches). Errors arrive in-band
-  with the batch that failed.
-- **The server watches each stream with `Stream.Recv`.** Nothing is sent on a
-  session stream except requests, so the watcher's `Recv` returns only when the
-  stream closes or the link fails. That is how teardown (section 8.3) starts.
-  A plain message on a session stream is a protocol violation and also ends the
-  session.
-- **Pooled connections are reset.** The driver sends Rollback before it reuses
-  a connection. This is a no-op outside a transaction, so it costs one round
-  trip per checkout and ensures a transaction begun with plain SQL cannot leak
-  into the next user of the connection.
+- **Pull-based row streaming (`Fetch`)**: rows are pulled by the client via `Query` and `Fetch` RPC calls rather than pushed asynchronously via `Stream.Send`. Under HQQ's default `OverflowBlock` policy, a full stream queue pauses the link-wide receive path; pull-based batching guarantees that a slow consumer on one stream can never stall other sessions sharing the link.
+- **Stream lifecycle monitoring**: the server parks a watcher on `Stream.Recv` for each session stream. Because clients only send RPC requests (`Stream.Call`) and never plain data messages (`Stream.Send`), `Stream.Recv` unblocks only when the stream closes or the link fails, immediately triggering §8.3 teardown.
+- **Connection pool hygiene**: when a connection is returned to `database/sql`'s pool, `ResetSession` issues a `Rollback` (a fast no-op outside a transaction) so transactions started via raw `BEGIN` SQL cannot leak into subsequent callers.
 
 ## 16. Worked examples
 
-The bytes below are produced by the Go encoder and pinned by the test
-`TestGoldenExamples` in `sqlite/internal/wire/wire_test.go`. Spaces separate fields for
-readability only; the real messages have no spaces.
+The hexadecimal byte vectors below are generated by `sqlite/internal/wire` and verified in CI by `TestGoldenExamples` (`sqlite/internal/wire/wire_test.go`). Spaces separate logical fields for readability:
 
-Open request for database `main`, flags READWRITE|CREATE (0x6), busy timeout
-5000 ms, one pragma `journal_mode = WAL`:
+1. **`Open` request** for database `"main"`, flags `READWRITE | CREATE` (`0x6`), `busy_ms = 5000`, and one pragma `journal_mode = WAL`:
 
-```
+```text
 0100 0000                 major 1, minor 0
 04000000 6d61696e         db = "main"
 06000000                  flags = 0x2 | 0x4
@@ -548,19 +338,18 @@ Open request for database `main`, flags READWRITE|CREATE (0x6), busy timeout
 03000000 57414c           value = "WAL"
 ```
 
-Exec request `INSERT INTO t VALUES (?)` with one positional parameter 42:
+2. **`Exec` request** for `INSERT INTO t VALUES (?)` with one positional parameter `42`:
 
-```
+```text
 18000000 494e5345525420494e544f20742056414c55455320283f29   sql = "INSERT INTO t VALUES (?)"
 01000000                  nparams = 1
 01000000 00000000         ordinal = 1, name = "" (positional)
 01 2a00000000000000       INTEGER 42
 ```
 
-Query response for `SELECT n FROM t` with one column `n` and one row 42. The
-result is complete, so the cursor is 0 and `more` is 0:
+3. **`Query` response** for `SELECT n FROM t` returning one column `"n"` and one completed row `42` (`cursor = 0`, `more = 0`):
 
-```
+```text
 00000000                  cursor = 0 (none)
 01000000                  ncolumns = 1
 01000000 6e 00000000      column name = "n", decltype = ""
@@ -569,9 +358,9 @@ result is complete, so the cursor is 0 and `more` is 0:
 01 2a00000000000000       INTEGER 42
 ```
 
-Values, one after another: TEXT `hi`, NULL, FLOAT 1.5:
+4. **Consecutive encoded `Value` records**: `TEXT "hi"`, `NULL`, and `FLOAT 1.5`:
 
-```
+```text
 03 02000000 6869          TEXT "hi"
 05                        NULL
 02 000000000000f83f       FLOAT 1.5

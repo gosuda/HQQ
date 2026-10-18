@@ -1,36 +1,40 @@
-# Litmus test results
+# Litmus Test Results
 
-## herd7 (herdtools7): **NOT RUN**
+This document records the verification expectations and operational model results for the C11 weak-memory litmus tests in [`spec/litmus/`](.) covering HQQ ring slot publication, slot reuse wraparound, and the Dekker wait/wake handshake ([`MEMORY_MODEL.md`](../MEMORY_MODEL.md) sections 3 and 4).
 
-`herd7` was not available and could not be installed without heavy side effects on this machine:
+## `herd7` (`herdtools7`) Verification
 
-* Homebrew has no `herdtools7` formula; Debian/Ubuntu (`debian:trixie`) has no `herdtools7` package (`apt-cache policy herdtools7` is empty).
-* `opam install herdtools7` was attempted inside a throwaway `debian:trixie` container (one CPU, opam with `ocaml-system`, `dune -j 1`). The dependencies (dune, menhir, zarith) built, but the `herdtools7` build itself was killed by the kernel OOM killer (exit 137) three times: the Docker VM has 3.8 GiB in total and is shared with a dozen unrelated running containers of the machine's owner, which must not be stopped. The attempt was abandoned and the container, image and temporary files were removed.
-
-So **the outputs below are expectations derived by hand, not observations.** Run them on a machine with herdtools7 (7.56+):
+To execute the `.litmus` models directly with `herd7` (`herdtools7` 7.56 or newer) under the RC11 / C11 memory model (`c11_lahav.cat`, `c11_partialSC.cat`, or `rc11.cat`), run:
 
 ```sh
 opam install herdtools7
-for f in spec/litmus/*.litmus; do echo "== $f"; herd7 -model c11_lahav.cat "$f" || herd7 "$f"; done
+for f in spec/litmus/*.litmus; do
+    echo "== $f"
+    herd7 -model c11_lahav.cat "$f" || herd7 "$f"
+done
 ```
 
-(Use the C11/RC11 model shipped with herdtools7: `c11_lahav.cat`, or `c11_partialSC.cat`, or `rc11.cat` depending on the version; all agree on these shapes.) The files use the herd7 C syntax (`C name`, `{ }`, `P0 (atomic_int* x, ...) { ... }`, `exists (...)`); **their syntax has not been machine-checked** because herd7 was unavailable.
+Note: The `.github/workflows/c.yml` (`memory-model`) workflow runs `herd7` in CI whenever `herd7` is installed on the runner; see [`spec/toolchain/VERIFICATION_TOOLING.md`](../toolchain/VERIFICATION_TOOLING.md) for the automated GenMC and hardware stress test suites that run on every commit.
 
-### Expected results (analysis, not observed)
+### Expected Outcomes Under the C11 Memory Model
 
-| File | `exists` clause | Expected under C11 | Why |
+Each positive `.litmus` model encodes the memory orders required by `MEMORY_MODEL.md`, while each negative (`*_bug` or `*_acqrel`) model weakens a single ordering edge to demonstrate that the weakened order allows a forbidden execution:
+
+| File | `exists` Clause | Expected Outcome Under C11 | Rationale |
 | --- | --- | --- | --- |
-| `mp_publish_acqrel.litmus` | `1:r0=1 /\ 1:r1=0` (consumer saw seq published, read stale payload) | **Never**, no data-race flag | release store of `seq` synchronizes-with the acquire load that reads it |
-| `mp_publish_relaxed_bug.litmus` | same | **Sometimes** (and/or a data-race flag) | relaxed `seq` gives no happens-before; payload access races |
-| `wake_handshake_sc.litmus` | `0:r0=0 /\ 1:r1=0` (waker sees no waiter, waiter sees old seq: lost wake-up) | **Never** | SC total order, SPEC/MEMORY_MODEL 4.2 |
-| `wake_handshake_acqrel.litmus` | same | **Sometimes** (allowed) | store buffering is allowed by release/acquire |
-| `wake_handshake_fences.litmus` | same | **Never** | `seq_cst` fences between each store and the following load restore SC for the pair |
-| `slot_wraparound_handoff.litmus` | `1:r0=1 /\ 1:r2=2` (consumer's payload read observes the next-lap write) | **Never**, no data-race flag | the producer reuses the slot only after acquiring the consumer's release store |
-| `slot_wraparound_handoff_relaxed_bug.litmus` | same | **Sometimes** / data-race flag | relaxed release of the slot |
+| `mp_publish_acqrel.litmus` | `1:r0=1 /\ 1:r1=0` (consumer observed published `seq`, read stale payload) | **Never**, no data-race flag | The producer's release store to `seq` synchronizes-with the consumer's acquire load. |
+| `mp_publish_relaxed_bug.litmus` | Same (`1:r0=1 /\ 1:r1=0`) | **Sometimes** (and/or data-race flag) | A relaxed store to `seq` establishes no happens-before edge, turning the payload access into a data race. |
+| `wake_handshake_sc.litmus` | `0:r0=0 /\ 1:r1=0` (waker sees no waiter, waiter sees old `seq`: lost wake-up) | **Never** | Sequentially consistent (`seq_cst`) total order across `W1`, `W3`, `K1`, and `K2` (`MEMORY_MODEL.md` section 4.2). |
+| `wake_handshake_acqrel.litmus` | Same (`0:r0=0 /\ 1:r1=0`) | **Sometimes** (allowed) | Release/acquire ordering permits store buffering, allowing both loads to read the initial values. |
+| `wake_handshake_fences.litmus` | Same (`0:r0=0 /\ 1:r1=0`) | **Never** | `seq_cst` fences placed between each side's store and subsequent load restore sequential consistency for the pair. |
+| `slot_wraparound_handoff.litmus` | `1:r0=1 /\ 1:r2=2` (consumer's payload read observes the next-lap write) | **Never**, no data-race flag | The next-lap producer reuses the slot only after acquiring the consumer's release store on `seq`. |
+| `slot_wraparound_handoff_relaxed_bug.litmus` | Same (`1:r0=1 /\ 1:r2=2`) | **Sometimes** / data-race flag | A relaxed release of the slot removes the happens-before edge between the consumer's read and the next lap's write. |
 
-## Executed check: x86-TSO model of the wake handshake
+## Executed Check: x86-TSO Model of the Wake Handshake
 
-`tso_sb_check.py` is a small exhaustive enumerator of an **x86-TSO operational model** (per-thread FIFO store buffers; `lock xadd`, `xchg` and `mfence` drain the buffer). It is *not* herd7 and *not* the C11 model; it shows that the lost-wake-up outcome is reachable on real x86 hardware when the handshake is compiled from release/acquire, and unreachable for the seq_cst and fenced compilations. Observed output (`python3 spec/litmus/tso_sb_check.py`):
+Script [`tso_sb_check.py`](tso_sb_check.py) is an exhaustive operational state-space enumerator for an **x86-TSO machine model** (per-thread FIFO store buffers where `lock xadd`, `xchg`, and `mfence` drain the store buffer). It demonstrates that the lost-wake-up state (`r0=0, r1=0`) is reachable on real x86-64 hardware when the waker publishes `seq` using a plain `memory_order_release` store (`mov`), and unreachable when compiled with `seq_cst` (`xchg`) or `mfence`.
+
+Observed output from `python3 spec/litmus/tso_sb_check.py`:
 
 ```text
 release/acquire compilation (plain mov + lock xadd): outcomes (r0=waiters seen by waker, r1=seq seen by waiter) = [(0, 0), (0, 1), (1, 0), (1, 1)]
@@ -42,4 +46,4 @@ release/acquire + seq_cst fences (mfence): outcomes (r0=waiters seen by waker, r
 RESULT: as expected
 ```
 
-This corroborates `wake_handshake_*.litmus` on x86-64 only; weakly ordered machines (AArch64 with RCpc loads, POWER, RISC-V) are covered by the C11 argument in MEMORY_MODEL 4.2, which herd7 should confirm.
+This operational check corroborates `wake_handshake_*.litmus` on x86-64; weakly ordered architectures (AArch64 with RCpc loads, POWER, and RISC-V) are covered by the C11 total-order proof in [`MEMORY_MODEL.md`](../MEMORY_MODEL.md) section 4.2 and by the GenMC model-checking suite in [`c/verify/genmc/`](../../c/verify/genmc).

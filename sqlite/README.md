@@ -1,27 +1,22 @@
-# sqlite: a database/sql driver for SQLite served over HQQ
+# `sqlite`: Pure-Go `database/sql` Driver Over HQQ Shared Memory
 
-`gosuda.org/hqq/sqlite` is a `database/sql` driver, registered as `hqq-sqlite`,
-for a SQLite database that runs as a separate service. The service is reached
-through an HQQ listener. The driver needs no cgo. Each `database/sql`
-connection is one HQQ stream of a shared link, and the server runs each stream
-as one session with its own SQLite connection, transaction state, and
-statements.
+`gosuda.org/hqq/sqlite` is a pure-Go `database/sql` driver, registered as `"hqq-sqlite"`, that connects to a SQLite database hosted by a separate server process over an HQQ shared-memory listener. Your Go binary requires zero `cgo`. Every `database/sql` connection maps to one logical HQQ stream over a shared `AdvancedLink`, and the server isolates each stream as an independent session with its own `sqlite3` connection handle, transaction state, and prepared statements.
 
-| Path | What it is |
-|---|---|
-| [`doc.go`](doc.go) | The package documentation (`go doc gosuda.org/hqq/sqlite`). |
-| [`PROTOCOL.md`](PROTOCOL.md) | The wire protocol 1.0: byte layouts, methods, status codes, state, cancellation, limits. The contract for every implementation. |
-| `internal/wire/` | The protocol encodings, shared by the driver and the fake server. Internal: it is an implementation detail. |
-| `internal/fakeserver/` | A Go stand-in for the C server (HQQ acceptor, sessions, an in-memory engine with a small SQL subset). Used by the tests. |
-| `internal/contract/` | The database/sql contract suite, run against any service (`contract.RunContract`). |
-| `e2e/` | End-to-end tests that run the contract and the driver tests against the C server. They skip without `HQQ_SQLITE_SERVER`. |
-| [`launcher/`](launcher) | Starts the C server as a child process, after verifying its digest, and returns a `database/sql` handle for it (see its README). |
-| [`../examples/sqlite/server/`](../examples/sqlite/server) | The C server (libhqq and SQLite; the system library, or an amalgamation via `HQQ_SQLITE_AMALGAMATION_DIR`). Linux, macOS and Windows (clang-cl). See its README. |
+| Path | Role |
+| :--- | :--- |
+| [`doc.go`](doc.go) | Package GoDoc reference (`go doc gosuda.org/hqq/sqlite`). |
+| [`PROTOCOL.md`](PROTOCOL.md) | Normative SQLite service wire protocol 1.0: frame layouts, opcodes, status codes, session state machine, cancellation, and resource limits. |
+| `internal/wire/` | Binary wire encoders and decoders shared by the driver and fake server. |
+| `internal/fakeserver/` | In-memory Go stand-in server implementing the wire protocol for unit testing without the C binary. |
+| `internal/contract/` | Reusable 107-case `database/sql` behavioral contract suite (`contract.RunContract`). |
+| `e2e/` | End-to-end test suite running the contract and crash-recovery tests against the compiled C server (`HQQ_SQLITE_SERVER`). |
+| [`launcher/`](launcher/README.md) | Verified child-process starter that hashes `hqq-sqlite-server` with `secureexec`, attaches a parent lifeline, and returns a ready `*sql.DB`. |
+| [`gendriver/`](gendriver) | Second `database/sql` driver (`"hqq-sqlite-gen"`) layered on the `hqq-bindgen`-generated SQLite client ([`bindgen/examples/sqlite3`](../bindgen/examples/sqlite3/README.md)). |
+| [`../examples/sqlite/server/`](../examples/sqlite/server/README.md) | Production C11 SQLite server (`libhqq` + SQLite; Linux, macOS, and Windows). |
 
 ## Using the driver
 
-Import the package for its side effect, which registers the driver, and open
-a database with a DSN:
+Import `gosuda.org/hqq/sqlite` to register `"hqq-sqlite"` with `database/sql` and open a handle using an `hqq://` DSN:
 
 ```go
 import (
@@ -37,8 +32,7 @@ if err != nil {
 defer db.Close()
 ```
 
-Build a connector when the link needs tuning, or when the caller keeps the
-connector to close the shared link later:
+When you prefer structured configuration over a DSN string or want direct access to the `driver.Connector`, construct one with `sqlite.NewConnector`:
 
 ```go
 c, err := sqlite.NewConnector("sqlite-svc", sqlite.Config{
@@ -50,47 +44,34 @@ c, err := sqlite.NewConnector("sqlite-svc", sqlite.Config{
 if err != nil {
 	return err
 }
-db := sql.OpenDB(c) // all connections of db share one link
+db := sql.OpenDB(c) // all connections of db multiplex over one shared HQQ link
 ```
 
-`ConnectorFromDSN(dsn)` returns a connector for a DSN, and
-`ParseDSN(dsn)` returns the listener name and the parsed `Config`. Closing the
-`*sql.DB` closes the connector (it is an `io.Closer`), and so the link.
+`ConnectorFromDSN(dsn)` builds a `*Connector` from a DSN string, and `ParseDSN(dsn)` parses the listener name and `Config` without opening a link. Closing `*sql.DB` automatically closes the underlying `*Connector` (which implements `io.Closer`) and tears down the shared HQQ link.
 
-## DSN
+## DSN format and configuration
 
-`hqq://<listener>?<options>`. The host is the listener name. Every option may
-appear once, and unknown options are errors.
+DSNs take the form `hqq://<listener>?<options>`, where `<listener>` is the HQQ acceptor name. Each query parameter may appear at most once, and unrecognized parameters return an error:
 
-| Option | Default | Meaning |
-|---|---|---|
-| `db` | required | Database alias or path, as the server accepts it. The server decides which names are allowed. |
-| `mode` | `rwc` | `rwc` open or create, `rw` open an existing database for writing, `ro` read-only. |
-| `timeout` | `10s` | Bounds connecting, and the requests that run outside a caller context (Commit, Rollback, closing cursors and statements). |
-| `fetch` | `256` | Rows per batch, 1 to 4096. |
-| `busy` | `5s` | How long the server waits for a lock held by another session. `-1s` disables the wait. |
-| `txlock` | `deferred` | BEGIN mode: `deferred`, `immediate`, or `exclusive`. |
-| `pragma.<name>` | none | A PRAGMA the server applies when a session opens (for example `pragma.query_only=1`). |
+| Parameter | Default | Description |
+| :--- | :--- | :--- |
+| `db` | required | Database alias or relative file path accepted by the server's open policy. |
+| `mode` | `rwc` | Open mode: `rwc` (read-write-create), `rw` (read-write existing file), or `ro` (read-only). |
+| `timeout` | `10s` | Bounds initial link connection and operations that run without a caller `context.Context` (`Commit`, `Rollback`, cursor/statement close). |
+| `fetch` | `256` | Number of rows fetched per batch (`1` to `4096`). |
+| `busy` | `5s` | Server-side `sqlite3_busy_timeout` duration when waiting on locks held by another session (`-1s` disables waiting). |
+| `txlock` | `deferred` | Default `BEGIN` mode for read-write transactions: `deferred`, `immediate`, or `exclusive`. |
+| `pragma.<name>` | none | Runs `PRAGMA <name> = <value>` when each session opens (for example `pragma.journal_mode=WAL` or `pragma.foreign_keys=1`). |
 
-The server leaves `journal_mode` at SQLite's default (rollback journal). With many
-concurrent writers on one database file, SQLite's busy handler has no queue, so a
-writer can starve past `busy`; set `pragma.journal_mode=WAL` for write-heavy
-concurrent workloads. An autocommit statement that fails with `IsBusy` did not
-commit and is safe to retry.
+By default, SQLite opens databases in rollback-journal mode. For workloads with concurrent writers, set `pragma.journal_mode=WAL` so readers do not block writers and writers contend only against other writers. An autocommit statement that fails with `sqlite.IsBusy(err)` never committed and is safe to retry.
 
-The `Config` fields are the same options: `Database`, `Mode`, `Timeout`,
-`FetchSize`, `BusyTimeout`, `TxMode`, `Pragmas`, and `Link` (the HQQ link
-settings; the features and the message size are fixed by the protocol).
+`sqlite.Config` exposes the exact same settings as struct fields: `Database`, `Mode`, `Timeout`, `FetchSize`, `BusyTimeout`, `TxMode`, `Pragmas`, and `Link` (custom HQQ `Config` geometry).
 
-## Errors
+## Error semantics and retry safety
 
-- **SQLite errors** are `*sqlite.Error`. `Code` is the primary result code, for
-  example `CodeConstraint` (19), and `ExtendedCode` is the extended code, for
-  example `CodeConstraintUnique` (2067). `ExtendedCode` equals `Code` when SQLite
-  gave none. `Message` is `sqlite3_errmsg()`. The helpers `IsBusy`, `IsLocked`,
-  `IsConstraint`, `IsReadOnly`, and `IsInterrupted` test the primary code, and
-  `errors.Is` matches the sentinels `ErrBusy`, `ErrLocked`, `ErrConstraint`,
-  `ErrReadOnly`, and `ErrInterrupted` the same way.
+The driver distinguishes SQLite engine errors, wire-protocol errors, retryable link drops, and ambiguous write drops:
+
+- **SQLite engine errors (`*sqlite.Error`)**: `Code` holds the primary SQLite result code (such as `CodeConstraint = 19`), `ExtendedCode` holds the extended result code (such as `CodeConstraintUnique = 2067`, or equals `Code` when no extended code applies), and `Message` holds `sqlite3_errmsg()`. Helper predicates `IsBusy`, `IsLocked`, `IsConstraint`, `IsReadOnly`, and `IsInterrupted` test the primary code, and `errors.Is` matches the sentinels `ErrBusy`, `ErrLocked`, `ErrConstraint`, `ErrReadOnly`, and `ErrInterrupted`:
 
   ```go
   if _, err := db.Exec("INSERT INTO users (email) VALUES (?)", email); err != nil {
@@ -105,178 +86,64 @@ settings; the features and the message size are fixed by the protocol).
   }
   ```
 
-- **Protocol errors** are `*sqlite.ProtocolError` (an alias of the wire type). `Code`
-  is a protocol code of PROTOCOL.md section 7: 1 BAD_REQUEST (also a second
-  statement in one call), 7 LIMIT, 9 FORBIDDEN (the database is not allowed by the
-  server's policy), and so on.
+- **Service protocol errors (`*sqlite.ProtocolError`)**: returned when a request violates the service contract in [`PROTOCOL.md`](PROTOCOL.md) §7, such as `1` (`BAD_REQUEST`, including multi-statement SQL strings), `7` (`LIMIT`), or `9` (`FORBIDDEN`, when the server's path/alias policy rejects the database name).
+- **Lost connections on reads and setup (`driver.ErrBadConn`)**: if the shared-memory link dies during `Connect`, `Query`, `Prepare`, `Begin`, `Ping`, `Commit`, or `Rollback`, the returned error wraps `driver.ErrBadConn`. `database/sql` discards the broken stream and automatically retries `Connect`, `Query`, `Prepare`, `Begin`, or `Ping` on a fresh connection. Because `Query` is treated as retryable by `database/sql`, never send mutating statements (such as `INSERT ... RETURNING`) through `Query` outside a transaction; use `Exec` or an explicit transaction instead.
+- **Lost connections during `Exec` (`sqlite.ErrOutcomeUnknown`)**: if the link dies while an `Exec` or `ExecStmt` call is in flight, the server may have already committed the write before crashing. The driver therefore returns an error wrapping `sqlite.ErrOutcomeUnknown` and deliberately **does not** wrap `driver.ErrBadConn`, preventing `database/sql` from silently re-executing a non-idempotent write.
+- **Context cancellation (`context.Canceled` / `context.DeadlineExceeded`)**: if `ctx` is already expired before a call starts, the driver returns `ctx.Err()` immediately and keeps the connection healthy. If `ctx` expires while a request is in flight on the server, the driver sends a Protocol 1.1 `OpCancel` frame (`sqlite3_interrupt` on the server), discards the connection stream, and lets the server roll back any open transaction on that session.
 
-- **Lost connections.** When the link dies, the error wraps `driver.ErrBadConn`
-  and `database/sql` discards the connection and retries the call on a new one
-  (`database/sql` retries at most twice). This holds for a connect, a Query, a
-  Prepare, a Begin, a Ping, a Commit, and a Rollback. The Commit case is the one
-  place where the outcome of the call is unknown: the transaction may have
-  committed. A Query is retried like a read, so a statement that writes through
-  `Query` (for example `INSERT ... RETURNING`) can run twice after a lost link:
-  send writes through `Exec`, or inside a transaction.
+## Parameter and result type mappings
 
-- **Lost connections during Exec.** An Exec or ExecStmt whose request was in
-  flight when the link died returns an error that wraps `sqlite.ErrOutcomeUnknown`,
-  and does not wrap `driver.ErrBadConn`. The statement may or may not have run, so
-  `database/sql` must not retry it. The connection is discarded. A write that
-  matters should run in a transaction, and its outcome should be checked by
-  reading the data again.
+Parameters are validated and converted by the driver's `CheckNamedValue` before any frame is sent:
 
-- **Cancellation** returns `context.Canceled` or `context.DeadlineExceeded`
-  (not `ErrBadConn`). A context that is already done is checked before anything is
-  sent, so the connection stays usable. A context that ends while a request is in
-  flight sends a cancel to the server, which interrupts the statement. The
-  connection is then unusable and is discarded, and the server rolls its
-  transaction back.
+| Go Parameter Type | SQLite Storage Class & Rules |
+| :--- | :--- |
+| `nil` | `NULL`. |
+| Signed integers (`int`, `int8`..`int64`); unsigned integers `<= math.MaxInt64` | `INTEGER` (`uint64 > math.MaxInt64` fails before send). |
+| `float32`, `float64` | `REAL`. `math.IsNaN` is rejected with an error (SQLite converts `NaN` to `NULL`; pass `nil` explicitly if you want `NULL`). `±Inf` is preserved. |
+| `bool` | `INTEGER` (`1` for `true`, `0` for `false`). |
+| `string` | `TEXT`. |
+| `[]byte`, `json.RawMessage` | `BLOB` (a `nil` slice encodes as a zero-length `BLOB`, not `NULL`; convert `json.RawMessage` to `string` if you want `TEXT`). |
+| `time.Time` | `TEXT` formatted as `2006-01-02 15:04:05.999999999-07:00` (preserving timezone offset). |
+| `driver.Valuer` (including `sql.Null*`) | Evaluates `.Value()` (nil pointer `Valuer` becomes `NULL`). |
+| Pointers and defined types over primitives | Dereferenced/unwrapped and converted by underlying kind. |
+| Structs, maps, slices, channels | Rejected locally with an error naming the unsupported type. |
 
-## Values
+Named parameters (`sql.Named("id", 7)`) match `:id`, `@id`, or `$id` in the SQL text and can be mixed with positional `?` parameters. Unbound parameter slots default to `NULL` per SQLite rules.
 
-Arguments are converted by the driver's `CheckNamedValue`, so the rules below
-hold for every call, including `db.Query` and `Stmt`:
+Result values returned from `Rows`:
 
-| Go | SQLite |
-|---|---|
-| `nil` | NULL |
-| all signed integers; unsigned integers up to `math.MaxInt64` | INTEGER. A larger `uint64` is an error. |
-| `float32`, `float64` | REAL. `NaN` is an error: SQLite stores NaN as NULL, and the driver does not guess, so pass `nil` to store NULL. `±Inf` is stored as is. |
-| `bool` | INTEGER 0 or 1 |
-| `string` | TEXT |
-| `[]byte`, `json.RawMessage` | BLOB. A nil slice is an empty BLOB, not NULL. Use `string(raw)` to store JSON text. |
-| `time.Time` | TEXT in the form `2006-01-02 15:04:05.999999999-07:00`, which keeps the value's offset. |
-| `driver.Valuer` (`sql.Null*` included) | the Value it returns, which must not be a Valuer. A nil pointer Valuer is NULL. |
-| pointers and named types | dereferenced, and converted by their kind |
-| anything else (structs, maps, channels) | an error that names the type, before anything is sent |
+| SQLite Storage Class | Returned Go Type |
+| :--- | :--- |
+| `INTEGER` | `int64` |
+| `REAL` | `float64` |
+| `TEXT` | `string`, or `time.Time` when the column's declared type is `DATE`, `DATETIME`, or `TIMESTAMP` (case-insensitive, ignoring length suffixes such as `DATETIME(6)`) and the text parses under one of the supported layouts (`2006-01-02 15:04:05.999999999-07:00`, RFC 3339, timezone-less UTC equivalents, `2006-01-02 15:04`, or `2006-01-02`). Unparseable strings remain `string`. |
+| `BLOB` | `[]byte` (a fresh caller-owned copy). |
+| `NULL` | `nil` |
 
-Named arguments use `sql.Named`, with or without the prefix: `sql.Named("id", 7)`
-binds `:id`, `@id`, or `$id`. Positional and named arguments may be mixed.
-Parameters that are not supplied are NULL, as in SQLite. The argument count is
-checked against the parameter count of a prepared statement, but not for a
-direct `Exec` or `Query`.
+## Column metadata, batches, and transactions
 
-Results:
+- **`Rows.ColumnTypes()`**: `DatabaseTypeName()` returns the uppercased declared column type (or the current row's storage class `INTEGER`, `REAL`, `TEXT`, `BLOB`, or `NULL` for untyped expressions). `ScanType()` maps declared affinities to `int64`, `string`, `float64`, `[]byte`, `time.Time` (for `DATE`/`DATETIME`/`TIMESTAMP`), or `any`.
+- **Prefetched row batches**: query results stream in batches of `fetch` rows (default `256`). While the caller iterates over the current batch, the driver prefetches the next batch in the background so at most two batches reside in memory at once. Closing `Rows` early closes the server-side cursor immediately. Any single row must fit within the 16 MiB message limit (`CodeTooBig` / `SQLITE_TOOBIG` otherwise).
+- **Single-statement rule**: each `Exec`, `Query`, or `Prepare` accepts exactly one SQL statement (trailing whitespace, comments, and a single `;` are permitted; multiple statements return `BAD_REQUEST`).
+- **Transactions**: `BeginTx` supports `sql.LevelDefault` and `sql.LevelSerializable`. Setting `ReadOnly: true` starts a `BEGIN DEFERRED` transaction with `PRAGMA query_only = 1`. For read-write transactions, the lock mode defaults to `Config.TxMode` (`deferred`, `immediate`, or `exclusive`) and can be overridden per transaction via `sqlite.WithTxMode(ctx, sqlite.TxImmediate)`. If `Commit` fails (for example with `SQLITE_BUSY`), the driver automatically issues a `Rollback` so the session never remains stuck inside an open transaction.
 
-| SQLite | Go |
-|---|---|
-| INTEGER | `int64` |
-| REAL | `float64` |
-| TEXT | `string`. A TEXT value of a column declared `DATE`, `DATETIME`, or `TIMESTAMP` (case-insensitive, any length suffix such as `(10)` is ignored) is a `time.Time` when it parses, and a `string` otherwise. |
-| BLOB | `[]byte` (a copy) |
-| NULL | `nil` |
+## Connection multiplexing and server security
 
-Parsed time text is one of: `2006-01-02 15:04:05.999999999-07:00`,
-RFC 3339 with `T` and an offset or `Z`, the same two forms without an offset
-(read as UTC), `2006-01-02 15:04`, `2006-01-02T15:04`, or `2006-01-02`. Times are
-UTC when the text has no offset. A time column holding an integer or real value
-keeps that value.
+All `*sql.Conn` handles opened from the same `*Connector` or `*sql.DB` share a single underlying HQQ `AdvancedLink` and multiplex as independent streams. If the link dies (`ErrPeerGone` or `ErrPeerClosed`), the connector drops the dead link and dials a fresh one on the next connection request.
 
-`json.RawMessage` values are BLOBs, like `[]byte`. Scan TEXT JSON into `string`
-or `[]byte`, then unmarshal.
+The C server (`examples/sqlite/server`) enforces database path sandboxing (`--alias` and `--allow-dir`), disables `ATTACH`, `DETACH`, and `sqlite3_load_extension`, and supports `--parent-stdin` so it rolls back open transactions and exits cleanly if its parent process dies (including via `SIGKILL`). See [`PROTOCOL.md`](PROTOCOL.md) §12 and [`../examples/sqlite/server/README.md`](../examples/sqlite/server/README.md).
 
-## Result columns
+## Running the tests
 
-`Rows.ColumnTypes` reports:
-
-- `DatabaseTypeName`: the declared type, uppercased (for example `VARCHAR(20)`
-  or `DATETIME`). A column with no declared type (an expression) reports the
-  storage class of its value in the current row: `INTEGER`, `REAL`, `TEXT`,
-  `BLOB`, or `NULL`. Before the first row, and after the last, it is empty.
-- `ScanType`, from the declared type under SQLite's affinity rules: INTEGER
-  (contains "INT") `int64`, TEXT (contains "CHAR", "CLOB", or "TEXT") `string`,
-  REAL (contains "REAL", "FLOA", or "DOUB") `float64`, BLOB `[]byte`, DATE,
-  DATETIME, and TIMESTAMP `time.Time`, and `any` otherwise. SQLite is dynamically
-  typed, so a value can differ from its column's type: scan into `any` when
-  unsure.
-- `Nullable`: not reported. The protocol carries no NOT NULL information.
-- `Length`: not reported. SQLite does not enforce declared lengths.
-
-`LastInsertId` is `sqlite3_last_insert_rowid()` of the session after the
-statement. `RowsAffected` is `sqlite3_changes64()` after the statement, the rows
-changed by the last INSERT, UPDATE, or DELETE; a SELECT or DDL leaves it as it was.
-Use them only after the statement they describe.
-
-## Rows and batches
-
-A result streams in batches of `fetch` rows. While the caller reads one batch,
-the next is fetched in the background, so at most two batches are held. A large
-result therefore uses bounded memory. Closing `Rows` early releases the cursor on
-the server. A `TEXT` or `BLOB` value is limited by the message size: a row must
-fit in 16 MiB. A larger row fails with a `*sqlite.Error` whose code is
-`CodeTooBig` (SQLITE_TOOBIG), and the cursor is released.
-
-Each `Exec` or `Query` takes one statement. A second statement is a BAD_REQUEST
-error, and so is an empty statement. A trailing semicolon and whitespace are
-allowed. There are no multiple result sets.
-
-## Transactions
-
-`BeginTx` accepts the default and the serializable isolation levels, since SQLite
-is always serializable. Other levels return an error before anything is sent.
-`ReadOnly` transactions begin DEFERRED with `query_only` set, so a write fails
-with an error for which `IsReadOnly` holds. The BEGIN mode of other transactions
-is `Config.TxMode` (or the `txlock` option), overridden for one transaction by
-`sqlite.WithTxMode(ctx, sqlite.TxImmediate)` in the context passed to `BeginTx`.
-
-A failed Commit is followed by a Rollback, because SQLite keeps the transaction
-open after some commit errors (such as `SQLITE_BUSY`). A transaction begun with
-plain `BEGIN` on a pooled connection is rolled back before the connection is
-reused (`ResetSession`).
-
-## Connection pool
-
-Each connection is a stream of one link. The connector dials the link once and
-shares it among the connections. When the link dies, it is dropped, and the next
-connect dials again. Concurrent connects wait for one dial. `SetMaxOpenConns`,
-`SetMaxIdleConns`, and `SetConnMaxLifetime` work as usual. `Ping` round-trips to
-the server, and `IsValid` discards a connection whose stream failed.
-
-## Server
-
-The server is the C server in `../examples/sqlite/server` (or the Go fake server
-in `internal/fakeserver`, which runs the same protocol with an in-memory engine
-with a small SQL subset, for tests). The server is a single process that listens
-on an HQQ name. It enforces a database policy: only the aliases in its
-configuration, and raw paths only when the policy allows them. It disables
-`ATTACH`, `DETACH`, and loadable extensions. It is for same-host, trusted clients:
-access control is the listener's permission. It does not authenticate requests.
-See PROTOCOL.md section 12.
-
-The C server with `--parent-stdin` also shuts down gracefully when the process that started it exits, including by SIGKILL (see the Parent lifeline section of `../examples/sqlite/server/README.md`). `sqlite/launcher` passes the flag itself; a different parent must keep the write end of a pipe open on the server's standard input and pass `--parent-stdin`.
-
-## Tests
+Execute the unit, contract, and end-to-end test suites from the repository root:
 
 ```sh
 go vet ./sqlite/...
-go test -race -count=1 ./sqlite/...      # fake server; the e2e tests skip
+go test -race -count=1 ./sqlite/...      # runs against the Go fake server; e2e tests skip without HQQ_SQLITE_SERVER
 HQQ_SQLITE_SERVER=/path/to/hqq-sqlite-server go test -count=1 ./sqlite/e2e/...
 ```
 
-- `internal/wire`: round trips, every strict prefix of a valid body is rejected,
-  status encoding, and golden bytes from PROTOCOL.md section 16.
-- `internal/fakeserver`: engine and session tests, without a network.
-- `internal/contract`: the database/sql contract, run by `contract_test.go`
-  against the fake server, and by `e2e/contract_test.go` against the C server.
-  It exercises the driver through `database/sql` only: every value type, NULL,
-  scanning, column types, multi-row and large results, statements, transactions,
-  context, errors, the pool, and concurrency. Cases that need real SQLite
-  features (arithmetic, ORDER BY, aggregates, `typeof`) run only with
-  `Capabilities.FullSQL`.
-- `driver_test.go`, `crash_test.go`: driver behavior over real HQQ links:
-  DSN and connectors, cancellation, early `Rows.Close`, large result memory,
-  the alias policy, read-only mode, link loss during requests (Exec is not
-  retried; Query is), and the server crash with reconnect (SIGKILL of a helper
-  process).
-- `e2e/`: the C server, the contract, and the server's process behavior (client
-  crashes, SIGKILL and reconnect, graceful shutdown, session limits, path policy).
-
-## Open issues
-
-- `Exec` accepts one statement; migration scripts must be split by the caller.
-- `rows_affected` after a SELECT still holds the previous value. This is SQLite's
-  behavior.
-- The fake engine is not SQLite. Its SQL subset and its behaviors differ in
-  details (affinity, rowid reuse, functions), so the contract asserts only the
-  behavior both share.
+- `internal/wire`: verifies frame round trips, strict-prefix truncation rejection, status encodings, and golden byte vectors from [`PROTOCOL.md`](PROTOCOL.md) §16.
+- `internal/fakeserver`: unit tests for the in-memory SQL engine and session state machine.
+- `internal/contract`: 107-case `database/sql` behavioral contract run against both the Go fake server (`sqlite/contract_test.go`), the C server (`sqlite/e2e/contract_test.go`), and the `hqq-bindgen` driver (`sqlite/gendriver`).
+- `driver_test.go`, `crash_test.go`: tests DSN parsing, mid-flight cancellation, early `Rows.Close`, bounded memory on large scans, `ErrOutcomeUnknown` vs `driver.ErrBadConn` retry rules, and automatic reconnection after `SIGKILL` of the server process.

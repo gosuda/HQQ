@@ -1,66 +1,59 @@
-# libhqq bindings: C++, Rust
+# `libhqq` Language Bindings: C++17 and Rust
 
-Language bindings for the C reference library [`c/`](../c) (`libhqq`). Each binding
-wraps the three layers of the C API (Standard link, Advanced layer, acceptor and
-connect) and ships an `hqq-interop` helper, so its programs interoperate with the Go
-implementation through the contract in [`conformance/INTEROP_CLI.md`](../conformance/INTEROP_CLI.md).
-Toolchain requirements, CI pins and the C API requests are in
-[`spec/toolchain/BINDINGS.md`](../spec/toolchain/BINDINGS.md).
+This directory contains the C++17 and Rust bindings for the [`libhqq`](../c/README.md) C11 reference library. Both bindings wrap all three layers of the protocol stack (Standard links, Advanced streams and RPC, and the multi-client Acceptor / Connect protocol) and include an `hqq-interop` binary implementing the cross-language test contract defined in [`conformance/INTEROP_CLI.md`](../conformance/INTEROP_CLI.md). Toolchain versions and FFI design rules are documented in [`spec/toolchain/BINDINGS.md`](../spec/toolchain/BINDINGS.md).
 
-| Binding | Path | Interface | Status on the authoring host (macOS arm64) |
-| --- | --- | --- | --- |
-| C++17 | [`cpp/`](cpp) | header-only `include/hqq/hqq.hpp`, CMake target `hqq::cpp` | tests, examples and interop verified (Apple clang, CMake 4.3) |
-| Rust | [`rust/`](rust) | Cargo workspace: `hqq-sys` (raw FFI), `hqq` (safe API), `hqq-interop` | tests, examples and interop verified (cargo 1.96); Windows builds the C library with clang-cl |
+| Binding | Directory | Interface | Verification Status |
+| :--- | :--- | :--- | :--- |
+| **C++17** | [`cpp/`](cpp) | Header-only `include/hqq/hqq.hpp`, CMake target `hqq::cpp` | Unit tests, examples, and Go/C++/Rust interop verified on macOS arm64 and in CI (`bindings.yml`: Linux GCC/Clang with ASan+UBSan, macOS, Windows `clang-cl`). |
+| **Rust** | [`rust/`](rust) | Cargo workspace: `hqq-sys` (FFI), `hqq` (safe API), `hqq-interop` | Unit, integration, and doc tests, examples, and interop verified on macOS arm64 and in CI (`bindings.yml`: Linux, macOS, Windows MSVC). |
 
-None of the bindings needs network access to build: the C library is compiled from
-`c/` in each build (CMake `add_subdirectory`, Cargo `build.rs`).
+Neither binding requires network access at build time: both compile `libhqq` directly from [`../c`](../c) (`add_subdirectory` in CMake, `build.rs` in Cargo) with zero external crate or package dependencies.
 
 ## Layout
 
 ```text
 bindings/
-  README.md                 this file
+  README.md                 Overview, build instructions, and API comparison
   cpp/
-    CMakeLists.txt          target hqq::cpp, tests, examples, hqq-interop (sanitizers, -Werror)
-    include/hqq/hqq.hpp     the wrapper (C++17, exceptions off by default)
-    tests/test_hqq.cpp      unit and integration tests (Standard, Advanced, acceptor)
-    examples/echo.cpp       echo over a Standard link (--create / --open / --selftest)
-    support/process_id.hpp  process id for unique segment names (POSIX and Windows)
-    examples/rpc.cpp        request/response over an Advanced link
-    interop/hqq_interop.cpp hqq-interop helper (contract)
+    CMakeLists.txt          CMake target hqq::cpp, tests, examples, hqq-interop
+    include/hqq/hqq.hpp     C++17 RAII wrapper (exceptions disabled by default)
+    tests/test_hqq.cpp      Unit and integration tests (Standard, Advanced, Acceptor)
+    examples/echo.cpp       Standard link echo (--create / --open / --selftest)
+    examples/rpc.cpp        Advanced link RPC example
+    support/process_id.hpp  Cross-platform PID helper for unique test names
+    interop/hqq_interop.cpp Cross-language interop CLI helper
   rust/
-    Cargo.toml              workspace (no crates.io dependencies)
-    hqq-sys/                raw FFI, build.rs compiles c/ with $CC and $AR
-    hqq/                    safe API: Link, AdvLink, Stream, Message, Acceptor, Error
-    hqq/tests/              integration tests; hqq/examples/ echo.rs and rpc.rs
-    hqq-interop/            hqq-interop helper (contract)
+    Cargo.toml              Offline Cargo workspace (zero external dependencies)
+    hqq-sys/                Raw C FFI bindings; build.rs compiles ../c
+    hqq/                    Safe Rust API: Link, AdvLink, Stream, Message, Acceptor, Error
+    hqq/tests/              Integration tests
+    hqq/examples/           echo.rs and rpc.rs examples
+    hqq-interop/            Cross-language interop CLI helper
 ```
 
 ## Build and test
 
-C++ (any C++17 compiler; the C library needs always-lock-free C11 atomics):
+Build and test the C++17 binding with CMake and Ninja (requires a C++17 compiler and a C11 compiler with lock-free atomics):
 
 ```sh
 cmake -S bindings/cpp -B build-cpp -G Ninja -DCMAKE_BUILD_TYPE=Release -DHQQ_CPP_WERROR=ON
 cmake --build build-cpp
 ctest --test-dir build-cpp --output-on-failure
-# ASan + UBSan: add -DCMAKE_BUILD_TYPE=Debug -DHQQ_CPP_SANITIZE=address+undefined
-# Exceptions in the tests: add -DHQQ_CPP_EXCEPTIONS=ON
+# With ASan + UBSan: add -DCMAKE_BUILD_TYPE=Debug -DHQQ_CPP_SANITIZE=address+undefined
+# With C++ exceptions enabled in tests: add -DHQQ_CPP_EXCEPTIONS=ON
 ```
 
-Rust (stable; `hqq-sys` compiles the C sources with `$HQQ_CC`, `$CC` or `cc`, and archives
-with `$HQQ_AR`, `$AR` or `ar`; `*-msvc` targets use `cl` and `lib`):
+Build and test the Rust workspace with Cargo (`hqq-sys` compiles the C sources using `$HQQ_CC`, `$CC`, or `cc`, and archives with `$HQQ_AR`, `$AR`, or `ar`; `*-msvc` targets use `cl.exe` with `/std:c11 /experimental:c11atomics` or `clang-cl`):
 
 ```sh
 cd bindings/rust
 cargo test --workspace
 cargo run -p hqq --example echo -- --selftest
 cargo run -p hqq --example rpc -- --selftest
-cargo build --release -p hqq-interop      # target/release/hqq-interop
+cargo build --release -p hqq-interop      # produces target/release/hqq-interop
 ```
 
-Interop with the Go implementation (run from the repository root, after building the
-helpers; the paths are absolute or relative to the module root):
+To run the two-process cross-language interoperability matrix against the Go implementation from the repository root:
 
 ```sh
 go build -o /tmp/hqq-interop-go ./cmd/hqq-interop
@@ -68,34 +61,29 @@ HQQ_INTEROP_IMPLS="go=/tmp/hqq-interop-go,cpp=$PWD/build-cpp/hqq-interop,rust=$P
   go test ./interop -run '^TestInteropMatrix$' -count=1 -timeout 30m
 ```
 
-The matrix runs every scenario that both helpers list, in both role directions.
+`TestInteropMatrix` executes every scenario supported by both helpers in a pair across both primary/secondary role assignments.
 
 ## API at a glance
 
-The C++ and Rust bindings use the same concepts, shown next to the C API. Names follow each language.
+Both bindings expose idiomatic RAII types that mirror the underlying `libhqq` concepts:
 
-| Concept | C | C++ (`hqq::`) | Rust (`hqq::`) |
-| --- | --- | --- | --- |
-| Standard link | `hqq_standard_create/open` | `Link::create/open` | `Link::create/open` |
-| write / read one message | `hqq_write`, `hqq_read` | `write`, `read`, `receive` | `write`, `read`, `receive` |
-| zero-copy reservations | `hqq_write_reserve`, ... | `reserve_write`, `reserve_read` | `reserve_write`, `reserve_read` |
-| Advanced link | `hqq_adv_create/open` | `AdvLink::create/open` | `AdvLink::create/open` |
-| negotiate | `hqq_adv_negotiate` | `negotiate(features, wait)` | `negotiate(features, wait)`, `negotiate_all` |
-| streams | `hqq_adv_open_stream` ... | `open_stream`, `accept_stream`, `Stream` | `open_stream`, `accept_stream`, `Stream<'_>` |
-| call | `hqq_stream_call` | `Stream::call` (`Message`, `Status`) | `Stream::call` (`Result<Message, CallError>`) |
-| serve | `hqq_adv_serve` | `serve(handler, wait)` | `serve(handler, wait)` (`Fn + Sync`) |
-| acceptor / connect | `hqq_acceptor_*`, `hqq_connect` | `Acceptor`, `connect` | `Acceptor`, `connect` |
-| wait and cancel | `hqq_wait`, `hqq_cancel` | `Wait`, `CancelToken` | `Wait<'_>`, `CancelToken` |
-| errors | `hqq_status` | `Status` (`std::error_code`), `Result<T>` | `Error` (one variant per status), `Result<T>` |
+| Concept | C (`libhqq`) | C++17 (`hqq::`) | Rust (`hqq::`) |
+| :--- | :--- | :--- | :--- |
+| Standard link | `hqq_standard_create` / `open` | `Link::create` / `open` | `Link::create` / `open` |
+| Whole-message I/O | `hqq_write`, `hqq_read` | `write`, `read`, `receive` | `write`, `read`, `receive` |
+| Zero-copy reservations | `hqq_write_reserve`, ... | `reserve_write`, `reserve_read` | `reserve_write`, `reserve_read` |
+| Advanced link | `hqq_adv_create` / `open` | `AdvLink::create` / `open` | `AdvLink::create` / `open` |
+| Protocol negotiation | `hqq_adv_negotiate` | `negotiate(features, wait)` | `negotiate(features, wait)`, `negotiate_all` |
+| Multiplexed streams | `hqq_adv_open_stream`, ... | `open_stream`, `accept_stream`, `Stream` | `open_stream`, `accept_stream`, `Stream<'_>` |
+| RPC call | `hqq_stream_call` | `Stream::call` (`Message`, `Status`) | `Stream::call` (`Result<Message, CallError>`) |
+| RPC server (`serve`) | `hqq_adv_serve` | `serve(handler, wait)` | `serve(handler, wait)` (`Fn + Sync`) |
+| Multi-client acceptor | `hqq_acceptor_*`, `hqq_connect` | `Acceptor`, `connect` | `Acceptor`, `connect` |
+| Deadlines & cancellation | `hqq_wait`, `hqq_cancel` | `Wait`, `CancelToken` | `Wait<'_>`, `CancelToken` |
+| Error handling | `hqq_status`, `hqq_error_is` | `Status` (`std::error_code`), `Result<T>`, `Status::matches` | `Error`, `Result<T>`, `Error::matches` |
 
-Ownership: C++ and Rust release every handle in the destructor (`Message` and
-reservations included). Streams and messages borrow the Advanced link they come from
-(Rust lifetimes; C++ documents it).
+**Resource ownership**: both bindings release links, pooled `Message` buffers, and slot reservations automatically in their destructors (`Drop` in Rust, `~Message` / `~Link` in C++). Streams and messages borrow their parent `AdvLink` (enforced at compile time via lifetimes in Rust and documented in C++).
 
-Errors are never swallowed: `Result`/`Status` carry the `hqq_status`, and `hqq_error_is`
-provides the Go "wraps" relation (`Error::matches` in Rust, `Status::matches` in C++).
-
-Example (Rust, from [`hqq/examples/echo.rs`](rust/hqq/examples/echo.rs)):
+Rust example ([`rust/hqq/examples/echo.rs`](rust/hqq/examples/echo.rs)):
 
 ```rust
 use hqq::{Link, Options, Wait};
@@ -105,7 +93,7 @@ link.write(b"ping", Wait::timeout(std::time::Duration::from_secs(5)))?;
 let reply = link.receive(Wait::timeout(std::time::Duration::from_secs(5)))?;
 ```
 
-Example (C++, from [`cpp/examples/rpc.cpp`](cpp/examples/rpc.cpp)):
+C++17 example ([`cpp/examples/rpc.cpp`](cpp/examples/rpc.cpp)):
 
 ```cpp
 auto link = hqq::AdvLink::open("my-service", 8, 4096);   // Result<AdvLink>
@@ -117,64 +105,27 @@ hqq::Status st = link.value().stream0().call(1, std::string("hello"), resp, hqq:
 
 ## Interop coverage
 
-Each helper lists the scenarios it implements; the driver runs a scenario only when both
-helpers list it, with the same variants and steps as the Go helper. The three-helper matrix
-(`TestInteropMatrix` with `go`, `cpp` and `rust` labels) ran on this host: every subtest of
-every pair passed, 0 failed, 0 skipped, in both role directions.
+Each language's `hqq-interop` binary advertises its supported scenarios via `--list`. Both the C++17 and Rust helpers implement 12 full scenarios (21 variants) verified against Go and against each other in both role directions:
 
-| Scenario | C++ | Rust |
-| --- | --- | --- |
-| X-01 create, open, exchange, close (2 variants) | yes | yes |
-| X-02 geometry mismatch (4 variants) | yes | yes |
-| X-03 third endpoint, re-join | yes | yes |
-| X-05 ring full, deadline | yes | yes |
-| X-06 bidirectional stream, sequence and CRC (ring2, ring256) | yes | yes |
-| X-07 kill -9 of the peer (3 variants) | yes | yes |
-| X-12 parked consumer woken (ring2) | yes | yes |
-| X-14 simple-mode peer (adaptive, spin-peer) | yes | yes |
-| X-A04 request/response, concurrent calls, errors | yes | yes |
-| X-A08 request metadata (metadata, without-metadata) | yes | yes |
-| X-A09 graceful shutdown | yes | yes |
-| X-A10 acceptor, connect, busy listener, acceptor close | yes | yes |
+| Scenario | C++17 | Rust |
+| :--- | :--- | :--- |
+| `X-01` create, open, exchange, graceful close (2 variants) | yes | yes |
+| `X-02` geometry mismatch detection (4 variants) | yes | yes |
+| `X-03` third-endpoint rejection and re-join after death | yes | yes |
+| `X-05` ring-full backpressure and deadline expiry | yes | yes |
+| `X-06` bidirectional stream with sequence and CRC checks (`ring2`, `ring256`) | yes | yes |
+| `X-07` `SIGKILL` crash detection (3 variants) | yes | yes |
+| `X-12` parked consumer wake-up across processes (`ring2`) | yes | yes |
+| `X-14` `HQQ_WAIT_SIMPLE` peer interop (`adaptive`, `spin-peer`) | yes | yes |
+| `X-A04` concurrent RPC request/response and application errors | yes | yes |
+| `X-A08` Protocol 1.1 request metadata (`metadata`, `without-metadata`) | yes | yes |
+| `X-A09` graceful `Shutdown` and request draining | yes | yes |
+| `X-A10` multi-client acceptor, connect, busy listener, acceptor close | yes | yes |
 
-Listed scenarios: C++ and Rust list 12 scenarios and 21 variants each.
+Additional scenarios implemented as standalone subcommands (`X-04` `before-creator` and `dead`, `X-A01` six negotiation variants, `X-A02` `sizes`, and `X-A05` `basic`) can be invoked directly; scenarios that require injecting intentionally corrupted raw ring frames remain in the Go and C helpers.
 
-"Run only" means implemented and checked by hand in both directions, but not listed: the
-driver requires the Go variant and step sets for a listed scenario. C++ and Rust run X-A01
-(six variants: `all-features`, `opener-initiates`, `simultaneous`, `messages-only`,
-`request-response-only`, `none`), X-A02 (`sizes`), X-A05 (`basic`) and X-04 (`before-creator`,
-`dead`).
+## Design notes and limits
 
-Not implemented in C++ and Rust: X-04 `initializing`, X-A01 `bad-major` and `op-error`,
-X-A02 `sender-abort-after-chunk-1`, X-A05 `bad-parity` and `duplicate`, X-A07 (cancel,
-nocancel), X-A03, X-A06, X-08, X-09, X-10, X-11, X-13, X-21. These need raw segment or frame
-writes (only the C helper has them) or a platform the helper does not run on.
-
-
-## Limits
-
-- Zero-copy callbacks (`hqq_read_zc`, `hqq_write_zc`) are not wrapped; reservations are.
-- The C++ wrapper's serve handler is a `F&&` invoked from worker threads; it must be
-  thread-safe and must not throw.
-- The Rust serve handler catches panics and answers with an error response
-  (`HQQ_ERRCODE_INVALID_OP`, payload `handler panicked`).
-- Windows is covered by CI only: C++ and Rust build the C library with clang-cl (the
-  Rust job sets `HQQ_CC=clang-cl`; cl.exe lacks always-lock-free C11 atomics on the runner).
-- Windows shared-memory names live only while a handle to them is open. The C++ and Rust
-  helpers follow the Go helper: X-01 creator-closes-first expects `ErrLinkBusy` from the
-  creator's probe (the opener still holds the segment), not `ErrNotExist`. The Rust examples run
-  in PowerShell, because Git Bash puts Git's `usr/bin/link.exe` before the MSVC linker.
-- `Acceptor::close` (Rust `close_shared`) and `AdvLink::close` (C++) may run while another
-  thread is inside `accept`/`call`/`serve`; the C library waits for those calls.
-
-## Status of the verification
-
-- C++: `hqq_cpp_test` passes with 105 checks in the default build and 106 with
-  `HQQ_CPP_EXCEPTIONS=ON` (the exception path is checked only there); the default and
-  ASan+UBSan CMake builds pass, plus the echo and rpc self-tests. macOS arm64 only.
-  LeakSanitizer is not supported on macOS, so the host ASan run omits `detect_leaks=1`
-  (CI on Linux keeps it).
-- Rust: `cargo test --workspace --locked` passes (3 unit, 9 integration, 1 doc test);
-  `cargo clippy --workspace --all-targets` is clean; echo and rpc self-tests pass.
-- Interop: the three-helper matrix (go, cpp, rust) passes in both directions.
-- Not run here: Windows, Linux. The Windows jobs are confirmed only by CI.
+- **Reservations over callbacks**: C++17 and Rust wrap RAII slot reservations (`reserve_write`, `reserve_read`) rather than the C callback-based `hqq_read_zc` / `hqq_write_zc` functions.
+- **Handler exception and panic safety**: C++ `serve` handlers are invoked from C worker threads and must be thread-safe and `noexcept`. Rust `serve` handlers catch panics at the FFI boundary with `catch_unwind` and reply with an `HQQ_ERRCODE_INVALID_OP` error frame (`"handler panicked"`).
+- **Concurrent close**: `Acceptor::close` (Rust `close_shared`) and `AdvLink::close` safely wake and wait for threads blocked inside `accept`, `call`, or `serve`.

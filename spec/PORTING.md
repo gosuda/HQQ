@@ -1,74 +1,77 @@
-# Porting HQQ to a new language
+# Porting HQQ to a New Language
 
-A step-by-step guide for writing a second (third, ...) implementation of the HQQ shared-memory protocol from [SPEC.md](SPEC.md), [MEMORY_MODEL.md](MEMORY_MODEL.md) and [constants.json](constants.json). Targets: C (the reference library `libhqq`), Rust, C++, and anything that can map shared memory and use lock-free 64-bit atomics.
+This guide provides a step-by-step roadmap for implementing the HQQ shared-memory protocol in a new language from [`SPEC.md`](SPEC.md), [`MEMORY_MODEL.md`](MEMORY_MODEL.md), and [`constants.json`](constants.json). It applies to C (`libhqq` in [`c/`](../c)), C++, Rust, and any systems language capable of mapping shared memory and issuing hardware lock-free 32-bit and 64-bit atomic operations.
 
-Rule zero: **the bytes in shared memory and the order of the atomic accesses are the contract; everything else (API, threading, allocation, error types) is yours.** Do not translate the Go API. Translate SPEC sections 2, 3, 5, 6, 7, 8, 9 and, if you want Advanced, 10.
+**Rule Zero**: The byte layout in shared memory and the memory ordering of atomic operations are the entire cross-process contract; API shape, concurrency primitives, memory allocation, and error types belong to the host language. Rather than translating Go types line by line, implement the state machines in `SPEC.md` sections 2 through 11 and verify against the golden vectors in [`conformance/`](../conformance/README.md).
 
-## 1. Conformance levels (the minimal subset, then growth)
+## 1. Incremental Conformance Levels
 
-You can stop at any level; each level interoperates with the Go implementation as long as the rules of that level are met.
+A port can be brought up and tested against the Go reference implementation in five incremental levels:
 
-| Level | Name | What you implement | Spec sections | Interop meaning |
+| Level | Name | Scope Implemented | `SPEC.md` Sections | Interoperability Milestone |
 | --- | --- | --- | --- | --- |
-| **L0** | Layout | Region offsets, superblock/endpoint/ring/slot/packet structs with static assertions, constants, golden vectors | 2, 3, 7.1, 9.1, 9.2, `constants.json` | Can parse any segment image. |
-| **L1** | Standard Opener, simple mode | Open an existing named segment as **Secondary**, attach rings, `Read`/`Write` of Standard `copy` packets, spin+sleep waiting, heartbeat and peer monitor, detach on close | 4 (Opener), 5.1 (Ready branch), 5.4, 5.5, 6, 7.3, 7.4, 9, 11 | A port process can talk to a Go **Primary**. Never creates or initializes anything. |
-| **L2** | Standard Creator/Primary | Create/reuse names, claim loop for every role, initialization, publish, takeover, reuse, safe unlink | 4, 5 (all), 7.2, 11 | Port can be the **Primary**; full lifecycle parity. |
-| **L3** | Parking | Waiter and waker protocol with futex/ulock/Windows semaphores | 8 | CPU-efficient waiting; correct cross-wakes with Go. |
-| **L4** | Advanced | Negotiation, streams, chunking, reassembly, request/response | 10 | Full feature parity. |
+| **L0** | Layout | Region offset computation, superblock/endpoint/ring/slot/packet structs with compile-time offset assertions, constants, and offline golden vectors. | 2, 3, 7.1, 9.1, 9.2, `constants.json` | Parses and validates any segment snapshot in `conformance/vectors/`. |
+| **L1** | Standard Opener (spin mode) | Open an existing named segment as **Secondary**, attach to rings, `Read`/`Write` Standard `OpCopy` packets, spin+sleep waiting, heartbeat and peer monitor, and graceful detach on close. | 4 (Opener), 5.1 (`Ready` branch), 5.4, 5.5, 6, 7.3, 7.4, 9, 11 | Exchanges messages bidirectionally with a Go **Primary** endpoint. |
+| **L2** | Standard Creator / Primary | Create and reuse named segments, full claim loop, ring formatting, buffer zeroing, superblock publication, stalled-initializer takeover, dead-session reuse, and safe unlink. | 4, 5 (all), 7.2, 11 | Acts as **Primary** or **Secondary** with full crash-recovery parity. |
+| **L3** | OS Parking | Dekker waiter and waker handshake over Linux `futex`, macOS `__ulock_wait` / `os_sync_wait_on_address`, or Windows named semaphores. | 8 | Zero-idle-CPU blocking waits with sub-millisecond cross-process wakeups. |
+| **L4** | Advanced Protocol | Version/feature negotiation (`1.1`), multiplexed streams, chunked transfers, reassembly budgets, RPC request/response, cancellation, metadata, and graceful shutdown. | 10, `PROTOCOL_1_1_DRAFT.md` | Full protocol feature parity across all `X-A01..X-A10` interop scenarios. |
 
-**The minimal useful subset is L1 + the waker duty of L3** (below). A port that stops at L1 is *valid*; its cost is CPU or latency, never correctness.
+The smallest practical subset for a client-only port is **L1 plus the 3-line waker duty of L3 (`K1`, `K2`, `K3`)**, which allows the port to attach to a Go or C server and wake parked peers immediately without needing OS-specific wait syscalls on its own receive path.
 
-### 1.1 Simple mode (no kernel waits)
+### 1.1 Simple Mode (Spin + Exponential Backoff Without Kernel Parking)
 
-Simple mode = **spin, then sleep with exponential backoff, never park**. It is a conforming implementation of section 8 because parking is optional for correctness:
+A port operating in **simple mode** (`WaitPolicySpin`) spins briefly and then sleeps with exponential backoff without ever parking in the kernel. Simple mode is a fully conforming implementation of `SPEC.md` section 8 because kernel parking is an optimization, not a correctness requirement:
 
-* A **simple-mode waiter** never touches `emptyWaiters`/`fullWaiters`/`notEmpty`/`notFull` and re-checks the slot sequence in a loop: spin for about 4 to 6 µs (256 steps of 4 slot reads, or 1024 single reads), then `sched_yield` ~256 iterations, then `nanosleep` doubling from 20 µs up to 2 ms (the Go fallback uses exactly this).
-* A **simple-mode waker** that does nothing after publish/release is still *correct*: a Go peer that is parked on that ring wakes at the end of its bounded park (at most 100 ms) and then finds the data. This costs up to 100 ms of latency, never a hang. RECOMMENDED: still do the two-access waker duty K1/K2 (and K3 if `n != 0`): it costs one `seq_cst` store and one load and gives the Go peer instant wake-ups.
-* **Never park without a timeout.** The park timeout is what makes every lost wake-up a latency event.
-* Simple mode is also the right first milestone for Windows, where parking needs the four named semaphores (SPEC 11.5).
+- **Simple-mode waiter**: Never modifies `emptyWaiters`, `fullWaiters`, `notEmpty`, or `notFull`. When a ring is empty or full, it polls `seq[s]` in a bounded loop: spin for ~4-6 us (256 iterations of 4 slot reads), then yield the processor (`sched_yield` / `SwitchToThread`) for ~256 iterations, then sleep with exponential backoff doubling from `20 us` up to `2 ms`.
+- **Simple-mode waker**: Even if a simple-mode waker performs nothing after `seq[s].store(pos + 1, SC)`, a parked Go or C peer will wake on its bounded 100 ms park timeout and consume the message. However, executing the waker check (`K1`, `K2`, and `K3` when `waiters != 0`) costs only one `seq_cst` load on the fast path and gives parked peers instant wakeups.
+- **Mandatory park timeout**: Any implementation that does park in the kernel `MUST` bound every wait call (at most `100 ms` per park iteration) so any missed wakeup degrades to a bounded latency hiccup rather than a deadlock.
 
-## 2. Step-by-step
+## 2. Step-by-Step Implementation Order
 
-1. **Pin the constants.** Generate a header/module from `constants.json` (offsets, magics, opcodes, flags, codes, timings). Add compile-time assertions (`_Static_assert(offsetof(...))`, `const _: () = assert!(...)`) for every offset and size, `sizeof(packet) == 64`, ring header 512, slot stride 128, superblock size 384. Add the platform guards of MEMORY_MODEL 6 and 7 (lock-free `u64`, little-endian).
-2. **Map the segment.** Named object per SPEC 11 (Linux: open `/dev/shm/<name>` with `O_NOFOLLOW|O_CLOEXEC`, `fstat` must be a regular file, check `st_size >= total` **before** mapping, `mmap(MAP_SHARED)`; macOS/FreeBSD: `shm_open("/<name>")`, 30-byte names; Windows: `OpenFileMapping` + four semaphores). Verify the base is page-aligned.
-3. **Compute regions** with the formula of SPEC 2.1 using the *runtime* page size (do not hard-code 4096). Check against the golden vectors for 4 KiB/16 KiB/64 KiB in a unit test.
-4. **Read the superblock** (atomic loads, SC for simplicity). Implement `claim` for the *Opener* role first: `Ready` branch only (check layout, liveness at open, geometry, `cas(endpoints[1].token, 0, token)`), plus the transient failures for `Empty`/`Initializing`. Add the *Creator* branches (L2) later.
-5. **Attach the rings** (SPEC 7.3). Validate magic, flag, stride 128, version 2, size == `bufferCount`. On any mismatch detach (`cas(token, mine, 1)`) and fail.
-6. **Implement the slot protocol** (SPEC 7.4, MEMORY_MODEL 3). Start with the SPSC variant (7.6) — it is a dozen lines per direction — and the memory orders of section 3 below. Unit test against `internal/mpmc/spec_constants_test.go`'s scenarios (publish/release sequence values, full, empty, second lap, wrap near `2^64`).
-7. **Standard send/receive** (SPEC 9): write payload then packet then publish; receive classifies by opcode, derives the slot from the position, releases promptly. Implement the drain rule of SPEC 6.4.
-8. **Liveness**: heartbeat thread (or lazy updates) writing `heartbeat` every interval, the peer monitor of SPEC 6.3, detach on close. Test against a Go peer that you `kill -9`.
-9. **Creator/Primary (L2)**: the rest of the claim loop, `beginInit`, `Format`, zeroing, publish with the exact store order of SPEC 5.3, takeover, reuse, creatorToken and safe unlink (SPEC 11.4). Test by killing a Go creator at each step (see 4.3).
-10. **Parking (L3)**: add the waiter protocol (SPEC 8.2) and waker duty (8.3) with the platform primitive (SPEC 8.5). Run the Dekker stress test of MEMORY_MODEL 10.5 on x86 *and* ARM hardware.
-11. **Advanced (L4)**: negotiation first (two packets), then `OpConnCopy` send/receive for plain messages, then reassembly limits and abort, then request/response, then streams.
-12. **Conformance**: run the interop matrix of section 6 against the Go implementation in both directions.
+1. **Pin layout constants and static assertions**: Generate or define the constants from `spec/constants.json` and add compile-time assertions (`_Static_assert`, `static_assert`, or `const _: () = assert!(...)`) verifying `sizeof(packet) == 64`, ring header size `512`, slot stride `128`, superblock size `384`, `ATOMIC_LLONG_LOCK_FREE == 2`, and little-endian byte order.
+2. **Map named shared memory (`SPEC 11`)**:
+   - Linux: open `/dev/shm/<name>` with `O_NOFOLLOW|O_CLOEXEC`, check `fstat` for a regular file and `st_size >= totalSize` before calling `mmap(..., MAP_SHARED)`.
+   - macOS / FreeBSD: call `shm_open("/<name>")` (enforcing the 30-byte name limit on macOS) and `mmap(..., MAP_SHARED)`.
+   - Windows: open or create the four named semaphores (`.hqq-sem0..3`) and the file mapping (`Local\hqq_v3_<name>`) and map with `MapViewOfFile`.
+3. **Compute page-aligned regions (`SPEC 2.1`)**: Query the host page size at runtime (`sysconf(_SC_PAGESIZE)` or `GetSystemInfo`) and verify region offsets against vector group `G-03` for 4 KiB, 16 KiB, and 64 KiB page sizes.
+4. **Implement the Opener superblock attach (`L1`)**: Using atomic loads, implement the Opener `Ready` branch (`SPEC 5.1`): validate `magic`, `major`, `requiredFeatures`, `pageSize`, `bufferCount`, `bufferSize`, `layoutSize`, and Primary liveness (`SPEC 6.2`), then claim `endpoints[1].token` via `CAS(0 -> myToken)`.
+5. **Attach both directional rings (`SPEC 7.3`)**: Validate `magic`, `flag == 2`, `stride == 128`, `version == 2`, and `size == bufferCount`. On any mismatch, detach (`CAS(token, myToken -> 1)`) and return `ErrIncompatibleLayout` or `ErrInvalidSize`.
+6. **Implement the ring slot protocol (`SPEC 7.4`, `MEMORY_MODEL 3`)**: Implement producer claim, payload copy, `seq_cst` publish (`pos + 1`), consumer claim, payload read, and `seq_cst` release (`pos + mask + 1`). Verify against vector group `G-07` (including wraparound at `2^64 - 2`).
+7. **Implement Standard `Read` and `Write` (`SPEC 9`)**: Classify incoming packets by opcode (`OpCopy` vs `OpError`), always derive the payload buffer index from `pos & mask`, release the slot before returning, and implement the post-close drain rule (`SPEC 6.4`).
+8. **Add heartbeats and peer monitoring (`SPEC 6.3`)**: Refresh `endpoints[self].heartbeat` every `HeartbeatInterval` (guarded by `token == myToken`), monitor the peer's `token`, `heartbeat`, and `epoch`, and detach cleanly (`CAS(token, myToken -> 1)`) on `Close`.
+9. **Add Creator / Primary initialization (`L2`)**: Implement the full claim loop (`Empty`, `Initializing` with stale takeover, and `Ready` reuse when both endpoints are dead), `Format`, payload zeroing with per-slice `initToken` checks, ordered publication (`SPEC 5.3`), and safe unlink (`SPEC 11.4`).
+10. **Add OS parking (`L3`)**: Implement the Dekker waiter (`W1..W4`) and waker (`K1..K3`) sequences (`SPEC 8.2, 8.3`) and verify with the Dekker stress test on both `x86_64` and `arm64`.
+11. **Add the Advanced protocol (`L4`)**: Implement `OpProtoNegotiate` / `OpProtoAck`, `OpConnCopy` chunking and reassembly budgets, RPC `Call` / `Serve`, streams (`OpConnCreate` / `OpConnClose`), and Protocol 1.1 (`OpCancel`, `AdvFlagMeta`, and `ErrCodeShuttingDown`).
+12. **Wire into the interop matrix**: Build an `hqq-interop` helper binary ([`conformance/INTEROP_CLI.md`](../conformance/INTEROP_CLI.md)) and run `go test ./interop/...` against the Go and C helpers.
 
-## 3. Ordering cheat-sheet
+## 3. Atomic Memory Ordering Quick Reference
 
-SC = seq_cst, ACQ = acquire, REL = release, AR = acq_rel, RLX = relaxed. The *required minimums* are in MEMORY_MODEL 2; this is how to spell them. **When in doubt use SC; it is never wrong.**
+The table below gives the exact C11, C++, and Rust spellings for every shared-memory operation (see [`MEMORY_MODEL.md`](MEMORY_MODEL.md) section 2 for full proofs). **When in doubt on cold-path control words, use `SeqCst`.**
 
-| Operation (SPEC reference) | C11 `<stdatomic.h>` | C++ `std::atomic` | Rust `Ordering` |
+| Operation (`SPEC.md` Reference) | C11 `<stdatomic.h>` | C++ `std::atomic` | Rust `Ordering` |
 | --- | --- | --- | --- |
-| producer/consumer claim: load `seq` (7.4) | `memory_order_acquire` | `memory_order_acquire` | `Acquire` |
-| publish / release: store `seq` (K1) | `memory_order_seq_cst` | `memory_order_seq_cst` | `SeqCst` |
-| waker: load `*Waiters` (K2) | `memory_order_seq_cst` | `memory_order_seq_cst` | `SeqCst` |
-| waker: `fetch_add` wake word (K3) | `memory_order_release` (SC fine) | `memory_order_release` | `Release` |
-| waiter: `fetch_add(+1)` count (W1) | `memory_order_seq_cst` | `memory_order_seq_cst` | `SeqCst` |
-| waiter: load wake word (W2) | `memory_order_acquire` or SC | `memory_order_acquire` | `Acquire` |
-| waiter: re-check load `seq` (W3) | `memory_order_seq_cst` | `memory_order_seq_cst` | `SeqCst` |
-| waiter: `fetch_sub(1)` count (W4) | `memory_order_release` or RLX | same | `Release` |
-| cursor `w`/`r` load / CAS / store | `memory_order_relaxed` | `memory_order_relaxed` | `Relaxed` |
-| ring header fields | store RLX; `flag` store **release** last; loads `magic`/`flag` **acquire** first | same | same |
-| superblock cold words | `memory_order_seq_cst` | `memory_order_seq_cst` | `SeqCst` |
-| `state` store `Ready` | `memory_order_release` (SC fine) | same | `Release` |
-| `state`/token load before using other words | `memory_order_acquire` | same | `Acquire` |
-| `initToken`/token/state CAS | `atomic_compare_exchange_strong_explicit(..., acq_rel, acquire)` | `compare_exchange_strong(..., acq_rel, acquire)` | `compare_exchange(.., AcqRel, Acquire)` |
-| heartbeat, `pid`, `interval`, `initHeartbeat` | `memory_order_relaxed` | same | `Relaxed` |
-| payload / packet | plain `memcpy` | plain `memcpy` | raw pointer `copy_nonoverlapping` |
-| fence-based equivalent of K1/K2 and W1/W3 | `atomic_thread_fence(memory_order_seq_cst)` between the two | `std::atomic_thread_fence` | `core::sync::atomic::fence(SeqCst)` |
-| 64-bit wrap arithmetic | `uint64_t` (unsigned wrap is defined) | `std::uint64_t` | `wrapping_add`, `wrapping_sub` |
-| signed difference | `(int64_t)(seq - pos)` | `std::int64_t(seq - pos)` | `seq.wrapping_sub(pos) as i64` |
+| Producer / consumer claim: load `seq[s]` (`7.4`) | `memory_order_acquire` | `memory_order_acquire` | `Acquire` |
+| Slot publish / release: store `seq[s]` (`K1`) | `memory_order_seq_cst` | `memory_order_seq_cst` | `SeqCst` |
+| Waker: load `emptyWaiters` / `fullWaiters` (`K2`) | `memory_order_seq_cst` | `memory_order_seq_cst` | `SeqCst` |
+| Waker: `fetch_add(1)` on `notEmpty` / `notFull` (`K3`) | `memory_order_release` (or `seq_cst`) | `memory_order_release` | `Release` |
+| Waiter: `fetch_add(1)` on waiter count (`W1`) | `memory_order_seq_cst` | `memory_order_seq_cst` | `SeqCst` |
+| Waiter: snapshot `notEmpty` / `notFull` (`W2`) | `memory_order_acquire` (or `seq_cst`) | `memory_order_acquire` | `Acquire` |
+| Waiter: re-check `seq[s]` before sleeping (`W3`) | `memory_order_seq_cst` | `memory_order_seq_cst` | `SeqCst` |
+| Waiter: `fetch_sub(1)` on waiter count (`W4`) | `memory_order_release` (or `relaxed`) | `memory_order_release` | `Release` |
+| Cursor `w` / `r` load, CAS, or SPSC store | `memory_order_relaxed` | `memory_order_relaxed` | `Relaxed` |
+| Ring header `Format` and `Attach` | Fields `relaxed`; `flag = 2` **release** last; `Attach` loads `magic`/`flag` **acquire** first | Same | Same |
+| Superblock cold control words | `memory_order_seq_cst` | `memory_order_seq_cst` | `SeqCst` |
+| Superblock `state = Ready` publication | `memory_order_release` (or `seq_cst`) | `memory_order_release` | `Release` |
+| Superblock `state` and `token` loads | `memory_order_acquire` | `memory_order_acquire` | `Acquire` |
+| `initToken`, `token`, and `state` CAS | `atomic_compare_exchange_strong_explicit(..., acq_rel, acquire)` | `compare_exchange_strong(..., acq_rel, acquire)` | `compare_exchange(..., AcqRel, Acquire)` |
+| `heartbeat`, `pid`, `interval`, `initHeartbeat` | `memory_order_relaxed` | `memory_order_relaxed` | `Relaxed` |
+| Packet (`64` B) and payload buffer bytes | Plain `memcpy` while owning slot | Plain `std::memcpy` | Raw-pointer `copy_nonoverlapping` |
+| 64-bit unsigned wraparound arithmetic | `uint64_t` subtraction | `std::uint64_t` subtraction | `wrapping_add`, `wrapping_sub` |
+| Signed sequence comparison | `(int64_t)(seq - pos)` | `static_cast<std::int64_t>(seq - pos)` | `seq.wrapping_sub(pos) as i64` |
 
-### 3.1 C11 reference snippets (compiled with `cc -std=c11 -Wall`)
+### 3.1 C11 Reference Ring Snippets
+
+The following C11 snippet illustrates the exact layout assertions and memory orders for ring operations (see `c/src/hqq_ring.h` for the complete production implementation):
 
 ```c
 #include <stdatomic.h>
@@ -76,31 +79,31 @@ SC = seq_cst, ACQ = acquire, REL = release, AR = acq_rel, RLX = relaxed. The *re
 #include <stddef.h>
 
 #if defined(__BYTE_ORDER__) && __BYTE_ORDER__ != __ORDER_LITTLE_ENDIAN__
-#error "HQQ requires a little-endian host"
+#error "HQQ requires a little-endian target"
 #endif
 #if ATOMIC_LLONG_LOCK_FREE != 2
-#error "HQQ requires lock-free 64-bit atomics that work across processes"
+#error "HQQ requires always-lock-free 64-bit atomics"
 #endif
 
 typedef struct {
     _Atomic uint64_t seq;        /* @0   */
-    uint8_t          packet[64]; /* @8   plain memory, owned by the slot's claimant */
+    uint8_t          packet[64]; /* @8   plain memory owned by the slot claimant */
     uint8_t          pad[56];    /* @72  (stride 128) */
 } hqq_slot;
 _Static_assert(sizeof(hqq_slot) == 128 && offsetof(hqq_slot, packet) == 8, "slot");
 
 typedef struct {
-    uint64_t magic, size, flag, stride, version;        uint8_t pad0[128 - 40];
-    _Atomic uint64_t r;                                 uint8_t pad1[128 - 8];
-    _Atomic uint64_t w;                                 uint8_t pad2[128 - 8];
+    uint64_t magic, size, flag, stride, version;                      uint8_t pad0[128 - 40];
+    _Atomic uint64_t r;                                               uint8_t pad1[128 - 8];
+    _Atomic uint64_t w;                                               uint8_t pad2[128 - 8];
     _Atomic uint32_t not_empty, empty_waiters, not_full, full_waiters; uint8_t pad3[128 - 16];
-} hqq_ring_header;                                      /* 512 bytes, see SPEC 7.1 */
+} hqq_ring_header;
 _Static_assert(sizeof(hqq_ring_header) == 512 && offsetof(hqq_ring_header, w) == 256 &&
                offsetof(hqq_ring_header, not_empty) == 384, "ring header");
 
 typedef struct { hqq_ring_header *h; hqq_slot *slots; uint64_t mask; } hqq_ring;
 
-/* Producer claim, CAS variant (several threads of this process). NULL = ring full. */
+/* Multi-producer claim via CAS on w. Returns NULL when the ring is full. */
 static hqq_slot *claim_producer(hqq_ring *r, uint64_t *pos_out) {
     uint64_t pos = atomic_load_explicit(&r->h->w, memory_order_relaxed);
     for (;;) {
@@ -108,7 +111,10 @@ static hqq_slot *claim_producer(hqq_ring *r, uint64_t *pos_out) {
         int64_t d = (int64_t)(atomic_load_explicit(&s->seq, memory_order_acquire) - pos);
         if (d == 0) {
             if (atomic_compare_exchange_weak_explicit(&r->h->w, &pos, pos + 1,
-                    memory_order_relaxed, memory_order_relaxed)) { *pos_out = pos; return s; }
+                    memory_order_relaxed, memory_order_relaxed)) {
+                *pos_out = pos;
+                return s;
+            }
         } else if (d > 0) {
             pos = atomic_load_explicit(&r->h->w, memory_order_relaxed);
         } else {
@@ -117,26 +123,28 @@ static hqq_slot *claim_producer(hqq_ring *r, uint64_t *pos_out) {
     }
 }
 
-/* Publish + waker duty: K1, K2, K3. After this the slot belongs to the consumer. */
+/* Publish slot + Dekker waker check (K1, K2, K3). */
 static void publish(hqq_ring *r, hqq_slot *s, uint64_t pos) {
     atomic_store_explicit(&s->seq, pos + 1, memory_order_seq_cst);                  /* K1 */
     if (atomic_load_explicit(&r->h->empty_waiters, memory_order_seq_cst) != 0) {    /* K2 */
         atomic_fetch_add_explicit(&r->h->not_empty, 1, memory_order_seq_cst);       /* K3 */
-        /* futex_wake_all(&r->h->not_empty) / ulock wake / ReleaseSemaphore(sem, n) */
+        /* futex_wake_all(&r->h->not_empty) / ulock_wake / ReleaseSemaphore(sem, 1) */
     }
 }
 
-/* SPSC consumer: one consumer thread (or a local lock). NULL = ring empty. */
+/* Single-consumer claim (or caller-serialized consumer). Returns NULL when empty. */
 static hqq_slot *claim_consumer_spsc(hqq_ring *r, uint64_t *pos_out) {
     uint64_t pos = atomic_load_explicit(&r->h->r, memory_order_relaxed);
     hqq_slot *s = &r->slots[pos & r->mask];
-    if ((int64_t)(atomic_load_explicit(&s->seq, memory_order_acquire) - (pos + 1)) < 0) return NULL;
-    atomic_store_explicit(&r->h->r, pos + 1, memory_order_relaxed);   /* keep the cursor canonical */
+    if ((int64_t)(atomic_load_explicit(&s->seq, memory_order_acquire) - (pos + 1)) < 0) {
+        return NULL;
+    }
+    atomic_store_explicit(&r->h->r, pos + 1, memory_order_relaxed);
     *pos_out = pos;
     return s;
 }
 
-/* Release + waker duty for the NotFull side. */
+/* Release slot + Dekker waker check for fullWaiters. */
 static void release_slot(hqq_ring *r, hqq_slot *s, uint64_t pos) {
     atomic_store_explicit(&s->seq, pos + r->mask + 1, memory_order_seq_cst);
     if (atomic_load_explicit(&r->h->full_waiters, memory_order_seq_cst) != 0) {
@@ -145,7 +153,7 @@ static void release_slot(hqq_ring *r, hqq_slot *s, uint64_t pos) {
     }
 }
 
-/* Consumer parks (the caller just saw seq < target). W1..W4. */
+/* Consumer Dekker park sequence (W1..W4). */
 static void park_consumer(hqq_ring *r, hqq_slot *s, uint64_t target /* pos + 1 */) {
     atomic_fetch_add_explicit(&r->h->empty_waiters, 1, memory_order_seq_cst);        /* W1 */
     uint32_t v = atomic_load_explicit(&r->h->not_empty, memory_order_seq_cst);       /* W2 */
@@ -155,145 +163,167 @@ static void park_consumer(hqq_ring *r, hqq_slot *s, uint64_t target /* pos + 1 *
 }
 ```
 
-### 3.2 Rust (compiled with `rustc 2021`)
+### 3.2 Rust Reference Ring Snippet
+
+In Rust, use raw pointers (`core::ptr::copy_nonoverlapping`) rather than `&mut [u8]` slices when reading or writing shared-memory slot payloads:
 
 ```rust
-use core::sync::atomic::{fence, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 #[repr(C)]
-pub struct Slot { seq: AtomicU64, packet: [u8; 64], _pad: [u8; 56] }
+pub struct Slot {
+    seq: AtomicU64,
+    packet: [u8; 64],
+    _pad: [u8; 56],
+}
 const _: () = assert!(core::mem::size_of::<Slot>() == 128);
 const _: () = assert!(core::mem::offset_of!(Slot, packet) == 8);
-#[cfg(not(target_endian = "little"))] compile_error!("HQQ requires a little-endian host");
-#[cfg(not(target_has_atomic = "64"))] compile_error!("HQQ requires native 64-bit atomics");
+#[cfg(not(target_endian = "little"))]
+compile_error!("HQQ requires a little-endian target");
+#[cfg(not(target_has_atomic = "64"))]
+compile_error!("HQQ requires hardware 64-bit atomics");
 
-// Never create `&mut [u8]` over the packet or payload of a slot you do not own:
-// use raw pointers (`ptr::copy_nonoverlapping`) only while you own the slot.
-pub unsafe fn publish(seq: &AtomicU64, empty_waiters: &AtomicU32, not_empty: &AtomicU32,
-                      pos: u64, wake_all: impl Fn(&AtomicU32)) {
-    seq.store(pos.wrapping_add(1), Ordering::SeqCst);               // K1
-    if empty_waiters.load(Ordering::SeqCst) != 0 {                  // K2
-        not_empty.fetch_add(1, Ordering::SeqCst);                   // K3
+pub unsafe fn publish(
+    seq: &AtomicU64,
+    empty_waiters: &AtomicU32,
+    not_empty: &AtomicU32,
+    pos: u64,
+    wake_all: impl Fn(&AtomicU32),
+) {
+    seq.store(pos.wrapping_add(1), Ordering::SeqCst);          // K1
+    if empty_waiters.load(Ordering::SeqCst) != 0 {             // K2
+        not_empty.fetch_add(1, Ordering::SeqCst);              // K3
         wake_all(not_empty);
     }
 }
-// Fence form (equivalent): seq.store(.., Release); fence(Ordering::SeqCst); empty_waiters.load(Relaxed) ...
-// AtomicU64::from_ptr(base.add(off) as *mut u64) (Rust >= 1.75) gives atomics over mapped memory.
 ```
 
-### 3.3 C++ (compiled with `clang++ -std=c++20`)
+### 3.3 C++ Reference Ring Snippet
+
+In C++, verify `is_always_lock_free` at compile time:
 
 ```cpp
 static_assert(std::endian::native == std::endian::little);
 static_assert(std::atomic<std::uint64_t>::is_always_lock_free);
-struct alignas(8) Slot { std::atomic<std::uint64_t> seq; std::uint8_t packet[64]; std::uint8_t pad[56]; };
+
+struct alignas(8) Slot {
+    std::atomic<std::uint64_t> seq;
+    std::uint8_t packet[64];
+    std::uint8_t pad[56];
+};
 static_assert(sizeof(Slot) == 128 && offsetof(Slot, packet) == 8);
-// Placement: the segment is raw bytes; use std::atomic_ref<std::uint64_t>(*reinterpret_cast<std::uint64_t*>(p))
-// (C++20) or construct std::atomic<> objects with placement new ONCE at Format time only (lifetime rules!).
-// publish: s->seq.store(pos + 1, std::memory_order_seq_cst); if (h->empty_waiters.load(std::memory_order_seq_cst)) {...}
 ```
 
-## 4. Pitfalls
+## 4. Common Implementation Pitfalls
 
-### 4.1 Memory model and layout
+The following checklist summarizes the memory-ordering, layout, and state-machine mistakes most frequently encountered when porting HQQ to a new language.
 
-1. **Publishing with `release` and then loading the waiter count** is the classic Dekker bug (works on most hardware most of the time, loses wake-ups under load, fails fast on x86 when the compiler emits `mov`). Use SC or SC fences (MEMORY_MODEL 4). Run the stress test.
-2. **Relaxed `seq` store** (even with a compiler barrier) breaks payload visibility on ARM/POWER.
-3. **Mixing atomic and plain access to the same word**, or going through `volatile`.
-4. **Using the cursor words for synchronization.** They are claim arbiters only; ownership of a slot is `seq`.
-5. **Taking the slot index from packet operand 1** instead of the position.
-6. **Plain-aligned structs**: i386 aligns `uint64_t` members to 4 bytes; use explicit offsets or `alignas(8)`. Never rely on `sizeof` of a C struct you did not assert.
-7. **Reading `r`/`w` once at attach and caching them forever** in a process that may share the side with another thread — or, in SPSC mode, *not storing* them. Keep the shared cursors canonical (SPEC 7.6).
-8. **Wrong wraparound arithmetic**: signed overflow in C is undefined; subtract in `uint64_t`, then cast to `int64_t`. In Rust use `wrapping_*`.
-9. **Treating the 64-byte packet as 8-aligned to 64**: it sits at slot offset 8; use `memcpy` of 64 bytes.
-10. **Copying `seq` along with the packet** (copy exactly the packet).
-11. **Holding a view of a payload buffer after release.**
-12. **`MAP_PRIVATE`** instead of `MAP_SHARED`; **mapping shorter than `total`**; **mapping before checking the object size** (SIGBUS).
-13. **Big-endian or 32-bit-MIPS/ARMv5-6 targets**: refuse to build (MEMORY_MODEL 6, 7).
+### 4.1 Memory Model and Layout Pitfalls
 
-### 4.2 Protocol
+1. **Publishing `seq` with `release` before loading `emptyWaiters`**: Causes lost wake-ups on x86-64 (store buffering) and ARM64 (RCpc). Always use `seq_cst` for `W1`, `W3`, `K1`, and `K2` (`MEMORY_MODEL.md` section 4.2).
+2. **Relaxed `seq` stores or compiler-only barriers**: Breaks payload visibility on weakly ordered architectures (ARM64, POWER, RISC-V).
+3. **Mixing atomic and non-atomic accesses to control words** or using `volatile` instead of `<stdatomic.h>`.
+4. **Relying on cursor words (`r`, `w`) for cross-process synchronization**: Slot ownership and payload visibility are governed exclusively by `seq[s]`.
+5. **Indexing payload buffers from packet operand 1**: Always compute `s = pos & mask` from the claimed ring position.
+6. **Assuming 8-byte struct alignment on 32-bit x86**: Force `alignas(8)` and verify every offset with `_Static_assert`.
+7. **Failing to update `r` or `w` in SPSC mode**: Always keep the shared-memory cursors canonical (`SPEC 7.6`).
+8. **Signed overflow in sequence comparisons**: Subtract in unsigned `uint64_t` first, then cast the difference to `int64_t`.
+9. **Assuming the 64-byte packet is 16-byte or 64-byte aligned**: It starts at slot offset `8`; access it via `memcpy` or 8-byte aligned words.
+10. **Overwriting `seq` during packet copy**: Copy 64 bytes starting at `slot + 8`, never `slot + 0`.
+11. **Retaining pointers into a payload buffer after releasing the slot**.
+12. **Mapping with `MAP_PRIVATE` or mapping before checking `st_size >= totalSize`** (which triggers `SIGBUS` on truncated files).
+13. **Compiling on big-endian or lock-emulated 32-bit architectures**: Reject at compile time.
 
-14. **Writing into an `Empty` segment whose page is not zero.** The zero check covers the **whole page** (page size bytes), every word read atomically. Never "just write magic" into an object you opened.
-15. **Openers must never initialize, reuse or take over.** An opener on a dead segment fails with the transient `errNoLiveEndpoint`; reuse is the creator's job.
-16. **Clocks.** Wall clock for the words, monotonic clock for decisions (initializer watch, peer monitor). Do not use the wall clock to decide takeover.
-17. **Forgetting to update `epoch` before `Ready`**, or ordering publish stores after the commit CAS.
-18. **Not checking `initToken` ownership before each initialization step**, or continuing after losing it.
-19. **Third endpoints**: `ErrLinkBusy` also when the live endpoint's *earlier peer is detached or dead* (`endpoints[1].token != 0`).
-20. **Detach is a CAS from your own token to 1**, never a blind store (the record may belong to a newer session).
-21. **Heartbeat writes must be guarded by `token == mine`.**
-22. **Partial records.** After the join CAS the record's `interval`/`heartbeat` are still `0` for a moment: treat `token != 0, interval == 0` as alive / heartbeats disabled; treat `heartbeat == 0` as alive (SPEC 6.2).
-23. **Standard receive must release the slot even on failure** (invalid size, unexpected opcode, panic/exception in the callback). A claimed slot that is never released stalls the ring.
-24. **A claimed producer slot must always be published** (tombstone if the write is abandoned). Exceptions/early returns between claim and publish are the usual leak.
-25. **Drain before reporting peer failure** (SPEC 6.4).
-26. **Waiter counts count processes.** Never decrement a count you did not increment; over-counting is harmless, under-counting loses wake-ups.
-27. **Park with a timeout always.** A park without a timeout converts a lost wake into a hang.
-28. **Windows**: tokens leak in the semaphore (cap `Release` at 1 per wake, FINDINGS F-02); create the four semaphores **before** the mapping; use the canonical suffixes; names are `Local\` unless prefixed.
-29. **macOS**: the name limit is **30** characters plus the slash; `ftruncate` only once on a shm object; `shm_open` names are not paths; the unlink identity check is by `creatorToken` because there are no inodes.
-30. **Linux**: `O_NOFOLLOW`, regular-file check, `fallocate` (not just `ftruncate`) to turn "tmpfs full" into an error instead of `SIGBUS`; remove a half-created object on failure.
-31. **Advanced receive loop must never wait for the tx ring** (SPEC 10.3); give control replies their own sender and a bounded queue.
-32. **Reassembly limits are mandatory**: charge `TotalSize + 256`, refuse the first chunk of an over-budget message, drain the rest (SPEC 10.5).
-33. **Stream-id parity** (Primary even, Secondary odd) and `MessageID` per sender across all streams.
-34. **`Abort` frames are accepted regardless of their other operands.**
-35. **Do not interpret reserved bits and operands** (SPEC 9.1, FINDINGS F-08); write zeros.
+### 4.2 Protocol State Machine Pitfalls
 
-## 5. What to deliver per language
+14. **Writing into an `Empty` segment without verifying that all of page 0 is zero**: Read every 64-bit word of the first page atomically before claiming `Empty -> Initializing`.
+15. **Allowing an Opener to initialize, take over, or reuse a segment**: Openers only attach to `Ready` segments with a live Primary.
+16. **Comparing stored wall-clock heartbeats against the local monotonic clock**: Store wall-clock `UnixNano` in heartbeat words, and use the local monotonic clock to measure elapsed watch durations.
+17. **Publishing `state = Ready` before incrementing `epoch`** or ordering publish stores after the `initToken` commit CAS.
+18. **Skipping `initToken` ownership checks between initialization slices** (`FINDINGS.md` F-01).
+19. **Allowing a second Secondary to attach in the same epoch**: Once `endpoints[1].token != 0` (even if `1` or dead), any further opener or creator must receive `ErrLinkBusy` until the segment is re-initialized (`FINDINGS.md` F-15).
+20. **Detaching with a blind store instead of `CAS(token, myToken -> 1)`**.
+21. **Writing heartbeats without checking `token == myToken`**.
+22. **Treating `token != 0, interval == 0` or `heartbeat == 0` as dead**: A newly joined Secondary fills `interval` and `heartbeat` right after its token CAS; treat `0` as alive (`SPEC 6.2`).
+23. **Returning from a failed `Read` without releasing the claimed consumer slot**.
+24. **Abandoning a claimed producer slot without publishing a tombstone frame** (`OpTombstone` or `OpError`).
+25. **Reporting `ErrPeerClosed` or `ErrPeerGone` before draining remaining published slots** (`SPEC 6.4`).
+26. **Decrementing a waiter counter you did not increment** or resetting waiter counters outside `Format`.
+27. **Parking without a bounded timeout** (cap every kernel wait to `<= 100 ms`).
+28. **Releasing `n = waiters` tokens on Windows semaphores**: Grant `1` token per wake (`ReleaseSemaphore(sem, 1, NULL)`) so stale waiter counts from killed processes do not accumulate millions of tokens (`FINDINGS.md` F-02).
+29. **Calling `ftruncate` more than once on macOS `shm_open` descriptors** (Darwin returns `EINVAL` on a second `ftruncate`).
+30. **Omitting `fallocate` on Linux `/dev/shm`** (use `fallocate` so out-of-space errors return `ENOSPC` at creation time rather than `SIGBUS` during ring writes).
+31. **Blocking the Advanced receive loop on the TX ring** (`SPEC 10.3`).
+32. **Omitting the `TotalSize + 256` per-assembly memory charge** against `MaxReassemblyBytes` (`SPEC 10.5`).
+33. **Violating stream ID parity** (Primary opens positive even IDs; Secondary opens odd IDs; stream `0` is the link-level stream).
+34. **Rejecting `Abort` frames due to non-zero size or offset operands** (`FINDINGS.md` F-06).
+35. **Failing to zero reserved packet bits or rejecting non-zero reserved bits on receive** (`FINDINGS.md` F-08).
 
-* A constants module generated from `constants.json` plus the compile-time assertions of step 1.
-* The ring (`format`, `attach`, claim/publish/release, SPSC and, if you want in-process multi-thread without a lock, CAS variants) with unit tests for every vector.
-* The link lifecycle (claim loop, init, publish, join, liveness, close/unlink) with the decision table test (see `TestSpecClaimTable` in the root package for the expected cases).
-* A `conformance` driver that speaks the stdin/stdout protocol the parent defines for the interop matrix.
-* A statement of the conformance level (section 1) and of the memory orders chosen.
+## 5. Deliverables for a Complete Language Port
 
-## 6. Conformance test list (to be built by the parent under `conformance/`)
+A complete port in this repository provides:
 
-### 6.1 Golden vectors (offline, no second process)
+- Compile-time layout assertions against `spec/constants.json`.
+- MPMC ring implementation (`Format`, `Attach`, claim/publish/release, and Dekker parking) verified against `G-07`.
+- Link lifecycle state machine (`Creator`, `Opener`, `InMemory`, heartbeats, peer liveness, and safe unlink) verified against `G-06`, `G-08`, and `G-09`.
+- An `hqq-interop` CLI helper binary implementing [`conformance/INTEROP_CLI.md`](../conformance/INTEROP_CLI.md) and registered in `.github/workflows/interop.yml`.
 
-| ID | Test | Source of truth |
+## 6. Conformance and Interop Verification Matrix
+
+Every language port is verified in two stages: offline against static golden byte vectors (`G-01` through `G-09`), and live across two OS processes (`I-01` through `I-18`).
+
+### 6.1 Offline Golden Vectors (`conformance/vectors/`)
+
+| Group ID | Verification Target | Source of Truth |
 | --- | --- | --- |
-| G-01 | Every `constants.json` offset/size/value is asserted at compile time or by a unit test | `constants.json` |
-| G-02 | 9 packet vectors: encode (operands → bytes) and decode (bytes → opcode + operands), byte-identical | `packet_vectors` |
-| G-03 | 12 region-layout vectors (3 page sizes × 4 geometries) | `segment.layout_vectors` |
-| G-04 | Invalid geometries yield size 0 / `ErrInvalidSize` (count 0,1,3; size 0,4,12; bounds + 1) | `geometry` |
-| G-05 | Name validation vectors for the host platform (invalid vectors; macOS length 30/31; Windows kernel-name vectors) | `platform` |
-| G-06 | **Golden segment images**: the Go implementation dumps a segment after (a) Primary ready, (b) Secondary joined, (c) one message in flight, (d) after one message consumed, (e) both closed, (f) re-initialized (epoch 2); the port parses each image and a port-built image for the same sequence matches except the documented variable words (tokens, `pid`, `heartbeat`, `initHeartbeat`, `creatorToken`) | Go `TestSpecSegmentImage` scenario, extended |
-| G-07 | Ring unit tests: publish `seq = pos+1`, release `seq = pos+mask+1`, full/empty detection without side effects, FIFO, second lap, wrap at `2^64 - 2`, `Attach` rejecting mutated headers (version, stride, size not a power of two, size 1, magic, init flag) | `internal/mpmc/spec_constants_test.go` |
-| G-08 | Claim-loop decision table (every row of SPEC 4 and the pseudocode of 5.1) against crafted superblock images, including: foreign page, unknown state, `HQQ_STL2`, unknown required feature, stalled initializer takeover with a short stale window, opener never writes | root `TestSpecClaimTable` |
-| G-09 | Peer-state derivation: not connected → connected → closed; replaced token; stalled heartbeat; epoch change | root `TestSpecPeerStateDerivation`, `TestSpecLiveness` |
-| G-10 | Advanced frame validation matrix: every rejection of SPEC 10.5 (unknown flags, request+response, error without response, bounds, zero-size rules, offset/aux, begin/abort/refused handling, limits) with the expected error and expected effect (drop/fail/drain) | new golden frames |
-| G-11 | Error-code mapping (7 codes + unknown) | `error_codes` |
+| `G-01` | Compile-time or unit-test verification of all `constants.json` offsets, sizes, magics, and opcodes | `spec/constants.json` |
+| `G-02` | 16 wire packet vectors (9 base + 7 extended/1.1 frames): byte-identical encode and decode | `manifest.json` (`packets`) |
+| `G-03` | 16 segment region-layout vectors across 4 KiB, 16 KiB, and 64 KiB page sizes | `manifest.json` (`layouts`) |
+| `G-04` | 12 valid and invalid geometry combinations (`bufferCount` and `bufferSize` bounds) | `manifest.json` (`geometry`) |
+| `G-05` | 24 platform segment-name vectors (POSIX, macOS 30/31-byte limit, Windows kernel paths) | `manifest.json` (`names`) |
+| `G-06` | 6-step normalized full-segment lifecycle sequence (`Primary ready` through `epoch 2` reuse) | `vectors/sequences/<page>/` |
+| `G-07` | 12 whole-segment ring images testing `Read`, `Write`, wraparound at `2^64`, and `Attach` validation | `manifest.json` (`rings`) |
+| `G-08` | 31 superblock state images testing Creator, Opener, and InMemory attach decisions | `manifest.json` (`superblocks`) |
+| `G-09` | Peer state transitions (`NotConnected -> Connected -> Closed`, token replacement, stale heartbeat, epoch change) | `TestPeerStateTransitions` |
+| `G-10` | 44-row Advanced frame validation matrix (`SPEC 10.5` and `PROTOCOL_1_1_DRAFT.md`) | `manifest.json` (`advanced_frames`) |
+| `G-11` | 11 wire error-code mappings (codes `0x01..0x08` plus unknown code fallback) | `manifest.json` (`error_codes`) |
 
-### 6.2 Interop matrix (two processes; both implementations in both roles)
+### 6.2 Two-Process Cross-Language Interop Matrix (`interop/`)
 
-Rows: `(A=go, B=port)` and `(A=port, B=go)`, A = Creator/Primary, B = Opener/Secondary; also port↔port for L2+. Each cell bounded to a few seconds.
+For every pair of implementations `(A, B)`, the interop test runner executes each scenario in both role assignments (`creator=A, opener=B` and `creator=B, opener=A`):
 
-| ID | Scenario | Expected |
+| Scenario ID | Description | Expected Outcome |
 | --- | --- | --- |
-| X-01 | create, open, exchange 1 B, `bufferSize` B, both directions, close in both orders | data intact; the other side sees close (`io.EOF`/`PeerClosed`); name removed by the creator |
-| X-02 | geometry mismatch (count, size) | `GeometryError` / `ErrInvalidSize` |
-| X-03 | third endpoint; secondary re-join after its own close; creator vs live segment | `ErrLinkBusy` |
-| X-04 | opener before creator; opener on an initializing segment; opener on a dead segment | transient errors; no write by the opener (compare the image) |
-| X-05 | ring full/backpressure: producer blocked with a 2-slot ring, then consumer drains; cancel by deadline | order preserved; `ErrTimeout` at the deadline; no data loss |
-| X-06 | 100k messages with sequence number + CRC, both directions concurrently, ring of 2 and 256 slots | in order, intact, no stall |
-| X-07 | `kill -9` of the peer (parked and running); peer timeout default and short | `ErrPeerGone` within `max(PeerTimeout, 4 × interval)`; buffered messages delivered first |
-| X-08 | `kill -9` of the initializer between claim and publish; between ring format and publish; during buffer zeroing (large geometry) | takeover by the next creator after the stale window; opener keeps waiting / fails transient |
-| X-09 | reuse of a name after both endpoints died; creatorToken changes; epoch increments | new Primary, old endpoints observe `ErrPeerGone` on resume |
-| X-10 | safe unlink: replace the name behind a live creator, then close the creator | the replacement survives (Linux and macOS); close of a missing name is a no-op |
-| X-11 | invalid names per platform; long names on macOS | `ErrInvalidName` |
-| X-12 | parked consumer woken by a producer of the other implementation; parked producer woken by a consumer of the other implementation (ring of 2, idle 50 ms between messages, park timeout raised to 2 s in a test build) | each message delivered within a few ms; **no lost wake-up** (Dekker) |
-| X-13 | Windows: four semaphores, create/open order, leftover tokens after `kill -9` of a parked process, mapping name vanishes with the last handle | Windows CI only |
-| X-14 | simple-mode port vs Go: port never parks | correct; Go-side parked waits end within the 100 ms bound |
-| X-15 | negotiation: each role initiates, simultaneous negotiation, feature subsets (messages only, request/response only, none), version major mismatch, `OpError` during negotiation, `Failed` is terminal | per SPEC 10.1 |
-| X-16 | messages of 0 B, 1 B, `bufferSize`, `bufferSize + 1`, `3 × bufferSize + 7`, `MaxMessageSize`; `MaxMessageSize + 1` refused locally; sender abort after chunk 1 | intact / `ErrBufferOverflow` / drop; the receiver survives an abort |
-| X-17 | reassembly limit: several large multi-chunk messages in flight with a small `MaxReassemblyBytes`; refused request answered with `ErrCodeBufferOverflow`, refused response fails the call with `ErrReassemblyLimit`, data dropped | per SPEC 10.5 |
-| X-18 | request/response: concurrent calls, out-of-order completion, error response with payload, cancelled call whose late response is discarded, unknown method | per SPEC 10.6 |
-| X-19 | streams: open/accept, refusal (not listening → 5, bad parity/duplicate → 6, accept queue full under drop → 7), data on the stream, close (peer sees `PeerClosed` after queued data), stream 0 not closable, ids never reused | per SPEC 10.3 |
-| X-20 | flood from both sides with a tiny ring and a slow consumer: no deadlock (receive path never waits for the tx ring) | both progress |
-| X-21 | protocol violations from a crafted peer (raw ring writer): unknown flags, invalid sizes, non-Begin chunk without assembly, duplicate Begin | receive path fails with the specified error; the process does not crash or hang |
+| `X-01` | Create, open, exchange messages in both directions, and close in both orders (`creator-closes-first`, `opener-closes-first`) | Payloads verified; peer observes `EOF` / `ErrPeerClosed`; segment unlinked cleanly. |
+| `X-02` | Geometry mismatch (`bufferCount` and `bufferSize` doubled or halved) | Opener fails with `ErrInvalidSize` (`GeometryError`). |
+| `X-03` | Third endpoint attach, Secondary re-attach after close, and Creator vs live segment | Rejected with `ErrLinkBusy`. |
+| `X-04` | Opener before Creator, Opener on `Initializing` segment, Opener on dead segment | Transient errors; Opener never mutates the segment. |
+| `X-05` | Ring full / backpressure on a 2-slot ring, consumer drain, and write deadline expiration | FIFO order preserved; expired write returns `ErrTimeout`. |
+| `X-06` | Bidirectional high-volume stream with SplitMix64 + CRC-32 verification on 2-slot and 256-slot rings | All messages delivered intact and in order without stalls. |
+| `X-07` | `SIGKILL` of peer (while running and while parked) with default and short `PeerTimeout` | Survivor drains buffered frames and reports `ErrPeerGone` within timeout. |
+| `X-08` | `SIGKILL` of initializer at `claim`, `format`, `publish`, and `zeroing` crash points | Next Creator takes over after `initStaleWindow` and completes initialization. |
+| `X-09` | Name reuse after both endpoints die (`epoch` increments and `creatorToken` changes) | New session succeeds; any resumed old endpoint observes `ErrPeerGone`. |
+| `X-10` | Safe unlink when a segment name was replaced behind a live Creator | Replacement segment survives when the original Creator closes. |
+| `X-11` | Invalid segment names per platform and 31-byte names on macOS | Rejected with `ErrInvalidName`. |
+| `X-12` | Cross-language Dekker wakeup ping-pong on a 2-slot ring | Every message wakes the parked peer within milliseconds; zero lost wake-ups. |
+| `X-13` | Windows named semaphores: ping-pong, parked `TerminateProcess`, and session reuse | Verified on Windows CI. |
+| `X-14` | Simple-mode (`--wait spin`) peer interoperating with an adaptive parking peer | Clean round-trips across 300 ms idle gaps. |
+| `X-21` | Crafted protocol violations on the Standard receive path | Receiver reports the expected protocol error without crashing or hanging. |
+| `X-A01` (`X-15`) | Advanced negotiation: creator-initiated, opener-initiated, simultaneous, feature subsets, and rejections | Matches `SPEC 10.1` and `PROTOCOL_1_1_DRAFT.md` section 1. |
+| `X-A02` (`X-16`) | Message sizes `0 .. MaxMessageSize`, local overflow refusal, and mid-message sender abort | Intact delivery, `ErrBufferOverflow`, and clean abort recovery. |
+| `X-A03` (`X-17`) | Reassembly budget enforcement (`MaxReassemblyBytes`) across requests, responses, and data messages | Request answered with `0x07`, response fails with `ErrReassemblyLimit`, data dropped. |
+| `X-A04` (`X-18`) | Concurrent RPC calls, out-of-order responses, application `ResponseError`, canceled call, and unknown method | Matches `SPEC 10.6`. |
+| `X-A05` (`X-19`) | Multiplexed streams: pre-`ListenStreams` hold window, parity checks, duplicate ID rejection, and stream close | Matches `SPEC 10.3`. |
+| `X-A06` (`X-20`) | Simultaneous bidirectional flood on a tiny ring with a slow consumer | Both sides complete without control-queue deadlock. |
+| `X-A07` | Protocol 1.1 `OpCancel`: handler context cancellation, unknown key ignored, and unnegotiated `FeatureCancel` | Matches `PROTOCOL_1_1_DRAFT.md` section 2. |
+| `X-A08` | Protocol 1.1 `AdvFlagMeta`: caller ID, trace ID, relative time budget, and locally expired deadline | Matches `PROTOCOL_1_1_DRAFT.md` section 3. |
+| `X-A09` | Protocol 1.1 graceful shutdown: new requests refused with status `8` while in-flight requests complete | Matches `PROTOCOL_1_1_DRAFT.md` section 6. |
+| `X-A10` | Multi-client `Acceptor` (`HQQ_LSN1`): `Listen` / `Dial` / `Connect`, busy listener rejection, and acceptor close | Matches `LISTENER_DRAFT.md`. |
 
-### 6.3 Platform matrix
+### 6.3 Target Platform Matrix
 
-Linux x86-64, Linux AArch64 (weak ordering; the Dekker and publish stress tests must run here), macOS arm64 (16 KiB pages), Windows x86-64 (semaphores), plus 32-bit x86 if a port claims it (alignment!). FreeBSD optional.
+All supported ports are verified across Linux `x86_64`, Linux `arm64` (native weak-memory hardware), macOS `arm64` (16 KiB page geometry), and Windows `x64` (`clang-cl` with named semaphores).
 
-## 7. When the spec and the code disagree
+## 7. Resolving Specification Questions
 
-The code (with `go test -run Spec`) is the oracle for the numeric constants; if you find a behavior the spec states that Go does not do (or vice versa), it is a spec bug: report it. Known gaps and accidental behaviors are in [FINDINGS.md](FINDINGS.md).
+The Go reference implementation and `conformance/` test suite (`go test ./conformance/...`) serve as the executable oracle for all numeric constants and state transitions. Historical audit findings and edge-case resolutions are cataloged in [`FINDINGS.md`](FINDINGS.md).

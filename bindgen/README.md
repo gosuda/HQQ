@@ -1,137 +1,148 @@
-# hqq-bindgen
+# `hqq-bindgen`: Cgo-Free Go-to-C IPC Code Generator
 
-`hqq-bindgen` generates a Go client and a C server from an interface description (IDL), so that Go can call a C library that runs in its own process, over HQQ shared memory, without cgo. The Go client never links C code. The C server links the real library and a small runtime (`libhqq`, `c/include/hqq/hqq_rpc.h`).
+`hqq-bindgen` compiles a declarative interface description (`.idl`) into a pure-Go client package and a C server dispatcher. The target C library executes inside its own OS process behind the generated C server, while the Go application links zero C code and communicates with the server over HQQ shared memory.
 
-The normative design is [`spec/toolchain/BINDGEN.md`](../spec/toolchain/BINDGEN.md): the IDL (section 2), the wire format with worked byte vectors (4), the session and handle model (5), errors (6), security (7), threading (8), the runtime APIs (9), the test plan (10) and the decisions (12). This file is the map and the measured status.
+The normative specification is [`spec/toolchain/BINDGEN.md`](../spec/toolchain/BINDGEN.md), covering the IDL grammar and validation rules V1 through V41 (§2), the wire protocol with worked hexadecimal byte vectors (§4), the session and generation-checked handle model (§5), error propagation (§6), threat model and memory safety (§7), threading (§8), runtime APIs (§9), test plan (§10), and architectural trade-offs (§12). This document summarizes the toolchain layout, operational limits, and measured performance against cgo.
 
 ```sh
 go run gosuda.org/hqq/cmd/hqq-bindgen -go-out client -go-strip ml_ -c-out server mylib.idl
 go run gosuda.org/hqq/cmd/hqq-bindgen -check -go-out client -go-strip ml_ -c-out server mylib.idl   # CI: fail on stale output
-go run gosuda.org/hqq/cmd/hqq-bindgen -print-digest mylib.idl                                       # interface digest
+go run gosuda.org/hqq/cmd/hqq-bindgen -print-digest mylib.idl                                       # print 256-bit interface digest
 ```
 
 ## What is generated
 
-| Output | Content |
-| --- | --- |
-| `<service>_client.go` | typed Go methods, futures (`...Async`), handle types, errors; calls `bindgen/rt` |
-| `<service>_server.h`, `<service>_server.c` | the op table and the glue that decodes a frame, validates it, calls the C function and encodes the response; calls `hqq_rpc.h` |
+For a service declared in `<service>.idl`, `hqq-bindgen` emits three files:
 
-You write the IDL, the interceptors (pre-call hooks that can refuse or rewrite a call), the `shim` functions (C functions for composite operations such as batching rows) and a `main.c` that calls `hqqrpc_main`. Only functions declared in the IDL can be called; everything else is refused (default deny). A client and a server compare the interface digest when a session opens, and a mismatch fails the connect.
+| Generated File | Role |
+| :--- | :--- |
+| `<service>_client.go` | Pure-Go client methods, pipelined futures (`...Async`), opaque handle wrappers, and error types layered on `bindgen/rt`. |
+| `<service>_server.h`, `<service>_server.c` | C dispatch table and per-function glue that validates incoming frames, decodes arguments in place, checks handle generations, calls the C library, and encodes responses into reserved ring slots via `hqq_rpc.h`. |
+
+You supply the `.idl` file, any optional `@intercept` pre-call policy hooks, C `shim` functions for composite operations (such as batching SQLite rows into a single frame), and a short `main.c` calling `hqqrpc_main`. By construction, only functions declared in the IDL are reachable (default deny), C pointers never cross the process boundary (clients hold generation-checked 64-bit handle IDs), and client and server verify a SHA-256 digest of the canonical IDL during the `HELLO` handshake.
 
 ## Layout
 
-| Path | Content |
-| --- | --- |
-| `cmd/hqq-bindgen` | the command line |
-| `bindgen/idl` | lexer, parser, validation rules V1 to V41, canonical form and digest, wire plan |
-| `bindgen/gen` | the Go and C emitters |
-| `bindgen/rt` | the Go runtime: frames, `Conn`, futures, flow control, `Pool` |
-| `c/include/hqq/hqq_rpc.h`, `c/src/hqq_rpc*.c` | the C runtime: frame validation, handle table, writers, session threads, `hqqrpc_main` |
-| `bindgen/testdata` | the MIT test library `microlib`, the IDL files, the golden vectors extracted from the design document |
-| `bindgen/e2e/microlib` | generated client and server for `microlib` and the end-to-end suite |
-| `bindgen/bench` | cgo comparison benchmarks (see its README for the exact commands) |
-| `bindgen/examples/zstd` | zstd 1.5.7 (pinned source, BSD-3-Clause option) through the generator, with tests and benchmarks |
-| `bindgen/examples/sqlite3`, `sqlite/gendriver` | a SQLite service built from a low-level IDL and a `database/sql` driver (`hqq-sqlite-gen`) on top of the generated client |
-| `launch` | starts a generated server: verifies the binary, ties its life to the parent, waits for the ready line |
+| Path | Description |
+| :--- | :--- |
+| `cmd/hqq-bindgen` | Command-line code generator binary. |
+| `bindgen/idl` | Lexer, parser, validation rules V1–V41, canonical printer, interface digest, and wire layout planner. |
+| `bindgen/gen` | Deterministic Go and C code emitters. |
+| `bindgen/rt` | Pure-Go client runtime: frame codecs, `Conn`, pipelined futures, credit flow control, and `Pool`. |
+| `c/include/hqq/hqq_rpc.h`, `c/src/hqq_rpc*.c` | C server runtime: frame validation, handle table, in-place readers/writers, session threads, and `hqqrpc_main`. |
+| `bindgen/testdata` | Reference C library `microlib`, test IDLs, and golden wire vectors extracted from `spec/toolchain/BINDGEN.md`. |
+| `bindgen/e2e/microlib` | Generated client and server for `microlib` plus the end-to-end integration and differential test suite. |
+| `bindgen/bench` | Microbenchmarks comparing generated IPC calls directly against in-process cgo ([`bindgen/bench/README.md`](bench/README.md)). |
+| `bindgen/examples/zstd` | Pinned zstd 1.5.7 wrapped via `hqq-bindgen`, with correctness tests and cgo crossover benchmarks ([`bindgen/examples/zstd/README.md`](examples/zstd/README.md)). |
+| `bindgen/examples/sqlite3`, `sqlite/gendriver` | Low-level SQLite IDL service and the `hqq-sqlite-gen` `database/sql` driver ([`bindgen/examples/sqlite3/README.md`](examples/sqlite3/README.md)). |
+| `launch` | Verified child-process starter (`secureexec` + `lifeline` + `ready <listener>` handshake). |
 
-## Limits
+## Operational limits
 
-- Output languages are Go (client) and C (server). The C server runs on POSIX systems; on Windows `hqqrpc_main` returns `HQQ_ERR_UNSUPPORTED`. The runtime sources compile on Windows and are part of the Rust build.
-- No call cancellation: a call that times out is abandoned, its outcome is unknown, and the session stays usable only through the rules of 6.3. A running `sqlite3_step` cannot be interrupted through the generated service.
-- No callbacks, no varargs, no composite in-parameters (a struct, union or array of structs as an argument); composite results and composite arguments go through `shim` functions.
-- A `Conn` is for one goroutine at a time (`rt.Pool` hands out connections). A server session is served by one thread; `@serialize(session)` also holds a lock around every library entry, `@serialize(none)` removes it for libraries that tolerate concurrent use.
-- Same-host, trusted-listener model: access control is the permission of the listener segment. A client that writes its own request slots concurrently can change arguments of functions that have no `@intercept` after the server validated them; the server stays memory safe (design document 7.2).
-- A crash of the C library ends the server process. The process boundary is the containment; there is no in-process recovery.
+- **Target languages and OS**: generates Go clients and C11 servers. The C server entry point (`hqqrpc_main`) runs on POSIX systems (`Linux`, `macOS`, `FreeBSD`) and returns `HQQ_ERR_UNSUPPORTED` on Windows (though the C runtime sources compile cleanly on Windows for FFI builds).
+- **No mid-call cancellation**: if a caller's context expires while waiting for a response, the call is abandoned locally and its server-side execution continues to completion (`spec/toolchain/BINDGEN.md` §6.3). Long-running C calls such as `sqlite3_step` cannot be interrupted mid-flight through a generated service without an out-of-band mechanism.
+- **IDL type surface**: no C-to-Go callbacks, no variadic functions, and no struct/union value parameters. Composite inputs or batched outputs are expressed as byte buffers or packed records via a C `shim` function.
+- **Concurrency and serialization**: each `rt.Conn` is used by one goroutine at a time (`rt.Pool` manages concurrent goroutine access), and each server session runs on a dedicated POSIX thread. `@serialize(session)` acquires a per-session or server lock around every C call, while `@serialize(none)` omits the lock for thread-safe functions.
+- **Fault containment**: a crash (`SIGSEGV`, `SIGABRT`) inside the C library terminates the C server process without corrupting the Go client process, which observes `ErrPeerGone` and can launch a fresh server.
 
 ## Measured status
 
-Apple M1, macOS, Go 1.27, quiet machine, spin wait policy, median of 3 runs of `-benchtime 1s` (`bindgen/bench`, `sqlite/gendriver`; `-benchtime 300ms` for `bindgen/examples/zstd`). The server runs as a separate process and the scheduler places it; macOS has no affinity API. Other machines will differ; run the benchmarks yourself with the commands in `bindgen/bench/README.md`.
+All measurements below were collected on an Apple M1 (`darwin/arm64`, Go 1.27, quiet machine, spin wait policy, median of 3 runs at `-benchtime 1s` for `bindgen/bench` and `sqlite/gendriver`, and `-benchtime 300ms` for `bindgen/examples/zstd`). The C server runs as a separate child process placed by the macOS kernel scheduler (macOS does not expose thread-affinity APIs). Reproduction commands are in [`bindgen/bench/README.md`](bench/README.md).
 
-**A call with no work.** `ml_add`, 25 ns through cgo.
+### 1. Call with no work (`ml_add`)
 
-| Path | ns/call |
-| --- | ---: |
-| cgo | 25 |
-| generated, synchronous | 335 |
-| generated, 8 in flight | 175 |
-| generated, 32 in flight | 164 |
-| generated, 64 in flight | 178 |
+Baseline integer addition (`25 ns` via in-process cgo):
 
-A synchronous call costs about 13 times a cgo call, and a pipelined call about 7 times. The floor of the link itself is one Standard-link round trip of about 193 ns (`BenchmarkCompareRoundTrip`); the generated path adds frame encoding, handle and bound checks, the response reservation and the execution lock on top. The design does not aim at tiny synchronous calls.
+| Path | Latency (`ns/call`) |
+| :--- | ---: |
+| `cgo` | `25` |
+| `hqq-bindgen`, synchronous | `335` |
+| `hqq-bindgen`, pipelined (`8` in flight) | `175` |
+| `hqq-bindgen`, pipelined (`32` in flight) | `164` |
+| `hqq-bindgen`, pipelined (`64` in flight) | `178` |
 
-**A call with work.** `ml_work(iters)`, a dependency chain of known cost (cgo ns/call in the first column).
+A synchronous no-op call costs ~13× an in-process cgo transition (~335 ns vs ~25 ns), and a pipelined call costs ~6.5× (~164 ns). The underlying `StandardLink` round trip accounts for ~193 ns (`BenchmarkCompareRoundTrip`); the remaining ~140 ns covers request framing, handle/bounds validation, response slot reservation, and the session lock. `hqq-bindgen` is not intended for nanosecond-scale getters executed in a tight synchronous loop.
 
-| `iters` | cgo | sync | 4 in flight | 64 in flight |
+### 2. Call with controlled CPU work (`ml_work(iters)`)
+
+A dependency chain of `iters` steps (`ns/call`):
+
+| `iters` | `cgo` | `hqq` sync | `hqq` 4 in flight | `hqq` 64 in flight |
 | ---: | ---: | ---: | ---: | ---: |
-| 0 | 25 | 331 | 178 | 181 |
-| 64 | 83 | 400 | 246 | 243 |
-| 256 | 396 | 1,795 | 568 | 565 |
-| 1,024 | 1,650 | 3,083 | 1,866 | 1,868 |
+| `0` | `25` | `331` | `178` | `181` |
+| `64` | `83` | `400` | `246` | `243` |
+| `256` | `396` | `1,795` | `568` | `565` |
+| `1,024` | `1,650` | `3,083` | `1,866` | `1,868` |
 
-With one calling goroutine the generated path does not cross cgo: pipelined, it trails cgo by about 155–220 ns per call at every size measured. On macOS the synchronous column grows faster than the work (about 1,400 ns of overhead at `iters=256`, against about 305 ns at `iters=0`; the run-to-run spread is large, and an earlier run of the same configuration measured 1,338 ns, even though this benchmark uses the spin policy and the C server runs with `--spin`). In a `linux/arm64` container on the same M1 with client and server pinned to separate cores (`HQQ_BENCH_SERVER_CPU=1 taskset -c 0`), the synchronous overhead stays flat across the sweep (`iters=0`: 403 ns against 26 ns, overhead 376 ns; `iters=64`: 501 ns against 98 ns, overhead 403 ns; `iters=256`: 962 ns against 486 ns, overhead 476 ns; `iters=1024`: 2,435 ns against 2,077 ns, overhead 358 ns), indicating that the `iters=256` jump on macOS is a scheduler/core-placement effect rather than a server-path defect.
+When pipelined from a single goroutine, `hqq-bindgen` trails `cgo` by a flat 155–220 ns per call across the entire sweep. On macOS, the synchronous column exhibits a step increase around `iters=256` (~1,400 ns overhead vs ~305 ns at `iters=0`). Running the exact same benchmark inside a `linux/arm64` container on the same M1 with client and server pinned to distinct CPU cores (`HQQ_BENCH_SERVER_CPU=1 taskset -c 0`) keeps synchronous overhead flat across every work size (`iters=0`: 403 ns vs 26 ns, overhead 376 ns; `iters=64`: 501 ns vs 98 ns, overhead 403 ns; `iters=256`: 962 ns vs 486 ns, overhead 476 ns; `iters=1,024`: 2,435 ns vs 2,077 ns, overhead 358 ns), confirming that the macOS `iters=256` jump comes from Darwin core placement rather than the C server runtime.
 
-**Buffers.** `ml_xor` over a source and a destination of the same size; cgo passes the Go slices in place.
+### 3. Buffer transfer (`ml_xor`)
 
-| Size | cgo | sync | 8 in flight | cgo GB/s | hqq in flight GB/s |
+XOR over an input buffer into an equal-sized output buffer (`cgo` passes Go slice pointers directly):
+
+| Payload Size | `cgo` | `hqq` sync | `hqq` 8 in flight | `cgo` (`GB/s`) | `hqq` 8 in flight (`GB/s`) |
 | ---: | ---: | ---: | ---: | ---: | ---: |
-| 64 B | 65 ns | 375 ns | 227 ns | 0.99 | 0.28 |
-| 1 KiB | 89 ns | 567 ns | 281 ns | 11.5 | 3.64 |
-| 64 KiB | 1,338 ns | 15,788 ns | 9,068 ns | 49 | 7.2 |
+| `64 B` | `65 ns` | `375 ns` | `227 ns` | `0.99` | `0.28` |
+| `1 KiB` | `89 ns` | `567 ns` | `281 ns` | `11.5` | `3.64` |
+| `64 KiB` | `1,338 ns` | `15,788 ns` | `9,068 ns` | `49` | `7.2` |
 
-Two copies (request into the ring, response out of it) bound the large sizes. `copy_request` (design 7.2) costs 10% for synchronous 64 B calls (414 against 375 ns), 4% for synchronous 1 KiB calls (590 against 567 ns), 2% for pipelined 64 B calls (232 against 227 ns), 0% for pipelined 1 KiB calls (282 against 281 ns), and 1% at 64 KiB (15,996 against 15,788 ns synchronous), so its default stays off. With a buffer size that holds the whole message in one frame (`hqq-sync-bigbuf`), 64 KiB synchronous takes 13,001 ns instead of 15,788 ns.
+At 64 KiB, performance is dominated by copying the request into shared memory and copying the response out, whereas `cgo` reads and writes the Go heap buffer in place. Enabling defensive request copying (`copy_request`, design §7.2) adds 10% on synchronous 64 B calls (414 ns vs 375 ns), 4% at 1 KiB (590 ns vs 567 ns), 0–2% when pipelined, and 1% at 64 KiB (15,996 ns vs 15,788 ns), so it remains opt-in. Increasing the ring slot size so 64 KiB fits in a single frame (`hqq-sync-bigbuf`) lowers synchronous 64 KiB latency from 15,788 ns to 13,001 ns.
 
-**zstd 1.5.7, level 1, text.** Same library called through cgo and through the generated client (`server_sync`, `server_pipelined`); `cgo_sync` is the baseline. Ratios are server time over cgo time.
+### 4. Real-world C library: zstd 1.5.7 (level 1, text corpus)
 
-| Payload | compress sync | compress pipelined | decompress sync | decompress pipelined |
+Calling the same zstd 1.5.7 C implementation via in-process `cgo` (`cgo_sync`) versus the `hqq-bindgen` server (`server_sync` and `server_pipelined`). Ratios report `server_time / cgo_time`:
+
+| Payload | Compress Sync | Compress Pipelined | Decompress Sync | Decompress Pipelined |
 | ---: | ---: | ---: | ---: | ---: |
-| 64 B | 1.39× | 1.15× | 2.2× | 1.4× |
-| 1 KiB | 1.20× | 1.09× | 1.77× | 1.14× |
-| 64 KiB | 1.18× | 1.01× | 1.56× | 1.07× |
-| 1 MiB | 1.04× | 1.00× | 1.20× | 1.05× |
-| 64 MiB | 1.04× | not run | 1.29× | not run |
+| `64 B` | `1.39×` | `1.15×` | `2.2×` | `1.4×` |
+| `1 KiB` | `1.20×` | `1.09×` | `1.77×` | `1.14×` |
+| `64 KiB` | `1.18×` | `1.01×` | `1.56×` | `1.07×` |
+| `1 MiB` | `1.04×` | `1.00×` | `1.20×` | `1.05×` |
+| `64 MiB` | `1.04×` | not run | `1.29×` | not run |
 
-Raw times behind the ratios above:
+Absolute latencies behind the ratios above:
 
 | Operation | `cgo_sync` | `server_sync` | `server_pipelined` |
-| --- | ---: | ---: | ---: |
-| compress 64 B | 911.5 ns | 1,271 ns | 1,044 ns |
-| compress 1 KiB | 4,618 ns | 5,559 ns | 5,020 ns |
-| compress 64 KiB | 160,754 ns | 189,990 ns | 162,757 ns |
-| compress 1 MiB | 2.784 ms | 2.887 ms | 2.778 ms |
-| compress 64 MiB | 180.5 ms | 187.8 ms | not run |
-| decompress 64 B | 232.5 ns | 517.8 ns | 329.0 ns |
-| decompress 1 KiB | 2,024 ns | 3,586 ns | 2,301 ns |
-| decompress 64 KiB | 49,823 ns | 77,627 ns | 53,322 ns |
-| decompress 1 MiB | 697,856 ns | 835,988 ns | 731,675 ns |
-| decompress 64 MiB | 44.59 ms | 57.67 ms | not run |
+| :--- | ---: | ---: | ---: |
+| Compress `64 B` | `911.5 ns` | `1,271 ns` | `1,044 ns` |
+| Compress `1 KiB` | `4,618 ns` | `5,559 ns` | `5,020 ns` |
+| Compress `64 KiB` | `160,754 ns` | `189,990 ns` | `162,757 ns` |
+| Compress `1 MiB` | `2.784 ms` | `2.887 ms` | `2.778 ms` |
+| Compress `64 MiB` | `180.5 ms` | `187.8 ms` | not run |
+| Decompress `64 B` | `232.5 ns` | `517.8 ns` | `329.0 ns` |
+| Decompress `1 KiB` | `2,024 ns` | `3,586 ns` | `2,301 ns` |
+| Decompress `64 KiB` | `49,823 ns` | `77,627 ns` | `53,322 ns` |
+| Decompress `1 MiB` | `697,856 ns` | `835,988 ns` | `731,675 ns` |
+| Decompress `64 MiB` | `44.59 ms` | `57.67 ms` | not run |
 
-For coarse calls (compression of 64 KiB to 1 MiB, including 256 KiB at 705,377 ns against 695,542 ns, or 1.4%) the pipelined generated client is within 2% of cgo with one goroutine; two sessions against two cgo threads are within 2% at 1 MiB (1.515 ms against 1.490 ms, 1.02×), 11% at 64 MiB (138.6 ms against 124.3 ms, 1.11×), and 11% at 64 KiB (96.7 µs against 87.1 µs). A trivial call (`ZSTD_versionNumber`) takes 26.7 ns through cgo, 339.8 ns synchronous, and 155.8 ns pipelined. Decompression moves more bytes per unit of work and pays for the response copy. The source of the crossover table is `bindgen/examples/zstd` (`go test -tags zstdcgo -bench 'Compress|Decompress|TrivialCall'`).
+For coarse compression workloads (`64 KiB` to `1 MiB`, including `256 KiB` at `705,377 ns` vs `695,542 ns`, or `1.4%`), pipelined `hqq-bindgen` stays within **2% of in-process cgo** on one goroutine, and two concurrent sessions against two cgo threads stay within **2% at 1 MiB** (`1.515 ms` vs `1.490 ms`, `1.02×`), **11% at 64 MiB** (`138.6 ms` vs `124.3 ms`), and **11% at 64 KiB** (`96.7 µs` vs `87.1 µs`). A no-op `ZSTD_versionNumber()` call takes `26.7 ns` via cgo, `339.8 ns` synchronous, and `155.8 ns` pipelined. Full benchmark details live in [`bindgen/examples/zstd/README.md`](examples/zstd/README.md).
 
-**SQLite, hand-written driver against the generated one.** Same workloads, each against its own server (`sqlite/gendriver` benchmarks).
+### 5. SQLite service: hand-written driver (`hqq-sqlite`) vs generated driver (`hqq-sqlite-gen`)
 
-| Workload | `hqq-sqlite` | `hqq-sqlite-gen` |
-| --- | ---: | ---: |
-| `SELECT 1` | 36.0 µs | 3.5 µs |
-| point select, prepared | 39.6 µs | 3.1 µs |
-| insert 1,000 rows in one transaction | 19.0 ms | 1.00 ms |
-| insert, autocommit | 55.6 µs | 9.8 µs |
-| scan 100,000 rows, fetch 256 | 36.6 ms | 19.5 ms |
-| scan 100,000 rows, fetch 4096 | 15.2 ms | 20.8 ms |
-| 1 MiB blob round trip | 2.28 ms | 2.02 ms |
-| point select, 8 parallel | 30.1 µs | 4.0 µs |
+Both drivers implement `database/sql/driver` and run against their respective C servers (`sqlite/gendriver` benchmarks):
 
-Inline request execution in `hqq_adv_serve` (about 35 µs to about 0.6 µs per call) and the wider adaptive spin window explain the shifts from the initial runs. The remaining difference on short statements comes from the transport and server threading models: each `hqq-sqlite` statement goes through an Advanced-link `Call`, stream routing, and a hand-off from the `hqq_adv_serve` handler to the session's SQLite worker thread, whereas `hqq-sqlite-gen` uses a dedicated Standard link per connection whose session thread calls SQLite directly. The fetch-4096 scan is the one workload where the generated driver is slower (1.36×, 20.8 ms against 15.2 ms).
+| Workload | `hqq-sqlite` (Hand-Written) | `hqq-sqlite-gen` (`hqq-bindgen`) |
+| :--- | ---: | ---: |
+| `SELECT 1` | `36.0 µs` | `3.5 µs` |
+| Point `SELECT`, prepared | `39.6 µs` | `3.1 µs` |
+| `INSERT` 1,000 rows in one transaction | `19.0 ms` | `1.00 ms` |
+| `INSERT`, autocommit | `55.6 µs` | `9.8 µs` |
+| Scan 100,000 rows (`fetch=256`) | `36.6 ms` | `19.5 ms` |
+| Scan 100,000 rows (`fetch=4096`) | `15.2 ms` | `20.8 ms` |
+| `1 MiB` BLOB round trip | `2.28 ms` | `2.02 ms` |
+| Point `SELECT`, 8 parallel connections | `30.1 µs` | `4.0 µs` |
 
-The generated driver passes the whole `database/sql` contract suite of `sqlite/internal/contract` (107 cases in 11 groups). One case needs a flag, `Capabilities.NoInterrupt`: a deadline cannot interrupt a running statement, because the generator has no call cancellation. The hand-written driver and server remain the supported SQLite service; nothing was replaced.
+Why do the two SQLite drivers have different latency profiles? `hqq-sqlite` multiplexes all connections of a `*sql.DB` as streams over a single `AdvancedLink` and dispatches each request from `hqq_adv_serve` onto a per-session SQLite worker queue, giving it built-in Protocol 1.1 request cancellation (`sqlite3_interrupt`). `hqq-sqlite-gen` dedicates a `StandardLink` ring and a dedicated POSIX server thread to each session, calling `sqlite3_*` directly on the receive thread with zero intermediate queueing. Only on large `fetch=4096` table scans is the hand-written streaming protocol faster (`15.2 ms` vs `20.8 ms`, `1.36×`).
+
+`hqq-sqlite-gen` passes all 107 tests across 11 groups in `sqlite/internal/contract` (setting `Capabilities.NoInterrupt` on the mid-query cancellation test because `hqq-bindgen` does not cancel in-flight calls). `hqq-sqlite` remains the primary supported SQLite driver with full query interruption.
 
 ## Tests
 
-| Command | Covers |
-| --- | --- |
-| `go test ./bindgen/... ./cmd/hqq-bindgen` | parser (rules, digests, plan), emitters (goldens, the examples of the design document, generated code compiled and run against the real runtimes), Go runtime (vectors, flow control, fuzz targets), end-to-end suite against the real C server |
-| `ctest` in a build of `c/` | C runtime: every vector of the design document, handle table, frame fuzzing, live sessions, peer death, `hqqrpc_main`, under ASan, UBSan and TSan in CI |
-| `go test ./sqlite/...` | the SQLite drivers, the shared `convert` and `dsn` packages, the contract suite against the generated server |
-| `go test -tags zstdcgo ./bindgen/examples/zstd/...` | the zstd example (needs `eval "$(bindgen/examples/zstd/build.sh)"`) |
+Run the `hqq-bindgen` test suites from the repository root:
 
-CI is `.github/workflows/bindgen.yml`.
+| Command | Coverage |
+| :--- | :--- |
+| `go test ./bindgen/... ./cmd/hqq-bindgen` | IDL parser (validation rules V1–V41, digests, wire plans), Go/C code emitters, Go client runtime (`bindgen/rt`), and end-to-end tests against the C `microlib` server. |
+| `ctest` in a CMake build of `c/` | C RPC runtime (`test_rpc`, `test_rpc_calls`, `test_rpc_handles`, `test_rpc_fuzz`, `test_rpc_live`, `test_rpc_main`), run with ASan, UBSan, and TSan in `.github/workflows/bindgen.yml`. |
+| `go test ./sqlite/...` | Both SQLite drivers (`hqq-sqlite` and `hqq-sqlite-gen`), shared parameter/DSN packages, and the 107-case `database/sql` contract suite. |
+| `go test -tags zstdcgo ./bindgen/examples/zstd/...` | End-to-end zstd correctness and differential tests against cgo (after `eval "$(bindgen/examples/zstd/build.sh)"`). |
