@@ -242,9 +242,19 @@ jobs:
         uses: actions/checkout@v6.0.2
 
       - name: Set up MSVC developer environment
-        uses: ilammy/msvc-dev-cmd@v1.13.0
-        with:
-          arch: ${{ matrix.arch }}
+        shell: pwsh
+        run: |
+          $vsPath = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath
+          $vcvars = Join-Path $vsPath "VC\Auxiliary\Build\vcvarsall.bat"
+          cmd.exe /c "call `"$vcvars`" ${{ matrix.arch }} >nul && set" | ForEach-Object {
+            if ($_ -match '^([^=]+)=(.*)$') {
+              if ($matches[1] -ieq 'PATH') {
+                $matches[2] -split ';' | Where-Object { $_ } | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+              } else {
+                "$($matches[1])=$($matches[2])" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+              }
+            }
+          }
 
       - name: Configure
         shell: bash
