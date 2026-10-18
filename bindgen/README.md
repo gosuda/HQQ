@@ -34,20 +34,20 @@ You supply the `.idl` file, any optional `@intercept` pre-call policy hooks, C `
 | `bindgen/e2e/microlib` | Generated client and server for `microlib` plus the end-to-end integration and differential test suite. |
 | `bindgen/bench` | Microbenchmarks comparing generated IPC calls directly against in-process cgo ([`bindgen/bench/README.md`](bench/README.md)). |
 | `bindgen/examples/zstd` | Pinned zstd 1.5.7 wrapped via `hqq-bindgen`, with correctness tests and cgo crossover benchmarks ([`bindgen/examples/zstd/README.md`](examples/zstd/README.md)). |
-| `bindgen/examples/sqlite3`, `sqlite/gendriver` | Low-level SQLite IDL service and the `hqq-sqlite-gen` `database/sql` driver ([`bindgen/examples/sqlite3/README.md`](examples/sqlite3/README.md)). |
+| `bindgen/examples/sqlite3`, `sqlite` | Low-level SQLite IDL service, the `hqq-sqlite-server` C server, and the `hqq-sqlite` `database/sql` driver ([`bindgen/examples/sqlite3/README.md`](examples/sqlite3/README.md)). |
 | `launch` | Verified child-process starter (`secureexec` + `lifeline` + `ready <listener>` handshake). |
 
 ## Operational limits
 
-- **Target languages and OS**: generates Go clients and C11 servers. The C server entry point (`hqqrpc_main`) runs on POSIX systems (`Linux`, `macOS`, `FreeBSD`) and returns `HQQ_ERR_UNSUPPORTED` on Windows (though the C runtime sources compile cleanly on Windows for FFI builds).
-- **No mid-call cancellation**: if a caller's context expires while waiting for a response, the call is abandoned locally and its server-side execution continues to completion (`spec/toolchain/BINDGEN.md` §6.3). Long-running C calls such as `sqlite3_step` cannot be interrupted mid-flight through a generated service without an out-of-band mechanism.
+- **Target languages and OS**: generates Go clients and C11 servers. The C server entry point (`hqqrpc_main`) runs on Linux, macOS, FreeBSD, and Windows.
+- **Handle-based call cancellation (`@cancel`)**: handle types can declare `@cancel(fn)` (for example `@cancel(sqlite3_interrupt)` on `handle Db`). Calling `Conn.Cancel()` sends a `BG_CANCEL` request on the control link (`HQQRPC_CANCEL_METHOD`), sets the session's canceled watermark (`hqqrpc_session_canceled`), and invokes the `@cancel` hook on every live handle of that type in the session. For handles without `@cancel`, an abandoned client wait leaves the server-side call running to completion (`spec/toolchain/BINDGEN.md` §6.3).
 - **IDL type surface**: no C-to-Go callbacks, no variadic functions, and no struct/union value parameters. Composite inputs or batched outputs are expressed as byte buffers or packed records via a C `shim` function.
-- **Concurrency and serialization**: each `rt.Conn` is used by one goroutine at a time (`rt.Pool` manages concurrent goroutine access), and each server session runs on a dedicated POSIX thread. `@serialize(session)` acquires a per-session or server lock around every C call, while `@serialize(none)` omits the lock for thread-safe functions.
+- **Concurrency and serialization**: each `rt.Conn` is used by one goroutine at a time (`rt.Pool` manages concurrent goroutine access), and each server session runs on a dedicated OS thread. `@serialize(session)` acquires a per-session or server lock around every C call, while `@serialize(none)` omits the lock for thread-safe functions.
 - **Fault containment**: a crash (`SIGSEGV`, `SIGABRT`) inside the C library terminates the C server process without corrupting the Go client process, which observes `ErrPeerGone` and can launch a fresh server.
 
 ## Measured status
 
-All measurements below were collected on an Apple M1 (`darwin/arm64`, Go 1.27, quiet machine, spin wait policy, median of 3 runs at `-benchtime 1s` for `bindgen/bench` and `sqlite/gendriver`, and `-benchtime 300ms` for `bindgen/examples/zstd`). The C server runs as a separate child process placed by the macOS kernel scheduler (macOS does not expose thread-affinity APIs). Reproduction commands are in [`bindgen/bench/README.md`](bench/README.md).
+All measurements below were collected on an Apple M1 (`darwin/arm64`, Go 1.27, quiet machine, spin wait policy, median of 3 runs at `-benchtime 1s` for `bindgen/bench` and `sqlite`, and `-benchtime 300ms` for `bindgen/examples/zstd`). The C server runs as a separate child process placed by the macOS kernel scheduler (macOS does not expose thread-affinity APIs). Reproduction commands are in [`bindgen/bench/README.md`](bench/README.md).
 
 ### 1. Call with no work (`ml_add`)
 
@@ -117,24 +117,22 @@ Absolute latencies behind the ratios above:
 
 For coarse compression workloads (`64 KiB` to `1 MiB`, including `256 KiB` at `705,377 ns` vs `695,542 ns`, or `1.4%`), pipelined `hqq-bindgen` stays within **2% of in-process cgo** on one goroutine, and two concurrent sessions against two cgo threads stay within **2% at 1 MiB** (`1.515 ms` vs `1.490 ms`, `1.02×`), **11% at 64 MiB** (`138.6 ms` vs `124.3 ms`), and **11% at 64 KiB** (`96.7 µs` vs `87.1 µs`). A no-op `ZSTD_versionNumber()` call takes `26.7 ns` via cgo, `339.8 ns` synchronous, and `155.8 ns` pipelined. Full benchmark details live in [`bindgen/examples/zstd/README.md`](examples/zstd/README.md).
 
-### 5. SQLite service: hand-written driver (`hqq-sqlite`) vs generated driver (`hqq-sqlite-gen`)
+### 5. SQLite service (`hqq-sqlite` on `hqq-bindgen`)
 
-Both drivers implement `database/sql/driver` and run against their respective C servers (`sqlite/gendriver` benchmarks):
+`gosuda.org/hqq/sqlite` (`"hqq-sqlite"`) implements `database/sql/driver` directly over the `hqq-bindgen` SQLite client (`bindgen/examples/sqlite3`) and C server (`hqq-sqlite-server`):
 
-| Workload | `hqq-sqlite` (Hand-Written) | `hqq-sqlite-gen` (`hqq-bindgen`) |
-| :--- | ---: | ---: |
-| `SELECT 1` | `36.0 µs` | `3.5 µs` |
-| Point `SELECT`, prepared | `39.6 µs` | `3.1 µs` |
-| `INSERT` 1,000 rows in one transaction | `19.0 ms` | `1.00 ms` |
-| `INSERT`, autocommit | `55.6 µs` | `9.8 µs` |
-| Scan 100,000 rows (`fetch=256`) | `36.6 ms` | `19.5 ms` |
-| Scan 100,000 rows (`fetch=4096`) | `15.2 ms` | `20.8 ms` |
-| `1 MiB` BLOB round trip | `2.28 ms` | `2.02 ms` |
-| Point `SELECT`, 8 parallel connections | `30.1 µs` | `4.0 µs` |
+| Workload | `hqq-sqlite` (`hqq-bindgen`) |
+| :--- | ---: |
+| `SELECT 1` | `3.5 µs` |
+| Point `SELECT`, prepared | `3.1 µs` |
+| `INSERT` 1,000 rows in one transaction | `1.00 ms` |
+| `INSERT`, autocommit | `9.8 µs` |
+| Scan 100,000 rows (`fetch=256`) | `19.5 ms` |
+| Scan 100,000 rows (`fetch=4096`) | `20.8 ms` |
+| `1 MiB` BLOB round trip | `2.02 ms` |
+| Point `SELECT`, 8 parallel connections | `4.0 µs` |
 
-Why do the two SQLite drivers have different latency profiles? `hqq-sqlite` multiplexes all connections of a `*sql.DB` as streams over a single `AdvancedLink` and dispatches each request from `hqq_adv_serve` onto a per-session SQLite worker queue, giving it built-in Protocol 1.1 request cancellation (`sqlite3_interrupt`). `hqq-sqlite-gen` dedicates a `StandardLink` ring and a dedicated POSIX server thread to each session, calling `sqlite3_*` directly on the receive thread with zero intermediate queueing. Only on large `fetch=4096` table scans is the hand-written streaming protocol faster (`15.2 ms` vs `20.8 ms`, `1.36×`).
-
-`hqq-sqlite-gen` passes all 107 tests across 11 groups in `sqlite/internal/contract` (setting `Capabilities.NoInterrupt` on the mid-query cancellation test because `hqq-bindgen` does not cancel in-flight calls). `hqq-sqlite` remains the primary supported SQLite driver with full query interruption.
+Each session uses a dedicated `StandardLink` ring and a dedicated server thread, calling `sqlite3_*` directly on the receive thread with zero intermediate queueing and supporting mid-query interruption via `@cancel(sqlite3_interrupt)`. `hqq-sqlite` passes all 107 tests across 11 groups in `sqlite/internal/contract`.
 
 ## Tests
 
@@ -144,5 +142,5 @@ Run the `hqq-bindgen` test suites from the repository root:
 | :--- | :--- |
 | `go test ./bindgen/... ./cmd/hqq-bindgen` | IDL parser (validation rules V1–V41, digests, wire plans), Go/C code emitters, Go client runtime (`bindgen/rt`), and end-to-end tests against the C `microlib` server. |
 | `ctest` in a CMake build of `c/` | C RPC runtime (`test_rpc`, `test_rpc_calls`, `test_rpc_handles`, `test_rpc_fuzz`, `test_rpc_live`, `test_rpc_main`), run with ASan, UBSan, and TSan in `.github/workflows/bindgen.yml`. |
-| `go test ./sqlite/...` | Both SQLite drivers (`hqq-sqlite` and `hqq-sqlite-gen`), shared parameter/DSN packages, and the 107-case `database/sql` contract suite. |
+| `go test ./sqlite/...` | The `hqq-sqlite` `database/sql` driver, parameter/DSN packages, and the 107-case `database/sql` contract suite. |
 | `go test -tags zstdcgo ./bindgen/examples/zstd/...` | End-to-end zstd correctness and differential tests against cgo (after `eval "$(bindgen/examples/zstd/build.sh)"`). |

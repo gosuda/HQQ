@@ -40,6 +40,32 @@
 
 static const uint8_t k_magic[4] = {0x48, 0x51, 0x42, 0x47}; /* "HQBG" */
 
+#if defined(_MSC_VER) && !defined(__clang__)
+static __declspec(thread) hqqrpc_session *g_tls_session;
+#else
+static _Thread_local hqqrpc_session *g_tls_session;
+#endif
+
+int hqqrpc_session_canceled(hqqrpc_session *s) {
+    int canceled = 0;
+
+    if (s == NULL) {
+        s = g_tls_session;
+    }
+    if (s == NULL) {
+        return 0;
+    }
+    if (s->end != HQQRPC_END_NONE) {
+        return 1;
+    }
+    if (s->cancel_mu != NULL) {
+        hqq_plat_mutex_lock(s->cancel_mu);
+        canceled = s->active_id != 0 && s->active_id <= s->canceled_id;
+        hqq_plat_mutex_unlock(s->cancel_mu);
+    }
+    return canceled;
+}
+
 static uint32_t min_u32(uint32_t a, uint32_t b) {
     return a < b ? a : b;
 }
@@ -47,8 +73,14 @@ static uint32_t min_u32(uint32_t a, uint32_t b) {
 /* ---- Transmit ------------------------------------------------------------------------------ */
 
 void hqqrpc_session_set_end(hqqrpc_session *s, hqqrpc_end why) {
+    if (s->cancel_mu != NULL) {
+        hqq_plat_mutex_lock(s->cancel_mu);
+    }
     if (s->end == HQQRPC_END_NONE) {
         s->end = why;
+    }
+    if (s->cancel_mu != NULL) {
+        hqq_plat_mutex_unlock(s->cancel_mu);
     }
 }
 
@@ -357,6 +389,7 @@ static void run_request(hqqrpc_session *s, uint16_t op, uint32_t id, const uint8
                         int copy) {
     hqqrpc_call call;
     hqqrpc_status st;
+    hqqrpc_session *prev_tls = g_tls_session;
 
     cs_reset(s, op, id);
     call.session = s;
@@ -369,22 +402,45 @@ static void run_request(hqqrpc_session *s, uint16_t op, uint32_t id, const uint8
         uint8_t *c = (uint8_t *)hqqrpc_scratch(s, blen);
 
         if (c == NULL) {
+            if (s->cancel_mu != NULL) {
+                hqq_plat_mutex_lock(s->cancel_mu);
+                s->completed_id = id;
+                hqq_plat_mutex_unlock(s->cancel_mu);
+            }
             finish_call(s, HQQRPC_E_INTERNAL);
             return;
         }
         memcpy(c, body, blen);
         call.body = c;
     }
+    g_tls_session = s;
+    if (s->cancel_mu != NULL) {
+        hqq_plat_mutex_lock(s->cancel_mu);
+        s->active_id = id;
+        hqq_plat_mutex_unlock(s->cancel_mu);
+    }
     if (op == 0 || op > s->iface->op_count) {
         st = HQQRPC_E_UNKNOWN_OP;
     } else {
         st = s->iface->dispatch(&call);
     }
+    if (s->cancel_mu != NULL) {
+        hqq_plat_mutex_lock(s->cancel_mu);
+        s->active_id = 0;
+        s->completed_id = id;
+        hqq_plat_mutex_unlock(s->cancel_mu);
+    }
+    g_tls_session = prev_tls;
     finish_call(s, st);
 }
 
 /* Answers a request that was received completely but cannot be executed (assembly out of memory). */
 static void answer_without_call(hqqrpc_session *s, uint16_t op, uint32_t id, hqqrpc_status st) {
+    if (s->cancel_mu != NULL) {
+        hqq_plat_mutex_lock(s->cancel_mu);
+        s->completed_id = id;
+        hqq_plat_mutex_unlock(s->cancel_mu);
+    }
     cs_reset(s, op, id);
     send_call_error(s, st);
     hqqrpc_scratch_release(s);
@@ -622,6 +678,11 @@ hqqrpc_session *hqqrpc_session_create(const hqqrpc_iface *iface, const hqqrpc_cf
         return NULL;
     }
     memset(s, 0, sizeof *s);
+    s->cancel_mu = hqq_plat_mutex_create(alloc);
+    if (s->cancel_mu == NULL) {
+        hqq_free(alloc, s, sizeof *s);
+        return NULL;
+    }
     s->srv = srv;
     s->iface = iface;
     s->cfg = *cfg;
@@ -656,7 +717,13 @@ void hqqrpc_session_finish(hqqrpc_session *s) {
     if (s->torn) {
         return;
     }
+    if (s->cancel_mu != NULL) {
+        hqq_plat_mutex_lock(s->cancel_mu);
+    }
     s->torn = 1;
+    if (s->cancel_mu != NULL) {
+        hqq_plat_mutex_unlock(s->cancel_mu);
+    }
     asm_drop(s);
     if (s->cs.held) {
         hqqrpc_tx_abort(s, &s->cs.res);
@@ -703,6 +770,10 @@ void hqqrpc_session_destroy(hqqrpc_session *s) {
     hqqrpc_tab_free(s);
     if (s->exec_mu_owned) {
         hqq_plat_mutex_destroy(s->alloc, s->exec_mu);
+    }
+    if (s->cancel_mu != NULL) {
+        hqq_plat_mutex_destroy(s->alloc, s->cancel_mu);
+        s->cancel_mu = NULL;
     }
     own = s->alloc == &s->alloc_copy;
     a = s->alloc_copy;

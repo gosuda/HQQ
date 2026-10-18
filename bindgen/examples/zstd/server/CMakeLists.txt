@@ -14,14 +14,11 @@
 #
 # This directory is the top-level project and pulls in libhqq from c/ with add_subdirectory.
 # HQQ_WERROR defaults to ON for the glue and the hooks; zstd's own sources are third-party code and
-# are built with their own flags. POSIX only: hqqrpc_main does not run on Windows (BINDGEN.md 1.2).
+# are built with their own flags.
 cmake_minimum_required(VERSION 3.21)
 
 if(NOT TARGET hqq::hqq)
   project(zstd_server LANGUAGES C)
-  if(WIN32)
-    message(FATAL_ERROR "zstd_server is POSIX only: hqqrpc_main does not support Windows")
-  endif()
   if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
   endif()

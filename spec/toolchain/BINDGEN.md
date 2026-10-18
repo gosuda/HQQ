@@ -2401,6 +2401,7 @@ typedef struct hqqrpc_handle_type {
     const char *name;
     uint16_t parent;                 /* handle type id of the owner, 0 for none; ids are 1-based array indices */
     int (*destroy)(void *ptr);       /* destroys the C object; 0 on success */
+    void (*cancel)(void *ptr);       /* optional: interrupts an in-flight call on this handle (NULL if none) */
 } hqqrpc_handle_type;
 
 #define HQQRPC_SERIALIZE_SESSION 0u
@@ -3009,8 +3010,8 @@ static hqqrpc_status microlib_dispatch(hqqrpc_call *c) {
 }
 
 static const hqqrpc_handle_type microlib_handle_types[] = {
-    { "Counter", 0, destroy_Counter },                  /* MICROLIB_H_COUNTER */
-    { "Cursor", MICROLIB_H_COUNTER, destroy_Cursor },   /* MICROLIB_H_CURSOR, owned_by Counter */
+    { "Counter", 0, destroy_Counter, NULL },                  /* MICROLIB_H_COUNTER */
+    { "Cursor", MICROLIB_H_COUNTER, destroy_Cursor, NULL },   /* MICROLIB_H_CURSOR, owned_by Counter */
 };
 
 static const char *const microlib_op_names[] = {
@@ -3110,7 +3111,7 @@ int main(int argc, char **argv) {
 ```cmake
 # bindgen/e2e/microlib/server/CMakeLists.txt; c/CMakeLists.txt adds it behind
 #   option(HQQ_BUILD_BINDGEN_TESTS "Build the hqq-bindgen microlib server and C tests" OFF)
-# the way HQQ_BUILD_SQLITE_SERVER adds examples/sqlite/server.
+# the way HQQ_BUILD_SQLITE_SERVER adds bindgen/examples/sqlite3/server.
 add_executable(microlib_server main.c microlib_server.c microlib_hooks.c
                ../../../testdata/microlib/microlib.c)
 target_include_directories(microlib_server PRIVATE ../../../testdata/microlib)

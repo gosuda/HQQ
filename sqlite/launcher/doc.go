@@ -1,5 +1,5 @@
-// Package launcher starts the HQQ SQLite server (examples/sqlite/server) as a
-// supervised child process and returns a database/sql handle to it.
+// Package launcher starts the HQQ SQLite server (bindgen/examples/sqlite3/server)
+// as a supervised child process and returns a database/sql handle to it.
 //
 // Start verifies the server binary with secureexec before it runs: the expected
 // digest comes from Config.SHA256 or from a signed release manifest

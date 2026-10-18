@@ -3,7 +3,6 @@ package sqlite3_test
 import (
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -41,35 +40,5 @@ func TestGeneratedFilesAreFresh(t *testing.T) {
 	cmd := exec.Command(goBin, append([]string{"run", bindgenCmd, "-check"}, args...)...)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("hqq-bindgen -check: %v\n%s\nrun `go generate ./bindgen/examples/sqlite3/...`", err, out)
-	}
-}
-
-// TestPolicyIsNotForked checks that the server takes the path and open policy from the hand-written server's
-// sources: the CMake file compiles them through a relative path, and this directory holds no copy.
-func TestPolicyIsNotForked(t *testing.T) {
-	cm, err := os.ReadFile(filepath.Join("server", "CMakeLists.txt"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, f := range []string{"sqlsrv_pathrules.c", "sqlsrv_policy.c", "sqlsrv_proto.c", "sqlsrv_port_posix.c"} {
-		if !strings.Contains(string(cm), `"${SQLSRV_SRC}/`+f+`"`) {
-			t.Errorf("server/CMakeLists.txt does not compile %s from the hand-written server", f)
-		}
-		orig := filepath.Join("..", "..", "..", "examples", "sqlite", "server", "src", f)
-		if _, err := os.Stat(orig); err != nil {
-			t.Errorf("the hand-written source %s is missing: %v", orig, err)
-		}
-	}
-	if !strings.Contains(string(cm), "../../../../examples/sqlite/server/src") {
-		t.Error("server/CMakeLists.txt does not point at examples/sqlite/server/src")
-	}
-	err = filepath.WalkDir(".", func(path string, d os.DirEntry, err error) error {
-		if err == nil && !d.IsDir() && strings.HasPrefix(d.Name(), "sqlsrv_") {
-			t.Errorf("%s: a copy of a hand-written server file", path)
-		}
-		return err
-	})
-	if err != nil {
-		t.Fatal(err)
 	}
 }

@@ -155,9 +155,9 @@ if(HQQ_BUILD_TESTS AND HQQ_BUILD_STRESS AND NOT WIN32)
   add_subdirectory(verify/stress)
 endif()
 
-# The hqq-sqlite C server (examples/sqlite/server): needs SQLite, so it is off
-# by default. See examples/sqlite/server/CMakeLists.txt.
-option(HQQ_BUILD_SQLITE_SERVER "Build the hqq-sqlite C server (examples/sqlite/server)" OFF)
+# The hqq-sqlite C server (bindgen/examples/sqlite3/server): needs SQLite, so it is off
+# by default. See bindgen/examples/sqlite3/server/CMakeLists.txt.
+option(HQQ_BUILD_SQLITE_SERVER "Build the hqq-sqlite C server (bindgen/examples/sqlite3/server)" OFF)
 if(HQQ_BUILD_SQLITE_SERVER)
-  add_subdirectory(../examples/sqlite/server sqlite-server)
+  add_subdirectory(../bindgen/examples/sqlite3/server sqlite-server)
 endif()

@@ -1239,9 +1239,9 @@ static hqqrpc_status edge_dispatch(hqqrpc_call *c) {
 }
 
 static const hqqrpc_handle_type edge_handle_types[] = {
-    { "Dir", 0, destroy_Dir },            /* EDGE_H_DIR */
-    { "File", EDGE_H_DIR, destroy_File }, /* EDGE_H_FILE, owned_by Dir */
-    { "Tag", 0, destroy_Tag },            /* EDGE_H_TAG */
+    { "Dir", 0, destroy_Dir, NULL },            /* EDGE_H_DIR */
+    { "File", EDGE_H_DIR, destroy_File, NULL }, /* EDGE_H_FILE, owned_by Dir */
+    { "Tag", 0, destroy_Tag, NULL },            /* EDGE_H_TAG */
 };
 
 static const char *const edge_op_names[] = {

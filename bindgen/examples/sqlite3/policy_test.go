@@ -20,17 +20,16 @@ import (
 	"gosuda.org/hqq/bindgen/rt"
 )
 
-// The policy tests mirror the refusals of the hand-written server, which the server of this directory
-// shares: the policy code is compiled from examples/sqlite/server/src (sqlsrv_policy.c,
-// sqlsrv_pathrules.c, sqlsrv_proto.c). Each test names the case of the hand-written suite that it follows.
+// The policy tests cover the server's path and open refusals (server/sqlsrv_policy.c,
+// server/sqlsrv_pathrules.c, server/sqlsrv_proto.c, and server/tests/test_units.c):
 //
 //	TestPathPolicy          sqlite/e2e/e2e_test.go TestPathPolicy, and test_policy in
-//	                        examples/sqlite/server/tests/test_units.c (traversal, absolute paths, "..",
+//	                        server/tests/test_units.c (traversal, absolute paths, "..",
 //	                        a missing parent directory)
 //	TestPathPolicySymlinks  sqlite/e2e/e2e_test.go TestPathPolicySymlinks, and test_policy (links)
 //	TestAliasOnlyPolicy     sqlite/e2e/e2e_test.go TestAliasOnlyPolicy
-//	TestOpenFlags           test_validation in test_units.c (sqlsrv_valid_open_flags) and PROTOCOL.md 6.1
-//	TestNoURIAndNoMemory    the comment "No SQLITE_OPEN_URI" in do_open (sqlsrv_session.c)
+//	TestOpenFlags           test_validation in server/tests/test_units.c (sqlsrv_valid_open_flags)
+//	TestNoURIAndNoMemory    URI and in-memory database rejection
 //	TestAttachAndExtensions PROTOCOL.md section 12 (authorizer, extension loading)
 //	TestSqlAndColumnLimits  PROTOCOL.md section 11 (sqlite3_limit), in errors_test.go
 //	TestOpenMissingFile     PROTOCOL.md 6.1 ("does not exist and CREATE is not set": SQLITE_CANTOPEN)

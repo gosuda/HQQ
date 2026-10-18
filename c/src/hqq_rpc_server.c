@@ -41,7 +41,15 @@
 #include <stdlib.h>
 #include <string.h>
 
-#if !defined(_WIN32)
+#if defined(_WIN32)
+#  include <fcntl.h>
+#  include <io.h>
+#  include <signal.h>
+#  include <windows.h>
+#  ifndef SIGBREAK
+#    define SIGBREAK 21
+#  endif
+#else
 #  include <pthread.h>
 #  include <signal.h>
 #  include <unistd.h>
@@ -99,6 +107,7 @@ struct hqqrpc_server {
     hqqrpc_ctl *ctls;
     unsigned ctl_count;
     uint64_t ctl_seq;
+    hqqrpc_session *sess_list;
     uint32_t sessions;
     int state;
 };
@@ -289,10 +298,25 @@ static void session_loop(hqqrpc_session *s) {
 static void session_main(void *arg) {
     hqqrpc_session *s = (hqqrpc_session *)arg;
     hqqrpc_server *srv = s->srv;
+    hqqrpc_session **pp;
 
     hqqrpc_session_start_callback(s);
     session_loop(s);
     hqqrpc_session_finish(s);
+    hqq_plat_mutex_lock(srv->mu);
+    for (pp = &srv->sess_list; *pp != NULL; pp = &(*pp)->srv_next) {
+        if (*pp == s) {
+            *pp = s->srv_next;
+            s->srv_next = NULL;
+            break;
+        }
+    }
+    while (s->cancel_refs > 0) {
+        hqq_plat_mutex_unlock(srv->mu);
+        hqq_plat_sleep_ns(1000000u);
+        hqq_plat_mutex_lock(srv->mu);
+    }
+    hqq_plat_mutex_unlock(srv->mu);
     hqqrpc_session_destroy(s); /* closes the link: the creator removes the name if it is still there */
     hqq_plat_mutex_lock(srv->mu);
     srv->sessions--;
@@ -346,6 +370,7 @@ static void ctl_handler(void *user, hqq_req_ctx *rctx, hqq_response *w, const hq
     hqqrpc_server *srv = ctl->srv;
     const uint8_t *d = (const uint8_t *)hqq_request_data(req);
     size_t n = hqq_request_len(req);
+    uint64_t method = hqq_request_method(req);
     uint32_t B;
     uint32_t S;
     int expected = 0;
@@ -358,7 +383,52 @@ static void ctl_handler(void *user, hqq_req_ctx *rctx, hqq_response *w, const hq
     int attempt;
 
     (void)rctx;
-    if (hqq_request_method(req) != HQQRPC_OPEN_METHOD) {
+    if (method == HQQRPC_CANCEL_METHOD) {
+        uint32_t req_id;
+        uint16_t cname_len;
+        char cname[32];
+        hqqrpc_session *target = NULL;
+
+        if (n < 17 || d == NULL || memcmp(d, "HQBC", 4) != 0) {
+            open_error(w, HQQRPC_OPEN_E_INTERNAL, "bad cancel request");
+            return;
+        }
+        if (hqqrpc_le16(d + 4) != HQQRPC_PROTO_MAJOR) {
+            open_error(w, HQQRPC_OPEN_E_VERSION, "unsupported protocol version");
+            return;
+        }
+        req_id = hqqrpc_le32(d + 8);
+        cname_len = hqqrpc_le16(d + 12);
+        if (cname_len < 1 || cname_len >= sizeof cname || n != 16u + cname_len || hqqrpc_le16(d + 14) != 0) {
+            open_error(w, HQQRPC_OPEN_E_INTERNAL, "bad cancel request");
+            return;
+        }
+        if (!atomic_compare_exchange_strong(&ctl->opened, &expected, 1)) {
+            open_error(w, HQQRPC_OPEN_E_INTERNAL, "control link already used");
+            return;
+        }
+        hqqrpc_server_session_started(srv, ctl->id);
+        memcpy(cname, d + 16, cname_len);
+        cname[cname_len] = '\0';
+        hqq_plat_mutex_lock(srv->mu);
+        for (s = srv->sess_list; s != NULL; s = s->srv_next) {
+            if (strcmp(s->sess_name, cname) == 0) {
+                s->cancel_refs++;
+                target = s;
+                break;
+            }
+        }
+        hqq_plat_mutex_unlock(srv->mu);
+        if (target != NULL) {
+            hqqrpc_session_cancel(target, req_id);
+            hqq_plat_mutex_lock(srv->mu);
+            target->cancel_refs--;
+            hqq_plat_mutex_unlock(srv->mu);
+        }
+        (void)hqq_response_write(w, NULL, 0);
+        return;
+    }
+    if (method != HQQRPC_OPEN_METHOD) {
         open_error(w, HQQRPC_OPEN_E_INTERNAL, "unknown method");
         return;
     }
@@ -425,7 +495,23 @@ static void ctl_handler(void *user, hqq_req_ctx *rctx, hqq_response *w, const hq
         s->cancel = &srv->cancel;
         s->exec_mu = srv->exec_mu;
         s->ctl_id = ctl->id;
+        memcpy(s->sess_name, name, strlen(name) + 1u);
+        hqq_plat_mutex_lock(srv->mu);
+        s->srv_next = srv->sess_list;
+        srv->sess_list = s;
+        hqq_plat_mutex_unlock(srv->mu);
         if (srv_spawn(srv, session_main, s) != 0) {
+            hqqrpc_session **pp;
+
+            hqq_plat_mutex_lock(srv->mu);
+            for (pp = &srv->sess_list; *pp != NULL; pp = &(*pp)->srv_next) {
+                if (*pp == s) {
+                    *pp = s->srv_next;
+                    s->srv_next = NULL;
+                    break;
+                }
+            }
+            hqq_plat_mutex_unlock(srv->mu);
             hqqrpc_session_destroy(s); /* closes the link */
             st = HQQ_ERR_SYSTEM;
         }
@@ -749,22 +835,13 @@ hqq_status hqqrpc_server_destroy(hqqrpc_server *srv) {
 
 /* ---- hqqrpc_main ---------------------------------------------------------------------------- */
 
-#if defined(_WIN32)
-
-int hqqrpc_main(const hqqrpc_iface *iface, const hqqrpc_server_options *defaults, int argc, char **argv) {
-    (void)iface;
-    (void)defaults;
-    (void)argc;
-    (void)argv;
-    fprintf(stderr, "hqqrpc_main: not supported on Windows\n");
-    return (int)HQQ_ERR_UNSUPPORTED;
-}
-
-#else
-
 typedef struct main_ctx {
     hqqrpc_server *srv;
+#if defined(_WIN32)
+    HANDLE done_event;
+#else
     sigset_t set;
+#endif
     _Atomic int done;      /* run returned: the signal thread only has to exit */
     _Atomic int signo;     /* the signal that stopped the server, 0 if none */
     _Atomic int parent;    /* hqq_lifeline_reason that fired, 0 if none */
@@ -776,6 +853,50 @@ static void on_parent_gone(void *ctx, hqq_lifeline_reason reason) {
     atomic_store(&m->parent, (int)reason);
     hqqrpc_server_stop(m->srv);
 }
+
+#if defined(_WIN32)
+
+static main_ctx *_Atomic g_win_main_ctx;
+
+static BOOL WINAPI on_console_ctrl(DWORD type) {
+    main_ctx *m = atomic_load(&g_win_main_ctx);
+    int sig = 0;
+
+    if (m == NULL) {
+        return FALSE;
+    }
+    switch (type) {
+    case CTRL_C_EVENT:
+        sig = SIGINT;
+        break;
+    case CTRL_BREAK_EVENT:
+        sig = SIGBREAK;
+        break;
+    case CTRL_CLOSE_EVENT:
+    case CTRL_SHUTDOWN_EVENT:
+        sig = SIGTERM;
+        break;
+    default:
+        return FALSE;
+    }
+    if (!atomic_load(&m->done)) {
+        int expected = 0;
+        (void)atomic_compare_exchange_strong(&m->signo, &expected, sig);
+        hqqrpc_server_stop(m->srv);
+    }
+    if ((type == CTRL_CLOSE_EVENT || type == CTRL_SHUTDOWN_EVENT) && m->done_event != NULL) {
+        (void)WaitForSingleObject(m->done_event, 4000u);
+    }
+    return TRUE;
+}
+
+static int stdin_is_terminal(void) {
+    DWORD mode = 0;
+    HANDLE h = GetStdHandle(STD_INPUT_HANDLE);
+    return h != NULL && h != INVALID_HANDLE_VALUE && GetConsoleMode(h, &mode) != 0 ? 1 : 0;
+}
+
+#else
 
 static void signal_thread(void *arg) {
     main_ctx *m = (main_ctx *)arg;
@@ -789,6 +910,12 @@ static void signal_thread(void *arg) {
         hqqrpc_server_stop(m->srv);
     }
 }
+
+static int stdin_is_terminal(void) {
+    return isatty(STDIN_FILENO);
+}
+
+#endif
 
 static void stderr_log(void *user, int level, const char *msg) {
     static const char *const names[] = {"error", "warning", "info"};
@@ -852,14 +979,28 @@ int hqqrpc_main(const hqqrpc_iface *iface, const hqqrpc_server_options *defaults
     const char *name = NULL;
     main_ctx m;
     hqq_lifeline *ll = NULL;
+#if !defined(_WIN32)
     hqq_plat_thread *sigthr = NULL;
+    int os_err = 0;
+#endif
     uint64_t grace_ms = 5000;
     int lifeline_mode = 0; /* 0: off, 1: --parent-stdin, 2: --parent-stdin=force */
-    int os_err = 0;
     int i;
     int signo;
     int parent;
     hqq_status st;
+
+#if defined(_WIN32)
+    if (_fileno(stdin) >= 0) {
+        (void)_setmode(_fileno(stdin), _O_BINARY);
+    }
+    if (_fileno(stdout) >= 0) {
+        (void)_setmode(_fileno(stdout), _O_BINARY);
+    }
+    if (_fileno(stderr) >= 0) {
+        (void)_setmode(_fileno(stderr), _O_BINARY);
+    }
+#endif
 
     if (iface == NULL) {
         fprintf(stderr, "%s: no interface\n", prog);
@@ -947,12 +1088,19 @@ int hqqrpc_main(const hqqrpc_iface *iface, const hqqrpc_server_options *defaults
         return 2;
     }
 
-    /* Shutdown signals are taken by one thread with sigwait(): block them before any thread exists. */
-    (void)signal(SIGPIPE, SIG_IGN);
     memset(&m, 0, sizeof m);
     atomic_init(&m.done, 0);
     atomic_init(&m.signo, 0);
     atomic_init(&m.parent, 0);
+#if defined(_WIN32)
+    m.done_event = CreateEventW(NULL, TRUE, FALSE, NULL);
+    if (m.done_event == NULL) {
+        fprintf(stderr, "%s: cannot create the shutdown event\n", prog);
+        return 1;
+    }
+#else
+    /* Shutdown signals are taken by one thread with sigwait(): block them before any thread exists. */
+    (void)signal(SIGPIPE, SIG_IGN);
     sigemptyset(&m.set);
     sigaddset(&m.set, SIGINT);
     sigaddset(&m.set, SIGTERM);
@@ -960,10 +1108,14 @@ int hqqrpc_main(const hqqrpc_iface *iface, const hqqrpc_server_options *defaults
         fprintf(stderr, "%s: cannot block the shutdown signals\n", prog);
         return 1;
     }
+#endif
 
     st = hqqrpc_server_create(iface, name, &o, &srv);
     if (st != HQQ_OK) {
         fprintf(stderr, "%s: cannot create the server on %s: %s\n", prog, name, hqq_strerror(st));
+#if defined(_WIN32)
+        (void)CloseHandle(m.done_event);
+#endif
         return 1;
     }
     m.srv = srv;
@@ -973,7 +1125,7 @@ int hqqrpc_main(const hqqrpc_iface *iface, const hqqrpc_server_options *defaults
     if (lifeline_mode != 0) {
         hqq_lifeline_options lo;
 
-        if (lifeline_mode == 1 && isatty(STDIN_FILENO)) {
+        if (lifeline_mode == 1 && stdin_is_terminal()) {
             fprintf(stderr, "%s: --parent-stdin: standard input is a terminal, not watched "
                             "(use --parent-stdin=force to watch it)\n", prog);
         }
@@ -985,9 +1137,16 @@ int hqqrpc_main(const hqqrpc_iface *iface, const hqqrpc_server_options *defaults
         if (hqq_lifeline_start(&lo, &ll) != HQQ_OK) {
             fprintf(stderr, "%s: cannot watch standard input\n", prog);
             (void)hqqrpc_server_destroy(srv);
+#if defined(_WIN32)
+            (void)CloseHandle(m.done_event);
+#endif
             return 1;
         }
     }
+#if defined(_WIN32)
+    atomic_store(&g_win_main_ctx, &m);
+    (void)SetConsoleCtrlHandler(on_console_ctrl, TRUE);
+#else
     sigthr = hqq_plat_thread_start(NULL, signal_thread, &m, &os_err);
     if (sigthr == NULL) {
         fprintf(stderr, "%s: cannot start the signal thread (%d)\n", prog, os_err);
@@ -995,29 +1154,42 @@ int hqqrpc_main(const hqqrpc_iface *iface, const hqqrpc_server_options *defaults
         (void)hqqrpc_server_destroy(srv);
         return 1;
     }
+#endif
 
     st = hqqrpc_server_run(srv);
 
     atomic_store(&m.done, 1);
+#if defined(_WIN32)
+    (void)SetConsoleCtrlHandler(on_console_ctrl, FALSE);
+    atomic_store(&g_win_main_ctx, NULL);
+#else
     if (atomic_load(&m.signo) == 0) {
         (void)kill(getpid(), SIGTERM); /* wakes the signal thread; the signal stays blocked elsewhere */
     }
     hqq_plat_thread_join(NULL, sigthr);
+#endif
     signo = atomic_load(&m.signo);
     parent = atomic_load(&m.parent);
     if (parent != 0) {
-        fprintf(stderr, "%s: parent lifeline (%s): shut down\n", prog,
+        fprintf(stderr, "%s: parent lifeline (%s): shutting down; shut down\n", prog,
                 parent == (int)HQQ_LIFELINE_REASON_EOF ? "standard input closed" : "standard input error");
     } else if (signo != 0) {
-        fprintf(stderr, "%s: signal %d: shut down\n", prog, signo);
+        fprintf(stderr, "%s: signal %d: shutting down; shut down\n", prog, signo);
     }
     hqq_lifeline_stop(ll); /* joins the lifeline thread: no callback runs after this */
     if (st != HQQ_OK) {
         fprintf(stderr, "%s: server run failed: %s; not freeing the server, the process must exit\n", prog,
                 hqq_strerror(st));
+#if defined(_WIN32)
+        (void)SetEvent(m.done_event);
+        (void)CloseHandle(m.done_event);
+#endif
         return 1;
     }
     (void)hqqrpc_server_destroy(srv);
+#if defined(_WIN32)
+    (void)SetEvent(m.done_event);
+    (void)CloseHandle(m.done_event);
+#endif
     return 0;
 }
-#endif

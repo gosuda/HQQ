@@ -1,6 +1,6 @@
 //go:build unix
 
-package gendriver_test
+package sqlite_test
 
 import (
 	"context"
@@ -32,11 +32,9 @@ func okCancelError(err error) bool {
 // TestCancelRace cancels the context of queries at random moments while the
 // driver has a fetch-ahead in flight and decodes batches in place: during
 // QueryContext, during Next, during rows.Close, and between statements of one
-// connection. The cancellation reaches the driver as a Kill of the session from
-// another goroutine (the guard), while the owner may be inside the generated
-// client's decoder. Before Kill was made safe against a concurrent owner
-// (bindgen/rt Conn.Kill), this unmapped the link under the decoder and crashed
-// the process with a fault.
+// connection. The cancellation reaches the driver as a Kill and Cancel of the
+// session from another goroutine (the guard), while the owner may be inside the
+// generated client's decoder.
 //
 // It asserts: no crash, every error is the cancellation or a bad connection,
 // canceled connections are discarded and replaced, and the pool keeps working.

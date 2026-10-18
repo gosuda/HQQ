@@ -1,6 +1,6 @@
 // sqlite3.idl: the subset of the SQLite C API that a database/sql driver needs, for hqq-bindgen.
-// README.md says what is exposed, what is deliberately not, and how the policy of the server maps
-// to the hand-written hqq-sqlite server (examples/sqlite/server).
+// README.md says what is exposed, what is deliberately not, and how the open policy of the server
+// works (server/sqlsrv_policy.c and server/sqlsrv_pathrules.c).
 //
 // Threading. SQLite 3.x built with SQLITE_THREADSAFE=1 is safe when every connection is used by one
 // thread at a time, and a session is one server thread that owns its connections and statements.
@@ -64,6 +64,7 @@ const SVC_FETCH_BOUND: u32 = 65536;
 const SVC_INFO_BOUND: u32 = 1048576;
 
 @c("sqlite3 *")
+@cancel(sqlite3_interrupt)
 handle Db destroy sqlite3_close;
 
 @c("sqlite3_stmt *")
@@ -113,13 +114,13 @@ struct StmtMeta {
 
 // ---- Connections -----------------------------------------------------------------------------
 
-// The interceptor (server/sqlite3_hooks.c) applies the path policy of the hand-written server
-// (examples/sqlite/server/src/sqlsrv_policy.c and sqlsrv_pathrules.c, compiled into this server):
+// The interceptor (server/sqlite3_hooks.c) applies the server's path and open policy
+// (server/sqlsrv_policy.c and server/sqlsrv_pathrules.c):
 // filename is an alias or a path inside the allow directory, flags are exactly one of READONLY and
 // READWRITE plus optionally CREATE (no URI, no cache or mutex flags), and zvfs must be NULL. A
 // refusal is E_DENIED. Every connection that this process opens gets the connection setup of
 // sqlite3_hooks.c (limits, no extension loading, an authorizer that denies ATTACH and DETACH,
-// extended result codes) through sqlite3_auto_extension.
+// extended result codes).
 @intercept
 @error(status, ok(SQLITE_OK), detail(db_errmsg, db))
 fn sqlite3_open_v2(filename: str<=SVC_MAX_PATH, out db: Db, flags: i32, zvfs: str<=64 @nullable) -> i32;

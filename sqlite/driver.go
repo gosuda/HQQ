@@ -11,7 +11,8 @@ import (
 	"time"
 
 	"gosuda.org/hqq"
-	dsnparse "gosuda.org/hqq/sqlite/internal/dsn"
+	"gosuda.org/hqq/bindgen/rt"
+	"gosuda.org/hqq/sqlite/internal/dsn"
 	"gosuda.org/hqq/sqlite/internal/wire"
 )
 
@@ -34,36 +35,23 @@ func init() {
 // package's init function.
 type Driver struct{}
 
-// Open connects to the service named by dsn and returns one connection. The
-// connection owns the Connector it creates, so closing the connection closes
-// the link. database/sql never calls Open: it uses OpenConnector.
+// Open connects to the service named by dsn and returns one connection.
+// database/sql never calls Open: it uses OpenConnector.
 func (d *Driver) Open(dsn string) (driver.Conn, error) {
 	c, err := ConnectorFromDSN(dsn)
 	if err != nil {
 		return nil, err
 	}
-	dc, err := c.Connect(context.Background())
-	if err != nil {
-		_ = c.Close()
-		return nil, err
-	}
-	dc.(*conn).owner = c
-	return dc, nil
+	return c.Connect(context.Background())
 }
 
-// OpenConnector parses dsn and returns a Connector for it. database/sql uses
-// it for sql.Open, so all connections of the pool share one link.
+// OpenConnector parses dsn and returns a Connector for it. database/sql uses it
+// for sql.Open.
 func (d *Driver) OpenConnector(dsn string) (driver.Connector, error) {
-	c, err := ConnectorFromDSN(dsn)
-	if err != nil {
-		return nil, err
-	}
-	return c, nil
+	return ConnectorFromDSN(dsn)
 }
 
 // ConnectorFromDSN parses dsn (see ParseDSN) and returns a Connector for it.
-// Use it with sql.OpenDB to keep the Connector at hand, for example to Close
-// the shared link after the pool is closed.
 func ConnectorFromDSN(dsn string) (*Connector, error) {
 	listener, cfg, err := ParseDSN(dsn)
 	if err != nil {
@@ -92,7 +80,7 @@ const (
 	TxExclusive = wire.TxExclusive
 )
 
-// Pragma is a PRAGMA the server applies when a session opens.
+// Pragma is a PRAGMA the driver applies when a session opens.
 type Pragma struct {
 	Name  string
 	Value string
@@ -100,23 +88,25 @@ type Pragma struct {
 
 // Config configures a Connector. The zero value is valid once Database is set.
 type Config struct {
-	// Database is the database alias or path, required.
+	// Database is the database alias or path the server's open hook resolves,
+	// required.
 	Database string
 
 	// Mode is the open mode. Default: ModeReadWriteCreate.
 	Mode Mode
 
-	// Timeout bounds connecting (waiting for the listener, attaching the
-	// link, and opening the session) and the requests that run outside a
-	// caller context (Commit, Rollback, closing cursors and statements).
-	// Default: 10s.
+	// Timeout bounds connecting (the bootstrap, the handshake, and opening
+	// the database) and the requests that run outside a caller context
+	// (Commit, Rollback, closing cursors and statements, closing the
+	// session). Default: 10s.
 	Timeout time.Duration
 
-	// FetchSize is the number of rows per batch. Default: 256; the server
-	// caps it at wire.MaxFetchRows (4096).
+	// FetchSize is the number of rows requested per batch. Default: 256, at
+	// most wire.MaxFetchRows (4096). The server may return fewer rows to stay
+	// within the size bound of one batch.
 	FetchSize int
 
-	// BusyTimeout is how long the server waits for a lock held by another
+	// BusyTimeout is how long SQLite waits for a lock held by another
 	// session. Zero selects 5s; a negative value disables the wait.
 	BusyTimeout time.Duration
 
@@ -124,13 +114,16 @@ type Config struct {
 	// WithTxMode overrides it per transaction. Default: TxDeferred.
 	TxMode TxMode
 
-	// Pragmas are applied by the server when a session opens.
+	// Pragmas are applied by the driver when a session opens, in order.
 	Pragmas []Pragma
 
-	// Link configures the HQQ link. Zero fields select the driver's values
-	// (64 buffers of 4096 bytes). Features and the message size are fixed by
-	// the protocol and override any value given here; heartbeat and timeout
-	// settings are used as given.
+	// Session configures the session of the generated client. Zero fields
+	// select the driver's values. CallTimeout is not set by the driver:
+	// context deadlines are honored by interrupting and closing the session;
+	// a CallTimeout set here applies to every call in addition.
+	Session rt.Options
+
+	// Link configures the HQQ link when Session.Link is not set.
 	Link hqq.Config
 }
 
@@ -139,8 +132,6 @@ const (
 	defaultTimeout     = 10 * time.Second
 	defaultBusyTimeout = 5 * time.Second
 	defaultFetchSize   = wire.DefaultFetchRows
-	defaultBufferCount = 64
-	defaultBufferSize  = 4096
 )
 
 // normalized returns cfg with the defaults applied and its values checked.
@@ -178,28 +169,14 @@ func (cfg Config) normalized() (Config, error) {
 	return cfg, nil
 }
 
-// linkConfig returns the HQQ configuration of the connector's link.
-func (cfg Config) linkConfig() hqq.Config {
-	lc := cfg.Link
-	if lc.BufferCount == 0 {
-		lc.BufferCount = defaultBufferCount
-	}
-	if lc.BufferSize == 0 {
-		lc.BufferSize = defaultBufferSize
-	}
-	lc.Features = hqq.FeatureRequestResponse | hqq.FeatureCancel | hqq.FeatureMetadata
-	lc.Advanced.MaxMessageSize = wire.MaxMessageBytes
-	return lc
-}
-
 // ParseDSN parses a DSN of the form
 //
 //	hqq://<listener>?db=...&mode=...&timeout=...&fetch=...&busy=...&txlock=...&pragma.<name>=<value>
 //
-// and returns the listener name and the Config. Unknown options are errors, so
-// misspelled options are not ignored. Every option may appear once.
-func ParseDSN(dsn string) (string, Config, error) {
-	o, err := dsnparse.Parse(dsn)
+// and returns the listener name and the Config. Unknown options are errors.
+// Every option may appear once.
+func ParseDSN(s string) (string, Config, error) {
+	o, err := dsn.Parse(s)
 	if err != nil {
 		return "", Config{}, err
 	}
@@ -217,19 +194,15 @@ func ParseDSN(dsn string) (string, Config, error) {
 	return o.Listener, cfg, nil
 }
 
-// Connector connects to one service. All connections of a Connector are
-// streams of one shared link, which the Connector dials again when it dies.
-// Connector implements io.Closer; closing it closes the link. sql.DB calls
-// Close when the DB is closed, if the Connector implements io.Closer.
+// Connector connects to one service. Every connection is its own session of
+// the generated client, with its own shared-memory link. Connector implements
+// io.Closer; sql.DB calls Close when the DB is closed.
 type Connector struct {
 	listener string
 	cfg      Config
-	linkCfg  hqq.Config
 
-	mu      sync.Mutex
-	link    *hqq.NamedAdvancedLink
-	dialing chan struct{} // closed when the dial in progress ends
-	closed  bool
+	mu     sync.Mutex
+	closed bool
 }
 
 var errConnectorClosed = errors.New("sqlite: connector closed")
@@ -243,159 +216,25 @@ func NewConnector(listener string, cfg Config) (*Connector, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Connector{listener: listener, cfg: cfg, linkCfg: cfg.linkConfig()}, nil
+	return &Connector{listener: listener, cfg: cfg}, nil
 }
 
 // Driver returns the driver of the connector.
 func (c *Connector) Driver() driver.Driver { return &Driver{} }
 
-// Close closes the shared link. Connections already open fail with
-// driver.ErrBadConn; further Connect calls fail.
+// Close marks the connector closed: further Connect calls fail. Connections
+// already open stay usable until database/sql closes them.
 func (c *Connector) Close() error {
 	c.mu.Lock()
 	c.closed = true
-	link := c.link
-	c.link = nil
 	c.mu.Unlock()
-	if link != nil {
-		return link.Close()
-	}
 	return nil
 }
 
-// Connect opens a session: it gets the shared link (dialing it if needed),
-// opens a stream on it, and sends Open. ctx and Config.Timeout bound it.
-func (c *Connector) Connect(ctx context.Context) (driver.Conn, error) {
-	ctx, cancel := context.WithTimeout(ctx, c.cfg.Timeout)
-	defer cancel()
-	link, err := c.acquire(ctx)
-	if err != nil {
-		return nil, err
-	}
-	stream, err := link.OpenStream(ctx)
-	if err != nil {
-		return nil, c.linkError(link, err)
-	}
-	cn := &conn{c: c, link: link, st: stream, fetch: c.cfg.FetchSize}
-	if err := cn.open(ctx); err != nil {
-		cn.discard()
-		return nil, err
-	}
-	return cn, nil
-}
-
-// acquire returns the shared link, dialing it if there is none or the one
-// there is has died. Concurrent callers wait for a single dial.
-func (c *Connector) acquire(ctx context.Context) (*hqq.NamedAdvancedLink, error) {
-	for {
-		c.mu.Lock()
-		if c.closed {
-			c.mu.Unlock()
-			return nil, errConnectorClosed
-		}
-		if l := c.link; l != nil {
-			if !linkDead(l) {
-				c.mu.Unlock()
-				return l, nil
-			}
-			c.link = nil
-			_ = l.Close()
-		}
-		if c.dialing != nil {
-			wait := c.dialing
-			c.mu.Unlock()
-			select {
-			case <-wait:
-				continue
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			}
-		}
-		done := make(chan struct{})
-		c.dialing = done
-		c.mu.Unlock()
-
-		l, err := c.dial(ctx)
-
-		c.mu.Lock()
-		c.dialing = nil
-		close(done)
-		if err == nil && c.closed {
-			err = errConnectorClosed
-		}
-		if err == nil {
-			c.link = l
-		}
-		c.mu.Unlock()
-		if err != nil {
-			if l != nil {
-				_ = l.Close()
-			}
-			return nil, err
-		}
-		return l, nil
-	}
-}
-
-// dial connects the link and checks that the service negotiated the features
-// the protocol needs.
-func (c *Connector) dial(ctx context.Context) (*hqq.NamedAdvancedLink, error) {
-	l, err := hqq.Connect(ctx, c.listener, c.linkCfg)
-	if err != nil {
-		return nil, transportError(err)
-	}
-	const need = hqq.FeatureRequestResponse | hqq.FeatureCancel
-	if l.NegotiatedFeatures()&need != need {
-		_ = l.Close()
-		return nil, fmt.Errorf("sqlite: service %q does not support request/response with cancel", c.listener)
-	}
-	return l, nil
-}
-
-// linkDead reports whether the peer of l is gone or closed the link.
-func linkDead(l *hqq.NamedAdvancedLink) bool {
-	st := l.PeerState()
-	return st == hqq.PeerGone || st == hqq.PeerClosed
-}
-
-// linkError maps an error of a link operation. A lost link is dropped so the
-// next Connect dials again.
-func (c *Connector) linkError(link *hqq.NamedAdvancedLink, err error) error {
-	if errors.Is(err, hqq.ErrPeerGone) || errors.Is(err, hqq.ErrPeerClosed) {
-		c.dropLink(link)
-	}
-	return transportError(err)
-}
-
-// dropLink forgets link if it is still the shared one, and closes it.
-func (c *Connector) dropLink(link *hqq.NamedAdvancedLink) {
+func (c *Connector) isClosed() bool {
 	c.mu.Lock()
-	if c.link == link {
-		c.link = nil
-	}
-	c.mu.Unlock()
-	_ = link.Close()
-}
-
-// transportError marks a failure of the link or of the peer as
-// driver.ErrBadConn, so database/sql discards the connection and may retry on
-// a new one. It is used where no statement can have run: dialing and opening
-// a session.
-func transportError(err error) error {
-	if errors.Is(err, driver.ErrBadConn) {
-		return err
-	}
-	if isTransportError(err) {
-		return fmt.Errorf("%w: %w", driver.ErrBadConn, err)
-	}
-	return err
-}
-
-// isTransportError reports whether err is a failure of the link or the peer.
-func isTransportError(err error) bool {
-	return errors.Is(err, hqq.ErrPeerGone) || errors.Is(err, hqq.ErrPeerClosed) ||
-		errors.Is(err, hqq.ErrClosed) || errors.Is(err, hqq.ErrListenerGone) ||
-		errors.Is(err, hqq.ErrListenerClosed) || errors.Is(err, hqq.ErrShuttingDown)
+	defer c.mu.Unlock()
+	return c.closed
 }
 
 type txModeKey struct{}

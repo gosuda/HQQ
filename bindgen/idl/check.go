@@ -193,6 +193,25 @@ func (c *checker) checkFreeSym(pos Pos, s string) {
 	}
 }
 
+// checkCancelSym applies V1/V36/V37 to a @cancel symbol.
+func (c *checker) checkCancelSym(pos Pos, s string) {
+	if len(s) < 1 || len(s) > 64 {
+		c.sink.add(pos, "V36", "@cancel symbol has length %d, want 1 to 64", len(s))
+		return
+	}
+	if !isIdentStart(s[0]) {
+		c.sink.add(pos, "V36", "@cancel symbol %q must start with a letter or _", s)
+		return
+	}
+	for i := range len(s) {
+		if !isIdentPart(s[i]) {
+			c.sink.add(pos, "V36", "@cancel symbol %q must be a single identifier", s)
+			return
+		}
+	}
+	c.checkName(pos, s, "@cancel symbol")
+}
+
 // annSet is the annotations of one place by name.
 type annSet map[string]*rawAnn
 
@@ -353,12 +372,21 @@ func (c *checker) declareTypes() {
 	}
 	for i := range f.handles {
 		rh := &f.handles[i]
-		set := c.takeAnns(rh.anns, "a handle", "c")
+		set := c.takeAnns(rh.anns, "a handle", "c", "cancel")
 		h := &Handle{Name: rh.name.text, ID: i + 1, Pos: rh.name.pos}
 		if a := set["c"]; a != nil {
 			if s, ok := c.oneString(a); ok {
 				c.checkCType(a.args[0].pos, s)
 				h.CType = s
+			}
+		}
+		if a := set["cancel"]; a != nil {
+			if len(a.args) == 1 && !a.args[0].hasParens && (a.args[0].kind == aIdent || a.args[0].kind == aStr) {
+				s := a.args[0].text
+				c.checkCancelSym(a.args[0].pos, s)
+				h.Cancel = s
+			} else {
+				c.sink.add(a.pos, RuleSyntax, "annotation @cancel takes one function name argument")
 			}
 		}
 		c.spec.Handles = append(c.spec.Handles, h)

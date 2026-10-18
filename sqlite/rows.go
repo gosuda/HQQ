@@ -8,161 +8,177 @@ import (
 	"io"
 	"reflect"
 
-	"gosuda.org/hqq"
+	"gosuda.org/hqq/bindgen/examples/sqlite3"
 	"gosuda.org/hqq/sqlite/internal/convert"
-	"gosuda.org/hqq/sqlite/internal/wire"
 )
 
-// rows streams the batches of one cursor. While the caller reads a batch, the
-// next one is fetched in the background (fetch-ahead), so at most two batches
-// are held at a time, whatever the size of the result.
+// rows streams the batches of one statement. After it has decoded a batch, it
+// requests the next one (fetch-ahead), so the server steps while the caller reads,
+// and at most two batches are held at a time, whatever the size of the result.
+//
+// The prefetch is submitted only after the previous batch is fully decoded,
+// including the cells that did not fit it: fetch_rows steps first, so a request
+// that went out earlier would step over a row whose big cells are still to be
+// read (sqlite3.idl, Value).
 type rows struct {
-	cn      *conn
-	ctx     context.Context // context of the query: it ends the fetch-ahead too
-	cursor  uint32
-	cols    []wire.Column
-	types   []convert.Column
-	open    bool         // the server still holds the cursor
-	cur     *hqq.Message // batch being read
-	dec     *wire.Decoder
-	left    uint32       // rows left in cur
-	pending chan batch   // fetch-ahead in flight, or nil
-	vals    []wire.Value // scratch row
-	valid   bool         // vals holds the row the last successful Next returned
-	err     error        // sticky: io.EOF, or the error that ended the rows
-	closed  bool
+	cn   *conn
+	ctx  context.Context // context of the query: it bounds the waits of the rows
+	st   *stmt
+	ncol int
+
+	cells []sqlite3.Value // current batch, row-major
+	pos   int             // index in cells of the next row
+	// bigs holds the value of each BigText and BigBlob cell of the last row of the
+	// batch, by index in cells.
+	bigs map[int]driver.Value
+
+	pending  func() (sqlite3.Rows, error) // fetch-ahead in flight, or nil
+	final    bool                         // the batch in cells is the last: the statement ended
+	endErr   error                        // io.EOF, or the failure of the step that ended the statement
+	cur      []sqlite3.Value              // the row the last successful Next returned
+	valid    bool                         // cur is set
+	err      error                        // sticky: the error Next returns
+	closed   bool
+	released bool // release ran
 }
 
-// batch is the result of one Fetch, or of the first batch of a Query.
-type batch struct {
-	msg   *hqq.Message
-	dec   *wire.Decoder // positioned at the first row
-	nrows uint32
-	more  bool
-	err   error
+func newRows(cn *conn, ctx context.Context, st *stmt) *rows {
+	return &rows{cn: cn, ctx: ctx, st: st, endErr: io.EOF}
 }
 
-// newRows wraps the first batch of a Query. d is positioned at its rows.
-func newRows(ctx context.Context, cn *conn, msg *hqq.Message, d *wire.Decoder, h wire.ResultHeader, nrows uint32) *rows {
-	r := &rows{
-		cn:     cn,
-		ctx:    ctx,
-		cursor: h.Cursor,
-		cols:   h.Columns,
-		types:  make([]convert.Column, len(h.Columns)),
-		open:   h.More,
-		cur:    msg,
-		dec:    d,
-		left:   nrows,
-		vals:   make([]wire.Value, len(h.Columns)),
-	}
-	for i, c := range h.Columns {
-		r.types[i] = convert.NewColumn(c.Decltype)
-	}
-	if r.open {
-		r.startPrefetch()
-	}
-	return r
-}
-
-// fetchBatch sends Fetch for n rows of the cursor and parses the reply.
-func (cn *conn) fetchBatch(ctx context.Context, cursor uint32, n int) batch {
-	e := wire.NewEncoder(8)
-	wire.AppendFetchRequest(e, wire.FetchRequest{Cursor: cursor, NRows: uint32(n)})
-	msg, err := cn.call(ctx, wire.MethodFetch, e.Bytes())
-	if err != nil {
-		return batch{err: err}
-	}
-	d := wire.NewDecoder(msg.Bytes())
-	more := wire.ParseFetchResponseHeader(d)
-	nrows := d.U32()
-	if err := d.Err(); err != nil {
-		msg.Release()
-		cn.markBad()
-		return batch{err: fmt.Errorf("sqlite: malformed Fetch response: %w", err)}
-	}
-	if more && nrows == 0 {
-		msg.Release()
-		cn.markBad()
-		return batch{err: errors.New("sqlite: malformed Fetch response: open cursor with an empty batch")}
-	}
-	return batch{msg: msg, dec: d, nrows: nrows, more: more}
-}
-
-// startPrefetch fetches the next batch in the background.
-func (r *rows) startPrefetch() {
-	ch := make(chan batch, 1)
-	r.pending = ch
-	cursor, n := r.cursor, r.cn.fetch
-	go func() { ch <- r.cn.fetchBatch(r.ctx, cursor, n) }()
-}
-
-// advance makes the next batch current: the prefetched one, or a fetch now.
-func (r *rows) advance() error {
-	var b batch
-	if r.pending != nil {
-		b = <-r.pending
-		r.pending = nil
-	} else {
-		b = r.cn.fetchBatch(r.ctx, r.cursor, r.cn.fetch)
-	}
-	if b.err != nil {
-		// Only a server error response releases the cursor. Otherwise it is
-		// still open (a call that failed before it was sent, or a dead conn).
-		if isServerError(b.err) {
-			r.open = false
+// ingest makes b the current batch. It reads the big cells of its last row, and
+// requests the next batch unless the statement ended.
+func (r *rows) ingest(b sqlite3.Rows) error {
+	cn := r.cn
+	if int(b.Ncols) != len(r.st.cols) {
+		// The schema changed since the statement was prepared: SQLite recompiled it.
+		if err := r.st.loadInfo(); err != nil {
+			return err
 		}
-		return b.err
 	}
-	r.open = b.more
-	if r.cur != nil {
-		r.cur.Release()
+	r.ncol = int(b.Ncols)
+	switch {
+	case r.ncol != len(r.st.cols),
+		r.ncol == 0 && len(b.Cells) > 0,
+		r.ncol > 0 && len(b.Cells)%r.ncol != 0:
+		cn.markBad()
+		return fmt.Errorf("sqlite: malformed fetch_rows answer: %d columns, %d cells, statement has %d columns",
+			b.Ncols, len(b.Cells), len(r.st.cols))
 	}
-	r.cur, r.dec, r.left = b.msg, b.dec, b.nrows
-	if b.more {
-		r.startPrefetch()
+	r.cells, r.pos, r.bigs = b.Cells, 0, nil
+	switch b.Rc {
+	case sqlite3.SQLITE_ROW:
+		if len(b.Cells) == 0 {
+			cn.markBad()
+			return errors.New("sqlite: malformed fetch_rows answer: open batch without rows")
+		}
+	case sqlite3.SQLITE_DONE:
+		r.final = true
+	default:
+		// The step failed. The rows read before it are in the batch, and the
+		// caller sees them before the error.
+		r.final = true
+		r.endErr = libError(int64(b.Rc), b.Errmsg)
+	}
+	if err := r.readBig(); err != nil {
+		return err
+	}
+	if r.final {
+		r.release()
+		return nil
+	}
+	w, err := cn.api.FetchRowsAsync(r.st.id, int32(cn.fetch))
+	if err != nil {
+		return err
+	}
+	r.pending = w
+	return nil
+}
+
+// readBig reads the cells of the last row of the batch that did not fit it. The
+// statement is positioned on that row until the next fetch.
+func (r *rows) readBig() error {
+	if r.ncol == 0 || len(r.cells) == 0 {
+		return nil
+	}
+	last := len(r.cells) - r.ncol
+	for i, c := range r.cells {
+		if c.Tag != sqlite3.ValueBigText && c.Tag != sqlite3.ValueBigBlob {
+			continue
+		}
+		if i < last {
+			r.cn.markBad()
+			return errors.New("sqlite: malformed fetch_rows answer: a big cell before the last row")
+		}
+		var n uint64
+		text := c.Tag == sqlite3.ValueBigText
+		if text {
+			n = c.BigText
+		} else {
+			n = c.BigBlob
+		}
+		v, err := r.readCell(i-last, n, text)
+		if err != nil {
+			return err
+		}
+		if r.bigs == nil {
+			r.bigs = make(map[int]driver.Value)
+		}
+		r.bigs[i] = v
 	}
 	return nil
 }
 
-// isServerError reports whether err is an error response of the server.
-func isServerError(err error) bool {
-	var se *Error
-	var pe *ProtocolError
-	return errors.As(err, &se) || errors.As(err, &pe)
+// readCell reads the n bytes of column col of the current row with column_chunk.
+func (r *rows) readCell(col int, n uint64, text bool) (driver.Value, error) {
+	if n > maxCell {
+		r.cn.markBad()
+		return nil, fmt.Errorf("sqlite: a cell of %d bytes is larger than the driver reads", n)
+	}
+	buf := make([]byte, n)
+	for off := uint64(0); off < n; {
+		end := min(off+uint64(sqlite3.SVC_MAX_CHUNK), n)
+		got, err := r.cn.api.ColumnChunk(r.st.id, int32(col), off, buf[off:end])
+		if err != nil {
+			return nil, err
+		}
+		if len(got) == 0 {
+			r.cn.markBad()
+			return nil, fmt.Errorf("sqlite: column_chunk returned no bytes at offset %d of %d", off, n)
+		}
+		off += uint64(len(got))
+	}
+	if text {
+		return r.st.cols[col].TextValue(buf), nil
+	}
+	return buf, nil
 }
 
 // Columns implements driver.Rows.
-func (r *rows) Columns() []string {
-	names := make([]string, len(r.cols))
-	for i, c := range r.cols {
-		names[i] = c.Name
-	}
-	return names
-}
+func (r *rows) Columns() []string { return r.st.colNames }
 
 // ColumnTypeDatabaseTypeName implements driver.RowsColumnTypeDatabaseTypeName.
 // It is the uppercased declared type of the column. A column with no declared
 // type (an expression, for example) reports the storage class of its value in
-// the current row: INTEGER, REAL, TEXT, BLOB, or NULL. Before the first row
-// and after the end, it is "".
+// the current row: INTEGER, REAL, TEXT, BLOB, or NULL. Before the first row and
+// after the end, it is "".
 func (r *rows) ColumnTypeDatabaseTypeName(i int) string {
-	if d := r.types[i].Decl; d != "" {
+	if d := r.st.cols[i].Decl; d != "" {
 		return d
 	}
 	if !r.valid {
 		return ""
 	}
-	switch r.vals[i].Type {
-	case wire.TypeInteger:
+	switch r.cur[i].Tag {
+	case sqlite3.ValueInt:
 		return convert.ClassInteger
-	case wire.TypeFloat:
+	case sqlite3.ValueFloat:
 		return convert.ClassReal
-	case wire.TypeText:
+	case sqlite3.ValueText, sqlite3.ValueTextRaw, sqlite3.ValueBigText:
 		return convert.ClassText
-	case wire.TypeBlob:
+	case sqlite3.ValueBlob, sqlite3.ValueBigBlob:
 		return convert.ClassBlob
-	case wire.TypeNull:
+	case sqlite3.ValueNull:
 		return convert.ClassNull
 	}
 	return ""
@@ -171,9 +187,7 @@ func (r *rows) ColumnTypeDatabaseTypeName(i int) string {
 // ColumnTypeScanType implements driver.RowsColumnTypeScanType. See
 // convert.NewColumn. SQLite is dynamically typed, so a value may not match the
 // affinity type: scan into an interface, a string, or a []byte in that case.
-func (r *rows) ColumnTypeScanType(i int) reflect.Type {
-	return r.types[i].Scan
-}
+func (r *rows) ColumnTypeScanType(i int) reflect.Type { return r.st.cols[i].Scan }
 
 // Next implements driver.Rows. It returns io.EOF after the last row, and the
 // same error on every later call once the rows have failed.
@@ -182,52 +196,86 @@ func (r *rows) Next(dest []driver.Value) error {
 		return r.err
 	}
 	r.valid = false
-	for r.left == 0 {
-		if !r.open {
-			r.err = io.EOF
-			return io.EOF
+	for r.pos >= len(r.cells) {
+		if r.final {
+			r.err = r.endErr
+			return r.err
 		}
 		if err := r.advance(); err != nil {
 			r.err = err
 			return err
 		}
 	}
-	r.dec.Row(r.vals)
-	if err := r.dec.Err(); err != nil {
-		r.cn.markBad()
-		r.err = fmt.Errorf("sqlite: malformed row: %w", err)
-		return r.err
+	row := r.cells[r.pos : r.pos+r.ncol]
+	for i := range row {
+		v, err := r.value(r.pos+i, i, row[i])
+		if err != nil {
+			r.cn.markBad()
+			r.err = err
+			return err
+		}
+		dest[i] = v
 	}
-	for i := range r.vals {
-		dest[i] = r.driverValue(i, r.vals[i])
-	}
+	r.cur = row
+	r.pos += r.ncol
 	r.valid = true
-	r.left--
 	return nil
 }
 
-// driverValue converts a protocol value of column i to a driver.Value. Text
-// and blobs are copied, because the message buffer is released with the batch.
-// A TEXT value of a DATE, DATETIME, or TIMESTAMP column becomes a time.Time when
-// it parses (see convert.ParseTime); otherwise it stays a string.
-func (r *rows) driverValue(i int, v wire.Value) driver.Value {
-	switch v.Type {
-	case wire.TypeInteger:
-		return v.Int
-	case wire.TypeFloat:
-		return v.Float
-	case wire.TypeText:
-		return r.types[i].TextValue(v.Bytes)
-	case wire.TypeBlob:
-		b := make([]byte, len(v.Bytes))
-		copy(b, v.Bytes)
-		return b
+// advance makes the next batch current: the prefetched one, or a fetch now.
+func (r *rows) advance() error {
+	return r.cn.run(r.ctx, "Fetch", func() error {
+		w := r.pending
+		r.pending = nil
+		if w == nil {
+			var err error
+			if w, err = r.cn.api.FetchRowsAsync(r.st.id, int32(r.cn.fetch)); err != nil {
+				return err
+			}
+		}
+		b, err := w()
+		if err != nil {
+			// The statement is left where it was. A server error response ends
+			// the rows: nothing more can be fetched from them.
+			r.final = true
+			return err
+		}
+		return r.ingest(b)
+	})
+}
+
+// value converts cell c of column col, at index idx in the batch, to a driver.Value.
+// Text and blobs of the batch are owned by the rows: the generated client copied
+// them out of the message.
+func (r *rows) value(idx, col int, c sqlite3.Value) (driver.Value, error) {
+	switch c.Tag {
+	case sqlite3.ValueInt:
+		return c.Int, nil
+	case sqlite3.ValueFloat:
+		return c.Float, nil
+	case sqlite3.ValueText:
+		return r.st.cols[col].StringValue(c.Text), nil
+	case sqlite3.ValueBlob:
+		if c.Blob == nil {
+			return []byte{}, nil
+		}
+		return c.Blob, nil
+	case sqlite3.ValueNull:
+		return nil, nil
+	case sqlite3.ValueTextRaw:
+		return r.st.cols[col].TextValue(c.TextRaw), nil
+	case sqlite3.ValueBigText, sqlite3.ValueBigBlob:
+		if v, ok := r.bigs[idx]; ok {
+			return v, nil
+		}
 	}
-	return nil
+	return nil, fmt.Errorf("sqlite: malformed fetch_rows answer: cell tag %d", c.Tag)
 }
 
-// Close implements driver.Rows. A cursor that still has rows is closed on the
-// server. An open fetch-ahead is waited for first, so requests never overlap.
+// Close implements driver.Rows. The statement is released: an ad-hoc statement is
+// finalized, and a prepared one that was not read to its end is reset, so it
+// does not hold its read lock. A fetch-ahead in flight is waited for first, so
+// requests never overlap.
 func (r *rows) Close() error {
 	if r.closed {
 		return nil
@@ -236,42 +284,62 @@ func (r *rows) Close() error {
 	if r.err == nil {
 		r.err = io.EOF
 	}
+	cn := r.cn
+	if cn.closed.Load() || cn.bad.Load() {
+		return nil // the session is gone, and the server released the statement
+	}
 	if r.pending != nil {
-		b := <-r.pending
+		w := r.pending
 		r.pending = nil
-		if b.msg != nil {
-			b.msg.Release()
+		// The wait is bounded by the connector's timeout and by the query's
+		// context: database/sql closes rows when their context ends.
+		stop := cn.guard(r.ctx, cn.timeout)
+		_, err := w()
+		if stop() || (err != nil && !isServerError(err)) {
+			cn.markBad()
+			return nil
 		}
-		if b.err == nil {
-			r.open = b.more
-		} else {
-			r.open = false
-		}
 	}
-	if r.cur != nil {
-		r.cur.Release()
-		r.cur, r.dec = nil, nil
-	}
-	if !r.open {
-		return nil
-	}
-	r.open = false
-	if r.cn.bad.Load() || r.cn.closed.Load() {
-		return nil // the session is gone: the server released the cursor
-	}
-	return r.cn.closeCursor(r.cursor)
-}
-
-// closeCursor sends CloseCursor, with the configured timeout.
-func (cn *conn) closeCursor(cursor uint32) error {
-	ctx, cancel := context.WithTimeout(context.Background(), cn.c.cfg.Timeout)
-	defer cancel()
-	e := wire.NewEncoder(4)
-	wire.AppendIDRequest(e, wire.IDRequest{ID: cursor})
-	msg, err := cn.call(ctx, wire.MethodCloseCursor, e.Bytes())
-	if err != nil {
-		return err
-	}
-	msg.Release()
+	r.release()
 	return nil
 }
+
+// abandon drops the rows because another execution of the statement starts.
+// The caller is inside a call of the conn.
+func (r *rows) abandon() {
+	if r.closed {
+		return
+	}
+	r.closed = true
+	r.err = errSuperseded
+	if r.pending != nil {
+		w := r.pending
+		r.pending = nil
+		if _, err := w(); err != nil && !isServerError(err) {
+			r.cn.markBad()
+		}
+	}
+	r.st.active = nil
+}
+
+// release lets go of the statement of the rows once: it is finalized if it is
+// ad-hoc, and reset if it is prepared and the rows did not read it to its end.
+func (r *rows) release() {
+	if r.st.active == r {
+		r.st.active = nil
+	}
+	if r.released {
+		return
+	}
+	r.released = true
+	switch {
+	case r.st.adhoc:
+		r.cn.deferFinalize(r.st.id)
+	case !r.final:
+		r.cn.deferReset(r.st.id)
+	}
+}
+
+// maxCell is the largest text or blob the driver reads, SQLite's own limit
+// (SQLITE_MAX_LENGTH, 1e9 bytes, rounded up to a power of two).
+const maxCell = 1 << 30

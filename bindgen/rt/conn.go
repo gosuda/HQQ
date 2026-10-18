@@ -1,6 +1,7 @@
 package rt
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"sync"
@@ -46,12 +47,16 @@ type rfEntry struct {
 
 // Conn is one session. It is NOT safe for concurrent use (8.2).
 type Conn struct {
-	link    *hqq.StandardLink
-	closeFn func() error
-	iface   *Iface
-	sess    uint64
-	lim     Limits
-	chunk   int
+	link      *hqq.StandardLink
+	closeFn   func() error
+	iface     *Iface
+	sess      uint64
+	lim       Limits
+	chunk     int
+	listener  string
+	sessName  string
+	linkOpts  hqq.LinkOptions
+	lastSubID atomic.Uint32
 
 	callTimeout  time.Duration
 	closeTimeout time.Duration
@@ -346,6 +351,7 @@ func (c *Conn) Submit(e *Enc) (*Call, error) {
 		return nil, ErrInvalidArg
 	}
 	id := nextID(c.nextID)
+	c.lastSubID.Store(id)
 	h := header{kind: kindRequest, op: e.op, id: id, total: uint32(e.bodyLen)}
 	var (
 		err       error
@@ -1105,4 +1111,40 @@ func (c *Conn) Kill() {
 	now := time.Now()
 	_ = c.link.SetReadDeadline(now)
 	_ = c.link.SetWriteDeadline(now)
+}
+
+// Cancel sends a best-effort BG_CANCEL request on a fresh control link to
+// interrupt the in-flight request of this session on the server (invoking any
+// @cancel handle hooks). Safe to call from any goroutine.
+func (c *Conn) Cancel() error {
+	if c.listener == "" || c.sessName == "" {
+		return nil
+	}
+	reqID := c.lastSubID.Load()
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	ctl, err := hqq.Connect(ctx, c.listener, hqq.Config{
+		BufferCount: 4,
+		BufferSize:  4096,
+		Features:    hqq.FeatureRequestResponse,
+		Advanced:    hqq.AdvancedOptions{Link: c.linkOpts},
+	})
+	if err != nil {
+		return err
+	}
+	defer func() { _ = ctl.Close() }()
+	req := make([]byte, 16+len(c.sessName))
+	copy(req[0:4], cancelMagic[:])
+	le.PutUint16(req[4:6], protoMajor)
+	le.PutUint16(req[6:8], protoMinor)
+	le.PutUint32(req[8:12], reqID)
+	le.PutUint16(req[12:14], uint16(len(c.sessName)))
+	le.PutUint16(req[14:16], 0)
+	copy(req[16:], c.sessName)
+	msg, err := ctl.Call(ctx, cancelMeth, req)
+	if err != nil {
+		return err
+	}
+	msg.Release()
+	return nil
 }

@@ -1,18 +1,18 @@
 # `sqlite`: Pure-Go `database/sql` Driver Over HQQ Shared Memory
 
-`gosuda.org/hqq/sqlite` is a pure-Go `database/sql` driver, registered as `"hqq-sqlite"`, that connects to a SQLite database hosted by a separate server process over an HQQ shared-memory listener. Your Go binary requires zero `cgo`. Every `database/sql` connection maps to one logical HQQ stream over a shared `AdvancedLink`, and the server isolates each stream as an independent session with its own `sqlite3` connection handle, transaction state, and prepared statements.
+`gosuda.org/hqq/sqlite` is a pure-Go `database/sql` driver, registered as `"hqq-sqlite"`, built on the `hqq-bindgen`-generated SQLite client ([`bindgen/examples/sqlite3`](../bindgen/examples/sqlite3/README.md)). It connects to a SQLite database hosted by a separate server process over an HQQ shared-memory listener with zero `cgo` in the Go binary. Every `database/sql` connection opens an isolated `StandardLink` session with its own `sqlite3` connection handle, transaction state, and prepared statements.
 
 | Path | Role |
 | :--- | :--- |
 | [`doc.go`](doc.go) | Package GoDoc reference (`go doc gosuda.org/hqq/sqlite`). |
-| [`PROTOCOL.md`](PROTOCOL.md) | Normative SQLite service wire protocol 1.0: frame layouts, opcodes, status codes, session state machine, cancellation, and resource limits. |
-| `internal/wire/` | Binary wire encoders and decoders shared by the driver and fake server. |
-| `internal/fakeserver/` | In-memory Go stand-in server implementing the wire protocol for unit testing without the C binary. |
+| [`PROTOCOL.md`](PROTOCOL.md) | SQLite service protocol reference: status codes, single-statement rules, cancellation, and resource limits. |
+| `internal/wire/` | Protocol status constants (`ProtoError`, `ProtoLimit`, `ProtoForbidden`) and binary wire codecs. |
+| `internal/convert/` | Parameter conversion (`CheckNamedValue`) and timestamp parsing. |
+| `internal/dsn/` | DSN parser (`hqq://<listener>?...`) and configuration validation. |
 | `internal/contract/` | Reusable 107-case `database/sql` behavioral contract suite (`contract.RunContract`). |
 | `e2e/` | End-to-end test suite running the contract and crash-recovery tests against the compiled C server (`HQQ_SQLITE_SERVER`). |
 | [`launcher/`](launcher/README.md) | Verified child-process starter that hashes `hqq-sqlite-server` with `secureexec`, attaches a parent lifeline, and returns a ready `*sql.DB`. |
-| [`gendriver/`](gendriver) | Second `database/sql` driver (`"hqq-sqlite-gen"`) layered on the `hqq-bindgen`-generated SQLite client ([`bindgen/examples/sqlite3`](../bindgen/examples/sqlite3/README.md)). |
-| [`../examples/sqlite/server/`](../examples/sqlite/server/README.md) | Production C11 SQLite server (`libhqq` + SQLite; Linux, macOS, and Windows). |
+| [`../bindgen/examples/sqlite3/`](../bindgen/examples/sqlite3/README.md) | Generated Go client (`sqlite3_client.go`), IDL (`sqlite3.idl`), and production C11 SQLite server (`server/`, Linux, macOS, and Windows). |
 
 ## Using the driver
 
@@ -44,10 +44,10 @@ c, err := sqlite.NewConnector("sqlite-svc", sqlite.Config{
 if err != nil {
 	return err
 }
-db := sql.OpenDB(c) // all connections of db multiplex over one shared HQQ link
+db := sql.OpenDB(c)
 ```
 
-`ConnectorFromDSN(dsn)` builds a `*Connector` from a DSN string, and `ParseDSN(dsn)` parses the listener name and `Config` without opening a link. Closing `*sql.DB` automatically closes the underlying `*Connector` (which implements `io.Closer`) and tears down the shared HQQ link.
+`ConnectorFromDSN(dsn)` builds a `*Connector` from a DSN string, and `ParseDSN(dsn)` parses the listener name and `Config` without opening a link. `*Connector` implements `io.Closer` as a no-op because each `database/sql` connection owns its own session link.
 
 ## DSN format and configuration
 
@@ -87,9 +87,9 @@ The driver distinguishes SQLite engine errors, wire-protocol errors, retryable l
   ```
 
 - **Service protocol errors (`*sqlite.ProtocolError`)**: returned when a request violates the service contract in [`PROTOCOL.md`](PROTOCOL.md) §7, such as `1` (`BAD_REQUEST`, including multi-statement SQL strings), `7` (`LIMIT`), or `9` (`FORBIDDEN`, when the server's path/alias policy rejects the database name).
-- **Lost connections on reads and setup (`driver.ErrBadConn`)**: if the shared-memory link dies during `Connect`, `Query`, `Prepare`, `Begin`, `Ping`, `Commit`, or `Rollback`, the returned error wraps `driver.ErrBadConn`. `database/sql` discards the broken stream and automatically retries `Connect`, `Query`, `Prepare`, `Begin`, or `Ping` on a fresh connection. Because `Query` is treated as retryable by `database/sql`, never send mutating statements (such as `INSERT ... RETURNING`) through `Query` outside a transaction; use `Exec` or an explicit transaction instead.
+- **Lost connections on reads and setup (`driver.ErrBadConn`)**: if the shared-memory link dies during `Connect`, `Query`, `Prepare`, `Begin`, `Ping`, `Commit`, or `Rollback`, the returned error wraps `driver.ErrBadConn`. `database/sql` discards the broken session and automatically retries `Connect`, `Query`, `Prepare`, `Begin`, or `Ping` on a fresh connection. Because `Query` is treated as retryable by `database/sql`, never send mutating statements (such as `INSERT ... RETURNING`) through `Query` outside a transaction; use `Exec` or an explicit transaction instead.
 - **Lost connections during `Exec` (`sqlite.ErrOutcomeUnknown`)**: if the link dies while an `Exec` or `ExecStmt` call is in flight, the server may have already committed the write before crashing. The driver therefore returns an error wrapping `sqlite.ErrOutcomeUnknown` and deliberately **does not** wrap `driver.ErrBadConn`, preventing `database/sql` from silently re-executing a non-idempotent write.
-- **Context cancellation (`context.Canceled` / `context.DeadlineExceeded`)**: if `ctx` is already expired before a call starts, the driver returns `ctx.Err()` immediately and keeps the connection healthy. If `ctx` expires while a request is in flight on the server, the driver sends a Protocol 1.1 `OpCancel` frame (`sqlite3_interrupt` on the server), discards the connection stream, and lets the server roll back any open transaction on that session.
+- **Context cancellation (`context.Canceled` / `context.DeadlineExceeded`)**: if `ctx` is already expired before a call starts, the driver returns `ctx.Err()` immediately and keeps the connection healthy. If `ctx` expires while a request is in flight on the server, the driver kills the local session wait and sends a `BG_CANCEL` request (`@cancel(sqlite3_interrupt)` on the server), discards the connection session, and lets the server roll back any open transaction on that session.
 
 ## Parameter and result type mappings
 
@@ -123,15 +123,15 @@ Result values returned from `Rows`:
 ## Column metadata, batches, and transactions
 
 - **`Rows.ColumnTypes()`**: `DatabaseTypeName()` returns the uppercased declared column type (or the current row's storage class `INTEGER`, `REAL`, `TEXT`, `BLOB`, or `NULL` for untyped expressions). `ScanType()` maps declared affinities to `int64`, `string`, `float64`, `[]byte`, `time.Time` (for `DATE`/`DATETIME`/`TIMESTAMP`), or `any`.
-- **Prefetched row batches**: query results stream in batches of `fetch` rows (default `256`). While the caller iterates over the current batch, the driver prefetches the next batch in the background so at most two batches reside in memory at once. Closing `Rows` early closes the server-side cursor immediately. Any single row must fit within the 16 MiB message limit (`CodeTooBig` / `SQLITE_TOOBIG` otherwise).
+- **Prefetched row batches and chunked large cells**: query results stream in batches of up to `fetch` rows (default `256`, within a 64 KiB batch buffer). While the caller iterates over a normal batch, the driver prefetches the next batch in the background so at most two batches reside in memory at once. Cells larger than the remaining batch buffer are returned as `BigText` or `BigBlob` markers and streamed in 1 MiB chunks via `column_chunk` up to 1 GiB.
 - **Single-statement rule**: each `Exec`, `Query`, or `Prepare` accepts exactly one SQL statement (trailing whitespace, comments, and a single `;` are permitted; multiple statements return `BAD_REQUEST`).
 - **Transactions**: `BeginTx` supports `sql.LevelDefault` and `sql.LevelSerializable`. Setting `ReadOnly: true` starts a `BEGIN DEFERRED` transaction with `PRAGMA query_only = 1`. For read-write transactions, the lock mode defaults to `Config.TxMode` (`deferred`, `immediate`, or `exclusive`) and can be overridden per transaction via `sqlite.WithTxMode(ctx, sqlite.TxImmediate)`. If `Commit` fails (for example with `SQLITE_BUSY`), the driver automatically issues a `Rollback` so the session never remains stuck inside an open transaction.
 
-## Connection multiplexing and server security
+## Session isolation and server security
 
-All `*sql.Conn` handles opened from the same `*Connector` or `*sql.DB` share a single underlying HQQ `AdvancedLink` and multiplex as independent streams. If the link dies (`ErrPeerGone` or `ErrPeerClosed`), the connector drops the dead link and dials a fresh one on the next connection request.
+Each `*sql.Conn` opened from a `*Connector` or `*sql.DB` dials a dedicated `StandardLink` session served by its own thread in the C server. If a session link dies (`ErrPeerGone` or `ErrPeerClosed`), `database/sql` discards the broken connection and dials a fresh session on the next request.
 
-The C server (`examples/sqlite/server`) enforces database path sandboxing (`--alias` and `--allow-dir`), disables `ATTACH`, `DETACH`, and `sqlite3_load_extension`, and supports `--parent-stdin` so it rolls back open transactions and exits cleanly if its parent process dies (including via `SIGKILL`). See [`PROTOCOL.md`](PROTOCOL.md) §12 and [`../examples/sqlite/server/README.md`](../examples/sqlite/server/README.md).
+The C server (`bindgen/examples/sqlite3/server`) enforces database path sandboxing (`--alias` and `--allow-dir`), disables `ATTACH`, `DETACH`, and `sqlite3_load_extension`, and supports `--parent-stdin` so it rolls back open transactions and exits cleanly if its parent process dies (including via `SIGKILL`). See [`PROTOCOL.md`](PROTOCOL.md) §12 and [`../bindgen/examples/sqlite3/README.md`](../bindgen/examples/sqlite3/README.md).
 
 ## Running the tests
 
@@ -139,11 +139,10 @@ Execute the unit, contract, and end-to-end test suites from the repository root:
 
 ```sh
 go vet ./sqlite/...
-go test -race -count=1 ./sqlite/...      # runs against the Go fake server; e2e tests skip without HQQ_SQLITE_SERVER
-HQQ_SQLITE_SERVER=/path/to/hqq-sqlite-server go test -count=1 ./sqlite/e2e/...
+go test -race -count=1 ./sqlite/...      # runs against the in-memory fake and (when built) C server
+HQQ_SQLITE_SERVER=/path/to/hqq-sqlite-server go test -count=1 ./sqlite/...
 ```
 
-- `internal/wire`: verifies frame round trips, strict-prefix truncation rejection, status encodings, and golden byte vectors from [`PROTOCOL.md`](PROTOCOL.md) §16.
-- `internal/fakeserver`: unit tests for the in-memory SQL engine and session state machine.
-- `internal/contract`: 107-case `database/sql` behavioral contract run against both the Go fake server (`sqlite/contract_test.go`), the C server (`sqlite/e2e/contract_test.go`), and the `hqq-bindgen` driver (`sqlite/gendriver`).
-- `driver_test.go`, `crash_test.go`: tests DSN parsing, mid-flight cancellation, early `Rows.Close`, bounded memory on large scans, `ErrOutcomeUnknown` vs `driver.ErrBadConn` retry rules, and automatic reconnection after `SIGKILL` of the server process.
+- `internal/wire`, `internal/convert`, `internal/dsn`: verify status encodings, parameter conversions, timestamp layouts, and DSN parsing.
+- `internal/contract`: 107-case `database/sql` behavioral contract run against both the in-memory Go fake and the C server (`sqlite/contract_test.go`, `sqlite/e2e/contract_test.go`).
+- `driver_test.go`, `cancel_race_test.go`, `e2e/e2e_test.go`: test DSN parsing, mid-flight cancellation, early `Rows.Close`, bounded memory on large scans, `ErrOutcomeUnknown` vs `driver.ErrBadConn` retry rules, and automatic reconnection after `SIGKILL` of the server process.

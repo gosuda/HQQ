@@ -1,6 +1,6 @@
 //go:build unix
 
-package gendriver_test
+package sqlite_test
 
 import (
 	"bytes"
@@ -10,36 +10,26 @@ import (
 	"sync"
 	"testing"
 
-	_ "gosuda.org/hqq/sqlite"           // registers hqq-sqlite
-	_ "gosuda.org/hqq/sqlite/gendriver" // registers hqq-sqlite-gen
+	_ "gosuda.org/hqq/sqlite" // registers hqq-sqlite
 )
 
-// Benchmarks of the hand-written driver (hqq-sqlite) and the generated one
-// (hqq-sqlite-gen) on identical workloads, through database/sql only. Every
-// benchmark runs once per engine and verifies what it reads. An engine whose
-// server binary is not set (HQQ_SQLITE_SERVER, HQQ_SQLITE3GEN_SERVER) skips.
+// Benchmarks of the driver (hqq-sqlite) through database/sql.
 //
-//	go test -run '^$' -bench . -benchtime 2s -count 5 ./sqlite/gendriver
+//	go test -run '^$' -bench . -benchtime 2s -count 5 ./sqlite
 //
-// Both engines run with journal_mode=WAL and synchronous=OFF, so that the
+// Benchmarks run with journal_mode=WAL and synchronous=OFF, so that the
 // benchmarks measure the request path and not the fsync of the file system.
-// Autocommit writes are therefore not durable; durability is not what is
-// compared.
 
 // benchPragmas is the pragma part of every benchmark DSN.
 const benchPragmas = "&pragma.journal_mode=WAL&pragma.synchronous=OFF"
 
-// engineBench runs fn once per engine, on a fresh server and database. opts is
-// appended to the DSN, after the pragmas.
+// engineBench runs fn on a fresh server and database. opts is appended to the
+// DSN, after the pragmas.
 func engineBench(b *testing.B, opts string, fn func(b *testing.B, db *sql.DB)) {
 	b.Helper()
-	for _, tg := range []target{oldTarget, genTarget} {
-		b.Run(tg.name, func(b *testing.B) {
-			s := tg.start(b)
-			db := tg.open(b, s, "bench.db", benchPragmas+opts)
-			fn(b, db)
-		})
-	}
+	s := startGenServer(b)
+	db := openBenchDB(b, s, "bench.db", benchPragmas+opts)
+	fn(b, db)
 }
 
 // mustB fails the benchmark when err is not nil.
@@ -178,9 +168,7 @@ const scanRows = 100000
 const scanSum = int64(scanRows) * (scanRows + 1) / 2
 
 // BenchmarkScan reads 100000 rows of (id, text) per iteration with the default
-// fetch size and with a large one. The server may cap a batch below the
-// requested size (the hand-written server at 4096 rows, the generated one at
-// the byte bound of its fetch_rows shim); the DSN option is the request.
+// fetch size and with a large one.
 func BenchmarkScan(b *testing.B) {
 	for _, fetch := range []int{256, 4096} {
 		b.Run(fmt.Sprintf("fetch=%d", fetch), func(b *testing.B) {

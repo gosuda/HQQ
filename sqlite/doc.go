@@ -1,8 +1,9 @@
-// Package sqlite is a database/sql driver for SQLite served over HQQ. The
-// SQLite engine runs in its own process (the C server in examples/sqlite/server,
-// or the Go fake server in sqlite/internal/fakeserver for tests). Clients need
-// no cgo: every database/sql connection is one HQQ stream of a shared link, and
-// the server runs each stream as one session with its own SQLite connection.
+// Package sqlite is a database/sql driver for SQLite served over HQQ, built on
+// the Go client that hqq-bindgen generates from
+// bindgen/examples/sqlite3/sqlite3.idl. The SQLite engine runs in its own
+// process (the C server in bindgen/examples/sqlite3/server). Clients need no
+// cgo: every database/sql connection is one generated-client session with its
+// own shared-memory link, server thread, and SQLite connection.
 //
 // The driver registers itself as "hqq-sqlite" when the package is imported:
 //
@@ -21,7 +22,8 @@
 // (applied when a session opens). Unknown or repeated options are errors. ParseDSN
 // returns the parsed form.
 //
-// To keep the connector, for example to tune the link, build it yourself:
+// To keep the connector, for example to tune the session or link options, build
+// it yourself:
 //
 //	c, err := sqlite.NewConnector("sqlite-svc", sqlite.Config{
 //		Database:    "main",
@@ -29,7 +31,7 @@
 //		FetchSize:   256,
 //		BusyTimeout: 5 * time.Second,
 //	})
-//	db := sql.OpenDB(c) // all connections of db share one link
+//	db := sql.OpenDB(c)
 //
 // Errors. A SQLite error from the server is a *Error with Code (the primary
 // result code, such as CodeConstraint or CodeBusy) and ExtendedCode (such as
@@ -44,6 +46,12 @@
 // statement may have run, so the error wraps ErrOutcomeUnknown and database/sql
 // does not retry it.
 //
+// Cancellation. When the context of a call ends while the server runs it, the
+// driver sends an out-of-band cancellation over the control link (which invokes
+// the @cancel(sqlite3_interrupt) hook on the session's Db handle) and closes
+// the session link, returning the context's error at once and discarding the
+// connection.
+//
 // Values. Arguments: nil is NULL; all integers are INTEGER (uint64 values above
 // math.MaxInt64 are an error); float32 and float64 are REAL (NaN is an error,
 // ±Inf is stored); bool is 0 or 1; string is TEXT; []byte and json.RawMessage are
@@ -54,7 +62,8 @@
 // float64, TEXT is string, BLOB is []byte, and NULL is nil. A TEXT value of a
 // column declared DATE, DATETIME, or TIMESTAMP is a time.Time when it parses
 // (a date, or a time with or without a zone, UTC when none is given), and a
-// string otherwise.
+// string otherwise. Large text and blob cells that do not fit a batch are
+// streamed in chunks via column_chunk up to SQLite's 1 GiB limit.
 //
 // Transactions. BeginTx accepts the default and serializable isolation levels,
 // since SQLite is always serializable, and refuses others with an error.
@@ -65,6 +74,5 @@
 // Each Exec or Query takes one statement. Trailing text after a second statement
 // is a BAD_REQUEST error ("multiple statements").
 //
-// The wire protocol is documented in sqlite/PROTOCOL.md. Operational notes are
-// in sqlite/README.md.
+// Operational notes are in sqlite/README.md.
 package sqlite

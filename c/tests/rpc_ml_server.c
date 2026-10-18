@@ -401,8 +401,8 @@ static hqqrpc_status microlib_dispatch(hqqrpc_call *c) {
 }
 
 static const hqqrpc_handle_type microlib_handle_types[] = {
-    { "Counter", 0, destroy_Counter },                  /* MICROLIB_H_COUNTER */
-    { "Cursor", MICROLIB_H_COUNTER, destroy_Cursor },   /* MICROLIB_H_CURSOR, owned_by Counter */
+    { "Counter", 0, destroy_Counter, NULL },                  /* MICROLIB_H_COUNTER */
+    { "Cursor", MICROLIB_H_COUNTER, destroy_Cursor, NULL },   /* MICROLIB_H_CURSOR, owned_by Counter */
 };
 
 static const char *const microlib_op_names[] = {

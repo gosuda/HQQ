@@ -1,6 +1,6 @@
 # `hqq-sqlite` Wire Protocol, Version 1.0
 
-This specification defines the binary wire contract between the Go `database/sql` client (`gosuda.org/hqq/sqlite`, driver name `"hqq-sqlite"`), the in-memory Go fake server (`sqlite/internal/fakeserver`), and the C11 production server (`examples/sqlite/server`, built on `libhqq` and SQLite). The Go codecs in `sqlite/internal/wire` implement the exact byte layouts specified below.
+This specification documents the SQLite service error codes (`sqlite/internal/wire`), open-policy rules, single-statement rules, and resource limits enforced by the `gosuda.org/hqq/sqlite` driver (`"hqq-sqlite"`) and the C11 SQLite server (`bindgen/examples/sqlite3/server`, built on `libhqq` and `hqq-bindgen`).
 
 The key words `MUST`, `MUST NOT`, `SHOULD`, and `MAY` in this document are to be interpreted as described in RFC 2119.
 

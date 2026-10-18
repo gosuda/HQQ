@@ -1,21 +1,22 @@
 # `bindgen/examples/sqlite3`: SQLite Service Built with `hqq-bindgen`
 
-This directory implements an out-of-process SQLite service using `hqq-bindgen`: a pure-Go client and a C server generated from [`sqlite3.idl`](sqlite3.idl), paired with a concise C hook file (`server/sqlite3_hooks.c`) that provides open-policy interception and batching shims. Go applications invoke SQLite over HQQ shared memory without linking cgo, and a crash inside SQLite terminates only the worker process.
+This directory implements the out-of-process SQLite service using `hqq-bindgen`: a pure-Go client and the C server (`hqq-sqlite-server` / `sqlite3_server`) generated from [`sqlite3.idl`](sqlite3.idl), paired with a concise C hook file (`server/sqlite3_hooks.c`) and path-policy modules (`server/sqlsrv_policy.c`, `server/sqlsrv_pathrules.c`). Go applications invoke SQLite over HQQ shared memory without linking cgo, and a crash inside SQLite terminates only the worker process.
 
-This package serves as a **second, generated implementation alongside the hand-written SQLite service** (`sqlite/`, [`sqlite/PROTOCOL.md`](../../../sqlite/PROTOCOL.md), `examples/sqlite/server/`). Both implementations coexist and deliberately share the exact same database path and open-policy C modules (`sqlsrv_pathrules.c` and `sqlsrv_policy.c`). The `database/sql` driver layered on top of this generated client lives in [`sqlite/gendriver`](../../../sqlite/gendriver).
+The `database/sql` driver (`gosuda.org/hqq/sqlite`, driver name `"hqq-sqlite"`) is layered directly on top of this generated client; see [`sqlite/README.md`](../../../sqlite/README.md).
 
 | Path | Role |
 | :--- | :--- |
-| `sqlite3.idl` | Declarative interface: `Db` and `Stmt` handles, the `Value` tagged union, core SQLite functions, and batching shims. |
+| `sqlite3.idl` | Declarative interface: `Db` (`@cancel(sqlite3_interrupt)`) and `Stmt` handles, the `Value` tagged union, core SQLite functions, and batching shims. |
 | `sqlite3_client.go` | Generated pure-Go client (`package sqlite3`). |
 | `server/sqlite3_server.{h,c}` | Generated C server dispatch and wire codecs. |
 | `server/sqlite3_hooks.c` | Hand-written `sqlite3_open_v2` interceptor, `prepare_one` / `bind_values` / `exec_stmt` / `fetch_rows` / `column_chunk` shims, and per-connection hardening setup. |
+| `server/sqlsrv_policy.{h,c}`, `server/sqlsrv_pathrules.{h,c}`, `server/sqlsrv_port*.{h,c}` | Database alias and `--allow-dir` path sandboxing (Linux, macOS, and Windows) with unit tests in `server/tests/test_units.c`. |
 | `server/main.c`, `server/sqlite3srv.h` | Process entry point layered on `hqqrpc_main`. |
-| `server/CMakeLists.txt` | CMake build linking the pinned SQLite amalgamation and shared policy sources. |
+| `server/CMakeLists.txt` | CMake build producing `hqq-sqlite-server`, `sqlite3_server`, and `hqqsqlite_server_unit_tests`. |
 | `build.sh` | Fetches the pinned SQLite amalgamation, builds `sqlite3_server`, and prints `export HQQ_SQLITE3GEN_SERVER=...`. |
 | `sqlite3srv/` | Reusable Go test helper that locates or builds `sqlite3_server`, starts it via `launch.Start`, and connects. |
 | `generate.go` | `go:generate` directive for `hqq-bindgen`. |
-| `*_test.go` | End-to-end integration tests and benchmarks (POSIX). |
+| `*_test.go` | End-to-end integration tests and benchmarks. |
 
 ## Build and run
 
@@ -26,7 +27,15 @@ eval "$(bindgen/examples/sqlite3/build.sh)"     # fetches pinned SQLite (cached 
 go test -race -count=1 ./bindgen/examples/sqlite3/...
 ```
 
-Passing `-s address+undefined` to `build.sh` compiles the server with AddressSanitizer and UndefinedBehaviorSanitizer; passing `-T` enables a test-only statement-leak hook used by `TestCloseRetainOnFail`. When `HQQ_SQLITE3GEN_SERVER` is unset, `go test` compiles the server automatically (with `-T`) on first run and skips cleanly if `cmake`, `ninja`, `unzip`, or network access is unavailable. Set `HQQ_SQLITE3GEN_SANITIZE=address+undefined` to run the auto-built server under sanitizers, or `HQQ_SQLITE_AMALGAMATION_DIR` to point at an already unpacked SQLite amalgamation.
+Or build `hqq-sqlite-server` and its C unit tests from the top-level `c/` CMake project (using system SQLite or `-DHQQ_SQLITE_AMALGAMATION_DIR=...`):
+
+```sh
+cmake -S c -B build -DHQQ_BUILD_SQLITE_SERVER=ON -DHQQ_WERROR=ON
+cmake --build build --target hqq-sqlite-server hqqsqlite_server_unit_tests
+ctest --test-dir build -R hqqsqlite_server --output-on-failure
+```
+
+Passing `-s address+undefined` to `build.sh` compiles the server with AddressSanitizer and UndefinedBehaviorSanitizer; passing `-T` enables a test-only statement-leak hook used by `TestCloseRetainOnFail`. When `HQQ_SQLITE3GEN_SERVER` (or `HQQ_SQLITE_SERVER`) is unset, `go test` compiles the server automatically (with `-T`) on first run and skips cleanly if `cmake`, `ninja`, `unzip`, or network access is unavailable. Set `HQQ_SQLITE3GEN_SANITIZE=address+undefined` to run the auto-built server under sanitizers, or `HQQ_SQLITE_AMALGAMATION_DIR` to point at an already unpacked SQLite amalgamation.
 
 Regenerate bindings after editing `sqlite3.idl`:
 
@@ -39,25 +48,12 @@ go generate ./bindgen/examples/sqlite3/...
 Server CLI synopsis:
 
 ```text
-sqlite3_server <listener> [--allow-dir DIR] [--alias NAME=PATH]... [--max-sessions N]
-               [hqqrpc_main flags: --perm --max-handles --max-message --buffer-size --buffer-count
-                --heartbeat-ms --peer-timeout-ms --shutdown-timeout-ms --parent-stdin[=force] ...]
+hqq-sqlite-server <listener> [--allow-dir DIR] [--alias NAME=PATH]... [--max-sessions N]
+                  [hqqrpc_main flags: --perm --max-handles --max-message --buffer-size --buffer-count
+                   --heartbeat-ms --peer-timeout-ms --shutdown-timeout-ms --parent-stdin[=force] ...]
 ```
 
 On startup the server prints `ready <listener>` on standard output, and logs `sqlite3_server: session started` and `session ended` on standard error as sessions open and finish rolling back or closing their connections.
-
-### Comparison with the hand-written `hqq-sqlite-server`
-
-| Aspect | `hqq-sqlite-server` (Hand-Written) | `sqlite3_server` (`hqq-bindgen`) |
-| :--- | :--- | :--- |
-| `--alias`, `--allow-dir` | Enforced via `sqlsrv_policy.c` | Compiles and runs the exact same `sqlsrv_policy.c` functions |
-| `--max-sessions` | Default `256`; excess refused at `Open` with `LIMIT` | Default `256`; excess refused at **`Dial`** with `*rt.OpenError` code `3` (`rt.ErrLimit`) |
-| Statement / cursor limits | `256` statements and `64` cursors per session | Unified per-session handle table (`--max-handles`, default `4096`) |
-| Listener architecture | Single `AdvancedLink` acceptor multiplexing streams | Bootstrap control links handing off dedicated per-session `StandardLink` rings (`--max-control-links` defaults to `256`) |
-| `hqqrpc_main` tuning flags | Standard server flags only | Adds `--max-handles`, `--max-message`, `--buffer-size`, `--buffer-count`, `--max-in-flight`, `--max-control-links`, `--max-segment-bytes`, `--open-timeout-ms`, `--write-stall-ms`, `--idle-timeout-ms`, `--copy-request`, `--spin` |
-| Connection `PRAGMA`s | Validated list in `Open` request | Executed as regular SQL statements by the client |
-| SQLite library source | System SQLite or pinned amalgamation | Pinned amalgamation compiled with `SQLITE_THREADSAFE=1`, `SQLITE_OMIT_LOAD_EXTENSION`, `SQLITE_DEFAULT_MEMSTATUS=0` (uses `sqlite3_auto_extension`) |
-| Oversize SQL (`> 1 MiB`) or name (`> 4096 B`) | Server returns `LIMIT` | Rejected client-side by generated wire bounds check (`rt.ErrInvalidArg`) before transmission |
 
 ## Exposed IDL surface
 
@@ -65,7 +61,7 @@ On startup the server prints `ready <listener>` on standard output, and logs `sq
 
 | Category | Exposed Functions and Shims |
 | :--- | :--- |
-| **Connection** | `sqlite3_open_v2` (`@intercept`), `sqlite3_close` (`Db` destructor with `@retain_on_fail`), `sqlite3_busy_timeout`, `sqlite3_changes64`, `sqlite3_last_insert_rowid`, `sqlite3_get_autocommit`, `sqlite3_errcode`, `sqlite3_extended_errcode`, `sqlite3_errmsg`, `sqlite3_libversion`, `sqlite3_libversion_number` |
+| **Connection** | `sqlite3_open_v2` (`@intercept`), `sqlite3_close` (`Db` destructor with `@retain_on_fail` and `@cancel(sqlite3_interrupt)`), `sqlite3_busy_timeout`, `sqlite3_changes64`, `sqlite3_last_insert_rowid`, `sqlite3_get_autocommit`, `sqlite3_errcode`, `sqlite3_extended_errcode`, `sqlite3_errmsg`, `sqlite3_libversion`, `sqlite3_libversion_number` |
 | **Statements** | `sqlite3_prepare_v2` (raw multi-statement tail support), `prepare_one` (shim enforcing the single-statement rule), `sqlite3_step`, `sqlite3_reset`, `sqlite3_finalize` (`Stmt` destructor), `sqlite3_clear_bindings`, `sqlite3_stmt_readonly` |
 | **Parameter binding** | `sqlite3_bind_parameter_count`, `sqlite3_bind_parameter_index`, `sqlite3_bind_parameter_name`, `sqlite3_bind_int64`, `sqlite3_bind_double`, `sqlite3_bind_null`, `sqlite3_bind_zeroblob64`, `bind_text`, `bind_blob`, `bind_values` (bulk array shim) |
 | **Composite operations** | `exec_stmt` (atomic reset + bind + step-to-done + changes + last_insert_rowid), `stmt_info` (parameter names, column names/decltypes, readonly flag), `fetch_rows` (batched row fetch), `column_chunk` (chunked large-cell reader) |
@@ -76,11 +72,11 @@ Because SQLite `TEXT` values can contain embedded NUL bytes that IDL `str` param
 
 ### Error mapping
 
-Functions annotated with `@error(status, ...)` return `*rt.LibError` on failure, where `Code` carries the **extended** SQLite result code (enabled on every connection at open time) and `Detail` carries `sqlite3_errmsg(db)`. Service-specific validation failures use negative synthetic constants declared in the IDL (`SVC_SQL_EMPTY`, `SVC_SQL_MULTIPLE`, `SVC_BAD_ARGS`). Pre-call interceptor refusals return `*rt.StatusError` (`rt.ErrDenied` for path-policy violations, `0x0100 + SQLITE_CANTOPEN` when the parent directory does not exist, `SVC_STATUS_NAME_TOO_LONG`, and `SVC_STATUS_META_TOO_LARGE`).
+Functions annotated with `@error(status, ...)` return `*rt.LibError` on failure, where `Code` carries the **extended** SQLite result code (enabled on every connection at open time) and `Detail` carries `sqlite3_errmsg(db)`. Service-specific validation failures use synthetic constants declared in the IDL (`SVC_SQL_EMPTY`, `SVC_SQL_MULTIPLE`, `SVC_BAD_ARGS`). Pre-call interceptor refusals return `*rt.StatusError` (`rt.ErrDenied` for path-policy violations, `0x0100 + SQLITE_CANTOPEN` when the parent directory does not exist, `SVC_STATUS_NAME_TOO_LONG`, and `SVC_STATUS_META_TOO_LARGE`).
 
 ## Key design decisions
 
-Four architectural choices shape how `sqlite3.idl` and `sqlite3_shim.c` map SQLite's C API onto HQQ sessions:
+Five architectural choices shape how `sqlite3.idl` and `sqlite3_hooks.c` map SQLite's C API onto HQQ sessions:
 
 ### 1. `@serialize(none)` for concurrent multi-session execution
 
@@ -108,26 +104,26 @@ Because validation rule V38 forbids arrays of unions (`Value[]`) as input parame
 
 ### 4. Single-statement enforcement (`prepare_one`)
 
-`prepare_one` wraps `sqlite3_prepare_v2` and enforces the single-statement rule from [`sqlite/PROTOCOL.md`](../../../sqlite/PROTOCOL.md) §6.2 using the same scanner as `sqlsrv_session.c`: trailing whitespace, SQL comments, and a single semicolon are permitted, while a second SQL statement fails with `SVC_SQL_MULTIPLE` ( finalizing the prepared handle immediately so no statement leaks) and an empty string fails with `SVC_SQL_EMPTY`. Raw `sqlite3_prepare_v2` is also exposed for callers that intentionally step through multi-statement scripts via the returned `tail` offset.
+`prepare_one` wraps `sqlite3_prepare_v2` and enforces the single-statement rule from [`sqlite/PROTOCOL.md`](../../../sqlite/PROTOCOL.md) §6.2: trailing whitespace, SQL comments, and a single semicolon are permitted, while a second SQL statement fails with `SVC_SQL_MULTIPLE` (finalizing the prepared handle immediately so no statement leaks) and an empty string fails with `SVC_SQL_EMPTY`. Raw `sqlite3_prepare_v2` is also exposed for callers that intentionally step through multi-statement scripts via the returned `tail` offset.
 
-### 5. Connection open policy and `sqlite3_auto_extension` hardening
+### 5. Connection open policy and hardening (`sqlite3srv_open_v2`)
 
 `sqlite3_intercept_sqlite3_open_v2` runs on private copies of the request arguments before calling SQLite (`spec/toolchain/BINDGEN.md` §7.2–§7.3). It validates open flags via `sqlsrv_valid_open_flags`, resolves database aliases or `--allow-dir` relative paths via `sqlsrv_policy_resolve` (rejecting `..` traversal, out-of-tree paths, and symlinks), requires `zvfs == NULL`, and rewrites `filename` to the canonical resolved path.
 
-Post-open connection hardening (enabling extended result codes, setting `sqlite3_limit` bounds on SQL length, bind variables, columns, and attached databases, disabling `sqlite3_enable_load_extension`, and registering the authorizer that denies `ATTACH` and `DETACH`) is installed via `sqlite3_auto_extension(conn_setup)` at server startup, guaranteeing that SQLite applies these restrictions inside `sqlite3_open_v2` before any connection handle is returned.
+Post-open connection hardening (enabling extended result codes, setting `sqlite3_limit` bounds on SQL length, bind variables, columns, and attached databases, disabling `SQLITE_DBCONFIG_ENABLE_LOAD_EXTENSION`, and registering the authorizer that denies `ATTACH` and `DETACH`) runs inside `sqlite3srv_open_v2` before any connection handle is returned to the session table.
 
-## Shared policy verification
+## Policy verification
 
-`server/CMakeLists.txt` compiles `sqlsrv_pathrules.c`, `sqlsrv_policy.c`, `sqlsrv_proto.c`, and `sqlsrv_port_posix.c` directly from `examples/sqlite/server/src` (`TestPolicyIsNotForked`). Every security refusal tested on the hand-written server is tested identically here:
+`server/CMakeLists.txt` compiles `sqlsrv_pathrules.c`, `sqlsrv_policy.c`, `sqlsrv_proto.c`, and `sqlsrv_port_{posix,win}.c` into `sqlite3gen_policy` and runs the C unit tests in `server/tests/test_units.c` (`hqqsqlite_server_unit_tests`). Every security refusal is tested both in C and end-to-end from Go:
 
-| Policy Rule | Hand-Written Server Test | Generated Server Test |
+| Policy Rule | C & Driver Suite (`sqlite/e2e`) | Low-Level Client Suite (`bindgen/examples/sqlite3`) |
 | :--- | :--- | :--- |
-| Reject `../x`, `a/../../x`, `..`, and paths outside `--allow-dir` | `TestPathPolicy` (`sqlite/e2e`); `test_policy`, `test_path_rules` | `TestPathPolicy` (`rt.ErrDenied`) |
+| Reject `../x`, `a/../../x`, `..`, and paths outside `--allow-dir` | `TestPathPolicy`; `test_policy`, `test_path_rules` | `TestPathPolicy` (`rt.ErrDenied`) |
 | Missing parent directory returns `CANTOPEN` (`0x010E`), not `DENIED` | `test_policy` | `TestPathPolicy` (status `0x010E`) |
 | Reject symlinks and dangling links escaping `--allow-dir` | `TestPathPolicySymlinks`; `test_policy` | `TestPathPolicySymlinks` |
 | Without `--allow-dir`, allow only registered `--alias` names | `TestAliasOnlyPolicy` | `TestAliasOnlyPolicy`, `TestAliasAndAllowDir` |
 | Open flags restricted to `READONLY`, `READWRITE`, and optional `CREATE` | `test_validation` | `TestOpenFlags` |
-| Reject URI filenames and `:memory:` databases | `do_open` policy | `TestNoURIAndNoMemory` |
+| Reject URI filenames and `:memory:` databases | `test_validation` | `TestNoURIAndNoMemory` |
 | Missing file without `CREATE` returns `CANTOPEN` | `PROTOCOL.md` §6.1 | `TestOpenMissingFile` |
 | Block `ATTACH`, `DETACH`, and `load_extension()` | `PROTOCOL.md` §12 | `TestAttachAndExtensions` |
 | Enforce 2,000 columns, 32,766 parameters, and 1 MiB SQL length | `PROTOCOL.md` §11 | `TestSqlAndColumnLimits` |
@@ -152,7 +148,7 @@ Every test launches an isolated `sqlite3_server` instance verified via `launch.S
 | `TestServerKilled`, `TestGracefulShutdown` | Client error reporting on server `SIGKILL`, subsequent server recovery, and clean `SIGTERM` shutdown. |
 | `TestSessionLimit`, `TestParallelSessions`, `TestDialBurstBeyondControlLinks` | `--max-sessions` enforcement, 16 concurrent writers + 4 readers under WAL, and `--max-control-links` burst handling. |
 | `TestPipelinedBindsAndStep`, `TestPipelinedBindFailureDoesNotAbortStep`, `TestPipelinedChunkReads`, `TestSmallGeometry` | Credit flow control across 25 pipelined calls per row, pipelined `column_chunk` reads, and small ring geometries (`B=2, S=256`). |
-| `TestAttachAndExtensions`, `TestDefaultDeny`, `TestPolicyIsNotForked`, `TestGeneratedFilesAreFresh` | Authorizer enforcement, opcode allowlist, shared C policy files, and up-to-date generated code. |
+| `TestAttachAndExtensions`, `TestDefaultDeny`, `TestGeneratedFilesAreFresh` | Authorizer enforcement, opcode allowlist, and up-to-date generated code. |
 
 ## License
 

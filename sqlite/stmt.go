@@ -3,51 +3,85 @@ package sqlite
 import (
 	"context"
 	"database/sql/driver"
-	"sync/atomic"
+	"errors"
 
-	"gosuda.org/hqq/sqlite/internal/wire"
+	"gosuda.org/hqq/bindgen/examples/sqlite3"
+	"gosuda.org/hqq/sqlite/internal/convert"
 )
 
-// stmt is a prepared statement: a statement id of the session. It is valid as
-// long as its connection is. Executing it again resets it on the server.
+// stmt is a statement of the session: a statement handle of the server, with the
+// parameters and columns it reported. It is valid as long as its connection is.
+// An ad-hoc statement (the one a Query or Exec on the connection makes) is
+// finalized when its rows end.
 type stmt struct {
-	cn      *conn
-	id      uint32
-	nparams int
-	cols    []wire.Column
-	closed  atomic.Bool
+	cn *conn
+	id stmtID
+
+	haveInfo bool     // the fields below are set
+	nparams  int      // sqlite3_bind_parameter_count
+	names    []string // the name of each parameter as SQLite spells it, or ""
+	readonly bool     // sqlite3_stmt_readonly
+	colNames []string
+	cols     []convert.Column
+
+	fresh  bool // never executed: it has no earlier step to reset and no bindings to clear
+	adhoc  bool // finalized when its rows end
+	closed bool
+	active *rows // the rows that read the statement now
 }
 
-// Close implements driver.Stmt. The server finalizes the statement. Close is
-// idempotent. On a conn that is already gone it does nothing and reports
-// driver.ErrBadConn.
-func (s *stmt) Close() error {
-	if s.closed.Swap(true) {
-		return nil
-	}
-	if s.cn.closed.Load() || s.cn.bad.Load() {
-		return nil // the session, and with it the statement, is gone
-	}
-	return s.cn.closeStmt(s.id)
-}
+var errStmtClosed = errors.New("sqlite: statement is closed")
 
-// closeStmt sends CloseStmt for a statement of the session.
-func (cn *conn) closeStmt(id uint32) error {
-	ctx, cancel := context.WithTimeout(context.Background(), cn.c.cfg.Timeout)
-	defer cancel()
-	e := wire.NewEncoder(4)
-	wire.AppendIDRequest(e, wire.IDRequest{ID: id})
-	msg, err := cn.call(ctx, wire.MethodCloseStmt, e.Bytes())
+// loadInfo reads the parameters and columns of the statement.
+func (s *stmt) loadInfo() error {
+	meta, err := s.cn.api.StmtInfo(s.id)
 	if err != nil {
 		return err
 	}
-	msg.Release()
+	s.setInfo(meta)
 	return nil
 }
 
-// NumInput implements driver.Stmt. It is the parameter count the server
-// reports (sqlite3_bind_parameter_count) and never -1: the count is always
-// known for a prepared statement.
+// setInfo stores the answer of stmt_info.
+func (s *stmt) setInfo(meta sqlite3.StmtMeta) {
+	s.haveInfo = true
+	s.nparams = int(meta.Nparams)
+	s.names = meta.Param_names
+	s.readonly = meta.Readonly
+	s.colNames = make([]string, len(meta.Columns))
+	s.cols = make([]convert.Column, len(meta.Columns))
+	for i, c := range meta.Columns {
+		s.colNames[i] = c.Name
+		s.cols[i] = convert.NewColumn(c.Decltype)
+	}
+}
+
+// Close implements driver.Stmt. The server finalizes the statement. Close is
+// idempotent. On a conn that is already gone it does nothing.
+func (s *stmt) Close() error {
+	if s.closed {
+		return nil
+	}
+	s.closed = true
+	cn := s.cn
+	if cn.closed.Load() || cn.bad.Load() {
+		return nil // the session, and with it the statement, is gone
+	}
+	err := cn.runTimed("CloseStmt", func() error {
+		if s.active != nil {
+			s.active.abandon()
+		}
+		return cn.api.Finalize(s.id)
+	})
+	if err != nil && isServerError(err) {
+		return nil // finalize repeats the error of the last step
+	}
+	return err
+}
+
+// NumInput implements driver.Stmt. It is the parameter count the server reports
+// (sqlite3_bind_parameter_count) and never -1: the count is always known for a
+// prepared statement.
 func (s *stmt) NumInput() int { return s.nparams }
 
 // Exec implements driver.Stmt.
@@ -62,24 +96,177 @@ func (s *stmt) Query(args []driver.Value) (driver.Rows, error) {
 
 // ExecContext implements driver.StmtExecContext.
 func (s *stmt) ExecContext(ctx context.Context, args []driver.NamedValue) (driver.Result, error) {
-	params, err := wireParams(args)
+	if s.closed {
+		return nil, errStmtClosed
+	}
+	var res result
+	err := s.cn.run(ctx, "ExecStmt", func() error {
+		var err error
+		res, err = s.exec(args)
+		return err
+	})
 	if err != nil {
 		return nil, err
 	}
-	e := wire.NewEncoder(64)
-	wire.AppendStmtExecRequest(e, wire.StmtExecRequest{Stmt: s.id, Params: params})
-	return s.cn.execResult(ctx, wire.MethodExecStmt, e.Bytes())
+	return res, nil
+}
+
+// exec runs the statement to completion in one atomic call: reset, bind, step to
+// the end, and the two counters.
+func (s *stmt) exec(args []driver.NamedValue) (result, error) {
+	cn := s.cn
+	if s.active != nil {
+		s.active.abandon()
+	}
+	b, err := cn.encode(args, s.names)
+	if err != nil {
+		return result{}, err
+	}
+	changes, rowid, err := cn.api.ExecStmt(s.id, b.kinds, b.words, b.data)
+	if err != nil {
+		return result{}, mutatingError{err}
+	}
+	s.fresh = false
+	return result{rowsAffected: changes, lastInsertID: rowid}, nil
 }
 
 // QueryContext implements driver.StmtQueryContext.
 func (s *stmt) QueryContext(ctx context.Context, args []driver.NamedValue) (driver.Rows, error) {
-	params, err := wireParams(args)
+	if s.closed {
+		return nil, errStmtClosed
+	}
+	var r *rows
+	err := s.cn.run(ctx, "QueryStmt", func() error {
+		var err error
+		r, err = s.query(ctx, args)
+		return err
+	})
 	if err != nil {
 		return nil, err
 	}
-	e := wire.NewEncoder(64)
-	wire.AppendStmtQueryRequest(e, wire.StmtQueryRequest{Stmt: s.id, Params: params, Fetch: uint32(s.cn.fetch)})
-	return s.cn.queryRows(ctx, wire.MethodQueryStmt, e.Bytes())
+	return r, nil
+}
+
+// query starts the statement and returns its rows, with the first batch read.
+//
+// The calls are pipelined: reset, bind_values and fetch_rows go out together and
+// are answered in one round trip. The fetch is committed before the bind is
+// known to have succeeded, and the server runs every committed request, so the
+// pipeline is only used when a failed bind cannot do harm: the statement is
+// read-only, or it has nothing to bind. Otherwise the bind is waited for first.
+// On an ad-hoc statement without arguments the statement info is requested in
+// the same flight.
+func (s *stmt) query(ctx context.Context, args []driver.NamedValue) (*rows, error) {
+	cn := s.cn
+	if s.active != nil {
+		s.active.abandon()
+	}
+	if !s.haveInfo && len(args) > 0 {
+		if err := s.loadInfo(); err != nil {
+			return nil, err
+		}
+	}
+	b, err := cn.encode(args, s.names)
+	if err != nil {
+		return nil, err
+	}
+	needReset := !s.fresh
+	needBind := !b.empty() || (s.haveInfo && s.nparams > 0 && !s.fresh)
+	pipelineFetch := !needBind || s.readonly || !s.haveInfo
+
+	var resetW, bindW func() error
+	var infoW func() (sqlite3.StmtMeta, error)
+	var fetchW func() (sqlite3.Rows, error)
+	var firstErr error
+	// waits are consumed whatever happens, so that no future is left behind.
+	note := func(err error) {
+		if firstErr == nil {
+			firstErr = err
+		}
+	}
+	finish := func() {
+		if resetW != nil {
+			if err := resetW(); err != nil && !isServerError(err) {
+				note(err) // a server error repeats the last step's: not ours
+			}
+			resetW = nil
+		}
+		if bindW != nil {
+			note(bindW())
+			bindW = nil
+		}
+		if infoW != nil {
+			meta, err := infoW()
+			if err != nil {
+				note(err)
+			} else {
+				s.setInfo(meta)
+			}
+			infoW = nil
+		}
+	}
+
+	if needReset {
+		if resetW, err = cn.api.ResetAsync(s.id); err != nil {
+			return nil, err
+		}
+	}
+	if needBind {
+		if bindW, err = cn.api.BindValuesAsync(s.id, b.kinds, b.words, b.data); err != nil {
+			finish()
+			return nil, firstOr(firstErr, err)
+		}
+	}
+	if !s.haveInfo {
+		if infoW, err = cn.api.StmtInfoAsync(s.id); err != nil {
+			finish()
+			return nil, firstOr(firstErr, err)
+		}
+	}
+	if pipelineFetch {
+		if fetchW, err = cn.api.FetchRowsAsync(s.id, int32(cn.fetch)); err != nil {
+			finish()
+			return nil, firstOr(firstErr, err)
+		}
+	}
+	s.fresh = false
+	finish()
+	var batch sqlite3.Rows
+	if fetchW != nil {
+		var ferr error
+		batch, ferr = fetchW()
+		if firstErr == nil {
+			firstErr = ferr
+		}
+	} else if firstErr == nil {
+		// The bind is known to have worked: fetch now.
+		w, err := cn.api.FetchRowsAsync(s.id, int32(cn.fetch))
+		if err != nil {
+			return nil, err
+		}
+		if batch, err = w(); err != nil {
+			return nil, err
+		}
+	}
+	if firstErr != nil {
+		return nil, firstErr
+	}
+	r := newRows(cn, ctx, s)
+	if err := r.ingest(batch); err != nil {
+		return nil, err // nothing was released: the caller finalizes an ad-hoc statement
+	}
+	if !s.adhoc && !r.final {
+		s.active = r
+	}
+	return r, nil
+}
+
+// firstOr returns first when it is set, else err.
+func firstOr(first, err error) error {
+	if first != nil {
+		return first
+	}
+	return err
 }
 
 // valuesToNamed converts positional legacy arguments to named ones.

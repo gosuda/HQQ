@@ -1,7 +1,7 @@
 package launcher_test
 
 // End-to-end tests against the real C server. HQQ_SQLITE_SERVER names the
-// binary (see examples/sqlite/server/README.md); without it every test skips.
+// binary (see bindgen/examples/sqlite3/README.md); without it every test skips.
 // The server is started through the launcher, so the binary is hash-verified.
 
 import (

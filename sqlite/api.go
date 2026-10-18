@@ -1,4 +1,4 @@
-package gendriver
+package sqlite
 
 import (
 	"gosuda.org/hqq/bindgen/examples/sqlite3"
@@ -16,13 +16,16 @@ type (
 // else: every method is one function of bindgen/examples/sqlite3 (see
 // sqlite3.idl for its contract). The *Async methods submit a request and return
 // the function that waits for its response; the driver pipelines with them. The
-// session is not safe for concurrent use, except Kill.
+// session is not safe for concurrent use, except Kill and Cancel.
 type api interface {
 	Close() error
-	// Kill closes the link without the CLOSE exchange. It is the one method that
-	// is safe from any goroutine, and how the driver stops waiting for a call
-	// that cannot be canceled. The calls in flight have an unknown outcome.
+	// Kill closes the link without the CLOSE exchange. It is safe from any
+	// goroutine, and how the driver stops waiting for a call when its context
+	// ends. The calls in flight have an unknown outcome.
 	Kill()
+	// Cancel asks the server over a control link to interrupt any call in
+	// flight on the session (sqlite3_interrupt). It is safe from any goroutine.
+	Cancel() error
 	// Err is the sticky failure of a broken session, or nil.
 	Err() error
 	OpenV2(filename string, flags int32) (dbID, error)
@@ -59,9 +62,10 @@ func (g genAPI) stmt(id stmtID) sqlite3.Stmt {
 	return sqlite3.Stmt{Handle: g.cl.Conn().NewHandle(uint32(id))}
 }
 
-func (g genAPI) Close() error { return g.cl.Close() }
-func (g genAPI) Kill()        { g.cl.Kill() }
-func (g genAPI) Err() error   { return g.cl.Conn().Err() }
+func (g genAPI) Close() error  { return g.cl.Close() }
+func (g genAPI) Kill()         { g.cl.Kill() }
+func (g genAPI) Cancel() error { return g.cl.Conn().Cancel() }
+func (g genAPI) Err() error    { return g.cl.Conn().Err() }
 
 func (g genAPI) OpenV2(filename string, flags int32) (dbID, error) {
 	db, err := g.cl.Sqlite3OpenV2(filename, flags, nil)

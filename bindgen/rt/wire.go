@@ -28,11 +28,12 @@ const (
 	minMaxMessage  = 4096
 	maxHandleCount = 65535
 
-	helloBody = 64
-	openReq   = 16
-	openResp  = 12
-	openName  = 64
-	openMeth  = 1 // control-link method BG_OPEN
+	helloBody  = 64
+	openReq    = 16
+	openResp   = 12
+	openName   = 64
+	openMeth   = 1 // control-link method BG_OPEN
+	cancelMeth = 2 // control-link method BG_CANCEL
 
 	// openStatusBase is added to the OPEN error code to form the Advanced
 	// response status (4.11).
@@ -40,8 +41,9 @@ const (
 )
 
 var (
-	magic     = [4]byte{'H', 'Q', 'B', 'G'}
-	openMagic = [4]byte{'H', 'Q', 'B', 'O'}
+	magic       = [4]byte{'H', 'Q', 'B', 'G'}
+	openMagic   = [4]byte{'H', 'Q', 'B', 'O'}
+	cancelMagic = [4]byte{'H', 'Q', 'B', 'C'}
 )
 
 // Frame kinds (4.4). The batch kinds are reserved by 4.13 and never sent or

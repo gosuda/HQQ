@@ -92,11 +92,9 @@ const char *stmt_errmsg(sqlite3_stmt *stmt) {
 
 sqlsrv_policy sqlite3srv_policy;
 
-/* Mirrors do_open of examples/sqlite/server/src/sqlsrv_session.c, in the same order: the flags, the
- * database name (an alias, or a raw path inside the allow directory), then the open itself. The
- * policy functions are those of the hand-written server (sqlsrv_policy.c, sqlsrv_pathrules.c), compiled
- * into this server; nothing is copied. What is not here: the busy timeout and the pragmas (the client
- * runs them as calls and SQL), and the connection setup (sqlite3srv_init). */
+/* Validates the open flags, resolves the database name (an alias or a raw path inside the allow
+ * directory) through sqlsrv_policy.c and sqlsrv_pathrules.c, and rewrites args->filename to the
+ * canonical path approved by the policy before sqlite3_open_v2 runs. */
 hqqrpc_status sqlite3_intercept_sqlite3_open_v2(hqqrpc_session *s, sqlite3_args_sqlite3_open_v2 *args) {
     sqlsrv_err e;
     char *path = NULL;
@@ -151,34 +149,35 @@ static int deny_attach(void *ud, int action, const char *a1, const char *a2, con
     return action == SQLITE_ATTACH || action == SQLITE_DETACH ? SQLITE_DENY : SQLITE_OK;
 }
 
-/* Runs inside sqlite3_open_v2, before it returns (sqlite3_auto_extension), so a connection is never
- * visible to a client without it. It is what do_open does after sqlite3_open_v2 in the hand-written
- * server, except the busy timeout (sqlite3_busy_timeout is a call of this service). */
-static int conn_setup(sqlite3 *db, char **errmsg, const sqlite3_api_routines *api) {
-    int rc;
+/* Wraps sqlite3_open_v2 (sqlite3_server.c is compiled with -Dsqlite3_open_v2=sqlite3srv_open_v2) so that
+ * every opened connection gets extended result codes, limits, disabled extension loading, and the
+ * ATTACH/DETACH authorizer before it is returned to the glue. */
+int sqlite3srv_open_v2(const char *filename, sqlite3 **ppDb, int flags, const char *zVfs) {
+    int rc = sqlite3_open_v2(filename, ppDb, flags, zVfs);
 
-    (void)api;
-    (void)sqlite3_extended_result_codes(db, 1);
-    (void)sqlite3_limit(db, SQLITE_LIMIT_SQL_LENGTH, SRV_MAX_SQL);
-    (void)sqlite3_limit(db, SQLITE_LIMIT_VARIABLE_NUMBER, SRV_MAX_PARAMS);
-    (void)sqlite3_limit(db, SQLITE_LIMIT_COLUMN, SRV_MAX_COLUMNS);
-    (void)sqlite3_limit(db, SQLITE_LIMIT_ATTACHED, 0);
-    /* A build without the extension loader reports the option as unsupported: that is the goal. */
-    rc = sqlite3_db_config(db, SQLITE_DBCONFIG_ENABLE_LOAD_EXTENSION, 0, NULL);
-    if (rc != SQLITE_OK && sqlite3_compileoption_used("OMIT_LOAD_EXTENSION") == 0) {
-        *errmsg = sqlite3_mprintf("cannot disable extension loading");
-        return rc;
+    if (rc == SQLITE_OK && ppDb != NULL && *ppDb != NULL) {
+        sqlite3 *db = *ppDb;
+
+        (void)sqlite3_extended_result_codes(db, 1);
+        (void)sqlite3_limit(db, SQLITE_LIMIT_SQL_LENGTH, SRV_MAX_SQL);
+        (void)sqlite3_limit(db, SQLITE_LIMIT_VARIABLE_NUMBER, SRV_MAX_PARAMS);
+        (void)sqlite3_limit(db, SQLITE_LIMIT_COLUMN, SRV_MAX_COLUMNS);
+        (void)sqlite3_limit(db, SQLITE_LIMIT_ATTACHED, 0);
+        /* A build without the extension loader reports the option as unsupported: that is the goal. */
+        rc = sqlite3_db_config(db, SQLITE_DBCONFIG_ENABLE_LOAD_EXTENSION, 0, NULL);
+        if (rc != SQLITE_OK && sqlite3_compileoption_used("OMIT_LOAD_EXTENSION") == 0) {
+            return rc;
+        }
+        rc = sqlite3_set_authorizer(db, deny_attach, NULL);
+        if (rc != SQLITE_OK) {
+            return rc;
+        }
     }
-    rc = sqlite3_set_authorizer(db, deny_attach, NULL);
-    if (rc != SQLITE_OK) {
-        *errmsg = sqlite3_mprintf("cannot set the authorizer");
-        return rc;
-    }
-    return SQLITE_OK;
+    return rc;
 }
 
 int sqlite3srv_init(void) {
-    return sqlite3_auto_extension((void (*)(void))conn_setup);
+    return SQLITE_OK;
 }
 
 /* ---- Statements ------------------------------------------------------------------------------- */
@@ -361,6 +360,9 @@ int32_t exec_stmt(sqlite3_stmt *stmt, const uint8_t *kinds, int32_t nkinds, cons
         return rc;
     }
     do {
+        if (hqqrpc_session_canceled(NULL)) {
+            return note(SQLITE_INTERRUPT, "interrupted");
+        }
         rc = sqlite3_step(stmt);
     } while (rc == SQLITE_ROW);
     if (rc != SQLITE_DONE) {
@@ -447,7 +449,7 @@ static void put_le32(uint8_t *p, uint32_t v) {
  * enough of the bound is left for it and for the markers of the cells that follow; otherwise the cell is a
  * BigText or BigBlob marker that carries its length, and *big is set. The reserve that fetch_rows checks
  * before it steps (CELL_WORST per column, ROWS_EPILOGUE) guarantees that every row fits as markers. */
-static hqqrpc_status put_row(hqqrpc_wr *w, sqlite3_stmt *st, int ncols, int *big) {
+static hqqrpc_status put_row(hqqrpc_wr *w, sqlite3_stmt *st, int ncols, int *big, int *sql_rc) {
     int i;
 
     for (i = 0; i < ncols; i++) {
@@ -465,6 +467,13 @@ static hqqrpc_status put_row(hqqrpc_wr *w, sqlite3_stmt *st, int ncols, int *big
             const char *p = (const char *)sqlite3_column_text(st, i);
             uint64_t n = (uint64_t)sqlite3_column_bytes(st, i);
 
+            if (p == NULL) {
+                int err = sqlite3_errcode(sqlite3_db_handle(st));
+                if (err != SQLITE_OK && err != SQLITE_ROW && err != SQLITE_DONE) {
+                    *sql_rc = err;
+                    return HQQRPC_OK;
+                }
+            }
             if (room(w) >= keep + CELL_OVERHEAD && room(w) - keep - CELL_OVERHEAD >= n) {
                 if (n > 0 && memchr(p, 0, (size_t)n) != NULL) {
                     r = sqlite3_Value_put_TextRaw(w, p, (uint32_t)n);
@@ -481,6 +490,13 @@ static hqqrpc_status put_row(hqqrpc_wr *w, sqlite3_stmt *st, int ncols, int *big
             const void *p = sqlite3_column_blob(st, i);
             uint64_t n = (uint64_t)sqlite3_column_bytes(st, i);
 
+            if (p == NULL) {
+                int err = sqlite3_errcode(sqlite3_db_handle(st));
+                if (err != SQLITE_OK && err != SQLITE_ROW && err != SQLITE_DONE) {
+                    *sql_rc = err;
+                    return HQQRPC_OK;
+                }
+            }
             if (room(w) >= keep + CELL_OVERHEAD && room(w) - keep - CELL_OVERHEAD >= n) {
                 r = sqlite3_Value_put_Blob(w, n > 0 ? p : "", (uint32_t)n);
             } else {
@@ -528,6 +544,13 @@ hqqrpc_status fetch_rows(sqlite3_stmt *stmt, int32_t max, hqqrpc_wr *w) {
     /* Step only while a whole row is certain to fit: a row that was stepped and does not fit would
      * be lost (the next step moves on), and there is no state between calls. */
     while (nrows < limit && !big) {
+        size_t row_off = w->off;
+        int sql_rc = SQLITE_OK;
+
+        if (hqqrpc_session_canceled(NULL)) {
+            rc = SQLITE_INTERRUPT;
+            break;
+        }
         if (room(w) < reserve) {
             if (nrows == 0) {
                 return SRV_STATUS_META_TOO_LARGE; /* ncols so large that even a row of markers cannot fit */
@@ -535,12 +558,21 @@ hqqrpc_status fetch_rows(sqlite3_stmt *stmt, int32_t max, hqqrpc_wr *w) {
             break;
         }
         rc = sqlite3_step(stmt);
+        if (rc == SQLITE_MISUSE && nrows == 0 && sqlite3_stmt_busy(stmt) == 0) {
+            (void)sqlite3_reset(stmt);
+            rc = sqlite3_step(stmt);
+        }
         if (rc != SQLITE_ROW) {
             break;
         }
-        st = put_row(w, stmt, ncols, &big);
+        st = put_row(w, stmt, ncols, &big, &sql_rc);
         if (st != HQQRPC_OK) {
             return st;
+        }
+        if (sql_rc != SQLITE_OK) {
+            w->off = row_off;
+            rc = sql_rc;
+            break;
         }
         nrows++;
     }
@@ -549,7 +581,11 @@ hqqrpc_status fetch_rows(sqlite3_stmt *stmt, int32_t max, hqqrpc_wr *w) {
         return st;
     }
     if (rc != SQLITE_ROW && rc != SQLITE_DONE) {
-        msg = sqlite3_errmsg(sqlite3_db_handle(stmt));
+        if (rc == SQLITE_INTERRUPT && sqlite3_errcode(sqlite3_db_handle(stmt)) != SQLITE_INTERRUPT) {
+            msg = "interrupted";
+        } else {
+            msg = sqlite3_errmsg(sqlite3_db_handle(stmt));
+        }
         mlen = strlen(msg);
         if (mlen > SRV_MAX_NAME) {
             mlen = SRV_MAX_NAME;
@@ -584,6 +620,12 @@ int32_t column_chunk(sqlite3_stmt *stmt, int32_t col, uint64_t offset, void *dst
         break;
     default:
         return note(SQLITE_RANGE, "the column is not text or blob");
+    }
+    if (p == NULL) {
+        int err = sqlite3_errcode(sqlite3_db_handle(stmt));
+        if (err != SQLITE_OK && err != SQLITE_ROW && err != SQLITE_DONE) {
+            return err;
+        }
     }
     len = (uint64_t)sqlite3_column_bytes(stmt, col);
     if (offset > len) {

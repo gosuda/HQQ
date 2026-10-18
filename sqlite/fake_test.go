@@ -1,4 +1,4 @@
-package gendriver
+package sqlite
 
 import (
 	"bytes"
@@ -15,7 +15,6 @@ import (
 
 	"gosuda.org/hqq/bindgen/examples/sqlite3"
 	"gosuda.org/hqq/bindgen/rt"
-	"gosuda.org/hqq/sqlite"
 	"gosuda.org/hqq/sqlite/internal/wire"
 )
 
@@ -55,8 +54,9 @@ func (f *fakeAPI) calls() string {
 	return strings.Join(f.log, ",")
 }
 
-func (f *fakeAPI) Close() error { f.rec("close"); return nil }
-func (f *fakeAPI) Kill()        { f.rec("kill"); f.once.Do(func() { close(f.killed) }) }
+func (f *fakeAPI) Close() error  { f.rec("close"); return nil }
+func (f *fakeAPI) Kill()         { f.rec("kill"); f.once.Do(func() { close(f.killed) }) }
+func (f *fakeAPI) Cancel() error { return nil }
 func (f *fakeAPI) Err() error {
 	select {
 	case <-f.killed:
@@ -250,7 +250,7 @@ func TestRowsBeforeError(t *testing.T) {
 		if n == 0 {
 			return intRows(sqlite3.SQLITE_ROW, "", 1, 2), nil
 		}
-		return intRows(sqlite.CodeConstraintUnique, "UNIQUE constraint failed: t.x", 3), nil
+		return intRows(CodeConstraintUnique, "UNIQUE constraint failed: t.x", 3), nil
 	}
 	cn := fakeConn(t, f)
 	rs, err := query(t, cn, context.Background(), "SELECT x")
@@ -262,8 +262,8 @@ func TestRowsBeforeError(t *testing.T) {
 	if fmt.Sprint(got) != "[1 2 3]" {
 		t.Fatalf("rows = %v", got)
 	}
-	var se *sqlite.Error
-	if !errors.As(err, &se) || se.Code != sqlite.CodeConstraint || se.ExtendedCode != sqlite.CodeConstraintUnique || !strings.Contains(se.Message, "t.x") {
+	var se *Error
+	if !errors.As(err, &se) || se.Code != CodeConstraint || se.ExtendedCode != CodeConstraintUnique || !strings.Contains(se.Message, "t.x") {
 		t.Fatalf("end error = %v", err)
 	}
 	if err2 := rs.Next(make([]driver.Value, 1)); err2 == nil || err2 == io.EOF {
@@ -330,7 +330,7 @@ func TestGuardTimeoutWithoutContext(t *testing.T) {
 func TestErrorMapping(t *testing.T) {
 	lost := &rt.TransportError{Func: "x", Err: io.ErrClosedPipe, Unknown: true}
 	refused := &rt.TransportError{Func: "x", Err: io.ErrClosedPipe}
-	lib := &rt.LibError{Func: "exec_stmt", Code: sqlite.CodeConstraintUnique, Detail: "UNIQUE failed"}
+	lib := &rt.LibError{Func: "exec_stmt", Code: CodeConstraintUnique, Detail: "UNIQUE failed"}
 	multi := &rt.LibError{Func: "prepare_one", Code: int64(sqlite3.SVC_SQL_MULTIPLE), Detail: "multiple statements"}
 
 	t.Run("exec in flight is unknown", func(t *testing.T) {
@@ -338,7 +338,7 @@ func TestErrorMapping(t *testing.T) {
 		f.exec = func() (int64, int64, error) { return 0, 0, lost }
 		cn := fakeConn(t, f)
 		_, err := cn.ExecContext(context.Background(), "INSERT", nil)
-		if !errors.Is(err, sqlite.ErrOutcomeUnknown) || errors.Is(err, driver.ErrBadConn) {
+		if !errors.Is(err, ErrOutcomeUnknown) || errors.Is(err, driver.ErrBadConn) {
 			t.Fatalf("err = %v, want ErrOutcomeUnknown and not ErrBadConn", err)
 		}
 		if cn.IsValid() {
@@ -358,7 +358,7 @@ func TestErrorMapping(t *testing.T) {
 		f.prep = func(string) error { return lost }
 		cn := fakeConn(t, f)
 		_, err := cn.ExecContext(context.Background(), "INSERT", nil)
-		if !errors.Is(err, driver.ErrBadConn) || errors.Is(err, sqlite.ErrOutcomeUnknown) {
+		if !errors.Is(err, driver.ErrBadConn) || errors.Is(err, ErrOutcomeUnknown) {
 			t.Fatalf("err = %v, want ErrBadConn and not unknown (nothing ran)", err)
 		}
 	})
@@ -376,8 +376,8 @@ func TestErrorMapping(t *testing.T) {
 		f.exec = func() (int64, int64, error) { return 0, 0, lib }
 		cn := fakeConn(t, f)
 		_, err := cn.ExecContext(context.Background(), "INSERT", nil)
-		var se *sqlite.Error
-		if !errors.As(err, &se) || se.ExtendedCode != sqlite.CodeConstraintUnique || !sqlite.IsConstraint(err) {
+		var se *Error
+		if !errors.As(err, &se) || se.ExtendedCode != CodeConstraintUnique || !IsConstraint(err) {
 			t.Fatalf("err = %v", err)
 		}
 		if !cn.IsValid() {
@@ -389,7 +389,7 @@ func TestErrorMapping(t *testing.T) {
 		f.prep = func(string) error { return multi }
 		cn := fakeConn(t, f)
 		_, err := cn.ExecContext(context.Background(), "SELECT 1; SELECT 2", nil)
-		var pe *sqlite.ProtocolError
+		var pe *ProtocolError
 		if !errors.As(err, &pe) || pe.Code != wire.ProtoBadRequest {
 			t.Fatalf("err = %v", err)
 		}
@@ -410,12 +410,12 @@ func TestErrorMapping(t *testing.T) {
 			if got := statusError(tc.st); got == nil {
 				t.Errorf("status %d: no mapping", tc.st.Status)
 			} else if tc.sql != 0 {
-				var se *sqlite.Error
+				var se *Error
 				if !errors.As(got, &se) || se.Code != tc.sql {
 					t.Errorf("status %d: %v", tc.st.Status, got)
 				}
 			} else {
-				var pe *sqlite.ProtocolError
+				var pe *ProtocolError
 				if !errors.As(got, &pe) || pe.Code != tc.want {
 					t.Errorf("status %d: %v, want protocol code %v", tc.st.Status, got, tc.want)
 				}
@@ -555,7 +555,7 @@ func TestEncode(t *testing.T) {
 	}
 	if _, err := cn.encode([]driver.NamedValue{named(1, "zzz", int64(1))}, names); err == nil {
 		t.Fatal("unknown parameter name accepted")
-	} else if se := (*sqlite.Error)(nil); !errors.As(err, &se) || se.Code != 25 {
+	} else if se := (*Error)(nil); !errors.As(err, &se) || se.Code != 25 {
 		t.Fatalf("unknown name: %v, want SQLITE_RANGE", err)
 	}
 
@@ -590,8 +590,9 @@ func TestEncode(t *testing.T) {
 	}
 }
 
-// TestTxStatements checks the statements of the transaction methods on the fake: no
-// round trip is spent on a Rollback outside a transaction beyond the check.
+// TestRollbackOutsideTransactionIsNoOp checks the statements of the transaction
+// methods on the fake: no round trip is spent on a Rollback outside a
+// transaction beyond the check.
 func TestRollbackOutsideTransactionIsNoOp(t *testing.T) {
 	f := newFake()
 	cn := fakeConn(t, f)

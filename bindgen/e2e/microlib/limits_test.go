@@ -189,7 +189,8 @@ func TestBootstrapRefusals(t *testing.T) {
 		{"request of 15 bytes", openMethod, open(1, 8, 4096)[:15], openCodeInternal, "bad open request"},
 		{"request of 17 bytes", openMethod, append(open(1, 8, 4096), 0), openCodeInternal, "bad open request"},
 		{"wrong magic", openMethod, append([]byte("XXXX"), open(1, 8, 4096)[4:]...), openCodeInternal, "bad open request"},
-		{"unknown method", 2, open(1, 8, 4096), openCodeInternal, "unknown method"},
+		{"bad cancel request", 2, open(1, 8, 4096), openCodeInternal, "bad cancel request"},
+		{"unknown method", 99, open(1, 8, 4096), openCodeInternal, "unknown method"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			r := openRefused(t, s, tc.method, tc.payload, tc.code)

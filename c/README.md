@@ -79,11 +79,11 @@ The Advanced layer overlays stream multiplexing, chunked message reassembly, and
 
 - The callback executes on the lifeline thread and should only trigger an orderly shutdown (setting an atomic flag, writing to a self-pipe, or signaling the main loop); it must not call `hqq_lifeline_stop` directly.
 - `hqq_lifeline_stop` cancels the watcher without firing the callback and joins the helper thread (using a `poll` self-pipe on POSIX and `CancelSynchronousIo` on Windows).
-- Used in production by `hqq-sqlite-server --parent-stdin` ([`examples/sqlite/server/README.md`](../examples/sqlite/server/README.md)).
+- Used in production by `hqq-sqlite-server --parent-stdin` ([`bindgen/examples/sqlite3/README.md`](../bindgen/examples/sqlite3/README.md)).
 
 ## RPC runtime for generated servers (`include/hqq/hqq_rpc.h`)
 
-`hqq_rpc.h` provides the C server runtime targeted by `hqq-bindgen` (specified in [`spec/toolchain/BINDGEN.md`](../spec/toolchain/BINDGEN.md) and [`bindgen/README.md`](../bindgen/README.md)). It serves one session per dedicated `StandardLink`: it validates incoming frames, decodes arguments in place from the request slot, maintains the per-session generation-checked handle table (destroying child handles before parents on teardown), executes pre-call interceptors and C library functions under the session/server execution lock, and encodes responses directly into reserved transmit slots. `hqqrpc_main` implements the standard CLI entry point (`ready <listener>` handshake, `--parent-stdin`, `SIGTERM`/`SIGINT` handling) on POSIX platforms and returns `HQQ_ERR_UNSUPPORTED` on Windows.
+`hqq_rpc.h` provides the C server runtime targeted by `hqq-bindgen` (specified in [`spec/toolchain/BINDGEN.md`](../spec/toolchain/BINDGEN.md) and [`bindgen/README.md`](../bindgen/README.md)). It serves one session per dedicated `StandardLink`: it validates incoming frames, decodes arguments in place from the request slot, maintains the per-session generation-checked handle table (destroying child handles before parents on teardown and invoking `@cancel` hooks on `HQQRPC_CANCEL_METHOD`), executes pre-call interceptors and C library functions under the session/server execution lock, and encodes responses directly into reserved transmit slots. `hqqrpc_main` implements the standard CLI entry point (`ready <listener>` handshake, `--parent-stdin`, `SIGTERM`/`SIGINT` on POSIX, and console control handlers on Windows).
 
 ## Platforms
 

@@ -5,14 +5,10 @@
  *                   --buffer-count N --max-message N --heartbeat-ms N --peer-timeout-ms N
  *                   --shutdown-timeout-ms N --parent-stdin[=force] --lifeline-grace-ms N ...]
  *
- * --allow-dir and --alias are the options of examples/sqlite/server/src/sqlsrv_main.c with the same
- * meaning, implemented by the same functions (sqlsrv_policy.c); every other option is parsed by
- * hqqrpc_main (c/include/hqq/hqq_rpc.h), which also prints "ready <listener-name>" once the listener
- * exists and shuts down on SIGINT, SIGTERM or end of file on the parent lifeline (--parent-stdin).
- *
- * Differences from hqq-sqlite-server are listed in README.md ("Differences from the hand-written
- * server"): the flags that hqqrpc_main adds, the defaults below, and the flags of the hand-written server
- * that do not exist here (--lifeline-grace-ms exists; there is no per-statement or per-cursor limit). */
+ * --allow-dir and --alias configure database path sandboxing (sqlsrv_policy.c); every other option is
+ * parsed by hqqrpc_main (c/include/hqq/hqq_rpc.h), which also prints "ready <listener-name>" once the
+ * listener exists and shuts down on SIGINT, SIGTERM or end of file on the parent lifeline
+ * (--parent-stdin). */
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -24,6 +20,7 @@
 #include "sqlite3_server.h"
 #include "sqlite3srv.h"
 #include "sqlsrv_policy.h"
+#include "sqlsrv_port.h"
 
 /* hqq-sqlite-server accepts 256 open sessions by default (sqlite/PROTOCOL.md section 11); hqqrpc_main's own
  * default is 64. */
@@ -91,7 +88,7 @@ int main(int argc, char **argv) {
             }
         } else if (strcmp(a, "--alias") == 0 && i + 1 < argc) {
             char *eq;
-            char *copy = strdup(argv[++i]);
+            char *copy = sqlsrv_port_strdup(argv[++i]);
 
             if (copy == NULL) {
                 return 1;

@@ -98,7 +98,7 @@ runtime. It is a factual description, not legal advice.
 
 | Component | Version | License | Text |
 |---|---|---|---|
-| libhqq (this repository: c/, examples/sqlite/server/) | $release | MIT | LICENSE |
+| libhqq (this repository: c/, bindgen/examples/sqlite3/server/) | $release | MIT | LICENSE |
 | SQLite amalgamation (sqlite3.c, sqlite3.h) | $version | Public domain | SQLITE-PUBLIC-DOMAIN.txt |
 
 The SQLite amalgamation is pinned in third_party/sqlite/ (\`$archive\`,

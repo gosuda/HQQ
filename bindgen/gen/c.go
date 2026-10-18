@@ -111,6 +111,10 @@ func newCGen(s *idl.Spec, o COptions) (*cgen, error) {
 		for _, t := range cIdents(h.CType) {
 			g.reserved[t] = true
 		}
+		if h.Cancel != "" {
+			g.reserved[h.Cancel] = true
+			g.children[h] = true
+		}
 		if h.Parent != nil {
 			g.children[h.Parent] = true
 		}
@@ -165,6 +169,11 @@ func (g *cgen) check() error {
 	for _, h := range g.s.Handles {
 		if err := claim("destroy_"+h.Name, "the destroy adapter of "+h.Name); err != nil {
 			return err
+		}
+		if h.Cancel != "" {
+			if err := claim("cancel_"+h.Name, "the cancel adapter of "+h.Name); err != nil {
+				return err
+			}
 		}
 	}
 	for _, f := range g.s.Funcs {
@@ -348,6 +357,9 @@ func (g *cgen) source() string {
 	}
 	for _, h := range g.s.Handles {
 		c.l("%s", g.adapter(h))
+		if h.Cancel != "" {
+			c.l("%s", g.cancelAdapter(h))
+		}
 	}
 	if len(g.s.Handles) > 0 {
 		c.l("")
@@ -373,7 +385,11 @@ func (g *cgen) source() string {
 			if h.Parent != nil {
 				parent = g.hmacro[h.Parent]
 			}
-			row := fmt.Sprintf("{ \"%s\", %s, destroy_%s },", h.Name, parent, h.Name)
+			cancel := "NULL"
+			if h.Cancel != "" {
+				cancel = "cancel_" + h.Name
+			}
+			row := fmt.Sprintf("{ \"%s\", %s, destroy_%s, %s },", h.Name, parent, h.Name, cancel)
 			rows = append(rows, row)
 			width = max(width, len(row))
 		}
@@ -463,6 +479,11 @@ func (g *cgen) adapter(h *idl.Handle) string {
 		fails = append(fails, fmt.Sprintf("ret != %d", v))
 	}
 	return fmt.Sprintf("%s\n    %s ret = %s;\n\n    return %s;\n}", head, valueC(f.Ret, f.RetAttrs), call, strings.Join(fails, " && "))
+}
+
+// cancelAdapter is the cancel hook adapter of a handle type declared with @cancel(fn).
+func (g *cgen) cancelAdapter(h *idl.Handle) string {
+	return fmt.Sprintf("static void cancel_%s(void *p) { (void)%s((%s)p); }", h.Name, h.Cancel, handleCType(h))
 }
 
 // ---- static assertions ---------------------------------------------------------------------------------

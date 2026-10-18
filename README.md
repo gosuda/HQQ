@@ -287,7 +287,7 @@ Beyond the core transport, the repository provides production packages for runni
 
 ### SQLite service (`sqlite`)
 
-The `sqlite` package is a pure-Go `database/sql` driver, registered as `hqq-sqlite`, that talks to a SQLite database running in a separate server process over an HQQ listener. The Go client requires no cgo. Each `database/sql` connection maps to one HQQ stream over a shared link, and the server isolates each stream as an independent session with its own `sqlite3` handle, transaction state, and prepared statements. The backing service is either the C server in [`examples/sqlite/server`](examples/sqlite/server) (Linux, macOS, and Windows) or the Go fake server used in unit tests.
+The `sqlite` package is a pure-Go `database/sql` driver, registered as `hqq-sqlite`, built on the `hqq-bindgen`-generated SQLite client ([`bindgen/examples/sqlite3`](bindgen/examples/sqlite3)). It talks to a SQLite database running in a separate server process over an HQQ listener without linking cgo into the Go binary. Each `database/sql` connection opens an isolated `StandardLink` session with its own `sqlite3` handle, transaction state, and prepared statements. The backing service is either the generated C server in [`bindgen/examples/sqlite3/server`](bindgen/examples/sqlite3/server) (Linux, macOS, and Windows) or the in-memory Go fake used in unit tests.
 
 ```go
 import (
@@ -299,7 +299,7 @@ import (
 db, err := sql.Open("hqq-sqlite", "hqq://sqlite-svc?db=main&timeout=5s&fetch=256&busy=5s")
 ```
 
-The DSN host names the HQQ listener. Supported query parameters are `db` (required: an alias or a file path), `mode` (`rwc`, `rw`, or `ro`), `timeout`, `fetch`, `busy`, `txlock`, and `pragma.<name>`; unknown or repeated keys are rejected. [`sqlite/README.md`](sqlite/README.md) documents the complete parameter set and SQLite type mappings. To construct a connector programmatically or manage the underlying link directly, call `sqlite.NewConnector`:
+The DSN host names the HQQ listener. Supported query parameters are `db` (required: an alias or a file path), `mode` (`rwc`, `rw`, or `ro`), `timeout`, `fetch`, `busy`, `txlock`, and `pragma.<name>`; unknown or repeated keys are rejected. [`sqlite/README.md`](sqlite/README.md) documents the complete parameter set and SQLite type mappings. To construct a connector programmatically, call `sqlite.NewConnector`:
 
 ```go
 c, err := sqlite.NewConnector("sqlite-svc", sqlite.Config{
@@ -311,7 +311,7 @@ c, err := sqlite.NewConnector("sqlite-svc", sqlite.Config{
 if err != nil {
 	return err
 }
-db := sql.OpenDB(c) // all connections of db share one link
+db := sql.OpenDB(c)
 ```
 
 SQLite engine errors unmarshal into `*sqlite.Error`, where `Code` is the primary result code and `ExtendedCode` is the extended result code:
@@ -331,7 +331,7 @@ if _, err := db.Exec("INSERT INTO users (email) VALUES (?)", email); err != nil 
 
 If the shared-memory link drops in the middle of `Exec`, the driver returns an error wrapping `sqlite.ErrOutcomeUnknown` rather than `driver.ErrBadConn`, preventing `database/sql` from automatically re-running a mutation that may have already committed. Lost-link errors during `Query` or connection setup wrap `driver.ErrBadConn` so `database/sql` can transparently retry on a fresh connection; always send writes through `Exec` or inside an explicit transaction.
 
-The `database/sql` contract suite (`sqlite/internal/contract`) runs against both the Go fake server (`go test ./sqlite`) and the C server (`sqlite/e2e`). Build and launch the C server with CMake:
+The `database/sql` contract suite (`sqlite/internal/contract`) runs against both the in-memory Go fake (`go test ./sqlite`) and the C server (`sqlite/e2e`). Build and launch the C server with CMake:
 
 ```sh
 cmake -S c -B build -DHQQ_BUILD_SQLITE_SERVER=ON -DHQQ_WERROR=ON
@@ -339,7 +339,7 @@ cmake --build build --target hqq-sqlite-server
 build/sqlite-server/hqq-sqlite-server sqlite-svc --alias main=/path/to/app.db
 ```
 
-The server opens database names registered with `--alias`, and raw filesystem paths only when they resolve inside `--allow-dir`. Its wire protocol is documented in [`sqlite/PROTOCOL.md`](sqlite/PROTOCOL.md).
+The server opens database names registered with `--alias`, and raw filesystem paths only when they resolve inside `--allow-dir`. Its interface and wire protocol are documented in [`bindgen/examples/sqlite3/README.md`](bindgen/examples/sqlite3/README.md) and [`sqlite/PROTOCOL.md`](sqlite/PROTOCOL.md).
 
 ### Starting the SQLite server from Go (`sqlite/launcher`)
 
@@ -381,9 +381,9 @@ go run gosuda.org/hqq/cmd/hqq-bindgen -go-out client -go-strip ml_ -c-out server
 go run gosuda.org/hqq/cmd/hqq-bindgen -check -go-out client -go-strip ml_ -c-out server mylib.idl   # fails on stale output
 ```
 
-Where `hqq-bindgen` shines, measured on an Apple M1 (full tables and caveats in [`bindgen/README.md`](bindgen/README.md)): coarse calls. Compressing 64 KiB to 1 MiB payloads with zstd 1.5.7 through the generated client, with calls pipelined, runs within 2% of in-process cgo on one goroutine, and two sessions against two cgo threads stay within 2% at 1 MiB. Where it does not compete with cgo: tiny synchronous calls. A no-op synchronous call takes ~335 ns over HQQ versus ~25 ns via cgo (~164 to 178 ns when pipelined). You trade that per-call floor for process isolation (a segfault in C kills the worker process, not the Go runtime), cgo-free cross-compilation and fast Go builds, and asynchronous futures that overlap C execution with Go work. The generated layer does not support call cancellation or C-to-Go callbacks, and the generated C server loop runs on POSIX systems only.
+Where `hqq-bindgen` shines, measured on an Apple M1 (full tables and caveats in [`bindgen/README.md`](bindgen/README.md)): coarse calls. Compressing 64 KiB to 1 MiB payloads with zstd 1.5.7 through the generated client, with calls pipelined, runs within 2% of in-process cgo on one goroutine, and two sessions against two cgo threads stay within 2% at 1 MiB. Where it does not compete with cgo: tiny synchronous calls. A no-op synchronous call takes ~335 ns over HQQ versus ~25 ns via cgo (~164 to 178 ns when pipelined). You trade that per-call floor for process isolation (a segfault in C kills the worker process, not the Go runtime), cgo-free cross-compilation and fast Go builds, and asynchronous futures that overlap C execution with Go work. Handle types can declare `@cancel(fn)` hooks (such as `@cancel(sqlite3_interrupt)`) invoked when a client calls `Conn.Cancel()`, and the generated C server entry point (`hqqrpc_main`) runs on Linux, macOS, FreeBSD, and Windows.
 
-The architecture and wire format are specified in [`spec/toolchain/BINDGEN.md`](spec/toolchain/BINDGEN.md). Working examples live in [`bindgen/examples/zstd`](bindgen/examples/zstd) and [`bindgen/examples/sqlite3`](bindgen/examples/sqlite3) (paired with the `hqq-sqlite-gen` driver in [`sqlite/gendriver`](sqlite/gendriver), which passes the same 107-case `database/sql` contract suite as `hqq-sqlite`). Generated servers can be started directly with [`launch`](#starting-any-hqq-server-from-go-launch).
+The architecture and wire format are specified in [`spec/toolchain/BINDGEN.md`](spec/toolchain/BINDGEN.md). Working examples live in [`bindgen/examples/zstd`](bindgen/examples/zstd) and [`bindgen/examples/sqlite3`](bindgen/examples/sqlite3) (which powers the [`sqlite`](sqlite) `database/sql` driver and `hqq-sqlite-server`). Generated servers can be started directly with [`launch`](#starting-any-hqq-server-from-go-launch).
 
 ### Verified executables
 

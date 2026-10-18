@@ -1,4 +1,4 @@
-package gendriver
+package sqlite
 
 import (
 	"database/sql/driver"
@@ -43,8 +43,7 @@ func (b bindArgs) empty() bool { return len(b.kinds) == 0 }
 // paramIndex returns the 1-based index of the parameter that arg binds. A
 // positional argument binds the parameter of its ordinal. A named argument binds
 // the parameter with that name, trying the prefixes ':', '@' and '$' in this
-// order, as the hand-written server does. names are the parameter names of the
-// statement, as SQLite spells them.
+// order. names are the parameter names of the statement, as SQLite spells them.
 func paramIndex(a driver.NamedValue, name string, names []string) (int, error) {
 	if name == "" {
 		return a.Ordinal, nil

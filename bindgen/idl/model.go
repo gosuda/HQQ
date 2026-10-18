@@ -160,6 +160,7 @@ type Handle struct {
 	Parent       *Handle // owned_by
 	Destroy      *Func   // the destroy function (V7)
 	RetainOnFail bool    // @retain_on_fail on Destroy (V39)
+	Cancel       string  // @cancel C function name, empty if absent
 	ID           int     // index in Spec.Handles plus 1
 	Pos          Pos
 }

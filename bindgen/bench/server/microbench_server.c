@@ -228,7 +228,7 @@ static hqqrpc_status microbench_dispatch(hqqrpc_call *c) {
 }
 
 static const hqqrpc_handle_type microbench_handle_types[] = {
-    { "Counter", 0, destroy_Counter }, /* MICROBENCH_H_COUNTER */
+    { "Counter", 0, destroy_Counter, NULL }, /* MICROBENCH_H_COUNTER */
 };
 
 static const char *const microbench_op_names[] = {

@@ -287,7 +287,7 @@
 //
 // Services built on the protocol live in their own packages. Package sqlite is
 // a database/sql driver for a SQLite service; its C server is in
-// examples/sqlite/server, and sqlite/launcher starts that server. Packages
+// bindgen/examples/sqlite3/server, and sqlite/launcher starts that server. Packages
 // secureexec and lifeline start executables verified by digest and tie a child
 // process to its parent.
 //

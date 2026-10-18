@@ -392,8 +392,8 @@ static hqqrpc_status sqlite_lowlevel_dispatch(hqqrpc_call *c) {
 }
 
 static const hqqrpc_handle_type sqlite_lowlevel_handle_types[] = {
-    { "Db", 0, destroy_Db },                        /* SQLITE_LOWLEVEL_H_DB */
-    { "Stmt", SQLITE_LOWLEVEL_H_DB, destroy_Stmt }, /* SQLITE_LOWLEVEL_H_STMT, owned_by Db */
+    { "Db", 0, destroy_Db, NULL },                        /* SQLITE_LOWLEVEL_H_DB */
+    { "Stmt", SQLITE_LOWLEVEL_H_DB, destroy_Stmt, NULL }, /* SQLITE_LOWLEVEL_H_STMT, owned_by Db */
 };
 
 static const char *const sqlite_lowlevel_op_names[] = {

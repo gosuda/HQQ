@@ -6,11 +6,12 @@ import (
 	"database/sql/driver"
 	"errors"
 	"fmt"
-	"sync"
 	"sync/atomic"
 	"time"
 
 	"gosuda.org/hqq"
+	"gosuda.org/hqq/bindgen/examples/sqlite3"
+	"gosuda.org/hqq/bindgen/rt"
 	"gosuda.org/hqq/sqlite/internal/convert"
 	"gosuda.org/hqq/sqlite/internal/wire"
 )
@@ -26,7 +27,6 @@ var (
 	_ driver.Pinger                         = (*conn)(nil)
 	_ driver.SessionResetter                = (*conn)(nil)
 	_ driver.Validator                      = (*conn)(nil)
-	_ driver.NamedValueChecker              = (*conn)(nil)
 	_ driver.Stmt                           = (*stmt)(nil)
 	_ driver.StmtExecContext                = (*stmt)(nil)
 	_ driver.StmtQueryContext               = (*stmt)(nil)
@@ -37,136 +37,249 @@ var (
 	_ driver.Result                         = result{}
 )
 
-// conn is one session: one stream of the connector's link. Its requests are
-// serialized by mu, so at most one request is in flight on the stream.
+// conn is one session of the generated client on one database connection of the
+// server. database/sql serializes the calls of a conn, and the session is used
+// from one goroutine at a time (BINDGEN.md 8.2), so a conn has no lock. The only
+// concurrent access is the guard of a call, which may interrupt and Kill the
+// session from another goroutine; it touches nothing but the atomics below and
+// the session's Kill and Cancel.
 //
-// A conn is marked bad when its stream can no longer be trusted (a transport
-// failure, a cancellation mid-request, or a malformed response). A bad conn
-// fails every call with driver.ErrBadConn, and IsValid reports false, so
-// database/sql discards it.
+// A conn is marked bad when its session can no longer be trusted: a lost link, a
+// call abandoned because its context ended, a malformed answer. A bad conn fails
+// every call with driver.ErrBadConn, and IsValid reports false, so database/sql
+// discards it.
 type conn struct {
-	c     *Connector
-	link  *hqq.NamedAdvancedLink
-	st    *hqq.Stream
-	owner *Connector // set by Driver.Open: closed together with the conn
+	c       *Connector
+	api     api
+	db      dbID
+	fetch   int           // rows requested per batch
+	timeout time.Duration // bound of the requests that run outside a caller context
 
-	mu     sync.Mutex  // serializes requests on st
 	closed atomic.Bool // Close was called
-	bad    atomic.Bool // the stream is unusable
-	fetch  int         // rows per batch, set once by open
+	bad    atomic.Bool // the session is unusable
+	killed atomic.Bool // a guard killed the session; killCause is set
+	// killCause is why the guard killed the session. It is written before killed
+	// is set and read only after killed is seen set.
+	killCause error
+
+	// deferred holds the waits of requests whose answer nobody needs: the
+	// finalize of an ad-hoc statement, the reset of a statement that was not read
+	// to its end. They are submitted early so that the server does the work in
+	// the shadow of the caller, and collected by drain before the next call.
+	deferred []func() error
+
+	// cached are statements the driver itself runs (BEGIN, COMMIT, ...), by SQL.
+	cached map[string]stmtID
+
+	// restoreQO is the query_only value to restore after a read-only transaction
+	// (PROTOCOL.md 6.9), or -1.
+	restoreQO int
+
+	// Scratch of encode. The slices alias nothing the caller owns.
+	vals  []driver.Value
+	idx   []int
+	slots []driver.Value
+	kinds []uint8
+	words []uint64
+	data  []byte
 }
 
-// open sends Open and checks the reply.
+// newConn wraps a dialed session. The caller opens the database.
+func newConn(c *Connector, a api) *conn {
+	return &conn{c: c, api: a, fetch: c.cfg.FetchSize, timeout: c.cfg.Timeout, restoreQO: -1,
+		cached: make(map[string]stmtID)}
+}
+
+// Connect opens a session: it dials the service and opens the database. ctx and
+// Config.Timeout bound it.
+func (c *Connector) Connect(ctx context.Context) (driver.Conn, error) {
+	if c.isClosed() {
+		return nil, errConnectorClosed
+	}
+	ctx, cancel := context.WithTimeout(ctx, c.cfg.Timeout)
+	defer cancel()
+	opts := c.cfg.Session
+	if opts.Link == (hqq.LinkOptions{}) && c.cfg.Link.Advanced.Link != (hqq.LinkOptions{}) {
+		opts.Link = c.cfg.Link.Advanced.Link
+	}
+	if opts.BufferCount == 0 && c.cfg.Link.BufferCount != 0 {
+		opts.BufferCount = c.cfg.Link.BufferCount
+	}
+	if opts.BufferSize == 0 && c.cfg.Link.BufferSize != 0 {
+		opts.BufferSize = c.cfg.Link.BufferSize
+	}
+	if opts.ConnectTimeout == 0 {
+		opts.ConnectTimeout = c.cfg.Timeout
+	}
+	if opts.CloseTimeout == 0 {
+		opts.CloseTimeout = c.cfg.Timeout
+	}
+	cl, err := sqlite3.Dial(ctx, c.listener, opts)
+	if err != nil {
+		// A bootstrap refusal due to --max-sessions or buffer geometry wraps both
+		// *ProtocolError (Code: ProtoLimit) and the *rt.OpenError.
+		var oe *rt.OpenError
+		if errors.As(err, &oe) && errors.Is(err, rt.ErrLimit) {
+			return nil, fmt.Errorf("%w (%w)", &wire.ProtocolError{Code: wire.ProtoLimit, Message: oe.Msg}, err)
+		}
+		// A connect that ran out of time is not a lost link: database/sql must not
+		// retry it at once. Either the caller's context or the session's own connect
+		// timeout ended it.
+		if cerr := ctx.Err(); cerr != nil {
+			return nil, fmt.Errorf("sqlite: connecting to %q: %w (%w)", c.listener, cerr, err)
+		}
+		if errors.Is(err, hqq.ErrTimeout) {
+			return nil, fmt.Errorf("sqlite: connecting to %q: %w", c.listener, err)
+		}
+		return nil, transportError(err)
+	}
+	cn := newConn(c, genAPI{cl})
+	if err := cn.open(ctx); err != nil {
+		cn.discard()
+		return nil, err
+	}
+	return cn, nil
+}
+
+// open opens the database and applies the busy timeout and the pragmas of the
+// configuration.
 func (cn *conn) open(ctx context.Context) error {
-	flags := uint32(wire.OpenReadWrite | wire.OpenCreate)
-	switch cn.c.cfg.Mode {
+	cfg := cn.c.cfg
+	flags := sqlite3.SQLITE_OPEN_READWRITE | sqlite3.SQLITE_OPEN_CREATE
+	switch cfg.Mode {
 	case ModeReadOnly:
-		flags = wire.OpenReadOnly
+		flags = sqlite3.SQLITE_OPEN_READONLY
 	case ModeReadWrite:
-		flags = wire.OpenReadWrite
+		flags = sqlite3.SQLITE_OPEN_READWRITE
 	}
-	req := wire.OpenRequest{
-		Major:  wire.ProtocolMajor,
-		Minor:  wire.ProtocolMinor,
-		DB:     cn.c.cfg.Database,
-		Flags:  flags,
-		BusyMS: busyMS(cn.c.cfg.BusyTimeout),
-	}
-	for _, p := range cn.c.cfg.Pragmas {
-		req.Pragmas = append(req.Pragmas, wire.Pragma{Name: p.Name, Value: p.Value})
-	}
-	e := wire.NewEncoder(128)
-	wire.AppendOpenRequest(e, req)
-	msg, err := cn.call(ctx, wire.MethodOpen, e.Bytes())
+	stop := cn.guard(ctx, 0)
+	err := func() error {
+		db, err := cn.api.OpenV2(cfg.Database, flags)
+		if err != nil {
+			return err
+		}
+		cn.db = db
+		if err := cn.api.BusyTimeout(db, busyMS(cfg.BusyTimeout)); err != nil {
+			return err
+		}
+		for _, p := range cfg.Pragmas {
+			if err := cn.execSQL("PRAGMA " + p.Name + " = " + p.Value); err != nil {
+				return err
+			}
+		}
+		return nil
+	}()
+	stop()
 	if err != nil {
-		return err
+		return cn.openFailure(ctx, err)
 	}
-	resp, err := wire.ParseOpenResponse(msg.Bytes())
-	msg.Release()
-	if err != nil {
-		cn.markBad()
-		return fmt.Errorf("sqlite: malformed Open response: %w", err)
-	}
-	if resp.Major != wire.ProtocolMajor {
-		cn.markBad()
-		return fmt.Errorf("sqlite: server speaks protocol %d.%d", resp.Major, resp.Minor)
-	}
-	cn.fetch = min(cn.fetch, int(min(resp.MaxFetchRows, wire.MaxFetchRows)))
 	return nil
 }
 
-func busyMS(d time.Duration) uint32 {
+// openFailure maps a failure of the open sequence. A lost link is
+// driver.ErrBadConn (nothing a retry could run twice).
+func (cn *conn) openFailure(ctx context.Context, err error) error {
+	if se := serverError(err); se != nil {
+		return se
+	}
+	if cn.killed.Load() && ctx.Err() != nil {
+		return ctx.Err()
+	}
+	return transportError(err)
+}
+
+func busyMS(d time.Duration) int32 {
 	if d < 0 {
 		return 0
 	}
-	return uint32(min(d.Milliseconds(), 1<<32-1))
+	return int32(min(d.Milliseconds(), 1<<31-1))
 }
 
-// call sends one request and returns its response. The caller releases the
-// message.
-func (cn *conn) call(ctx context.Context, m wire.Method, body []byte) (*hqq.Message, error) {
-	cn.mu.Lock()
-	defer cn.mu.Unlock()
-	return cn.callLocked(ctx, m, body)
-}
-
-// callLocked is call with mu held.
-func (cn *conn) callLocked(ctx context.Context, m wire.Method, body []byte) (*hqq.Message, error) {
-	if cn.closed.Load() || cn.bad.Load() {
-		return nil, driver.ErrBadConn // nothing is sent
+// guard arms the abandonment of the calls that follow: when ctx ends, or timeout
+// (if positive) passes, the session is killed and interrupted, which makes the
+// blocked call return and stops any running statement on the server. The conn is
+// bad afterwards. The returned function disarms the guard and reports whether it
+// fired. A context that never ends and no timeout cost nothing.
+func (cn *conn) guard(ctx context.Context, timeout time.Duration) (stop func() bool) {
+	if timeout > 0 {
+		tctx, cancel := context.WithTimeout(ctx, timeout)
+		return cn.arm(tctx, cancel)
 	}
-	if len(body) > wire.MaxMessageBytes {
-		return nil, fmt.Errorf("sqlite: %s request of %d bytes exceeds the %d byte limit",
-			m, len(body), wire.MaxMessageBytes)
+	if ctx.Done() == nil {
+		return func() bool { return false }
+	}
+	return cn.arm(ctx, func() {})
+}
+
+// arm kills and cancels the session when ctx ends. cancel is called when the
+// guard is disarmed.
+//
+// The kill runs on another goroutine than the owner of the session. Kill and
+// Cancel are safe from there (bindgen/rt Conn.Kill and Conn.Cancel), and the
+// fields the kill sets are atomics or are published by killed. stop does not
+// return while a kill that has started is still running, so that when it reports
+// that the guard fired, killed and killCause are set and no kill is left that
+// could overlap a later call of the owner.
+func (cn *conn) arm(ctx context.Context, cancel context.CancelFunc) (stop func() bool) {
+	finished := make(chan struct{})
+	disarm := context.AfterFunc(ctx, func() {
+		defer close(finished)
+		cn.killCause = context.Cause(ctx)
+		cn.killed.Store(true)
+		cn.bad.Store(true)
+		cn.api.Kill()
+		_ = cn.api.Cancel()
+	})
+	return func() bool {
+		fired := !disarm()
+		cancel()
+		if fired {
+			<-finished
+		}
+		return fired
+	}
+}
+
+// enter checks that the conn can start a call, and collects the answers of the
+// deferred requests. It sends nothing for a conn that is closed, bad, or whose
+// context is already done: the conn stays usable in the last case.
+func (cn *conn) enter(ctx context.Context) error {
+	if cn.closed.Load() || cn.bad.Load() {
+		return driver.ErrBadConn
 	}
 	if err := ctx.Err(); err != nil {
-		return nil, err // nothing is sent: the conn stays usable
+		return err
 	}
-	if linkDead(cn.link) {
-		cn.failLink()
-		return nil, fmt.Errorf("%w: the link is gone", driver.ErrBadConn) // nothing is sent
+	if len(cn.deferred) > 0 {
+		cn.drain()
+		if cn.bad.Load() {
+			return driver.ErrBadConn
+		}
 	}
-	msg, err := cn.st.CallWith(ctx, uint64(m), body, hqq.CallOptions{})
-	if err != nil {
-		return nil, cn.failure(ctx, m, err)
-	}
-	return msg, nil
+	return nil
 }
 
-// failure maps an error of a request that was sent. A server error response
-// keeps the conn usable. Anything else leaves the stream in an unknown state,
-// so the conn is marked bad and its stream is closed. That makes the server
-// roll the session back (PROTOCOL.md section 8.3).
-func (cn *conn) failure(ctx context.Context, m wire.Method, err error) error {
-	var re hqq.ResponseError
-	if errors.As(err, &re) && !errors.Is(err, hqq.ErrShuttingDown) {
-		return errorOf(wire.Status(re.Status), string(re.Payload))
+// drain waits for the deferred requests. A server answer is dropped (finalize
+// repeats the error of the last step, and nobody asked); a lost session marks
+// the conn bad.
+func (cn *conn) drain() {
+	stop := cn.guard(context.Background(), cn.timeout)
+	for _, w := range cn.deferred {
+		if err := w(); err != nil && !isServerError(err) {
+			cn.markBad()
+		}
 	}
-	cn.markBad()
-	if isTransportError(err) {
-		cn.c.dropLink(cn.link)
+	cn.deferred = cn.deferred[:0]
+	if stop() {
+		cn.markBad()
 	}
-	if ctxErr := ctx.Err(); ctxErr != nil {
-		return ctxErr
-	}
-	if m == wire.MethodExec || m == wire.MethodExecStmt {
-		// A retry could run the statement twice, so database/sql must not
-		// see driver.ErrBadConn here.
-		return fmt.Errorf("%w (%s): %w", ErrOutcomeUnknown, m, err)
-	}
-	return fmt.Errorf("%w: %w", driver.ErrBadConn, err)
 }
 
-// failLink drops the shared link of a conn whose peer is gone.
-func (cn *conn) failLink() {
-	cn.markBad()
-	cn.c.dropLink(cn.link)
-}
-
-// markBad makes the conn unusable and closes its stream in the background.
+// markBad makes the conn unusable and closes its link, which ends the session on
+// the server.
 func (cn *conn) markBad() {
 	if cn.bad.CompareAndSwap(false, true) {
-		go func() { _ = cn.st.Close() }()
+		cn.api.Kill()
 	}
 }
 
@@ -176,52 +289,159 @@ func (cn *conn) discard() {
 	cn.markBad()
 }
 
+// run runs one call of a driver method: fn talks to the session and returns raw
+// errors, which run maps (see failure). ctx bounds the whole of fn, with the
+// abandonment of guard; a nil fn error with a fired guard stays nil, because the
+// work was done, but the conn is bad.
+func (cn *conn) run(ctx context.Context, op string, fn func() error) error {
+	if err := cn.enter(ctx); err != nil {
+		return err
+	}
+	return cn.runEntered(ctx, op, fn)
+}
+
+// runEntered is run after enter.
+func (cn *conn) runEntered(ctx context.Context, op string, fn func() error) error {
+	stop := cn.guard(ctx, 0)
+	err := fn()
+	if stop() {
+		cn.markBad()
+	}
+	return cn.mapFailure(ctx, op, err)
+}
+
+// runTimed is run for the calls that have no caller context: it is bounded by the
+// connector's timeout.
+func (cn *conn) runTimed(op string, fn func() error) error {
+	if cn.closed.Load() || cn.bad.Load() {
+		return driver.ErrBadConn
+	}
+	if len(cn.deferred) > 0 {
+		cn.drain()
+		if cn.bad.Load() {
+			return driver.ErrBadConn
+		}
+	}
+	stop := cn.guard(context.Background(), cn.timeout)
+	err := fn()
+	if stop() {
+		cn.markBad()
+	}
+	return cn.mapFailure(context.Background(), op, err)
+}
+
+// mapFailure maps the error of fn: errors of the caller's input pass through.
+func (cn *conn) mapFailure(ctx context.Context, op string, err error) error {
+	var ue userError
+	if errors.As(err, &ue) {
+		return ue.err
+	}
+	return cn.failure(ctx, op, err)
+}
+
 // Prepare implements driver.Conn.
 func (cn *conn) Prepare(query string) (driver.Stmt, error) {
 	return cn.PrepareContext(context.Background(), query)
 }
 
 // PrepareContext implements driver.ConnPrepareContext. The statement is
-// prepared on the server; it has no effect until executed.
+// prepared on the server and its parameters and columns are read; it has no
+// effect until executed.
 func (cn *conn) PrepareContext(ctx context.Context, query string) (driver.Stmt, error) {
-	e := wire.NewEncoder(len(query) + 8)
-	wire.AppendPrepareRequest(e, wire.PrepareRequest{SQL: query})
-	msg, err := cn.call(ctx, wire.MethodPrepare, e.Bytes())
+	var st *stmt
+	err := cn.run(ctx, "Prepare", func() error {
+		s, err := cn.prepare(query)
+		if err != nil {
+			return err
+		}
+		if err := s.loadInfo(); err != nil {
+			cn.deferFinalize(s.id)
+			return err
+		}
+		st = s
+		return nil
+	})
 	if err != nil {
 		return nil, err
 	}
-	resp, err := wire.ParsePrepareResponse(msg.Bytes())
-	msg.Release()
-	if err != nil {
-		cn.markBad()
-		return nil, fmt.Errorf("sqlite: malformed Prepare response: %w", err)
-	}
-	return &stmt{cn: cn, id: resp.Stmt, nparams: int(resp.NParams), cols: resp.Columns}, nil
+	return st, nil
 }
 
-// Close implements driver.Conn. It asks the server to end the session, then
-// closes the stream. Errors are not reported: the session ends either way.
+// prepare compiles one statement (the single-statement rule is the server's).
+func (cn *conn) prepare(query string) (*stmt, error) {
+	id, err := cn.api.PrepareOne(cn.db, query)
+	if err != nil {
+		return nil, err
+	}
+	return &stmt{cn: cn, id: id, fresh: true}, nil
+}
+
+// deferFinalize finalizes a statement in the background of the next call.
+func (cn *conn) deferFinalize(id stmtID) {
+	w, err := cn.api.FinalizeAsync(id)
+	if err != nil {
+		cn.markBad()
+		return
+	}
+	cn.deferred = append(cn.deferred, w)
+}
+
+// deferReset resets a statement in the background of the next call.
+func (cn *conn) deferReset(id stmtID) {
+	w, err := cn.api.ResetAsync(id)
+	if err != nil {
+		cn.markBad()
+		return
+	}
+	cn.deferred = append(cn.deferred, w)
+}
+
+// cachedStmt returns the statement for sql, which the driver runs itself (BEGIN,
+// COMMIT, a PRAGMA). It is prepared once per session.
+func (cn *conn) cachedStmt(sql string) (stmtID, error) {
+	if id, ok := cn.cached[sql]; ok {
+		return id, nil
+	}
+	id, err := cn.api.PrepareOne(cn.db, sql)
+	if err != nil {
+		return 0, err
+	}
+	cn.cached[sql] = id
+	return id, nil
+}
+
+// execSQL runs a statement of the driver's own, without parameters or result.
+func (cn *conn) execSQL(sql string) error {
+	id, err := cn.cachedStmt(sql)
+	if err != nil {
+		return err
+	}
+	_, _, err = cn.api.ExecStmt(id, nil, nil, nil)
+	return err
+}
+
+// Close implements driver.Conn. It asks the server to end the session. Errors are
+// not reported: the session ends either way.
 func (cn *conn) Close() error {
-	cn.mu.Lock()
-	defer cn.mu.Unlock()
-	if cn.closed.Load() {
+	if cn.closed.Swap(true) {
 		return nil
 	}
-	if !cn.bad.Load() {
-		ctx, cancel := context.WithTimeout(context.Background(), cn.c.cfg.Timeout)
-		msg, err := cn.callLocked(ctx, wire.MethodClose, nil)
-		cancel()
-		if err == nil {
-			msg.Release()
-		}
+	if cn.bad.Load() {
+		cn.api.Kill()
+		return nil
 	}
-	cn.closed.Store(true)
+	stop := cn.guard(context.Background(), cn.timeout)
+	for _, w := range cn.deferred {
+		_ = w()
+	}
+	cn.deferred = nil
+	err := cn.api.Close()
+	if stop() {
+		cn.api.Kill()
+	}
 	cn.bad.Store(true)
-	err := cn.st.Close()
-	if cn.owner != nil {
-		_ = cn.owner.Close()
-	}
-	return err
+	_ = err
+	return nil
 }
 
 // Begin implements driver.Conn.
@@ -229,39 +449,10 @@ func (cn *conn) Begin() (driver.Tx, error) {
 	return cn.BeginTx(context.Background(), driver.TxOptions{})
 }
 
-// BeginTx implements driver.ConnBeginTx.
-//
-// SQLite is always serializable, so the default and serializable isolation
-// levels are accepted and every other level is refused with an error before
-// anything is sent. ReadOnly transactions begin DEFERRED with query_only set
-// (PROTOCOL.md section 6.9); the BEGIN mode of other transactions comes from
-// Config.TxMode or WithTxMode.
-func (cn *conn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, error) {
-	if !sqlIsolation(opts.Isolation) {
-		return nil, fmt.Errorf("sqlite: isolation level %d is not supported: SQLite is always serializable; use the default or serializable level", opts.Isolation)
-	}
-	req := wire.BeginRequest{Mode: txModeFrom(ctx, cn.c.cfg.TxMode), ReadOnly: opts.ReadOnly}
-	if req.ReadOnly {
-		req.Mode = wire.TxDeferred
-	}
-	e := wire.NewEncoder(2)
-	wire.AppendBeginRequest(e, req)
-	msg, err := cn.call(ctx, wire.MethodBegin, e.Bytes())
-	if err != nil {
-		return nil, err
-	}
-	msg.Release()
-	return &tx{cn: cn}, nil
-}
-
-// sqlIsolation reports whether level is the default or serializable.
-func sqlIsolation(level driver.IsolationLevel) bool {
-	return level == driver.IsolationLevel(sql.LevelDefault) || level == driver.IsolationLevel(sql.LevelSerializable)
-}
-
 // CheckNamedValue implements driver.NamedValueChecker. It converts every
-// argument with the rules of convert.ArgValue, so database/sql's default converter is
-// never used (it would store json.RawMessage as a BLOB, for example).
+// argument with the rules of convert.ArgValue, so database/sql's default
+// converter is never used (it would store json.RawMessage as a BLOB, for
+// example).
 func (cn *conn) CheckNamedValue(nv *driver.NamedValue) error {
 	v, err := convert.ArgValue(nv.Value)
 	if err != nil {
@@ -273,95 +464,93 @@ func (cn *conn) CheckNamedValue(nv *driver.NamedValue) error {
 
 // ExecContext implements driver.ExecerContext. The SQL must be one statement.
 func (cn *conn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
-	params, err := wireParams(args)
+	var res result
+	err := cn.run(ctx, "Exec", func() error {
+		st, err := cn.prepare(query)
+		if err != nil {
+			return err
+		}
+		// The statement is finalized in the shadow of the next call, whatever
+		// happens below.
+		defer cn.deferFinalize(st.id)
+		if needsNames(args) {
+			if err := st.loadInfo(); err != nil {
+				return err
+			}
+		}
+		res, err = st.exec(args)
+		return err
+	})
 	if err != nil {
 		return nil, err
 	}
-	e := wire.NewEncoder(len(query) + 64)
-	wire.AppendExecRequest(e, wire.ExecRequest{SQL: query, Params: params})
-	return cn.execResult(ctx, wire.MethodExec, e.Bytes())
+	return res, nil
 }
 
 // QueryContext implements driver.QueryerContext. The SQL must be one statement.
 func (cn *conn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
-	params, err := wireParams(args)
+	var r *rows
+	err := cn.run(ctx, "Query", func() error {
+		st, err := cn.prepare(query)
+		if err != nil {
+			return err
+		}
+		st.adhoc = true
+		r, err = st.query(ctx, args)
+		if err != nil {
+			// The rows do not exist, so nobody else finalizes the statement.
+			cn.deferFinalize(st.id)
+			return err
+		}
+		return nil
+	})
 	if err != nil {
 		return nil, err
 	}
-	e := wire.NewEncoder(len(query) + 64)
-	wire.AppendQueryRequest(e, wire.QueryRequest{SQL: query, Params: params, Fetch: uint32(cn.fetch)})
-	return cn.queryRows(ctx, wire.MethodQuery, e.Bytes())
-}
-
-// queryRows runs a Query or QueryStmt request and returns the rows.
-func (cn *conn) queryRows(ctx context.Context, m wire.Method, body []byte) (driver.Rows, error) {
-	msg, err := cn.call(ctx, m, body)
-	if err != nil {
-		return nil, err
-	}
-	d := wire.NewDecoder(msg.Bytes())
-	h := wire.ParseResultHeader(d)
-	nrows := d.U32()
-	if err := d.Err(); err != nil {
-		msg.Release()
-		cn.markBad()
-		return nil, fmt.Errorf("sqlite: malformed %s response: %w", m, err)
-	}
-	if h.More && nrows == 0 {
-		msg.Release()
-		cn.markBad()
-		return nil, fmt.Errorf("sqlite: malformed %s response: open cursor with an empty batch", m)
-	}
-	return newRows(ctx, cn, msg, d, h, nrows), nil
-}
-
-// execResult runs an Exec or ExecStmt request.
-func (cn *conn) execResult(ctx context.Context, m wire.Method, body []byte) (driver.Result, error) {
-	msg, err := cn.call(ctx, m, body)
-	if err != nil {
-		return nil, err
-	}
-	resp, err := wire.ParseExecResponse(msg.Bytes())
-	msg.Release()
-	if err != nil {
-		cn.markBad()
-		return nil, fmt.Errorf("sqlite: malformed %s response: %w", m, err)
-	}
-	return result{rowsAffected: resp.RowsAffected, lastInsertID: resp.LastInsertRowID}, nil
+	return r, nil
 }
 
 // Ping implements driver.Pinger. It round-trips to the server. A failure of the
 // link is driver.ErrBadConn.
 func (cn *conn) Ping(ctx context.Context) error {
-	msg, err := cn.call(ctx, wire.MethodPing, nil)
-	if err != nil {
+	return cn.run(ctx, "Ping", func() error {
+		_, err := cn.api.GetAutocommit(cn.db)
 		return err
-	}
-	msg.Release()
-	return nil
+	})
 }
 
 // ResetSession implements driver.SessionResetter. Before a pooled conn is
-// reused, the server rolls back any transaction still open on the session,
-// including one begun with plain SQL. Rollback is a no-op outside a
-// transaction (PROTOCOL.md section 6.10), so the cost is one round trip. Any
+// reused, a transaction still open on the session, including one begun with
+// plain SQL, is rolled back, and the query_only setting of a read-only
+// transaction is restored. The transaction state is SQLite's own
+// (sqlite3_get_autocommit), so the cost of a clean conn is one round trip. Any
 // failure makes the conn unusable: database/sql then discards it.
 func (cn *conn) ResetSession(ctx context.Context) error {
-	msg, err := cn.call(ctx, wire.MethodRollback, nil)
+	err := cn.run(ctx, "ResetSession", func() error {
+		ac, err := cn.api.GetAutocommit(cn.db)
+		if err != nil {
+			return err
+		}
+		if ac == 0 {
+			if err := cn.execSQL("ROLLBACK"); err != nil {
+				return err
+			}
+		}
+		return cn.restoreQueryOnly()
+	})
 	if err != nil {
 		return driver.ErrBadConn
 	}
-	msg.Release()
 	return nil
 }
 
-// IsValid implements driver.Validator. A conn whose stream failed, or whose
-// link is gone, is not valid, and database/sql closes it instead of pooling it.
+// IsValid implements driver.Validator. A conn whose session failed is not valid,
+// and database/sql closes it instead of pooling it.
 func (cn *conn) IsValid() bool {
 	if cn.bad.Load() || cn.closed.Load() {
 		return false
 	}
-	return !linkDead(cn.link)
+	return cn.api.Err() == nil
 }
 
 // result implements driver.Result.
@@ -380,29 +569,11 @@ func (r result) LastInsertId() (int64, error) { return r.lastInsertID, nil }
 // or DDL statement leaves it unchanged, as SQLite does.
 func (r result) RowsAffected() (int64, error) { return r.rowsAffected, nil }
 
-// wireParams converts database/sql arguments to protocol parameters.
-func wireParams(args []driver.NamedValue) ([]wire.Param, error) {
-	if len(args) > wire.MaxParams {
-		return nil, fmt.Errorf("sqlite: %d arguments exceed the limit of %d", len(args), wire.MaxParams)
-	}
-	params := make([]wire.Param, 0, len(args))
-	for _, a := range args {
-		if a.Ordinal < 1 {
-			return nil, fmt.Errorf("sqlite: argument ordinal %d is invalid", a.Ordinal)
-		}
-		name, err := convert.ParamName(a.Name, wire.MaxNameBytes)
-		if err != nil {
-			return nil, err
-		}
-		v, err := convert.ArgValue(a.Value)
-		if err != nil {
-			return nil, fmt.Errorf("sqlite: argument %d: %w", a.Ordinal, err)
-		}
-		wv, err := wireValue(v)
-		if err != nil {
-			return nil, fmt.Errorf("sqlite: argument %d: %w", a.Ordinal, err)
-		}
-		params = append(params, wire.Param{Ordinal: uint32(a.Ordinal), Name: name, Value: wv})
-	}
-	return params, nil
+// sqlIsolation reports whether level is the default or serializable.
+func sqlIsolation(level driver.IsolationLevel) bool {
+	return level == driver.IsolationLevel(sql.LevelDefault) || level == driver.IsolationLevel(sql.LevelSerializable)
 }
+
+// errSuperseded is the error of rows whose statement another execution of it has
+// taken over.
+var errSuperseded = errors.New("sqlite: the statement was executed again: its earlier rows are released")

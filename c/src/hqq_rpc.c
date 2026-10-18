@@ -704,18 +704,32 @@ hqqrpc_status hqqrpc_handle_get(hqqrpc_session *s, uint32_t id, uint16_t type, i
 }
 
 hqqrpc_status hqqrpc_handle_reserve(hqqrpc_session *s, unsigned n) {
-    uint64_t avail = (uint64_t)s->free_count + (s->cfg.max_handles - s->high_water);
-    uint64_t want = (uint64_t)s->cs.hreserved + n;
+    uint64_t avail;
+    uint64_t want;
     uint64_t fresh;
 
+    if (s->cancel_mu != NULL) {
+        hqq_plat_mutex_lock(s->cancel_mu);
+    }
+    avail = (uint64_t)s->free_count + (s->cfg.max_handles - s->high_water);
+    want = (uint64_t)s->cs.hreserved + n;
     if (want > avail) {
+        if (s->cancel_mu != NULL) {
+            hqq_plat_mutex_unlock(s->cancel_mu);
+        }
         return HQQRPC_E_LIMIT;
     }
     fresh = want > s->free_count ? want - s->free_count : 0;
     if (fresh != 0 && tab_grow(s, (uint32_t)(s->high_water + fresh)) != 0) {
+        if (s->cancel_mu != NULL) {
+            hqq_plat_mutex_unlock(s->cancel_mu);
+        }
         return HQQRPC_E_INTERNAL;
     }
     s->cs.hreserved += n;
+    if (s->cancel_mu != NULL) {
+        hqq_plat_mutex_unlock(s->cancel_mu);
+    }
     return HQQRPC_OK;
 }
 
@@ -736,7 +750,7 @@ static void entry_unlink(hqqrpc_session *s, uint32_t idx) {
     e->next = 0;
 }
 
-/* Frees the entry: generation + 1, index to the free list. */
+/* Frees the entry: generation + 1, index to the free list. Caller holds cancel_mu if present. */
 static void entry_free(hqqrpc_session *s, uint32_t idx) {
     hqqrpc_hentry *e = &s->tab[idx];
 
@@ -777,12 +791,18 @@ hqqrpc_status hqqrpc_handle_put(hqqrpc_session *s, uint16_t type, void *ptr, uin
         cs->reg = nr;
         cs->regcap = ncap;
     }
+    if (s->cancel_mu != NULL) {
+        hqq_plat_mutex_lock(s->cancel_mu);
+    }
     if (s->free_head != 0) {
         idx = s->free_head;
         s->free_head = s->tab[idx].free_next;
         s->free_count--;
     } else {
         if (s->high_water >= s->cfg.max_handles || s->high_water + 1u >= s->tab_cap) {
+            if (s->cancel_mu != NULL) {
+                hqq_plat_mutex_unlock(s->cancel_mu);
+            }
             return HQQRPC_E_INTERNAL;
         }
         idx = ++s->high_water;
@@ -806,28 +826,54 @@ hqqrpc_status hqqrpc_handle_put(hqqrpc_session *s, uint16_t type, void *ptr, uin
     cs->hreserved--;
     *id = ((uint32_t)e->gen << 16) | idx;
     cs->reg[cs->nreg++] = *id;
+    if (s->cancel_mu != NULL) {
+        hqq_plat_mutex_unlock(s->cancel_mu);
+    }
     return HQQRPC_OK;
 }
 
 void hqqrpc_handle_consume(hqqrpc_session *s, uint32_t id) {
+    if (s->cancel_mu != NULL) {
+        hqq_plat_mutex_lock(s->cancel_mu);
+    }
     if (tab_lookup(s, id) != NULL) {
         entry_free(s, id & 0xFFFFu);
+    }
+    if (s->cancel_mu != NULL) {
+        hqq_plat_mutex_unlock(s->cancel_mu);
     }
 }
 
 /* Calls the destroy adapter of the entry and consumes it whatever the adapter returns. The caller
  * holds the execution lock. */
 static void entry_destroy(hqqrpc_session *s, uint32_t idx) {
-    hqqrpc_hentry *e = &s->tab[idx];
-    uint16_t type = e->type;
-    void *ptr = e->ptr;
-    int (*destroy)(void *) = s->iface->handle_types[type - 1u].destroy;
+    hqqrpc_hentry *e;
+    uint16_t type;
+    void *ptr;
+    int (*destroy)(void *);
     int failed = 0;
 
+    if (s->cancel_mu != NULL) {
+        hqq_plat_mutex_lock(s->cancel_mu);
+    }
+    e = &s->tab[idx];
+    type = e->type;
+    ptr = e->ptr;
+    e->live = 0; /* prevent concurrent hqqrpc_session_cancel from calling cancel(ptr) */
+    if (s->cancel_mu != NULL) {
+        hqq_plat_mutex_unlock(s->cancel_mu);
+    }
+    destroy = s->iface->handle_types[type - 1u].destroy;
     if (destroy != NULL) {
         failed = destroy(ptr) != 0;
     }
+    if (s->cancel_mu != NULL) {
+        hqq_plat_mutex_lock(s->cancel_mu);
+    }
     entry_free(s, idx);
+    if (s->cancel_mu != NULL) {
+        hqq_plat_mutex_unlock(s->cancel_mu);
+    }
     if (failed) {
         s->destroy_failures++;
         hqqrpc_log(s, HQQRPC_LOG_WARN, "destroy of a %s handle failed; the object may leak",
@@ -862,6 +908,13 @@ void hqqrpc_handle_destroy_children(hqqrpc_session *s, uint32_t id) {
     if (tab_lookup(s, id) == NULL) {
         return;
     }
+    if (s->cancel_mu != NULL) {
+        hqq_plat_mutex_lock(s->cancel_mu);
+    }
+    s->destroy_id = id;
+    if (s->cancel_mu != NULL) {
+        hqq_plat_mutex_unlock(s->cancel_mu);
+    }
     i = s->live_tail;
     while (i != 0) {
         uint32_t prev = s->tab[i].prev;
@@ -884,6 +937,15 @@ void hqqrpc_handles_destroy_all(hqqrpc_session *s) {
 void hqqrpc_call_handles_end(hqqrpc_session *s, int rollback) {
     hqqrpc_cstate *cs = &s->cs;
 
+    if (s->destroy_id != 0) {
+        if (s->cancel_mu != NULL) {
+            hqq_plat_mutex_lock(s->cancel_mu);
+        }
+        s->destroy_id = 0;
+        if (s->cancel_mu != NULL) {
+            hqq_plat_mutex_unlock(s->cancel_mu);
+        }
+    }
     if (rollback) {
         while (cs->nreg > 0) {
             uint32_t id = cs->reg[--cs->nreg];
@@ -897,4 +959,55 @@ void hqqrpc_call_handles_end(hqqrpc_session *s, int rollback) {
     }
     cs->nreg = 0;
     cs->hreserved = 0;
+}
+
+void hqqrpc_session_cancel(hqqrpc_session *s, uint32_t req_id) {
+    int step;
+    int max_steps;
+    uint32_t interrupted_id = 0;
+
+    if (s == NULL || s->cancel_mu == NULL) {
+        return;
+    }
+    max_steps = s->link != NULL ? 50 : 1;
+    for (step = 0; step < max_steps; step++) {
+        uint32_t i;
+        uint32_t target_id;
+        int done;
+
+        hqq_plat_mutex_lock(s->cancel_mu);
+        target_id = req_id != 0 ? req_id : (s->active_id != 0 ? s->active_id : s->last_id + 1u);
+        if (s->canceled_id < target_id) {
+            s->canceled_id = target_id;
+        }
+        if (s->torn || s->end != HQQRPC_END_NONE || (req_id != 0 && s->completed_id >= req_id)) {
+            hqq_plat_mutex_unlock(s->cancel_mu);
+            return;
+        }
+        if (interrupted_id != 0 && s->completed_id >= interrupted_id && s->active_id == 0) {
+            hqq_plat_mutex_unlock(s->cancel_mu);
+            return;
+        }
+        if (s->active_id != 0 && (req_id == 0 || s->active_id <= req_id)) {
+            interrupted_id = s->active_id;
+            for (i = s->live_head; i != 0; i = s->tab[i].next) {
+                hqqrpc_hentry *e = &s->tab[i];
+                uint32_t hid = ((uint32_t)e->gen << 16) | i;
+
+                if (e->live && hid != s->destroy_id && e->type >= 1u && e->type <= s->iface->handle_type_count) {
+                    void (*cancel_fn)(void *) = s->iface->handle_types[e->type - 1u].cancel;
+
+                    if (cancel_fn != NULL && e->ptr != NULL) {
+                        cancel_fn(e->ptr);
+                    }
+                }
+            }
+        }
+        done = req_id == 0 || s->completed_id >= req_id || s->torn || s->end != HQQRPC_END_NONE;
+        hqq_plat_mutex_unlock(s->cancel_mu);
+        if (done || step + 1 >= max_steps) {
+            return;
+        }
+        hqq_plat_sleep_ns(1000000u);
+    }
 }

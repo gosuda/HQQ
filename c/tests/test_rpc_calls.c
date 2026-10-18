@@ -73,8 +73,8 @@ static int destroy_sub(void *p) {
 }
 
 static const hqqrpc_handle_type g_types[] = {
-    {"Res", 0, destroy_res},
-    {"Sub", 1, destroy_sub},
+    {"Res", 0, destroy_res, NULL},
+    {"Sub", 1, destroy_sub, NULL},
 };
 
 static uint64_t le64(const uint8_t *p) {

@@ -187,6 +187,15 @@ struct hqqrpc_session {
     uint64_t last_req_ns;
     uint64_t ctl_id;             /* control link that created this session, 0 for none */
 
+    struct hqqrpc_session *srv_next; /* linked in srv->sess_list while active (guarded by srv->mu) */
+    char sess_name[32];              /* session segment name for HQQRPC_CANCEL_METHOD */
+    uint32_t cancel_refs;            /* active HQQRPC_CANCEL_METHOD callers (guarded by srv->mu) */
+    hqq_plat_mutex *cancel_mu;       /* guards tab mutations and active_id / completed_id / canceled_id */
+    uint32_t active_id;              /* request id currently in dispatch, 0 if none */
+    uint32_t completed_id;           /* last request id that finished dispatch */
+    uint32_t canceled_id;            /* request id canceled via hqqrpc_session_cancel */
+    uint32_t destroy_id;             /* handle id currently being destroyed, 0 if none */
+
     /* assembly of a multi-frame request (4.8) */
     int asm_active;
     int asm_discard;             /* out of memory: validate and drop the chunks, answer E_INTERNAL */

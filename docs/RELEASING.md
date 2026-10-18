@@ -29,7 +29,7 @@ Because GitHub Release assets occupy a flat namespace, the `licenses/` directory
 
 Every binary is compiled natively on a runner of its target architecture and smoke-tested on that same machine by running the `sqlite/e2e` Go test suite against the stripped binary. Cross-compiled binaries are never published without native execution.
 
-Windows binaries (`windows/amd64` and `windows/arm64`, built with `clang-cl` and static CRT linkage) are required release targets: a failure on any platform blocks the `publish` job. Windows build details live in [`examples/sqlite/server/README.md`](../examples/sqlite/server/README.md).
+Windows binaries (`windows/amd64` and `windows/arm64`, built with `clang-cl` and static CRT linkage) are required release targets: a failure on any platform blocks the `publish` job. Build details live in [`bindgen/examples/sqlite3/README.md`](../bindgen/examples/sqlite3/README.md).
 
 ## SQLite Amalgamation
 

@@ -93,13 +93,15 @@ func Cleanup() {
 }
 
 func build() {
-	if p := os.Getenv(EnvServer); p != "" {
-		if _, err := os.Stat(p); err != nil {
-			buildErr = fmt.Errorf("%s: %w", EnvServer, err)
+	for _, env := range []string{EnvServer, "HQQ_SQLITE_SERVER"} {
+		if p := os.Getenv(env); p != "" {
+			if _, err := os.Stat(p); err != nil {
+				buildErr = fmt.Errorf("%s: %w", env, err)
+				return
+			}
+			buildBin = p
 			return
 		}
-		buildBin = p
-		return
 	}
 	switch {
 	case testing.Short():

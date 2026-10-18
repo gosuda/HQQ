@@ -13,16 +13,12 @@
 #      The binary is build-ml/microlib_server. HQQ_WERROR defaults to ON here.
 #
 #   2. From c/CMakeLists.txt, behind an option, the way HQQ_BUILD_SQLITE_SERVER adds
-#      examples/sqlite/server: then the hqq::hqq target already exists and is reused.
+#      bindgen/examples/sqlite3/server: then the hqq::hqq target already exists and is reused.
 #
-# POSIX only: hqqrpc_main does not run on Windows (BINDGEN.md 1.2).
 cmake_minimum_required(VERSION 3.21)
 
 if(NOT TARGET hqq::hqq)
   project(microlib_server LANGUAGES C)
-  if(WIN32)
-    message(FATAL_ERROR "microlib_server is POSIX only: hqqrpc_main does not support Windows")
-  endif()
   set(HQQ_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../../..")
   # Only the library is needed: no tests, no C++ consumer check, no stress harness.
   set(HQQ_BUILD_TESTS OFF)

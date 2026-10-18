@@ -1,9 +1,9 @@
 // Package e2e runs the Go driver (gosuda.org/hqq/sqlite) against the C server
-// (examples/sqlite/server) over real HQQ links.
+// (bindgen/examples/sqlite3/server) over real HQQ links.
 //
 // The server binary is named by HQQ_SQLITE_SERVER. When it is not set, or it
 // does not exist, every test skips. Build it with libhqq's CMake; see
-// examples/sqlite/server/README.md. The tests start and stop the server
+// bindgen/examples/sqlite3/README.md. The tests start and stop the server
 // themselves, one per scenario.
 package e2e
 

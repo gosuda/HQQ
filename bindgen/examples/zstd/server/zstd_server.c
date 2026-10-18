@@ -806,8 +806,8 @@ static hqqrpc_status zstd_dispatch(hqqrpc_call *c) {
 }
 
 static const hqqrpc_handle_type zstd_handle_types[] = {
-    { "CCtx", 0, destroy_CCtx }, /* ZSTD_H_CCTX */
-    { "DCtx", 0, destroy_DCtx }, /* ZSTD_H_DCTX */
+    { "CCtx", 0, destroy_CCtx, NULL }, /* ZSTD_H_CCTX */
+    { "DCtx", 0, destroy_DCtx, NULL }, /* ZSTD_H_DCTX */
 };
 
 static const char *const zstd_op_names[] = {

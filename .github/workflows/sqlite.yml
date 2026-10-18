@@ -1,6 +1,6 @@
 name: SQLite service
 
-# The hqq-sqlite C server (examples/sqlite/server) built on libhqq, its C unit
+# The hqq-sqlite C server (bindgen/examples/sqlite3/server) built on libhqq, its C unit
 # tests, the Go tests of the sqlite package (fake server, no C server needed),
 # and the Go end-to-end tests that run the Go driver against the C server
 # (sqlite/e2e). On Linux and macOS SQLite comes from the system: libsqlite3-dev

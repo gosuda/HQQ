@@ -1,3 +1,5 @@
+//go:build unix
+
 package sqlite_test
 
 import (
@@ -7,99 +9,58 @@ import (
 	"database/sql/driver"
 	"errors"
 	"fmt"
-	"math/rand/v2"
-	"net/url"
 	"os"
-	"runtime"
+	"path/filepath"
+	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
 	"gosuda.org/hqq"
-	hqqsqlite "gosuda.org/hqq/sqlite"
-	"gosuda.org/hqq/sqlite/internal/fakeserver"
+	"gosuda.org/hqq/bindgen/examples/sqlite3/sqlite3srv"
+	"gosuda.org/hqq/bindgen/rt"
+	"gosuda.org/hqq/sqlite"
 	"gosuda.org/hqq/sqlite/internal/wire"
 )
 
-// fastLink makes heartbeats quick, so crash detection takes a few hundred
+// fastLink makes heartbeats quick, so a dead server is seen within a few hundred
 // milliseconds instead of seconds.
 var fastLink = hqq.LinkOptions{
 	HeartbeatInterval: 20 * time.Millisecond,
 	PeerTimeout:       300 * time.Millisecond,
 }
 
-var listenerSeq atomic.Uint64
-
-// listenerName returns a short unique listener name (the macOS shared memory
-// name limit is 31 bytes).
-func listenerName() string {
-	return fmt.Sprintf("hqs%d-%d", os.Getpid()%100000, listenerSeq.Add(1))
+// genConfig is the connector configuration of the tests.
+func genConfig(db string) sqlite.Config {
+	return sqlite.Config{
+		Database:    db,
+		Timeout:     10 * time.Second,
+		BusyTimeout: 5 * time.Second,
+		Session:     rt.Options{Link: fastLink},
+	}
 }
 
-// startServer starts a fake server and closes it when the test ends.
-func startServer(t *testing.T, opts fakeserver.Options) (string, *fakeserver.Server) {
+// openGen returns a sql.DB on database db of the server, with cfg applied.
+func openGen(t *testing.T, srv *sqlite3srv.Server, cfg sqlite.Config) *sql.DB {
 	t.Helper()
-	name := listenerName()
-	if opts.Link == (hqq.LinkOptions{}) {
-		opts.Link = fastLink
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	srv, err := fakeserver.Listen(ctx, name, opts)
-	if err != nil {
-		t.Fatalf("listen %s: %v", name, err)
-	}
-	t.Cleanup(func() { _ = srv.Close() })
-	return name, srv
-}
-
-// testConfig returns the connector configuration of the tests.
-func testConfig(db string) hqqsqlite.Config {
-	return hqqsqlite.Config{
-		Database: db,
-		Timeout:  5 * time.Second,
-		Link:     hqq.Config{Advanced: hqq.AdvancedOptions{Link: fastLink}},
-	}
-}
-
-// openDB opens a sql.DB on a new connector for listener name.
-func openDB(t *testing.T, name string, cfg hqqsqlite.Config) (*sql.DB, *hqqsqlite.Connector) {
-	t.Helper()
-	c, err := hqqsqlite.NewConnector(name, cfg)
+	c, err := sqlite.NewConnector(srv.Listener(), cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
 	db := sql.OpenDB(c)
 	t.Cleanup(func() { _ = db.Close() })
-	return db, c
+	return db
 }
 
-// serve starts a server and returns a sql.DB on the default test database.
-func serve(t *testing.T) (*sql.DB, *fakeserver.Server) {
+func startGen(t *testing.T) (*sqlite3srv.Server, *sql.DB) {
 	t.Helper()
-	name, srv := startServer(t, fakeserver.Options{})
-	db, _ := openDB(t, name, testConfig("main"))
-	return db, srv
+	srv := sqlite3srv.Start(t, sqlite3srv.Config{})
+	return srv, openGen(t, srv, genConfig("main"))
 }
 
-func waitUntil(t *testing.T, d time.Duration, what string, cond func() bool) {
-	t.Helper()
-	deadline := time.Now().Add(d)
-	for !cond() {
-		if time.Now().After(deadline) {
-			t.Fatalf("timed out waiting for %s", what)
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-}
-
-// execer is *sql.DB or *sql.Tx.
-type execer interface {
-	Exec(query string, args ...any) (sql.Result, error)
-}
-
-func mustExec(t *testing.T, db execer, query string, args ...any) sql.Result {
+func mustExec(t *testing.T, db interface {
+	Exec(string, ...any) (sql.Result, error)
+}, query string, args ...any) sql.Result {
 	t.Helper()
 	res, err := db.Exec(query, args...)
 	if err != nil {
@@ -108,800 +69,666 @@ func mustExec(t *testing.T, db execer, query string, args ...any) sql.Result {
 	return res
 }
 
-func TestRoundTripValues(t *testing.T) {
-	db, _ := serve(t)
-	mustExec(t, db, "CREATE TABLE v (i INTEGER, f REAL, s TEXT, b BLOB, n TEXT)")
-	res := mustExec(t, db, "INSERT INTO v (i, f, s, b, n) VALUES (?, ?, ?, ?, ?)",
-		int64(-7), 2.5, "héllo", []byte{0, 1, 0xff}, nil)
-	if id, _ := res.LastInsertId(); id != 1 {
-		t.Fatalf("LastInsertId = %d", id)
+func queryInt(t *testing.T, db *sql.DB, query string, args ...any) int64 {
+	t.Helper()
+	var v int64
+	if err := db.QueryRow(query, args...).Scan(&v); err != nil {
+		t.Fatalf("query %q: %v", query, err)
 	}
-	if n, _ := res.RowsAffected(); n != 1 {
-		t.Fatalf("RowsAffected = %d", n)
-	}
-	var (
-		i  int64
-		f  float64
-		s  string
-		b  []byte
-		nn sql.NullString
-	)
-	if err := db.QueryRow("SELECT i, f, s, b, n FROM v").Scan(&i, &f, &s, &b, &nn); err != nil {
-		t.Fatal(err)
-	}
-	if i != -7 || f != 2.5 || s != "héllo" || !bytes.Equal(b, []byte{0, 1, 0xff}) || nn.Valid {
-		t.Fatalf("row = %d %v %q %x %+v", i, f, s, b, nn)
-	}
-
-	when := time.Date(2026, 10, 17, 1, 2, 3, 4, time.UTC)
-	mustExec(t, db, "INSERT INTO v (i, s, b) VALUES (?, ?, ?)", true, when, []byte{})
-	var got string
-	var empty []byte
-	if err := db.QueryRow("SELECT s, b FROM v WHERE i = 1").Scan(&got, &empty); err != nil {
-		t.Fatal(err)
-	}
-	if got != when.Format("2006-01-02 15:04:05.999999999-07:00") || empty == nil || len(empty) != 0 {
-		t.Fatalf("time/bool round trip: %q, empty blob %#v", got, empty)
-	}
+	return v
 }
 
-func TestNamedParametersAndPreparedStatements(t *testing.T) {
-	db, _ := serve(t)
-	mustExec(t, db, "CREATE TABLE n (a INTEGER, b TEXT)")
-	mustExec(t, db, "INSERT INTO n (a, b) VALUES (:a, :b)", sql.Named("a", 1), sql.Named("b", "x"))
-	var b string
-	if err := db.QueryRow("SELECT b FROM n WHERE a = :a", sql.Named("a", 1)).Scan(&b); err != nil || b != "x" {
-		t.Fatalf("named query: %q %v", b, err)
+func sqliteCode(err error) int {
+	var se *sqlite.Error
+	if errors.As(err, &se) {
+		return se.Code
 	}
+	return -1
+}
 
-	ins, err := db.Prepare("INSERT INTO n (a) VALUES (?)")
+func protoCode(err error) wire.ProtoCode {
+	var pe *sqlite.ProtocolError
+	if errors.As(err, &pe) {
+		return pe.Code
+	}
+	return 0
+}
+
+// TestRegistered opens a database through the registry of database/sql, with a DSN
+// that sets every option, and checks that the options took effect.
+func TestRegistered(t *testing.T) {
+	srv := sqlite3srv.Start(t, sqlite3srv.Config{})
+	dsn := fmt.Sprintf("hqq://%s?db=reg.db&timeout=5s&busy=250ms&fetch=3&txlock=immediate&pragma.journal_mode=WAL&pragma.synchronous=OFF", srv.Listener())
+	db, err := sql.Open(sqlite.DriverName, dsn)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ins.Close()
-	for i := range 100 {
-		if _, err := ins.Exec(i); err != nil {
-			t.Fatal(err)
-		}
+	defer db.Close()
+	var mode string
+	if err := db.QueryRow("PRAGMA journal_mode").Scan(&mode); err != nil || mode != "wal" {
+		t.Fatalf("journal_mode = %q, %v; want wal", mode, err)
 	}
-	q, err := db.Prepare("SELECT a FROM n WHERE a >= ?")
-	if err != nil {
-		t.Fatal(err)
+	if n := queryInt(t, db, "PRAGMA synchronous"); n != 0 {
+		t.Fatalf("synchronous = %d, want 0 (OFF)", n)
 	}
-	defer q.Close()
-	rows, err := q.Query(50)
+	if n := queryInt(t, db, "PRAGMA busy_timeout"); n != 250 {
+		t.Fatalf("busy_timeout = %d, want 250", n)
+	}
+	if _, err := os.Stat(filepath.Join(srv.AllowDir, "reg.db")); err != nil {
+		t.Fatalf("database file not created in the allow directory: %v", err)
+	}
+	// fetch=3 with 10 rows: four batches.
+	mustExec(t, db, "CREATE TABLE r (x INTEGER)")
+	mustExec(t, db, "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 10) INSERT INTO r SELECT x FROM c")
+	rows, err := db.Query("SELECT x FROM r ORDER BY x")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer rows.Close()
-	count := 0
+	var got []int64
 	for rows.Next() {
-		count++
-	}
-	// Values 0..99 were inserted; 50..99 satisfy the filter.
-	if err := rows.Err(); err != nil || count != 50 {
-		t.Fatalf("prepared query returned %d rows: %v", count, err)
-	}
-}
-
-func TestMultipleBatchesAndSmallFetch(t *testing.T) {
-	name, _ := startServer(t, fakeserver.Options{})
-	cfg := testConfig("main")
-	cfg.FetchSize = 7 // 1000 rows in 143 batches
-	db, _ := openDB(t, name, cfg)
-
-	rows, err := db.Query("SELECT value FROM hqq_series(1, 1000)")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer rows.Close()
-	sum, n := 0, 0
-	for rows.Next() {
-		var v int
-		if err := rows.Scan(&v); err != nil {
+		var x int64
+		if err := rows.Scan(&x); err != nil {
 			t.Fatal(err)
 		}
-		n++
-		sum += v
+		got = append(got, x)
 	}
-	if err := rows.Err(); err != nil {
-		t.Fatal(err)
+	if err := rows.Err(); err != nil || len(got) != 10 || got[9] != 10 {
+		t.Fatalf("rows = %v, %v", got, err)
 	}
-	if n != 1000 || sum != 500500 {
-		t.Fatalf("rows = %d, sum = %d", n, sum)
-	}
-}
-
-func TestLargeBlobsAreChunked(t *testing.T) {
-	db, _ := serve(t)
-	mustExec(t, db, "CREATE TABLE blobs (id INTEGER PRIMARY KEY, data BLOB)")
-	r := rand.New(rand.NewPCG(1, 2))
-	big := make([]byte, 3<<20) // several multi-chunk messages each way
-	for i := range big {
-		big[i] = byte(r.UintN(256))
-	}
-	mustExec(t, db, "INSERT INTO blobs (id, data) VALUES (1, ?)", big)
-	var got []byte
-	if err := db.QueryRow("SELECT data FROM blobs WHERE id = 1").Scan(&got); err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(got, big) {
-		t.Fatalf("blob of %d bytes did not round trip (got %d)", len(big), len(got))
-	}
-}
-
-func TestNullsAndTypes(t *testing.T) {
-	db, _ := serve(t)
-	mustExec(t, db, "CREATE TABLE z (a TEXT, b INTEGER)")
-	mustExec(t, db, "INSERT INTO z VALUES (NULL, NULL)")
-	rows, err := db.Query("SELECT a, b FROM z")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer rows.Close()
-	cols, _ := rows.ColumnTypes()
-	if cols[0].DatabaseTypeName() != "TEXT" || cols[1].DatabaseTypeName() != "INTEGER" {
-		t.Fatalf("declared types = %q, %q", cols[0].DatabaseTypeName(), cols[1].DatabaseTypeName())
-	}
-	if !rows.Next() {
-		t.Fatal("no row")
-	}
-	var a sql.NullString
-	var b sql.NullInt64
-	if err := rows.Scan(&a, &b); err != nil || a.Valid || b.Valid {
-		t.Fatalf("NULLs scanned as %+v %+v (%v)", a, b, err)
-	}
-}
-
-func TestTransactionsCommitAndRollback(t *testing.T) {
-	db, _ := serve(t)
-	mustExec(t, db, "CREATE TABLE tx (id INTEGER)")
-	rowsOf := func() int {
-		rows, err := db.Query("SELECT id FROM tx")
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer rows.Close()
-		n := 0
-		for rows.Next() {
-			n++
-		}
-		if err := rows.Err(); err != nil {
-			t.Fatal(err)
-		}
-		return n
-	}
-
+	// txlock=immediate: a second connection cannot write while the transaction runs.
 	tx, err := db.Begin()
 	if err != nil {
 		t.Fatal(err)
 	}
-	mustExec(t, tx, "INSERT INTO tx VALUES (1)")
-	if got := rowsOf(); got != 0 {
-		t.Fatalf("uncommitted row visible to another connection: %d", got)
+	other, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close()
+	_, err = other.ExecContext(context.Background(), "INSERT INTO r VALUES (99)")
+	if !errors.Is(err, sqlite.ErrBusy) {
+		t.Fatalf("write beside an IMMEDIATE transaction: %v, want ErrBusy", err)
 	}
 	if err := tx.Rollback(); err != nil {
 		t.Fatal(err)
 	}
-	if got := rowsOf(); got != 0 {
-		t.Fatalf("rolled back row visible: %d", got)
+}
+
+// TestOpenModesAndPolicy covers the open mode and the path policy of the server.
+func TestOpenModesAndPolicy(t *testing.T) {
+	srv, db := startGen(t)
+	mustExec(t, db, "CREATE TABLE m (v INTEGER)")
+	mustExec(t, db, "INSERT INTO m VALUES (1)")
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
 	}
 
-	tx, err = db.Begin()
+	ro := genConfig("main")
+	ro.Mode = sqlite.ModeReadOnly
+	rdb := openGen(t, srv, ro)
+	if n := queryInt(t, rdb, "SELECT v FROM m"); n != 1 {
+		t.Fatalf("read-only read = %d", n)
+	}
+	if _, err := rdb.Exec("INSERT INTO m VALUES (2)"); !sqlite.IsReadOnly(err) {
+		t.Fatalf("write to a read-only database: %v, want IsReadOnly", err)
+	}
+
+	rw := genConfig("absent.db")
+	rw.Mode = sqlite.ModeReadWrite
+	if err := openGen(t, srv, rw).Ping(); sqliteCode(err) != sqlite.CodeCantOpen {
+		t.Fatalf("mode=rw on a missing database: %v, want SQLITE_CANTOPEN", err)
+	}
+	if _, err := os.Stat(filepath.Join(srv.AllowDir, "absent.db")); err == nil {
+		t.Fatal("mode=rw created the database")
+	}
+
+	outside := t.TempDir()
+	if err := os.WriteFile(filepath.Join(outside, "victim.db"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"../escape.db", "sub/../../escape.db", filepath.Join(outside, "victim.db"), ".."} {
+		err := openGen(t, srv, genConfig(name)).Ping()
+		if protoCode(err) != wire.ProtoForbidden {
+			t.Errorf("open %q: %v, want FORBIDDEN", name, err)
+		}
+	}
+	if err := openGen(t, srv, genConfig("inside.db")).Ping(); err != nil {
+		t.Fatalf("open inside.db: %v", err)
+	}
+}
+
+// TestNamedParameters checks the mapping of named and mixed arguments to the
+// parameters of a statement.
+func TestNamedParameters(t *testing.T) {
+	_, db := startGen(t)
+	mustExec(t, db, "CREATE TABLE n (id INTEGER PRIMARY KEY, a TEXT, b TEXT)")
+	mustExec(t, db, "INSERT INTO n VALUES (:id, @a, $b)", sql.Named("id", 1), sql.Named("a", "x"), sql.Named("b", "y"))
+	// A name used twice in the statement binds both places.
+	var a, b string
+	if err := db.QueryRow("SELECT a, b FROM n WHERE id = :id AND a = :a", sql.Named("id", 1), sql.Named("a", "x")).Scan(&a, &b); err != nil || a != "x" || b != "y" {
+		t.Fatalf("named select: %q %q %v", a, b, err)
+	}
+	var s string
+	if err := db.QueryRow("SELECT :v || :v", sql.Named("v", "ab")).Scan(&s); err != nil || s != "abab" {
+		t.Fatalf("name used twice: %q, %v", s, err)
+	}
+	// Numbered parameters follow the ordinal.
+	if err := db.QueryRow("SELECT ?2 || ?1", "a", "b").Scan(&s); err != nil || s != "ba" {
+		t.Fatalf("numbered parameters: %q, %v", s, err)
+	}
+	// A prepared statement is reused with named arguments.
+	st, err := db.Prepare("SELECT a FROM n WHERE id = :id")
 	if err != nil {
 		t.Fatal(err)
 	}
-	mustExec(t, tx, "INSERT INTO tx VALUES (2)")
-	if err := tx.Commit(); err != nil {
-		t.Fatal(err)
+	defer st.Close()
+	for range 3 {
+		if err := st.QueryRow(sql.Named("id", 1)).Scan(&s); err != nil || s != "x" {
+			t.Fatalf("prepared named: %q, %v", s, err)
+		}
 	}
-	if got := rowsOf(); got != 1 {
-		t.Fatalf("committed rows = %d", got)
+	// Unknown parameter: SQLITE_RANGE.
+	_, err = db.Exec("INSERT INTO n VALUES (:id, 'x', 'y')", sql.Named("nope", 1))
+	if sqliteCode(err) != 25 {
+		t.Fatalf("unknown parameter: %v (code %d), want SQLITE_RANGE", err, sqliteCode(err))
 	}
-	if err := tx.Commit(); err == nil {
-		t.Fatal("second Commit succeeded")
+	// Too many positional arguments: SQLITE_RANGE from the bind.
+	_, err = db.Exec("INSERT INTO n VALUES (?, 'x', 'y')", 5, 6)
+	if sqliteCode(err) != 25 {
+		t.Fatalf("too many arguments: %v (code %d), want SQLITE_RANGE", err, sqliteCode(err))
+	}
+	if n := queryInt(t, db, "SELECT count(*) FROM n"); n != 1 {
+		t.Fatalf("rows after the failed inserts: %d", n)
 	}
 }
 
-func TestTxModeFromContextAndBusyError(t *testing.T) {
-	name, _ := startServer(t, fakeserver.Options{})
-	cfg := testConfig("main")
-	cfg.BusyTimeout = 50 * time.Millisecond
-	db, _ := openDB(t, name, cfg)
-	mustExec(t, db, "CREATE TABLE b (id INTEGER)")
+// TestBigCells reads rows with several cells that do not fit a batch, text with a
+// NUL byte, and cells of a time column.
+func TestBigCells(t *testing.T) {
+	_, db := startGen(t)
+	mustExec(t, db, "CREATE TABLE bc (id INTEGER PRIMARY KEY, t TEXT, b BLOB, d DATETIME, small TEXT)")
+	t1 := strings.Repeat("é", 100_000)
+	b1 := bytes.Repeat([]byte{1, 2, 3, 4, 5, 6, 7}, 40_000)
+	b2 := make([]byte, 2<<20+17)
+	for i := range b2 {
+		b2[i] = byte(i * 31)
+	}
+	mustExec(t, db, "INSERT INTO bc VALUES (1, ?, ?, '2024-03-05 10:20:30', 'one')", t1, b1)
+	mustExec(t, db, "INSERT INTO bc VALUES (2, 'small', ?, '2024-03-06', 'two')", b2)
+	mustExec(t, db, "INSERT INTO bc VALUES (3, ?, X'', NULL, 'three')", "nul\x00inside")
+	mustExec(t, db, "INSERT INTO bc VALUES (4, ?, X'00', NULL, NULL)", strings.Repeat("x", 70_000)+"\x00tail")
+	mustExec(t, db, "INSERT INTO bc VALUES (5, 'last', X'ff', NULL, 'five')")
 
-	// An IMMEDIATE transaction takes the write lock at BEGIN.
-	ctx := hqqsqlite.WithTxMode(context.Background(), hqqsqlite.TxImmediate)
-	holder, err := db.BeginTx(ctx, nil)
+	rows, err := db.Query("SELECT id, t, b, d, small FROM bc ORDER BY id")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer holder.Rollback()
-
-	_, err = db.Exec("INSERT INTO b VALUES (1)")
-	if !errors.Is(err, hqqsqlite.ErrBusy) {
-		t.Fatalf("write while locked: %v, want ErrBusy", err)
+	defer rows.Close()
+	type rec struct {
+		id    int64
+		t     string
+		b     []byte
+		d     sql.NullTime
+		small sql.NullString
 	}
-	var se *hqqsqlite.Error
-	if !errors.As(err, &se) || se.Primary() != hqqsqlite.CodeBusy {
-		t.Fatalf("error %#v is not a BUSY sqlite error", err)
+	var got []rec
+	for rows.Next() {
+		var r rec
+		if err := rows.Scan(&r.id, &r.t, &r.b, &r.d, &r.small); err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, r)
 	}
-	if err := holder.Rollback(); err != nil {
+	if err := rows.Err(); err != nil {
 		t.Fatal(err)
 	}
-	mustExec(t, db, "INSERT INTO b VALUES (1)")
-}
-
-func TestConstraintErrorCodes(t *testing.T) {
-	db, _ := serve(t)
-	mustExec(t, db, "CREATE TABLE c (id INTEGER PRIMARY KEY, email TEXT UNIQUE, req TEXT NOT NULL)")
-	mustExec(t, db, "INSERT INTO c VALUES (1, 'a@x', 'r')")
-	tests := []struct {
-		name  string
-		query string
-		code  int
-	}{
-		{"primary key", "INSERT INTO c VALUES (1, 'b@x', 'r')", hqqsqlite.CodeConstraintPrimaryKey},
-		{"unique", "INSERT INTO c VALUES (2, 'a@x', 'r')", hqqsqlite.CodeConstraintUnique},
-		{"not null", "INSERT INTO c VALUES (3, 'c@x', NULL)", hqqsqlite.CodeConstraintNotNull},
+	if len(got) != 5 {
+		t.Fatalf("got %d rows, want 5", len(got))
 	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			_, err := db.Exec(tc.query)
-			if !errors.Is(err, hqqsqlite.ErrConstraint) {
-				t.Fatalf("err = %v, want ErrConstraint", err)
-			}
-			var se *hqqsqlite.Error
-			if !errors.As(err, &se) || se.ExtendedCode != tc.code {
-				t.Fatalf("code = %+v, want %d", err, tc.code)
-			}
-		})
+	if got[0].t != t1 || !bytes.Equal(got[0].b, b1) || !got[0].d.Valid || got[0].d.Time.Year() != 2024 || got[0].small.String != "one" {
+		t.Fatalf("row 1 differs: t %d bytes, b %d bytes, d %v, small %q", len(got[0].t), len(got[0].b), got[0].d, got[0].small.String)
+	}
+	if got[1].t != "small" || !bytes.Equal(got[1].b, b2) || got[1].d.Time.Day() != 6 || got[1].small.String != "two" {
+		t.Fatalf("row 2 differs: b %d bytes, d %v", len(got[1].b), got[1].d)
+	}
+	if got[2].t != "nul\x00inside" || len(got[2].b) != 0 || got[2].small.String != "three" {
+		t.Fatalf("row 3 (NUL in text) differs: %q %v", got[2].t, got[2].b)
+	}
+	if got[3].t != strings.Repeat("x", 70_000)+"\x00tail" || got[3].small.Valid {
+		t.Fatalf("row 4 differs: %d bytes", len(got[3].t))
+	}
+	if got[4].t != "last" || !bytes.Equal(got[4].b, []byte{0xff}) {
+		t.Fatalf("row 5 differs: %q %v", got[4].t, got[4].b)
 	}
 }
 
-func TestSQLErrorKeepsConnectionUsable(t *testing.T) {
-	db, _ := serve(t)
-	if _, err := db.Exec("SELEC nonsense"); err == nil {
-		t.Fatal("syntax error accepted")
+// TestHugeValues moves a blob above 16 MiB. The client reads a cell in chunks,
+// so a result is bounded by SQLite and not by one message; a request is still
+// bounded by one message.
+func TestHugeValues(t *testing.T) {
+	_, db := startGen(t)
+	mustExec(t, db, "CREATE TABLE huge (id INTEGER, b BLOB)")
+	payload := make([]byte, 12<<20)
+	for i := range payload {
+		payload[i] = byte(i*7 + 3)
 	}
-	conn, err := db.Conn(context.Background())
+	mustExec(t, db, "INSERT INTO huge VALUES (1, ?)", payload)
+	var back []byte
+	if err := db.QueryRow("SELECT b FROM huge WHERE id = 1").Scan(&back); err != nil || !bytes.Equal(back, payload) {
+		t.Fatalf("12 MiB blob: %d bytes, %v", len(back), err)
+	}
+	var n int
+	if err := db.QueryRow("SELECT length(zeroblob(17 * 1024 * 1024))").Scan(&n); err != nil || n != 17<<20 {
+		t.Fatalf("length of a 17 MiB blob: %d, %v", n, err)
+	}
+	var big []byte
+	if err := db.QueryRow("SELECT zeroblob(17 * 1024 * 1024)").Scan(&big); err != nil || len(big) != 17<<20 {
+		t.Fatalf("17 MiB blob result: %d bytes, %v", len(big), err)
+	}
+	// A request above the limit is refused by the driver and the connection stays usable.
+	_, err := db.Exec("INSERT INTO huge VALUES (2, ?)", make([]byte, 17<<20))
+	if err == nil {
+		t.Fatal("a 17 MiB argument was accepted")
+	}
+	if errors.Is(err, driver.ErrBadConn) {
+		t.Fatalf("a refused request is not a lost connection: %v", err)
+	}
+	if got := queryInt(t, db, "SELECT count(*) FROM huge"); got != 1 {
+		t.Fatalf("rows after the refused insert: %d", got)
+	}
+}
+
+// TestReadOnlyTransactionRestoresQueryOnly checks that a read-only transaction
+// puts the session's query_only back, whatever ends it.
+func TestReadOnlyTransactionRestoresQueryOnly(t *testing.T) {
+	_, db := startGen(t)
+	db.SetMaxOpenConns(1) // one session: the pragma is per session
+	mustExec(t, db, "CREATE TABLE q (v INTEGER)")
+	ctx := context.Background()
+
+	for _, initial := range []int64{0, 1} {
+		mustExec(t, db, fmt.Sprintf("PRAGMA query_only = %d", initial))
+		for _, end := range []string{"commit", "rollback", "sql-commit", "pool-reset"} {
+			if end == "pool-reset" {
+				// The connection goes back to the pool with the read-only transaction
+				// still open (begun below database/sql's Tx); the next checkout resets it.
+				c, err := db.Conn(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				err = c.Raw(func(dc any) error {
+					_, err := dc.(driver.ConnBeginTx).BeginTx(ctx, driver.TxOptions{ReadOnly: true})
+					return err
+				})
+				if err != nil {
+					t.Fatalf("initial %d: raw begin: %v", initial, err)
+				}
+				var inside int64
+				if err := c.QueryRowContext(ctx, "PRAGMA query_only").Scan(&inside); err != nil || inside != 1 {
+					t.Fatalf("initial %d: query_only inside = %d, %v", initial, inside, err)
+				}
+				if err := c.Close(); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				tx, err := db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+				if err != nil {
+					t.Fatalf("initial %d, end %s: begin: %v", initial, end, err)
+				}
+				if n := queryOnlyOf(t, tx); n != 1 {
+					t.Fatalf("query_only inside the read-only transaction = %d", n)
+				}
+				switch end {
+				case "commit":
+					err = tx.Commit()
+				case "rollback":
+					err = tx.Rollback()
+				case "sql-commit":
+					// The transaction ends with SQL text; Rollback is then a no-op and
+					// must still restore the setting.
+					if _, err = tx.Exec("COMMIT"); err == nil {
+						err = tx.Rollback()
+					}
+				}
+				if err != nil {
+					t.Fatalf("initial %d, end %s: %v", initial, end, err)
+				}
+			}
+			if got := queryInt(t, db, "PRAGMA query_only"); got != initial {
+				t.Fatalf("initial %d, end %s: query_only after = %d", initial, end, got)
+			}
+		}
+	}
+}
+
+func queryOnlyOf(t *testing.T, tx *sql.Tx) int64 {
+	t.Helper()
+	var v int64
+	if err := tx.QueryRow("PRAGMA query_only").Scan(&v); err != nil {
+		t.Fatal(err)
+	}
+	return v
+}
+
+// TestCancelAbandonsCall checks the behavior of a context that ends while a
+// statement runs: the caller gets its context error at the deadline, the server
+// interrupts the running statement, the connection is discarded, the pool
+// recovers, and a canceled Exec does not make database/sql believe it can retry.
+func TestCancelAbandonsCall(t *testing.T) {
+	srv, db := startGen(t)
+	const long = "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 8000000) SELECT count(*) FROM c"
+	mustExec(t, db, "CREATE TABLE cx (v INTEGER)")
+
+	for name, run := range map[string]func(ctx context.Context) error{
+		"query": func(ctx context.Context) error {
+			var n int64
+			return db.QueryRowContext(ctx, long).Scan(&n)
+		},
+		"exec": func(ctx context.Context) error {
+			_, err := db.ExecContext(ctx, "INSERT INTO cx SELECT count(*) FROM ("+long[:len(long)-len("SELECT count(*) FROM c")]+"SELECT x FROM c)")
+			return err
+		},
+	} {
+		ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+		start := time.Now()
+		err := run(ctx)
+		cancel()
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("%s: %v, want the deadline", name, err)
+		}
+		if d := time.Since(start); d > 3*time.Second {
+			t.Fatalf("%s: returned after %v", name, d)
+		}
+		if errors.Is(err, driver.ErrBadConn) {
+			t.Fatalf("%s: a deadline must not look like a lost connection: %v", name, err)
+		}
+		if n := queryInt(t, db, "SELECT 1"); n != 1 {
+			t.Fatalf("%s: SELECT 1 = %d", name, n)
+		}
+	}
+	// The abandoned sessions end on the server once their statement is interrupted.
+	if !srv.Log.WaitCount(sqlite3srv.LineSessionEnded, 2, 60*time.Second) {
+		t.Fatalf("abandoned sessions did not end:\n%s", srv.Log.String())
+	}
+}
+
+// TestServerKilled checks the mapping of a lost link: a statement that was in
+// flight has an unknown outcome and is not retried, any other call is a bad
+// connection that database/sql replaces.
+func TestServerKilled(t *testing.T) {
+	srv := sqlite3srv.Start(t, sqlite3srv.Config{})
+	cfg := genConfig("main")
+	conn, err := mustConnector(t, srv, cfg).Connect(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer conn.Close()
-	if _, err := conn.ExecContext(context.Background(), "SELECT * FROM missing"); err == nil {
-		t.Fatal("missing table accepted")
-	}
-	if err := conn.Raw(func(dc any) error {
-		if !dc.(driver.Validator).IsValid() {
-			return errors.New("connection invalid after SQL error")
-		}
-		return nil
-	}); err != nil {
+	exec := conn.(driver.ExecerContext)
+	if _, err := exec.ExecContext(context.Background(), "CREATE TABLE k (v INTEGER)", nil); err != nil {
 		t.Fatal(err)
 	}
-	var one int
-	if err := conn.QueryRowContext(context.Background(), "SELECT value FROM hqq_series(1, 1)").Scan(&one); err != nil || one != 1 {
-		t.Fatalf("query after error: %d %v", one, err)
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := exec.ExecContext(context.Background(),
+			"INSERT INTO k WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 50000000) SELECT count(*) FROM c", nil)
+		done <- err
+	}()
+	if !srv.Log.WaitCount(sqlite3srv.LineSessionStarted, 1, 10*time.Second) {
+		t.Fatal("no session")
+	}
+	time.Sleep(100 * time.Millisecond)
+	srv.KillServer()
+	select {
+	case err := <-done:
+		if !errors.Is(err, sqlite.ErrOutcomeUnknown) {
+			t.Fatalf("Exec in flight when the server died: %v, want ErrOutcomeUnknown", err)
+		}
+		if errors.Is(err, driver.ErrBadConn) {
+			t.Fatalf("an Exec of unknown outcome must not be retried by database/sql: %v", err)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("Exec did not return after the server died")
+	}
+	if v, ok := conn.(driver.Validator); !ok || v.IsValid() {
+		t.Fatal("the conn is still valid after its session failed")
+	}
+	if _, err := conn.(driver.QueryerContext).QueryContext(context.Background(), "SELECT 1", nil); !errors.Is(err, driver.ErrBadConn) {
+		t.Fatalf("Query on a dead conn: %v, want driver.ErrBadConn", err)
+	}
+	if err := conn.(driver.Pinger).Ping(context.Background()); !errors.Is(err, driver.ErrBadConn) {
+		t.Fatalf("Ping on a dead conn: %v, want driver.ErrBadConn", err)
+	}
+	// Dialing a listener whose server died fails either fast with "listener is gone"
+	// (a bad connection) or when the connect timeout ends (a deadline error, not a bad
+	// connection: database/sql must not retry it at once).
+	short := cfg
+	short.Timeout = 2 * time.Second
+	if _, err := mustConnector(t, srv, short).Connect(context.Background()); !errors.Is(err, driver.ErrBadConn) && !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, hqq.ErrTimeout) {
+		t.Fatalf("Connect with the server gone: %v, want driver.ErrBadConn or a timeout", err)
 	}
 }
 
-func TestCancelMidQuery(t *testing.T) {
-	name, srv := startServer(t, fakeserver.Options{})
-	c, err := hqqsqlite.NewConnector(name, testConfig("main"))
+// TestServerKilledIdle checks that a query on an idle connection whose server
+// died is a bad connection (so database/sql may retry it on a new one).
+func TestServerKilledIdle(t *testing.T) {
+	srv := sqlite3srv.Start(t, sqlite3srv.Config{})
+	conn, err := mustConnector(t, srv, genConfig("main")).Connect(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	st, err := conn.(driver.ConnPrepareContext).PrepareContext(context.Background(), "SELECT 1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv.KillServer()
+	start := time.Now()
+	_, err = st.(driver.StmtQueryContext).QueryContext(context.Background(), nil)
+	if !errors.Is(err, driver.ErrBadConn) {
+		t.Fatalf("query after SIGKILL: %v, want driver.ErrBadConn", err)
+	}
+	if d := time.Since(start); d > 5*time.Second {
+		t.Fatalf("crash detection took %v", d)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("Stmt.Close on a dead conn: %v", err)
+	}
+}
+
+func mustConnector(t *testing.T, srv *sqlite3srv.Server, cfg sqlite.Config) *sqlite.Connector {
+	t.Helper()
+	c, err := sqlite.NewConnector(srv.Listener(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c
+}
+
+// TestStatementReusedWhileRowsOpen executes a prepared statement again before its
+// earlier rows are read to the end, inside one transaction. The earlier rows are
+// released with an error.
+func TestStatementReusedWhileRowsOpen(t *testing.T) {
+	_, db := startGen(t)
+	mustExec(t, db, "CREATE TABLE s (id INTEGER PRIMARY KEY)")
+	mustExec(t, db, "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 1000) INSERT INTO s SELECT x FROM c")
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	st, err := tx.Prepare("SELECT id FROM s WHERE id > ? ORDER BY id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := st.Query(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	for range 5 {
+		if !first.Next() {
+			t.Fatalf("first rows ended early: %v", first.Err())
+		}
+	}
+	second, err := st.Query(990)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	n := 0
+	for second.Next() {
+		n++
+	}
+	if err := second.Err(); err != nil || n != 10 {
+		t.Fatalf("second rows: %d, %v", n, err)
+	}
+	for first.Next() {
+	}
+	if first.Err() == nil {
+		t.Fatal("the superseded rows ended without an error")
+	}
+}
+
+// TestIsolationLevels checks that an unsupported level is refused before anything
+// is sent and leaves the connection usable.
+func TestIsolationLevels(t *testing.T) {
+	_, db := startGen(t)
+	db.SetMaxOpenConns(1)
+	ctx := context.Background()
+	for _, lvl := range []sql.IsolationLevel{sql.LevelReadUncommitted, sql.LevelReadCommitted, sql.LevelRepeatableRead, sql.LevelSnapshot, sql.LevelLinearizable} {
+		if tx, err := db.BeginTx(ctx, &sql.TxOptions{Isolation: lvl}); err == nil {
+			_ = tx.Rollback()
+			t.Fatalf("isolation %v accepted", lvl)
+		}
+	}
+	c, err := db.Conn(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer c.Close()
-	cn, err := c.Connect(context.Background())
-	if err != nil {
+	if _, err := c.ExecContext(ctx, "BEGIN"); err != nil {
+		t.Fatalf("BEGIN after the refused levels: %v", err)
+	}
+	if _, err := c.ExecContext(ctx, "COMMIT"); err != nil {
 		t.Fatal(err)
 	}
-	defer cn.Close()
-	q := cn.(driver.QueryerContext)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-	defer cancel()
-	start := time.Now()
-	_, err = q.QueryContext(ctx, "SELECT hqq_sleep(10000)", nil)
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("canceled query err = %v", err)
-	}
-	if d := time.Since(start); d > 3*time.Second {
-		t.Fatalf("cancel took %v", d)
-	}
-	waitUntil(t, 3*time.Second, "server to observe the cancel", func() bool {
-		return srv.Stats().Interrupted >= 1
-	})
-	if cn.(driver.Validator).IsValid() {
-		t.Fatal("connection still valid after a canceled call")
-	}
-	if _, err := q.QueryContext(context.Background(), "SELECT 1", nil); !errors.Is(err, driver.ErrBadConn) {
-		t.Fatalf("use after cancel: %v, want ErrBadConn", err)
-	}
 }
 
-func TestCancelThroughSQLPool(t *testing.T) {
-	db, srv := serve(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-	defer cancel()
-	if _, err := db.QueryContext(ctx, "SELECT hqq_sleep(10000)"); err == nil {
-		t.Fatal("canceled query succeeded")
-	}
-	waitUntil(t, 3*time.Second, "interrupt", func() bool { return srv.Stats().Interrupted >= 1 })
-	var one int
-	if err := db.QueryRow("SELECT value FROM hqq_series(1, 1)").Scan(&one); err != nil || one != 1 {
-		t.Fatalf("pool after cancel: %v", err)
-	}
-}
-
-func TestFiftyConcurrentConnections(t *testing.T) {
-	db, srv := serve(t)
-	mustExec(t, db, "CREATE TABLE conc (id INTEGER PRIMARY KEY, v INTEGER)")
-	const conns = 50
+// TestConcurrentConnections uses many connections of one pool at once, each with
+// its own session, and checks every answer.
+func TestConcurrentConnections(t *testing.T) {
+	_, db := startGen(t)
+	mustExec(t, db, "PRAGMA journal_mode=WAL")
+	mustExec(t, db, "CREATE TABLE cc (k INTEGER PRIMARY KEY, v INTEGER)")
+	const workers, rounds = 24, 40
 	var wg sync.WaitGroup
-	errs := make(chan error, conns)
-	for i := range conns {
+	errc := make(chan error, workers)
+	for w := range workers {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if _, err := db.Exec("INSERT INTO conc (id, v) VALUES (?, ?)", i, i*i); err != nil {
-				errs <- err
-				return
-			}
-			var v int
-			if err := db.QueryRow("SELECT v FROM conc WHERE id = ?", i).Scan(&v); err != nil {
-				errs <- err
-				return
-			}
-			if v != i*i {
-				errs <- fmt.Errorf("id %d: v = %d", i, v)
+			for i := range rounds {
+				if _, err := db.Exec("INSERT OR REPLACE INTO cc (k, v) VALUES (?, ?)", w, i); err != nil {
+					errc <- fmt.Errorf("worker %d: %w", w, err)
+					return
+				}
+				var v int64
+				if err := db.QueryRow("SELECT v FROM cc WHERE k = ?", w).Scan(&v); err != nil || v != int64(i) {
+					errc <- fmt.Errorf("worker %d round %d: v = %d, %v", w, i, v, err)
+					return
+				}
 			}
 		}()
 	}
 	wg.Wait()
-	close(errs)
-	for err := range errs {
-		t.Fatal(err)
+	close(errc)
+	for err := range errc {
+		t.Error(err)
 	}
-	rows, err := db.Query("SELECT id FROM conc")
-	if err != nil {
-		t.Fatal(err)
-	}
-	n := 0
-	for rows.Next() {
-		n++
-	}
-	rows.Close()
-	if n != conns {
-		t.Fatalf("rows = %d, want %d", n, conns)
-	}
-	if st := srv.Stats(); st.Sessions < 2 {
-		t.Fatalf("expected several sessions, got %d", st.Sessions)
+	if n := queryInt(t, db, "SELECT count(*) FROM cc"); n != workers {
+		t.Fatalf("rows = %d, want %d", n, workers)
 	}
 }
 
-// TestLargeResultMemoryIsBounded streams a 16 MiB result. Live heap after a GC
-// must stay near the fetch size, not near the result size.
-func TestLargeResultMemoryIsBounded(t *testing.T) {
-	name, _ := startServer(t, fakeserver.Options{})
-	cfg := testConfig("main")
-	cfg.FetchSize = 64
-	db, _ := openDB(t, name, cfg)
-
-	const rows = 1024
-	text := string(bytes.Repeat([]byte("x"), 16<<10))
-	stmt, err := db.Prepare("SELECT ? FROM hqq_series(1, ?)")
+// TestSessionLimit checks that the server's session limit surfaces as an error of
+// Connect and not as a hang.
+func TestSessionLimit(t *testing.T) {
+	srv := sqlite3srv.Start(t, sqlite3srv.Config{Args: []string{"--max-sessions", "1"}})
+	c := mustConnector(t, srv, genConfig("main"))
+	first, err := c.Connect(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer stmt.Close()
-	res, err := stmt.Query(text, rows)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer res.Close()
-
-	live := func() uint64 {
-		runtime.GC()
-		var ms runtime.MemStats
-		runtime.ReadMemStats(&ms)
-		return ms.HeapAlloc
-	}
-	base := live()
-	var peak uint64
-	n, total := 0, 0
-	for res.Next() {
-		var s string
-		if err := res.Scan(&s); err != nil {
-			t.Fatal(err)
-		}
-		n++
-		total += len(s)
-		if n%128 == 0 {
-			peak = max(peak, live())
-		}
-	}
-	if err := res.Err(); err != nil {
-		t.Fatal(err)
-	}
-	if n != rows || total != rows*len(text) {
-		t.Fatalf("rows = %d, bytes = %d", n, total)
-	}
-	const budget = 12 << 20
-	if peak > base+budget {
-		t.Fatalf("live heap grew to %d (base %d): result is not streamed", peak, base)
-	}
-}
-
-func TestEarlyRowsCloseReleasesCursor(t *testing.T) {
-	name, _ := startServer(t, fakeserver.Options{})
-	cfg := testConfig("main")
-	cfg.FetchSize = 16
-	db, _ := openDB(t, name, cfg)
-	rows, err := db.Query("SELECT value FROM hqq_series(1, 100000)")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !rows.Next() {
-		t.Fatal("no first row")
-	}
-	if err := rows.Close(); err != nil {
-		t.Fatal(err)
-	}
-	var one int
-	if err := db.QueryRow("SELECT value FROM hqq_series(7, 7)").Scan(&one); err != nil || one != 7 {
-		t.Fatalf("query after early close: %d %v", one, err)
-	}
-}
-
-func TestRollbackWhenConnectionCloses(t *testing.T) {
-	name, srv := startServer(t, fakeserver.Options{})
-	c, err := hqqsqlite.NewConnector(name, testConfig("main"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c.Close()
-	ctx := context.Background()
-	a, err := c.Connect(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	b, err := c.Connect(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer b.Close()
-
-	exec := func(cn driver.Conn, q string) {
-		t.Helper()
-		if _, err := cn.(driver.ExecerContext).ExecContext(ctx, q, nil); err != nil {
-			t.Fatalf("%s: %v", q, err)
-		}
-	}
-	exec(a, "CREATE TABLE r (id INTEGER)")
-	exec(a, "BEGIN")
-	exec(a, "INSERT INTO r VALUES (1)")
-	if err := a.Close(); err != nil { // the session ends with a transaction open
-		t.Fatal(err)
-	}
-	waitUntil(t, 3*time.Second, "rollback on close", func() bool {
-		return srv.Stats().RolledBack >= 1
-	})
-	rows, err := b.(driver.QueryerContext).QueryContext(ctx, "SELECT id FROM r", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	dest := make([]driver.Value, 1)
-	if err := rows.Next(dest); err == nil {
-		t.Fatalf("rolled back row is visible: %v", dest)
-	}
-	rows.Close()
-}
-
-func TestPragmasAndReadOnlyMode(t *testing.T) {
-	name, _ := startServer(t, fakeserver.Options{})
-	rw, _ := openDB(t, name, testConfig("data"))
-	mustExec(t, rw, "CREATE TABLE ro (id INTEGER)")
-
-	roCfg := testConfig("data")
-	roCfg.Mode = hqqsqlite.ModeReadOnly
-	ro, _ := openDB(t, name, roCfg)
-	_, err := ro.Exec("INSERT INTO ro VALUES (1)")
-	if !errors.Is(err, hqqsqlite.ErrReadOnly) {
-		t.Fatalf("write in read-only mode: %v", err)
-	}
-
-	qCfg := testConfig("data")
-	qCfg.Pragmas = []hqqsqlite.Pragma{{Name: "query_only", Value: "1"}}
-	q, _ := openDB(t, name, qCfg)
-	if _, err := q.Exec("INSERT INTO ro VALUES (2)"); !errors.Is(err, hqqsqlite.ErrReadOnly) {
-		t.Fatalf("write with query_only: %v", err)
-	}
-}
-
-func TestDatabaseAliasPolicy(t *testing.T) {
-	name, _ := startServer(t, fakeserver.Options{
-		Aliases:      map[string]string{"main": "maindb"},
-		RequireAlias: true,
-	})
-	db, _ := openDB(t, name, testConfig("main"))
-	mustExec(t, db, "CREATE TABLE a (id INTEGER)")
-
-	other, _ := openDB(t, name, testConfig("elsewhere"))
-	_, err := other.Exec("CREATE TABLE a (id INTEGER)")
-	var pe *wire.ProtocolError
-	if !errors.As(err, &pe) || pe.Code != wire.ProtoForbidden {
-		t.Fatalf("unknown database: %v, want FORBIDDEN", err)
-	}
-}
-
-func TestConnectTimeoutWithoutServer(t *testing.T) {
-	cfg := testConfig("main")
-	cfg.Timeout = 300 * time.Millisecond
-	c, err := hqqsqlite.NewConnector(listenerName(), cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c.Close()
-	start := time.Now()
-	_, err = c.Connect(context.Background())
+	defer first.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	second, err := c.Connect(ctx)
 	if err == nil {
-		t.Fatal("connect to a missing service succeeded")
+		_ = second.Close()
+		t.Fatal("a second session beyond --max-sessions was accepted")
 	}
-	if d := time.Since(start); d > 3*time.Second {
-		t.Fatalf("connect took %v", d)
+	if !errors.Is(err, rt.ErrLimit) || protoCode(err) != wire.ProtoLimit {
+		t.Fatalf("second Connect: %v, want a limit error", err)
+	}
+	if err := first.(driver.Pinger).Ping(context.Background()); err != nil {
+		t.Fatalf("the first session after the refusal: %v", err)
 	}
 }
 
-func TestClosedConnectorFailsConnections(t *testing.T) {
-	name, _ := startServer(t, fakeserver.Options{})
-	c, err := hqqsqlite.NewConnector(name, testConfig("main"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	cn, err := c.Connect(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
+// TestConnectorClosed checks Connect after Close.
+func TestConnectorClosed(t *testing.T) {
+	srv := sqlite3srv.Start(t, sqlite3srv.Config{})
+	c := mustConnector(t, srv, genConfig("main"))
 	if err := c.Close(); err != nil {
 		t.Fatal(err)
-	}
-	if _, err := cn.(driver.QueryerContext).QueryContext(context.Background(), "SELECT 1", nil); !errors.Is(err, driver.ErrBadConn) {
-		t.Fatalf("query on closed connector: %v", err)
 	}
 	if _, err := c.Connect(context.Background()); err == nil {
 		t.Fatal("Connect after Close succeeded")
 	}
 }
 
-func TestDriverRegisteredAndDSN(t *testing.T) {
-	name, _ := startServer(t, fakeserver.Options{})
-	dsn := fmt.Sprintf("hqq://%s?db=%s&timeout=5s&fetch=32&busy=1s&txlock=immediate&mode=rwc&pragma.query_only=0",
-		name, url.QueryEscape("dsn"))
-	db, err := sql.Open(hqqsqlite.DriverName, dsn)
+// TestStatementClearsOldBindings runs a prepared statement with fewer arguments than
+// before, below database/sql (which checks the count): parameters nobody binds are
+// NULL again, not the values of the earlier run.
+func TestStatementClearsOldBindings(t *testing.T) {
+	srv := sqlite3srv.Start(t, sqlite3srv.Config{})
+	cn, err := mustConnector(t, srv, genConfig("main")).Connect(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
-	if err := db.Ping(); err != nil {
-		t.Fatal(err)
-	}
-	mustExec(t, db, "CREATE TABLE d (id INTEGER)")
-}
-
-func TestUnsupportedArgumentType(t *testing.T) {
-	db, _ := serve(t)
-	if _, err := db.Exec("SELECT ?", complex(1, 2)); err == nil {
-		t.Fatal("complex argument accepted")
-	}
-}
-
-func TestIsolationLevels(t *testing.T) {
-	db, _ := serve(t)
-	if _, err := db.BeginTx(context.Background(), &sql.TxOptions{Isolation: sql.LevelReadUncommitted}); err == nil {
-		t.Fatal("read uncommitted accepted")
-	}
-	tx, err := db.BeginTx(context.Background(), &sql.TxOptions{Isolation: sql.LevelSerializable, ReadOnly: true})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := tx.Rollback(); err != nil {
-		t.Fatal(err)
-	}
-}
-
-// TestLinkLossDuringRequest checks the retry contract of database/sql. A link
-// lost while an Exec is in flight must not be driver.ErrBadConn, because
-// database/sql would retry the statement and it may have run. A lost Query
-// is driver.ErrBadConn, so database/sql retries the read.
-func TestLinkLossDuringRequest(t *testing.T) {
-	tests := []struct {
-		name    string
-		query   string
-		badConn bool
-	}{
-		{"exec", "SELECT hqq_sleep(10000)", false},
-		{"query", "SELECT hqq_sleep(10000)", true},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			name, srv := startServer(t, fakeserver.Options{})
-			c, err := hqqsqlite.NewConnector(name, testConfig("main"))
-			if err != nil {
-				t.Fatal(err)
-			}
-			db := sql.OpenDB(c)
-			defer db.Close()
-			mustExec(t, db, "CREATE TABLE lost (v INTEGER)")
-			// A pinned connection makes the call a single attempt: database/sql
-			// would retry a Query on a new connection, which dials the gone listener.
-			cn, err := db.Conn(context.Background())
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer cn.Close()
-			before := srv.Stats().Requests
-			errc := make(chan error, 1)
-			go func() {
-				var err error
-				if tc.name == "exec" {
-					_, err = cn.ExecContext(context.Background(), tc.query)
-				} else {
-					var rows *sql.Rows
-					rows, err = cn.QueryContext(context.Background(), tc.query)
-					if err == nil {
-						rows.Close()
-					}
-				}
-				errc <- err
-			}()
-			waitUntil(t, 5*time.Second, "the request reaches the server", func() bool {
-				return srv.Stats().Requests > before
-			})
-			_ = srv.Close()
-			select {
-			case err := <-errc:
-				if errors.Is(err, driver.ErrBadConn) != tc.badConn {
-					t.Fatalf("err = %v, ErrBadConn = %v, want %v", err, errors.Is(err, driver.ErrBadConn), tc.badConn)
-				}
-				if !tc.badConn && !errors.Is(err, hqqsqlite.ErrOutcomeUnknown) {
-					t.Fatalf("err = %v, want ErrOutcomeUnknown", err)
-				}
-			case <-time.After(5 * time.Second):
-				t.Fatal("the call did not return after the server closed")
-			}
-		})
-	}
-}
-
-// TestConnectorFromDSNAndDriverOpen covers the entry points that do not go
-// through sql.Open: ConnectorFromDSN with sql.OpenDB, and Driver.Open, whose
-// connection owns the connector and closes it.
-func TestConnectorFromDSNAndDriverOpen(t *testing.T) {
-	name, _ := startServer(t, fakeserver.Options{})
-	dsn := "hqq://" + name + "?db=main&timeout=5s"
-	c, err := hqqsqlite.ConnectorFromDSN(dsn)
-	if err != nil {
-		t.Fatal(err)
-	}
-	db := sql.OpenDB(c)
-	var one int
-	if err := db.QueryRow("SELECT ?", 1).Scan(&one); err != nil || one != 1 {
-		t.Fatalf("SELECT ? = %d, %v", one, err)
-	}
-	if err := db.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := c.Connect(context.Background()); err == nil {
-		t.Fatal("Connect after db.Close succeeded")
-	}
-
-	dc, err := (&hqqsqlite.Driver{}).Open(dsn)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := dc.(driver.Pinger).Ping(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if err := dc.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if err := dc.(driver.Pinger).Ping(context.Background()); err == nil {
-		t.Fatal("Ping on a closed connection succeeded")
-	}
-}
-
-func TestParseDSN(t *testing.T) {
-	good := map[string]hqqsqlite.Config{
-		"hqq://svc?db=main": {Database: "main"},
-		"hqq://svc?db=/p/q.db&mode=ro&timeout=2s&fetch=10&busy=-1s&txlock=exclusive&pragma.journal_mode=WAL": {
-			Database: "/p/q.db", Mode: hqqsqlite.ModeReadOnly, Timeout: 2 * time.Second, FetchSize: 10,
-			BusyTimeout: -time.Second, TxMode: hqqsqlite.TxExclusive,
-			Pragmas: []hqqsqlite.Pragma{{Name: "journal_mode", Value: "WAL"}},
-		},
-	}
-	for dsn, want := range good {
-		listener, cfg, err := hqqsqlite.ParseDSN(dsn)
-		if err != nil {
-			t.Fatalf("%s: %v", dsn, err)
-		}
-		if listener != "svc" && listener != "" {
-			t.Fatalf("%s: listener %q", dsn, listener)
-		}
-		if cfg.Database != want.Database || cfg.Mode != want.Mode || cfg.Timeout != want.Timeout ||
-			cfg.FetchSize != want.FetchSize || cfg.BusyTimeout != want.BusyTimeout || cfg.TxMode != want.TxMode ||
-			fmt.Sprint(cfg.Pragmas) != fmt.Sprint(want.Pragmas) {
-			t.Fatalf("%s: cfg = %+v, want %+v", dsn, cfg, want)
-		}
-	}
-	for _, dsn := range []string{
-		"postgres://svc?db=x",
-		"hqq://?db=x",
-		"hqq://svc",
-		"hqq://svc?db=x&bogus=1",
-		"hqq://svc?db=x&fetch=many",
-		"hqq://svc?db=x&mode=nope",
-		"hqq://svc?db=x&timeout=soon",
-		"hqq://svc?db=x&txlock=sometimes",
-		"hqq://svc/path?db=x",
-		"hqq://svc?db=a&db=b",
-	} {
-		if _, _, err := hqqsqlite.ParseDSN(dsn); err == nil {
-			t.Errorf("%s: accepted", dsn)
-		}
-	}
-}
-
-func TestNewConnectorValidation(t *testing.T) {
-	bad := []hqqsqlite.Config{
-		{},
-		{Database: "x", FetchSize: wire.MaxFetchRows + 1},
-		{Database: "x", FetchSize: -1},
-		{Database: "x", Mode: 9},
-		{Database: "x", TxMode: 9},
-		{Database: "x", Pragmas: []hqqsqlite.Pragma{{Name: "bad name", Value: "1"}}},
-	}
-	for i, cfg := range bad {
-		if _, err := hqqsqlite.NewConnector("svc", cfg); err == nil {
-			t.Errorf("config %d accepted", i)
-		}
-	}
-	if _, err := hqqsqlite.NewConnector("", hqqsqlite.Config{Database: "x"}); err == nil {
-		t.Error("empty listener accepted")
-	}
-}
-
-// TestRawBeginRolledBackOnReuse checks that a transaction begun with plain SQL
-// does not survive the connection's return to the pool: the next checkout
-// rolls it back (ResetSession), so its rows are never visible.
-func TestRawBeginRolledBackOnReuse(t *testing.T) {
-	db, _ := serve(t)
-	mustExec(t, db, "CREATE TABLE rb (id INTEGER)")
+	defer cn.Close()
 	ctx := context.Background()
-
-	conn, err := db.Conn(ctx)
+	st, err := cn.(driver.ConnPrepareContext).PrepareContext(ctx, "SELECT ? IS NULL, ? IS NULL")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := conn.ExecContext(ctx, "BEGIN"); err != nil {
-		t.Fatal(err)
+	defer st.Close()
+	isNull := func(args ...driver.Value) []driver.Value {
+		t.Helper()
+		nv := make([]driver.NamedValue, len(args))
+		for i, a := range args {
+			nv[i] = driver.NamedValue{Ordinal: i + 1, Value: a}
+		}
+		rows, err := st.(driver.StmtQueryContext).QueryContext(ctx, nv)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rows.Close()
+		dest := make([]driver.Value, 2)
+		if err := rows.Next(dest); err != nil {
+			t.Fatal(err)
+		}
+		return dest
 	}
-	if _, err := conn.ExecContext(ctx, "INSERT INTO rb VALUES (1)"); err != nil {
-		t.Fatal(err)
+	if got := isNull(int64(1), int64(2)); got[0] != int64(0) || got[1] != int64(0) {
+		t.Fatalf("bound: %v", got)
 	}
-	if err := conn.Close(); err != nil { // back to the pool, transaction still open
-		t.Fatal(err)
+	if got := isNull(int64(1)); got[0] != int64(0) || got[1] != int64(1) {
+		t.Fatalf("one argument: %v, want the second parameter NULL", got)
 	}
-
-	rows, err := db.Query("SELECT id FROM rb")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer rows.Close()
-	// The same session would see its own uncommitted row, so an invisible row
-	// shows that the reset rolled the transaction back.
-	if rows.Next() {
-		t.Fatal("rows of an abandoned transaction are visible on reuse")
+	if got := isNull(); got[0] != int64(1) || got[1] != int64(1) {
+		t.Fatalf("no arguments: %v, want both parameters NULL", got)
 	}
 }

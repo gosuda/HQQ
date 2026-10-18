@@ -20,6 +20,7 @@
 
 static uint8_t g_fail[MAX_OBJECTS];      /* the adapter of object n fails */
 static uint8_t g_dcount[MAX_OBJECTS];    /* how often the adapter of object n ran */
+static uint8_t g_ccount[MAX_OBJECTS];    /* how often the cancel hook of object n ran */
 static uint32_t g_log[MAX_OBJECTS];      /* object numbers in destroy order */
 static size_t g_nlog;
 static uint32_t g_next_obj = 1;
@@ -42,10 +43,17 @@ static int destroy_any(void *p) {
     return g_fail[n];
 }
 
+static void cancel_any(void *p) {
+    uint32_t n = obj_number(p);
+
+    HQQ_CHECK(n != 0 && n < MAX_OBJECTS);
+    g_ccount[n]++;
+}
+
 static const hqqrpc_handle_type g_types[] = {
-    {"A", 0, destroy_any},
-    {"B", TA, destroy_any},
-    {"C", TB, destroy_any},
+    {"A", 0, destroy_any, cancel_any},
+    {"B", TA, destroy_any, NULL},
+    {"C", TB, destroy_any, NULL},
 };
 
 static hqqrpc_status unused_dispatch(hqqrpc_call *c) {

@@ -13,6 +13,7 @@ static int hqq_cstr_len(const char *s, uint32_t max, uint32_t *n) {
 }
 
 static int destroy_Db(void *p) { return sqlite3_close((sqlite3 *)p) != 0; }
+static void cancel_Db(void *p) { (void)sqlite3_interrupt((sqlite3 *)p); }
 static int destroy_Stmt(void *p) { return sqlite3_finalize((sqlite3_stmt *)p) != 0; }
 
 /* op 1: sqlite3_open_v2. @intercept, @error(status), detail. G1: flags i32 @0 (4). V1: filename,
@@ -1222,8 +1223,8 @@ static hqqrpc_status sqlite3_dispatch(hqqrpc_call *c) {
 }
 
 static const hqqrpc_handle_type sqlite3_handle_types[] = {
-    { "Db", 0, destroy_Db },                /* SQLITE3_H_DB */
-    { "Stmt", SQLITE3_H_DB, destroy_Stmt }, /* SQLITE3_H_STMT, owned_by Db */
+    { "Db", 0, destroy_Db, cancel_Db },           /* SQLITE3_H_DB */
+    { "Stmt", SQLITE3_H_DB, destroy_Stmt, NULL }, /* SQLITE3_H_STMT, owned_by Db */
 };
 
 static const char *const sqlite3_op_names[] = {

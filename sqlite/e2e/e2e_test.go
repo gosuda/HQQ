@@ -135,8 +135,9 @@ func TestMultipleBatchesAndSmallFetch(t *testing.T) {
 	}
 }
 
-// TestLargeBlobsAndRowLimit moves blobs of several batches and checks that a
-// row above the 16 MiB message limit is refused with SQLITE_TOOBIG.
+// TestLargeBlobsAndRowLimit moves blobs across several batches, streams a 17
+// MiB blob in chunks, and checks that a value above SQLite's limit is refused
+// with SQLITE_TOOBIG while keeping the connection usable.
 func TestLargeBlobsAndRowLimit(t *testing.T) {
 	_, name, _ := startTestServer(t)
 	db := openDB(t, name, "main")
@@ -156,13 +157,18 @@ func TestLargeBlobsAndRowLimit(t *testing.T) {
 		}
 	}
 
+	var big []byte
+	if err := db.QueryRow("SELECT zeroblob(17 * 1024 * 1024)").Scan(&big); err != nil || len(big) != 17<<20 {
+		t.Fatalf("17 MiB chunked blob: %d bytes, %v", len(big), err)
+	}
+
 	var n []byte
-	err := db.QueryRow("SELECT zeroblob(17 * 1024 * 1024)").Scan(&n)
+	err := db.QueryRow("SELECT zeroblob(1 << 31)").Scan(&n)
 	if err == nil {
-		t.Fatal("a 17 MiB row was returned")
+		t.Fatal("an oversized blob was returned")
 	}
 	if sqliteCode(err) != 18 {
-		t.Fatalf("oversized row: %v (code %d), want SQLITE_TOOBIG (18)", err, sqliteCode(err))
+		t.Fatalf("oversized blob: %v (code %d), want SQLITE_TOOBIG (18)", err, sqliteCode(err))
 	}
 	// The connection stays usable after a SQL error (PROTOCOL.md section 7).
 	if got := queryInt(t, db, "SELECT 7"); got != 7 {

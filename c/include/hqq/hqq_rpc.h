@@ -40,6 +40,7 @@ extern "C" {
 #define HQQRPC_VAR_SLACK 11u
 #define HQQRPC_NULL_LEN 0xFFFFFFFFu
 #define HQQRPC_OPEN_METHOD 1u            /* control-link method BG_OPEN */
+#define HQQRPC_CANCEL_METHOD 2u          /* control-link method BG_CANCEL */
 
 #define HQQRPC_K_REQUEST 0x01u
 #define HQQRPC_K_RESPONSE 0x02u
@@ -104,6 +105,7 @@ typedef struct hqqrpc_handle_type {
     const char *name;
     uint16_t parent;                 /* handle type id of the owner, 0 for none; ids are 1-based array indices */
     int (*destroy)(void *ptr);       /* destroys the C object; 0 on success */
+    void (*cancel)(void *ptr);       /* interrupts an in-flight call on the C object; NULL if none */
 } hqqrpc_handle_type;
 
 #define HQQRPC_SERIALIZE_SESSION 0u
@@ -194,6 +196,8 @@ HQQ_API void hqqrpc_exec_begin(hqqrpc_session *s);   /* no-op for HQQRPC_SERIALI
 HQQ_API void hqqrpc_exec_end(hqqrpc_session *s);
 HQQ_API void *hqqrpc_scratch(hqqrpc_session *s, size_t n);  /* call-scoped, ALIGN-aligned, NULL on failure */
 HQQ_API void *hqqrpc_session_user(hqqrpc_session *s);
+HQQ_API int hqqrpc_session_canceled(hqqrpc_session *s);     /* nonzero if the active call was canceled (s == NULL: current thread's session) */
+HQQ_API void hqqrpc_session_cancel(hqqrpc_session *s, uint32_t req_id); /* thread-safe: interrupts in-flight call <= req_id (0: any) */
 
 /* ---- Server ------------------------------------------------------------- */
 typedef struct hqqrpc_server_options {
