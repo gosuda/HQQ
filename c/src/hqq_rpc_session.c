@@ -246,7 +246,7 @@ hqqrpc_status hqqrpc_resp_commit(hqqrpc_call *call, hqqrpc_wr *w, uint8_t flags)
         return w->err;
     }
     if (!cs->began || cs->committed || w->priv != cs || s->end != HQQRPC_END_NONE ||
-        (flags & (uint8_t)~(HQQRPC_F_DETAIL | HQQRPC_F_FAIL)) != 0 ||
+        ((unsigned)flags & ~(HQQRPC_F_DETAIL | HQQRPC_F_FAIL)) != 0 ||
         ((flags & HQQRPC_F_DETAIL) != 0 && (flags & HQQRPC_F_FAIL) == 0) || w->off > cs->cap) {
         return HQQRPC_E_INTERNAL;
     }
@@ -499,7 +499,7 @@ int hqqrpc_session_rx(hqqrpc_session *s, const void *data, size_t size) {
     body_len = (uint64_t)size - HDR;
     body = (const uint8_t *)data + HDR;
 
-    if ((flags & (uint8_t)~(HQQRPC_F_DETAIL | HQQRPC_F_FAIL)) != 0 ||
+    if (((unsigned)flags & ~(HQQRPC_F_DETAIL | HQQRPC_F_FAIL)) != 0 ||
         (kind != HQQRPC_K_RESPONSE && flags != 0) ||
         ((flags & HQQRPC_F_DETAIL) != 0 && (flags & HQQRPC_F_FAIL) == 0)) {
         return violation(s, "bad flags");

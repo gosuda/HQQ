@@ -425,6 +425,7 @@ hqq_status hqq_adv_open_stream(hqq_adv *a, hqq_stream **out, const hqq_wait *in)
         return st;
     }
     adv_wait_init(&w, in);
+    memset(&o, 0, sizeof o);
 
     hqq_spin_lock(&a->lock);
     {
@@ -436,7 +437,6 @@ hqq_status hqq_adv_open_stream(hqq_adv *a, hqq_stream **out, const hqq_wait *in)
         st = adv_stream_register(a, s);
     }
     if (st == HQQ_OK) {
-        memset(&o, 0, sizeof o);
         o.id = id;
         o.next = a->opens;
         a->opens = &o;

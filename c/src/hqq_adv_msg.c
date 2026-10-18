@@ -146,7 +146,7 @@ static void finish_request_locked(hqq_adv *a, hqq_req_ctx *c) {
 hqq_status hqq_stream_send(hqq_stream *s, const void *data, size_t len, const hqq_wait *in) {
     hqq_adv *a;
     adv_wait w;
-    uint64_t mid;
+    uint64_t mid = 0;
     hqq_status st;
 
     if (s == NULL || (data == NULL && len != 0)) {
