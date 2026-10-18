@@ -4,9 +4,9 @@ All notable changes to **HQQ** (`gosuda.org/hqq`) are documented in this file.
 
 The project follows [Semantic Versioning](https://semver.org/). While in `v0.x`, minor releases may introduce breaking wire-layout or API improvements accompanied by explicit migration tables below.
 
-## Unreleased
+## v0.7.0 (2026-10-18)
 
-This cycle adds `hqq-bindgen` for cgo-free Go-to-C IPC code generation (including C header `.idl` bootstrapping via `hqq-bindgen init` / `-from-header` and the `.agents/skills/hqq-bindgen` agent skill), introduces `secureexec`, `lifeline`, and `launch` for verified and parent-tied child servers, moves the SQLite and Zstandard services into standalone Go modules (`gosuda.org/sqlite3` and `gosuda.org/zstd`), and optimizes both the Go and C fast paths.
+This release adds `hqq-bindgen` for cgo-free Go-to-C IPC code generation (including C header `.idl` bootstrapping via `hqq-bindgen init` / `-from-header` and the `.agents/skills/hqq-bindgen` agent skill), introduces `secureexec`, `lifeline`, and `launch` for verified and parent-tied child servers, moves the SQLite and Zstandard services into standalone Go modules (`gosuda.org/sqlite3` and `gosuda.org/zstd`), and optimizes both the Go and C fast paths.
 
 ### Added
 
@@ -38,12 +38,12 @@ This cycle adds `hqq-bindgen` for cgo-free Go-to-C IPC code generation (includin
 ### Removed
 
 - **Zig binding (`bindings/zig`)**: removed because it was not exercised in CI.
-- **SQLite and Zstandard packages (`examples/sqlite/*`, `sqlite/`, `bindgen/examples/*`, `third_party/*`)**: extracted into standalone repositories `gosuda.org/sqlite3` and `gosuda.org/zstd`.
+- **SQLite and Zstandard packages (`examples/sqlite/*`, `sqlite/`, `bindgen/examples/*`, `third_party/*`)**: extracted into standalone repositories `gosuda.org/sqlite3` (`v0.3.3540100`) and `gosuda.org/zstd` (`v0.3.10507`).
 - **`hqqd` and `supervisor` package**: removed `cmd/hqqd`, `hqqd ctl`, and `gosuda.org/hqq/supervisor` (introduced in v0.6.0) to keep the repository focused on IPC transport and point-to-point child launching (`launch`, `lifeline`, `secureexec`).
 
-### Migration (v0.6.0 to Unreleased)
+### Migration (v0.6.0 to v0.7.0)
 
-| v0.6.0 | Unreleased |
+| v0.6.0 | v0.7.0 |
 | :--- | :--- |
 | `import _ "gosuda.org/hqq/examples/sqlite/driver"` | `import _ "gosuda.org/sqlite3"` (standalone module `gosuda.org/sqlite3`) |
 | `examples/sqlite/server` | `gosuda.org/sqlite3` (`sqlite3/server`) |
@@ -69,7 +69,7 @@ This release introduces the multi-client acceptor (`NewAcceptor`, `Accept`, `Con
 - **Language bindings (`bindings/`)**: header-only C++17 wrapper (`hqq::`), Rust workspace (`hqq-sys`, `hqq`, `hqq-interop`), and Zig binding.
 - **Conformance and interoperability suite**: golden byte vectors in `conformance/`, `cmd/hqq-interop`, and the two-process test matrix in `interop/`.
 - **Memory-model verification (`c/verify/`)**: GenMC model-checking drivers, herd7 litmus tests, and weak-memory stress litmus tests.
-- **Process supervisor (`cmd/hqqd`, `supervisor`)**: experimental process manager (subsequently removed in Unreleased).
+- **Process supervisor (`cmd/hqqd`, `supervisor`)**: experimental process manager (subsequently removed in v0.7.0).
 - **SQLite service (`examples/sqlite`)**: wire protocol, `database/sql` driver `hqq-sqlite`, C server, Go fake server, and end-to-end tests.
 
 ### Changed
