@@ -6,6 +6,14 @@
 go get gosuda.org/hqq
 ```
 
+## Supported Platforms
+
+| OS | Architectures | Shared Memory Backing | Kernel Parking Primitive |
+| :--- | :--- | :--- | :--- |
+| **Linux** | `amd64`, `arm64` | `/dev/shm` (`mmap`) | `futex(2)` (`FUTEX_WAIT_BITSET`) |
+| **macOS** | `arm64` (Apple Silicon), `amd64` | `$TMPDIR` (`mmap`) | `__ulock_wait` / `__ulock_wake` (`UL_COMPARE_AND_WAIT_SHARED`) |
+| **Windows** | `amd64`, `arm64` | `%LOCALAPPDATA%\Temp` (`CreateFileMappingW` + `MapViewOfFile`) | Named Win32 Semaphores (`Local\hqq_sem_*`) |
+
 ---
 
 ## Quick Start
@@ -176,7 +184,7 @@ defer srv.Close()
 ```
 
 Official zero-`cgo` C library modules built on `hqq-bindgen`:
-- [**`gosuda.org/hqq-sqlite3`**](https://github.com/gosuda/hqq-sqlite3): Pure-Go `database/sql` SQLite driver (`"hqq-sqlite"`) and `hqq-sqlite-server`.
+- [**`gosuda.org/hqq-sqlite3`**](https://github.com/gosuda/hqq-sqlite3): Pure-Go `database/sql` SQLite driver (`"sqlite3"`) and `hqq-sqlite-server`.
 - [**`gosuda.org/hqq-zstd`**](https://github.com/gosuda/hqq-zstd): Pure-Go Zstandard (`libzstd`) client and `zstd_server`.
 
 ---

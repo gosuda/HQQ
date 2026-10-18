@@ -122,7 +122,7 @@ For coarse compression workloads (`64 KiB` to `1 MiB`, including `256 KiB` at `7
 
 ### 5. SQLite service (`gosuda.org/hqq-sqlite3` on `hqq-bindgen`)
 
-`gosuda.org/hqq-sqlite3` (`"hqq-sqlite"`) implements `database/sql/driver` directly over the `hqq-bindgen` SQLite client and C server (`hqq-sqlite-server`):
+`gosuda.org/hqq-sqlite3` (`"sqlite3"`) implements `database/sql/driver` directly over the `hqq-bindgen` SQLite client and C server (`hqq-sqlite-server`):
 
 | Workload | `hqq-sqlite` (`hqq-bindgen`) |
 | :--- | ---: |

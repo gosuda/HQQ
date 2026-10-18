@@ -96,7 +96,9 @@ jobs:
           cmd.exe /c "call `"$vcvars`" x64 >nul && set" | ForEach-Object {
             if ($_ -match '^([^=]+)=(.*)$') {
               if ($matches[1] -ieq 'PATH') {
-                $matches[2] -split ';' | Where-Object { $_ } | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+                $entries = @($matches[2] -split ';' | Where-Object { $_ })
+                [array]::Reverse($entries)
+                $entries | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
               } else {
                 "$($matches[1])=$($matches[2])" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
               }
@@ -184,7 +186,9 @@ jobs:
           cmd.exe /c "call `"$vcvars`" x64 >nul && set" | ForEach-Object {
             if ($_ -match '^([^=]+)=(.*)$') {
               if ($matches[1] -ieq 'PATH') {
-                $matches[2] -split ';' | Where-Object { $_ } | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+                $entries = @($matches[2] -split ';' | Where-Object { $_ })
+                [array]::Reverse($entries)
+                $entries | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
               } else {
                 "$($matches[1])=$($matches[2])" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
               }
