@@ -80,9 +80,10 @@ function(hqq_apply_compile_options target)
     if(HQQ_IS_MSVC_CL)
       target_compile_options(${target} PRIVATE
         $<$<COMPILE_LANGUAGE:C>:/experimental:c11atomics>
+        # C4125: 3-digit octal escape followed by a digit in generated literals.
         # C4127 (constant conditional) fires on test macros that check
         # compile-time constants; C4706 fires on `if ((st = fn()) != 0)`.
-        /wd4127 /wd4706)
+        /wd4125 /wd4127 /wd4706)
     endif()
   else()
     target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic)
