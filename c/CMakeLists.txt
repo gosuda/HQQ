@@ -48,12 +48,17 @@ set(CMAKE_REQUIRED_FLAGS "${HQQ_C11_ATOMICS_FLAGS_STR}")
 check_c_source_compiles("
 #include <stdatomic.h>
 #include <stdint.h>
-#if ATOMIC_LLONG_LOCK_FREE != 2
-#error not lock-free
+#if defined(_MSC_VER) && !defined(__clang__) && (defined(_M_X64) || defined(_M_ARM64))
+#  if ATOMIC_INT_LOCK_FREE < 1 || ATOMIC_LLONG_LOCK_FREE < 1
+#    error not lock-free
+#  endif
+#elif ATOMIC_INT_LOCK_FREE != 2 || ATOMIC_LLONG_LOCK_FREE != 2
+#  error not lock-free
 #endif
 int main(void) {
   _Atomic uint64_t x;
   atomic_init(&x, 1);
+  if (!atomic_is_lock_free(&x)) return 2;
   atomic_thread_fence(memory_order_seq_cst);
   return (int)atomic_fetch_add_explicit(&x, 1, memory_order_seq_cst) - 1;
 }" HQQ_HAVE_C11_ATOMICS)

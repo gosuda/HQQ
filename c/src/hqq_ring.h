@@ -36,7 +36,16 @@
     __BYTE_ORDER__ != __ORDER_LITTLE_ENDIAN__
 #  error "HQQ requires a little-endian host (SPEC 13.3)"
 #endif
-#if ATOMIC_INT_LOCK_FREE != 2 || ATOMIC_LLONG_LOCK_FREE != 2
+/*
+ * MSVC's <vcruntime_c11_stdatomic.h> defines ATOMIC_*_LOCK_FREE to 1 because
+ * unaligned (#pragma pack) fields are not lock-free; naturally aligned 32- and
+ * 64-bit objects on x64 and arm64 are unconditionally lock-free.
+ */
+#if defined(_MSC_VER) && !defined(__clang__) && (defined(_M_X64) || defined(_M_ARM64))
+#  if ATOMIC_INT_LOCK_FREE < 1 || ATOMIC_LLONG_LOCK_FREE < 1
+#    error "HQQ requires lock-free 32-bit and 64-bit C11 atomics"
+#  endif
+#elif ATOMIC_INT_LOCK_FREE != 2 || ATOMIC_LLONG_LOCK_FREE != 2
 #  error "HQQ requires always-lock-free 32-bit and 64-bit C11 atomics"
 #endif
 

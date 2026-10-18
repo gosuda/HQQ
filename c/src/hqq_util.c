@@ -4,7 +4,11 @@
 
 #include <stdint.h>
 
-#if ATOMIC_INT_LOCK_FREE != 2 || ATOMIC_LLONG_LOCK_FREE != 2
+#if defined(_MSC_VER) && !defined(__clang__) && (defined(_M_X64) || defined(_M_ARM64))
+#  if ATOMIC_INT_LOCK_FREE < 1 || ATOMIC_LLONG_LOCK_FREE < 1
+#    error "hqq requires lock-free 32-bit and 64-bit C11 atomics"
+#  endif
+#elif ATOMIC_INT_LOCK_FREE != 2 || ATOMIC_LLONG_LOCK_FREE != 2
 #  error "hqq requires always-lock-free 32-bit and 64-bit C11 atomics"
 #endif
 

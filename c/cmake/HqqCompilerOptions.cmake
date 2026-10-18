@@ -25,7 +25,7 @@ if(MSVC)
     # cl.exe: C11 atomics are experimental (VS 2022 17.5+) and need both
     # /std:c11 (set by CMAKE_C_STANDARD) and /experimental:c11atomics. The
     # compiler keeps defining __STDC_NO_ATOMICS__, which hqq.h bypasses.
-    list(APPEND HQQ_C11_ATOMICS_FLAGS /experimental:c11atomics)
+    list(APPEND HQQ_C11_ATOMICS_FLAGS /std:c11 /experimental:c11atomics)
     set(HQQ_C11_ATOMICS_FORCE_DEFINE ON)
   endif()
 endif()
@@ -81,8 +81,8 @@ function(hqq_apply_compile_options target)
       target_compile_options(${target} PRIVATE
         $<$<COMPILE_LANGUAGE:C>:/experimental:c11atomics>
         # C4127 (constant conditional) fires on test macros that check
-        # compile-time constants.
-        /wd4127)
+        # compile-time constants; C4706 fires on `if ((st = fn()) != 0)`.
+        /wd4127 /wd4706)
     endif()
   else()
     target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic)
