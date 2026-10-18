@@ -49,18 +49,18 @@ jobs:
       - name: Run vet
         run: go vet ./...
 
-      # The end-to-end suites of hqq-bindgen build and start C servers and run
-      # in their own workflow (bindgen.yml) with timeouts that fit them.
+      # The end-to-end suite of hqq-bindgen builds and starts a C server and runs
+      # in its own workflow (bindgen.yml) with timeouts that fit it.
       - name: Run tests
         shell: bash
-        run: go test $(go list ./... | grep -v -e '/bindgen/e2e/' -e '/bindgen/examples/') -count=1 -timeout=90s
+        run: go test $(go list ./... | grep -v '/bindgen/e2e/') -count=1 -timeout=90s
 
       - name: Run multi-process and lifecycle tests
         run: go test . -run 'TestMultiProcess|TestPeer|TestThirdEndpoint|TestListenDial|TestOpener|TestCloseDoesNotRemove|TestUnlinkRemovesStaleName|TestLargeMessageThresholdAPI' -count=2 -v -timeout=120s
 
       - name: Run race tests
         if: runner.os != 'Windows'
-        run: go test -race $(go list ./... | grep -v -e '/bindgen/e2e/' -e '/bindgen/examples/') -count=1 -timeout=120s
+        run: go test -race $(go list ./... | grep -v '/bindgen/e2e/') -count=1 -timeout=120s
 
       - name: Run fuzz smoke tests
         if: runner.os == 'Linux'

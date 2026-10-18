@@ -12,8 +12,8 @@
 #
 #      The binary is build-ml/microlib_server. HQQ_WERROR defaults to ON here.
 #
-#   2. From c/CMakeLists.txt, behind an option, the way HQQ_BUILD_SQLITE_SERVER adds
-#      bindgen/examples/sqlite3/server: then the hqq::hqq target already exists and is reused.
+#   2. As a subdirectory of a parent CMake project that already defines hqq::hqq:
+#      then the existing hqq::hqq target is reused.
 #
 cmake_minimum_required(VERSION 3.21)
 

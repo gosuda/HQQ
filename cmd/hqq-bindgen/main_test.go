@@ -106,3 +106,52 @@ func TestUsageErrors(t *testing.T) {
 		}
 	}
 }
+
+func TestFromHeaderBootstrap(t *testing.T) {
+	dir := t.TempDir()
+	hdrPath := filepath.Join(dir, "sample.h")
+	const cHeader = `
+#define SAMPLE_OK 0
+typedef struct sample_ctx_s sample_ctx_t;
+sample_ctx_t *sample_open(const char *name);
+int sample_close(sample_ctx_t *ctx);
+int sample_process(sample_ctx_t *ctx, const void *src, size_t src_len, void *dst, size_t dst_cap);
+`
+	if err := os.WriteFile(hdrPath, []byte(cHeader), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Write extracted IDL to stdout via `init` subcommand.
+	code, out, stderr := runCLI(t, "init", "-prefix", "sample_", "-serialize-none", hdrPath)
+	if code != exitOK || !strings.Contains(out, "handle Ctx destroy sample_close;") {
+		t.Fatalf("init stdout: code %d, out %q, stderr %q", code, out, stderr)
+	}
+
+	// 2. Write IDL + Go client + C server in one invocation via `-from-header`.
+	idlOut := filepath.Join(dir, "sample.idl")
+	goDir := filepath.Join(dir, "go")
+	cDir := filepath.Join(dir, "c")
+	code, _, stderr = runCLI(t,
+		"-from-header",
+		"-service", "sample",
+		"-prefix", "sample_",
+		"-idl-out", idlOut,
+		"-go-out", goDir,
+		"-c-out", cDir,
+		hdrPath,
+	)
+	if code != exitOK {
+		t.Fatalf("-from-header full generation failed: code %d, stderr %q", code, stderr)
+	}
+	for _, wantFile := range []string{
+		idlOut,
+		filepath.Join(goDir, "sample_client.go"),
+		filepath.Join(cDir, "sample_server.h"),
+		filepath.Join(cDir, "sample_server.c"),
+	} {
+		if _, err := os.Stat(wantFile); err != nil {
+			t.Fatalf("missing generated file %s: %v", wantFile, err)
+		}
+	}
+}
+

@@ -23,8 +23,8 @@
 //	<-ctx.Done()                        // standard input reached end of file or failed
 //
 // The child does not need to be written in Go to use the protocol: it only
-// needs to read standard input until end of file. The C server does this with
-// libhqq's parent lifeline (--parent-stdin); see bindgen/examples/sqlite3/README.md.
+// needs to read standard input until end of file. Generated C servers do this
+// with libhqq's parent lifeline (--parent-stdin in hqqrpc_main).
 //
 // Keepalives. [WithKeepalive] makes the parent write one byte every interval.
 // The bytes let a child that cares notice a wedged parent (a stopped process

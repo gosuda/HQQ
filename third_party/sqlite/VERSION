@@ -1,8 +1,0 @@
-# SQLite amalgamation pinned for hqq-sqlite-server release builds.
-# Read by scripts/release/fetch-sqlite.sh and fetch-sqlite.ps1.
-# Public domain (https://www.sqlite.org/copyright.html). Not vendored in git.
-# Checksums: SHA256 and SHA3-256 files in this directory; both are listed on
-# https://www.sqlite.org/download.html (SHA3-256 column).
-version=3.54.1
-archive=sqlite-amalgamation-3540100.zip
-url=https://www.sqlite.org/2026/sqlite-amalgamation-3540100.zip

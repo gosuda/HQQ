@@ -1,9 +1,0 @@
-# Zstandard source pinned for the bindgen zstd example (bindgen/examples/zstd).
-# Read by scripts/release/fetch-zstd.sh. Not vendored in git.
-# Dual-licensed (BSD-3-Clause or GPL-2.0-only); this project uses the BSD-3-Clause
-# option. LICENSE in this directory is the BSD text of the pinned release.
-# SHA256 is the digest of the official release tarball; the release also
-# publishes it as zstd-1.5.7.tar.gz.sha256 next to the tarball.
-version=1.5.7
-archive=zstd-1.5.7.tar.gz
-url=https://github.com/facebook/zstd/releases/download/v1.5.7/zstd-1.5.7.tar.gz

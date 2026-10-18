@@ -4,7 +4,7 @@ Status: implemented (second revision, incorporating the independent review resol
 
 Normative words (MUST, SHOULD, MAY) follow RFC 2119. Integers on the wire are little-endian, as in [SPEC.md](../SPEC.md) section 0. "Decision" marks a choice made in this document that the project brief did not dictate; they are collected in section 12.3. Statements about existing HQQ APIs cite the file that was read. Anything that is assumed to exist but does not is listed in section 12.1 with its assumed signature.
 
-Related documents: [SPEC.md](../SPEC.md) (segment, ring and Standard protocol), [MEMORY_MODEL.md](../MEMORY_MODEL.md), [BINDINGS.md](BINDINGS.md) (tone and CI conventions), [C_TOOLCHAIN.md](C_TOOLCHAIN.md), [`sqlite/PROTOCOL.md`](../../sqlite/PROTOCOL.md) (a hand-written instance of the same problem), [`spec/ext/LISTENER_DRAFT.md`](../ext/LISTENER_DRAFT.md) (rendezvous).
+Related documents: [SPEC.md](../SPEC.md) (segment, ring and Standard protocol), [MEMORY_MODEL.md](../MEMORY_MODEL.md), [BINDINGS.md](BINDINGS.md) (tone and CI conventions), [C_TOOLCHAIN.md](C_TOOLCHAIN.md), [`spec/ext/LISTENER_DRAFT.md`](../ext/LISTENER_DRAFT.md) (rendezvous).
 
 ## 1. Goals, non-goals and cost model
 
@@ -3109,9 +3109,7 @@ int main(int argc, char **argv) {
 ```
 
 ```cmake
-# bindgen/e2e/microlib/server/CMakeLists.txt; c/CMakeLists.txt adds it behind
-#   option(HQQ_BUILD_BINDGEN_TESTS "Build the hqq-bindgen microlib server and C tests" OFF)
-# the way HQQ_BUILD_SQLITE_SERVER adds bindgen/examples/sqlite3/server.
+# bindgen/e2e/microlib/server/CMakeLists.txt
 add_executable(microlib_server main.c microlib_server.c microlib_hooks.c
                ../../../testdata/microlib/microlib.c)
 target_include_directories(microlib_server PRIVATE ../../../testdata/microlib)
@@ -3243,7 +3241,7 @@ Measured on a quiet M1, cross-process, 64-byte payload, after the Standard link 
 | `BenchmarkAdd/hqq-sync` | 310 to 323 ns |
 | `BenchmarkAdd/hqq-pipe-*` | 160 to 177 ns per call |
 | `BenchmarkRoundTrip/echo` | 186 to 187 ns |
-| zstd example (`bindgen/examples/zstd`), 64 KiB to 1 MiB inputs, pipelined, against cgo | within 2% |
+| zstd example (`gosuda.org/hqq-zstd`), 64 KiB to 1 MiB inputs, pipelined, against cgo | within 2% |
 
 The per-call overhead is about 6 times (pipelined) to about 12 times (synchronous) that of a cgo call. The advantage of the design is isolation, no cgo, overlap with Go work and coarse calls, not trivial calls (1.3).
 

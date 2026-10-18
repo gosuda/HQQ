@@ -285,11 +285,10 @@
 // and spec/PORTING.md for porting. Golden vectors are in conformance/, and the
 // two-process interop harness is in interop/ (helper: cmd/hqq-interop).
 //
-// Services built on the protocol live in their own packages. Package sqlite is
-// a database/sql driver for a SQLite service; its C server is in
-// bindgen/examples/sqlite3/server, and sqlite/launcher starts that server. Packages
-// secureexec and lifeline start executables verified by digest and tie a child
-// process to its parent.
+// Services built on the protocol are generated with hqq-bindgen (bindgen/ and
+// cmd/hqq-bindgen) and live in standalone modules such as gosuda.org/hqq-sqlite3
+// and gosuda.org/hqq-zstd. Packages launch, secureexec, and lifeline start
+// executables verified by digest and tie a child process to its parent.
 //
 // # Platform Notes
 //

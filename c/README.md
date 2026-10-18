@@ -79,7 +79,7 @@ The Advanced layer overlays stream multiplexing, chunked message reassembly, and
 
 - The callback executes on the lifeline thread and should only trigger an orderly shutdown (setting an atomic flag, writing to a self-pipe, or signaling the main loop); it must not call `hqq_lifeline_stop` directly.
 - `hqq_lifeline_stop` cancels the watcher without firing the callback and joins the helper thread (using a `poll` self-pipe on POSIX and `CancelSynchronousIo` on Windows).
-- Used in production by `hqq-sqlite-server --parent-stdin` ([`bindgen/examples/sqlite3/README.md`](../bindgen/examples/sqlite3/README.md)).
+- Used in production by `hqqrpc_main --parent-stdin` (`c/include/hqq/hqq_rpc.h`).
 
 ## RPC runtime for generated servers (`include/hqq/hqq_rpc.h`)
 
