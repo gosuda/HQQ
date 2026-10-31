@@ -1,8 +1,6 @@
 module gosuda.org/hqq
 
-toolchain go1.26.2
-
-go 1.24
+go 1.27.3
 
 tool golang.org/x/tools/cmd/stringer
 
