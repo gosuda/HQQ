@@ -4,6 +4,23 @@ All notable changes to **HQQ** (`gosuda.org/hqq`) are documented in this file.
 
 The project follows [Semantic Versioning](https://semver.org/). While in `v0.x`, minor releases may introduce breaking wire-layout or API improvements accompanied by explicit migration tables below.
 
+## v0.7.1 (2026-11-23)
+
+This patch release eliminates idle spin/poll CPU overhead in C `hqq-bindgen` RPC servers (`hqq_rpc_server`, `hqq_link`, `hqq_listener`), adds timed surplus-session eviction to `bindgen/rt.Pool`, and updates the Go toolchain directive to `1.27.3`.
+
+### Added
+
+- **`bindgen/rt` (`Pool.SetIdleTimeout`)**: Retains up to `maxIdle` warm sessions indefinitely and lazily evicts surplus idle sessions via `time.AfterFunc` once they sit idle for `idleTimeout` (`bindgen/rt/pool.go`, covered by `TestPoolIdleEviction` in `bindgen/rt/pool_test.go`).
+- **Idle CPU regression test**: Added `test_idle_sessions_low_cpu` in `c/tests/test_rpc_live.c` verifying 32 idle RPC sessions remain well below 25% of a single core and wake promptly on server stop.
+
+### Changed
+
+- **Eliminate idle spin/poll wakeups in C RPC servers**:
+  - `c/src/hqq_rpc_server.c` (`session_loop` and `hqqrpc_server_run`): Replaced the fixed 250 ms poll loop with wakeable waits (`hqq_read_reserve_wakeable` / `hqq_acceptor_accept_wakeable`) using the remaining `open_timeout_ns` / `idle_timeout_ns` budget (or infinite timeout `-1` when idle timeout is disabled), while `hqqrpc_server_stop` wakes all parked links (`hqq_link_wake`) and the acceptor (`hqq_acceptor_wake`). Idle sessions no longer re-enter the 1,024-spin + 256-`sched_yield()` burst four times per second.
+  - `c/src/hqq_link.c`: Wakeable calls skip the 10 ms cancel-poll clamp and (when heartbeats are enabled) the 50 ms check-interval clamp, extending kernel park slices up to `HQQ_IDLE_PARK_NS` (`1000ms`).
+  - `c/src/hqq_listener.c`: Extended idle park slices for `lsn_disp_main` (`LSN_DISPATCH_IDLE_SLICE_NS = 500ms`) and `lsn_accept_wait` (`LSN_ACCEPT_IDLE_SLICE_NS = 1s`), and wakes consumers immediately on `lsn_shutdown`.
+- **Go toolchain version**: Updated `go` directive in `go.mod` to `1.27.3`.
+
 ## v0.7.0 (2026-10-18)
 
 This release adds `hqq-bindgen` for cgo-free Go-to-C IPC code generation (including C header `.idl` bootstrapping via `hqq-bindgen init` / `-from-header` and the `.agents/skills/hqq-bindgen` agent skill), introduces `secureexec`, `lifeline`, and `launch` for verified and parent-tied child servers, moves the SQLite and Zstandard services into standalone Go modules (`gosuda.org/sqlite3` and `gosuda.org/zstd`), and optimizes both the Go and C fast paths.
