@@ -46,6 +46,8 @@
 #define LSN_POLL_NS LSN_MS(1)
 #define LSN_SLICE_NS LSN_MS(10)         /* client waits: watch re-evaluated at least every 50 ms */
 #define LSN_DISPATCH_SLICE_NS LSN_MS(50)
+#define LSN_DISPATCH_IDLE_SLICE_NS LSN_MS(500)
+#define LSN_ACCEPT_IDLE_SLICE_NS LSN_S(1)
 #define LSN_BACKOFF_MAX_NS LSN_MS(100)
 
 #define LSN_LD(p) atomic_load_explicit((p), memory_order_seq_cst)
@@ -405,6 +407,20 @@ static void lsn_notify(const lsn_ring *r, int side) {
         if (r->ops != NULL && r->ops->wake != NULL) {
             r->ops->wake(r->ops_ctx, side, word, n);
         }
+    }
+}
+
+/* Unconditionally wakes any thread parked on NOT_EMPTY (used at shutdown). */
+static void lsn_wake_consumers(const lsn_ring *r) {
+    _Atomic uint32_t *word;
+    if (r == NULL || r->h == NULL) {
+        return;
+    }
+    word = lsn_word(r, HQQ_RING_NOT_EMPTY);
+    atomic_fetch_add_explicit(word, 1, memory_order_seq_cst);
+    if (r->ops != NULL && r->ops->wake != NULL) {
+        uint32_t n = atomic_load_explicit(lsn_waiters(r, HQQ_RING_NOT_EMPTY), memory_order_seq_cst);
+        r->ops->wake(r->ops_ctx, HQQ_RING_NOT_EMPTY, word, n);
     }
 }
 
@@ -922,7 +938,7 @@ static void lsn_stuck_check(hqq_acceptor *a, lsn_stuck *sk) {
 }
 
 /* Takes the next published record (and releases its slot), or parks one slice when none. */
-static int lsn_consume(hqq_acceptor *a, lsn_stuck *sk, lsn_record *out, uint64_t slice) {
+static int lsn_consume(hqq_acceptor *a, lsn_stuck *sk, lsn_record *out, uint64_t idle_slice, uint64_t stuck_slice) {
     lsn_ring *r = &a->seg.ring;
     uint64_t pos = 0;
 
@@ -935,7 +951,7 @@ static int lsn_consume(hqq_acceptor *a, lsn_stuck *sk, lsn_record *out, uint64_t
     if (a->cfg.stuck_ns != 0) {
         lsn_stuck_check(a, sk);
     }
-    lsn_park(r, HQQ_RING_NOT_EMPTY, pos, pos + 1, slice);
+    lsn_park(r, HQQ_RING_NOT_EMPTY, pos, pos + 1, sk->seen ? stuck_slice : idle_slice);
     return 0;
 }
 
@@ -1072,11 +1088,14 @@ static lsn_job *lsn_take_job(hqq_acceptor *a) {
 static void lsn_disp_main(void *arg) {
     hqq_acceptor *a = arg;
     lsn_stuck sk;
-    uint64_t slice = LSN_DISPATCH_SLICE_NS;
+    uint64_t stuck_slice = LSN_DISPATCH_SLICE_NS;
+    uint64_t idle_slice = LSN_DISPATCH_IDLE_SLICE_NS;
 
     memset(&sk, 0, sizeof sk);
     if (a->cfg.stuck_ns != 0) {
-        slice = lsn_min(slice, lsn_max(a->cfg.stuck_ns / 4, LSN_POLL_NS));
+        uint64_t q = lsn_max(a->cfg.stuck_ns / 4, LSN_POLL_NS);
+        stuck_slice = lsn_min(stuck_slice, q);
+        idle_slice = lsn_min(idle_slice, q);
     }
     while (!LSN_LD(&a->closing)) {
         lsn_job *j = lsn_take_job(a);
@@ -1085,7 +1104,7 @@ static void lsn_disp_main(void *arg) {
         if (j == NULL) {
             break;
         }
-        if (!lsn_consume(a, &sk, &j->rec, slice)) {
+        if (!lsn_consume(a, &sk, &j->rec, idle_slice, stuck_slice)) {
             continue;
         }
         if (!lsn_validate(a, &j->rec, j->name)) {
@@ -1166,6 +1185,7 @@ static hqq_status lsn_shutdown(hqq_acceptor *a) {
     if (a->ready != NULL) {
         hqq_plat_event_signal(a->ready); /* wake Accept calls: they see closing */
     }
+    lsn_wake_consumers(&a->seg.ring); /* wake dispatcher immediately */
     hqq_cancel_signal(&a->cancel);
     if (a->disp != NULL) {
         hqq_plat_thread_join(al, a->disp);
@@ -1313,14 +1333,21 @@ hqq_status hqq_acceptor_create(const char *name, const hqq_acceptor_options *in,
     return HQQ_OK;
 }
 
+void hqq_acceptor_wake(struct hqq_acceptor *a) {
+    if (a != NULL && a->ready != NULL) {
+        hqq_plat_event_signal(a->ready);
+    }
+}
+
 /* Waits for a negotiated link in the backlog. The ready event is reset under the lock
  * when the backlog is empty and signalled under the same lock by lsn_deliver and by
  * close, so a delivery can not be missed between the check and the wait. */
-static hqq_status lsn_accept_wait(hqq_acceptor *a, hqq_adv **out, const hqq_wait *wait) {
+static hqq_status lsn_accept_wait(hqq_acceptor *a, hqq_adv **out, const hqq_wait *wait, int cancel_wakeable) {
     hqq_ctx ctx;
     lsn_ctx_from_wait(wait, &ctx);
     for (;;) {
         hqq_status st;
+        uint64_t slice;
         if (LSN_LD(&a->closing)) {
             return HQQ_ERR_ACCEPTOR_CLOSED;
         }
@@ -1339,20 +1366,42 @@ static hqq_status lsn_accept_wait(hqq_acceptor *a, hqq_adv **out, const hqq_wait
         if (st != HQQ_OK) {
             return st;
         }
-        (void)hqq_plat_event_wait(a->ready, LSN_SLICE_NS);
+        if (cancel_wakeable || ctx.cancel == NULL) {
+            slice = LSN_ACCEPT_IDLE_SLICE_NS;
+            if (ctx.deadline_ns != 0) {
+                uint64_t now = hqq_plat_mono_ns();
+                uint64_t rem = ctx.deadline_ns > now ? ctx.deadline_ns - now : 0;
+                if (rem < slice) {
+                    slice = rem;
+                }
+            }
+        } else {
+            slice = LSN_SLICE_NS;
+        }
+        if (slice > 0) {
+            (void)hqq_plat_event_wait(a->ready, slice);
+        }
     }
 }
 
-hqq_status hqq_acceptor_accept(hqq_acceptor *a, hqq_adv **out, const hqq_wait *wait) {
+static hqq_status accept_impl(hqq_acceptor *a, hqq_adv **out, const hqq_wait *wait, int cancel_wakeable) {
     hqq_status st;
     if (a == NULL || out == NULL) {
         return HQQ_ERR_INVALID_ARGUMENT;
     }
     *out = NULL;
     LSN_ADD(&a->inflight, 1);
-    st = lsn_accept_wait(a, out, wait);
+    st = lsn_accept_wait(a, out, wait, cancel_wakeable);
     atomic_fetch_sub_explicit(&a->inflight, 1, memory_order_seq_cst);
     return st;
+}
+
+hqq_status hqq_acceptor_accept(hqq_acceptor *a, hqq_adv **out, const hqq_wait *wait) {
+    return accept_impl(a, out, wait, 0);
+}
+
+hqq_status hqq_acceptor_accept_wakeable(struct hqq_acceptor *a, struct hqq_adv **out, const hqq_wait *wait) {
+    return accept_impl(a, out, wait, 1);
 }
 
 hqq_status hqq_acceptor_close(hqq_acceptor *a) {

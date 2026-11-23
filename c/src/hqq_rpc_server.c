@@ -212,6 +212,7 @@ static void srv_reap(hqqrpc_server *srv) {
 
 void hqqrpc_server_stop(hqqrpc_server *srv) {
     hqqrpc_ctl *c;
+    hqqrpc_session *s;
 
     if (srv == NULL) {
         return;
@@ -221,6 +222,14 @@ void hqqrpc_server_stop(hqqrpc_server *srv) {
     hqq_plat_mutex_lock(srv->mu);
     for (c = srv->ctls; c != NULL; c = c->next) {
         hqq_cancel_signal(&c->cancel);
+    }
+    for (s = srv->sess_list; s != NULL; s = s->srv_next) {
+        if (s->link != NULL) {
+            hqq_link_wake(s->link);
+        }
+    }
+    if (srv->acc != NULL) {
+        hqq_acceptor_wake(srv->acc);
     }
     hqq_plat_mutex_unlock(srv->mu);
 }
@@ -259,9 +268,32 @@ static void session_loop(hqqrpc_session *s) {
         hqq_wait w;
         hqq_status st;
 
-        w.timeout_ns = HQQRPC_POLL_NS;
+        if (atomic_load(&srv->stop)) {
+            hqqrpc_session_set_end(s, HQQRPC_END_STOP);
+            return;
+        }
+        if (s->state == HQQRPC_ST_HELLO) {
+            uint64_t elapsed = hqq_plat_mono_ns() - s->start_ns;
+
+            if (elapsed >= (uint64_t)s->cfg.open_timeout_ns) {
+                hqqrpc_log(s, HQQRPC_LOG_WARN, "no HELLO within the open timeout");
+                hqqrpc_session_set_end(s, HQQRPC_END_HANDSHAKE);
+                return;
+            }
+            w.timeout_ns = (int64_t)((uint64_t)s->cfg.open_timeout_ns - elapsed);
+        } else if (s->cfg.idle_timeout_ns != 0 && s->state == HQQRPC_ST_ACTIVE) {
+            uint64_t elapsed = hqq_plat_mono_ns() - s->last_req_ns;
+
+            if (elapsed >= (uint64_t)s->cfg.idle_timeout_ns) {
+                hqqrpc_session_set_end(s, HQQRPC_END_IDLE);
+                return;
+            }
+            w.timeout_ns = (int64_t)((uint64_t)s->cfg.idle_timeout_ns - elapsed);
+        } else {
+            w.timeout_ns = -1;
+        }
         w.cancel = &srv->cancel;
-        st = hqq_read_reserve(s->link, &rr, &w);
+        st = hqq_read_reserve_wakeable(s->link, &rr, &w);
         if (st == HQQ_OK) {
             if (hqqrpc_session_rx_slot(s, &rr)) {
                 return;
@@ -273,11 +305,11 @@ static void session_loop(hqqrpc_session *s) {
 
             if (atomic_load(&srv->stop)) {
                 hqqrpc_session_set_end(s, HQQRPC_END_STOP);
-            } else if (s->state == HQQRPC_ST_HELLO && now - s->start_ns > (uint64_t)s->cfg.open_timeout_ns) {
+            } else if (s->state == HQQRPC_ST_HELLO && now - s->start_ns >= (uint64_t)s->cfg.open_timeout_ns) {
                 hqqrpc_log(s, HQQRPC_LOG_WARN, "no HELLO within the open timeout");
                 hqqrpc_session_set_end(s, HQQRPC_END_HANDSHAKE);
             } else if (s->cfg.idle_timeout_ns != 0 && s->state == HQQRPC_ST_ACTIVE &&
-                       now - s->last_req_ns > (uint64_t)s->cfg.idle_timeout_ns) {
+                       now - s->last_req_ns >= (uint64_t)s->cfg.idle_timeout_ns) {
                 hqqrpc_session_set_end(s, HQQRPC_END_IDLE);
             }
         } else if (st == HQQ_ERR_CANCELED) {
@@ -736,9 +768,9 @@ hqq_status hqqrpc_server_run(hqqrpc_server *srv) {
         hqq_wait w;
         hqq_status st;
 
-        w.timeout_ns = HQQRPC_POLL_NS;
+        w.timeout_ns = INT64_C(1000000000);
         w.cancel = &srv->cancel;
-        st = hqq_acceptor_accept(srv->acc, &adv, &w);
+        st = hqq_acceptor_accept_wakeable(srv->acc, &adv, &w);
         if (st == HQQ_OK) {
             errors = 0;
             on_accepted(srv, adv);
@@ -758,8 +790,17 @@ hqq_status hqqrpc_server_run(hqqrpc_server *srv) {
     }
 
     hqqrpc_server_stop(srv);
-    (void)hqq_acceptor_close(srv->acc); /* frees the acceptor; its name is removed */
-    srv->acc = NULL;
+    {
+        hqq_acceptor *acc;
+
+        hqq_plat_mutex_lock(srv->mu);
+        acc = srv->acc;
+        srv->acc = NULL;
+        hqq_plat_mutex_unlock(srv->mu);
+        if (acc != NULL) {
+            (void)hqq_acceptor_close(acc); /* frees the acceptor; its name is removed */
+        }
+    }
 
     /* Wait for every control and session thread; what is stuck in the library stays detached. */
     deadline = hqq_plat_mono_ns() + (uint64_t)srv->cfg.shutdown_timeout_ns;

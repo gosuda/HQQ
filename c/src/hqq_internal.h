@@ -241,6 +241,19 @@ hqq_status hqq_link_open_core(const hqq_open_req *req, uint64_t count, uint64_t 
 /* The SPEC 6.3 peer monitor. HQQ_OK, HQQ_ERR_PEER_CLOSED or HQQ_ERR_PEER_GONE. */
 hqq_status hqq_link_check_peer(hqq_link *l);
 
+/* Wakes every thread parked on either ring of l. Safe concurrently with blocked calls. */
+void hqq_link_wake(hqq_link *l);
+
+/* Like hqq_read_reserve, except the caller guarantees hqq_link_wake(l) is called whenever
+ * wait->cancel is signalled, so idle parks do not need to poll the cancel token every 10 ms. */
+hqq_status hqq_read_reserve_wakeable(hqq_link *l, hqq_read_reservation *res, const hqq_wait *wait);
+
+/* Acceptor wake helpers for hqqrpc_server: caller calls hqq_acceptor_wake(a) on cancel. */
+struct hqq_acceptor;
+struct hqq_adv;
+void hqq_acceptor_wake(struct hqq_acceptor *a);
+hqq_status hqq_acceptor_accept_wakeable(struct hqq_acceptor *a, struct hqq_adv **out, const hqq_wait *wait);
+
 /* Named segments (hqq_named.c). */
 hqq_status hqq_named_open(const char *name, uint64_t count, uint64_t size, int create, unsigned perm,
                           const hqq_options *opts, hqq_link **out, hqq_open_info *info);

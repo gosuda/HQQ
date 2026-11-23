@@ -30,6 +30,7 @@
 #if !defined(_WIN32)
 #  include <signal.h>
 #  include <spawn.h>
+#  include <sys/resource.h>
 #  include <sys/types.h>
 #  include <sys/wait.h>
 #  include <unistd.h>
@@ -921,6 +922,53 @@ static void test_peer_death(void) {
     HQQ_CHECK_EQ_INT(ml_test_live_objects(), 0);
     HQQ_CHECK_STATUS(srv_stop(&sc), HQQ_OK);
 }
+
+/* Thirty-two idle sessions must park in the kernel rather than re-entering the spin/yield burst
+ * on every poll slice. Also verifies that stop wakes all parked sessions promptly. */
+static void test_idle_sessions_low_cpu(void) {
+    enum { N = 32 };
+    srv_ctx sc;
+    hqqrpc_server_options o;
+    client c[N];
+    struct rusage ru0, ru1;
+    uint64_t t0, wall_ns, cpu_ns, stop0;
+    int i;
+
+    hqqrpc_server_options_init(&o);
+    o.max_sessions = N;
+    o.max_control_links = N;
+    srv_start(&sc, &microlib_iface, &o, "cpu");
+    for (i = 0; i < N; i++) {
+        cli_open(&c[i], sc.name, 4, 4096);
+        HQQ_CHECK_EQ_U64(cli_hello(&c[i], &microlib_iface, NULL, NULL), 0);
+        call_add(&c[i], i, 1, i + 1);
+    }
+    /* Let all session threads enter their idle kernel park. */
+    hqq_test_sleep_ms(100);
+    HQQ_REQUIRE(getrusage(RUSAGE_SELF, &ru0) == 0);
+    t0 = hqq_test_now_ns();
+    hqq_test_sleep_ms(600);
+    wall_ns = hqq_test_now_ns() - t0;
+    HQQ_REQUIRE(getrusage(RUSAGE_SELF, &ru1) == 0);
+    {
+        int64_t u_ns = (int64_t)(ru1.ru_utime.tv_sec - ru0.ru_utime.tv_sec) * SEC +
+                       (int64_t)(ru1.ru_utime.tv_usec - ru0.ru_utime.tv_usec) * 1000;
+        int64_t s_ns = (int64_t)(ru1.ru_stime.tv_sec - ru0.ru_stime.tv_sec) * SEC +
+                       (int64_t)(ru1.ru_stime.tv_usec - ru0.ru_stime.tv_usec) * 1000;
+        cpu_ns = (uint64_t)((u_ns > 0 ? u_ns : 0) + (s_ns > 0 ? s_ns : 0));
+    }
+    fprintf(stderr, "test_idle_sessions_low_cpu: %d idle sessions used %.2f%% CPU over %.0f ms\n",
+            N, 100.0 * (double)cpu_ns / (double)wall_ns, (double)wall_ns / 1e6);
+    /* Must stay well below 25% of one core (previously 32 idle sessions re-spun every 250 ms). */
+    HQQ_CHECK(cpu_ns * 4u < wall_ns);
+
+    stop0 = hqq_test_now_ns();
+    HQQ_CHECK_STATUS(srv_stop(&sc), HQQ_OK);
+    HQQ_CHECK(hqq_test_now_ns() - stop0 < 2u * (uint64_t)SEC);
+    for (i = 0; i < N; i++) {
+        cli_free(&c[i]);
+    }
+}
 #endif
 
 static srv_ctx g_stuck; /* kept reachable: a server whose run timed out is never freed */
@@ -1000,6 +1048,7 @@ int main(int argc, char **argv) {
     test_serialize();
 #if !defined(_WIN32)
     test_peer_death();
+    test_idle_sessions_low_cpu();
 #endif
     test_stuck_call_shutdown();
     return HQQ_TEST_RESULT("rpc_live");

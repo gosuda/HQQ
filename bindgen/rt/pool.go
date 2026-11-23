@@ -6,9 +6,15 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"time"
 )
 
 var errPoolClosed = fmt.Errorf("hqqbg: pool is closed: %w", net.ErrClosed)
+
+type idleEntry[T any] struct {
+	val        T
+	returnedAt time.Time
+}
 
 // Pool lends one Conn-like value to one goroutine at a time (8.2).
 type Pool[T any] struct {
@@ -16,11 +22,14 @@ type Pool[T any] struct {
 	closeFn func(T) error
 	max     int
 
-	mu      sync.Mutex
-	idle    []T
-	n       int // idle values, lent values and dials in progress
-	closed  bool
-	waiters []chan struct{}
+	mu          sync.Mutex
+	idle        []idleEntry[T]
+	n           int // idle values, lent values and dials in progress
+	closed      bool
+	waiters     []chan struct{}
+	maxIdle     int           // surplus idle values above maxIdle expire after idleTimeout
+	idleTimeout time.Duration // <= 0 disables timed eviction
+	reapTimer   *time.Timer
 }
 
 // NewPool returns a Pool of at most max values; a max below 1 means 1. dial
@@ -30,6 +39,77 @@ func NewPool[T any](max int, dial func(ctx context.Context) (T, error), closeFn 
 		max = 1
 	}
 	return &Pool[T]{dial: dial, closeFn: closeFn, max: max}
+}
+
+// SetIdleTimeout configures eviction of idle values. At most maxIdle warm idle
+// values are retained indefinitely; surplus idle values beyond maxIdle are
+// closed once they have sat idle for idleTimeout. A non-positive idleTimeout
+// disables timed eviction.
+func (p *Pool[T]) SetIdleTimeout(maxIdle int, idleTimeout time.Duration) {
+	if maxIdle < 0 {
+		maxIdle = 0
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed {
+		return
+	}
+	p.maxIdle = maxIdle
+	p.idleTimeout = idleTimeout
+	if p.reapTimer != nil {
+		p.reapTimer.Stop()
+		p.reapTimer = nil
+	}
+	if p.idleTimeout > 0 && len(p.idle) > p.maxIdle {
+		p.armReapLocked(time.Now())
+	}
+}
+
+// armReapLocked schedules the eviction timer for the oldest surplus idle entry.
+// p.mu must be held.
+func (p *Pool[T]) armReapLocked(now time.Time) {
+	if p.closed || p.idleTimeout <= 0 || len(p.idle) <= p.maxIdle || p.reapTimer != nil {
+		return
+	}
+	wait := p.idle[0].returnedAt.Add(p.idleTimeout).Sub(now)
+	if wait < time.Millisecond {
+		wait = time.Millisecond
+	}
+	p.reapTimer = time.AfterFunc(wait, p.reapIdle)
+}
+
+func (p *Pool[T]) reapIdle() {
+	var expired []T
+	p.mu.Lock()
+	p.reapTimer = nil
+	if !p.closed && p.idleTimeout > 0 {
+		now := time.Now()
+		cut := 0
+		for len(p.idle)-cut > p.maxIdle && !p.idle[cut].returnedAt.Add(p.idleTimeout).After(now) {
+			expired = append(expired, p.idle[cut].val)
+			cut++
+		}
+		if cut > 0 {
+			var zero idleEntry[T]
+			remaining := len(p.idle) - cut
+			copy(p.idle, p.idle[cut:])
+			for i := remaining; i < len(p.idle); i++ {
+				p.idle[i] = zero
+			}
+			p.idle = p.idle[:remaining]
+			p.n -= cut
+			for range cut {
+				p.wakeLocked()
+			}
+		}
+		if len(p.idle) > p.maxIdle {
+			p.armReapLocked(now)
+		}
+	}
+	p.mu.Unlock()
+	for _, v := range expired {
+		_ = p.closeFn(v)
+	}
 }
 
 // Get reuses an idle value or dials a new one while fewer than max exist. It
@@ -43,9 +123,14 @@ func (p *Pool[T]) Get(ctx context.Context) (T, error) {
 			p.mu.Unlock()
 			return zero, errPoolClosed
 		case len(p.idle) > 0:
-			v := p.idle[len(p.idle)-1]
-			p.idle[len(p.idle)-1] = zero
-			p.idle = p.idle[:len(p.idle)-1]
+			last := len(p.idle) - 1
+			v := p.idle[last].val
+			p.idle[last] = idleEntry[T]{}
+			p.idle = p.idle[:last]
+			if len(p.idle) <= p.maxIdle && p.reapTimer != nil {
+				p.reapTimer.Stop()
+				p.reapTimer = nil
+			}
 			p.mu.Unlock()
 			return v, nil
 		case p.n < p.max:
@@ -97,8 +182,12 @@ func (p *Pool[T]) dialNew(ctx context.Context) (T, error) {
 func (p *Pool[T]) Put(v T) {
 	p.mu.Lock()
 	if !p.closed {
-		p.idle = append(p.idle, v)
+		now := time.Now()
+		p.idle = append(p.idle, idleEntry[T]{val: v, returnedAt: now})
 		p.wakeLocked()
+		if p.idleTimeout > 0 && len(p.idle) > p.maxIdle {
+			p.armReapLocked(now)
+		}
 		p.mu.Unlock()
 		return
 	}
@@ -129,6 +218,10 @@ func (p *Pool[T]) Close() error {
 		return nil
 	}
 	p.closed = true
+	if p.reapTimer != nil {
+		p.reapTimer.Stop()
+		p.reapTimer = nil
+	}
 	idle := p.idle
 	p.idle = nil
 	p.n -= len(idle)
@@ -139,8 +232,8 @@ func (p *Pool[T]) Close() error {
 		w <- struct{}{}
 	}
 	var err error
-	for _, v := range idle {
-		err = errors.Join(err, p.closeFn(v))
+	for _, e := range idle {
+		err = errors.Join(err, p.closeFn(e.val))
 	}
 	return err
 }

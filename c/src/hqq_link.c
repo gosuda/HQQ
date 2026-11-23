@@ -20,6 +20,7 @@
 #define HQQ_SPIN_ITERATIONS 1024u
 #define HQQ_YIELD_ITERATIONS 256u
 #define HQQ_MAX_PARK_NS (100 * HQQ_NS_PER_MS)
+#define HQQ_IDLE_PARK_NS (1000 * HQQ_NS_PER_MS)
 #define HQQ_CHECK_INTERVAL_NS (50 * HQQ_NS_PER_MS)
 #define HQQ_MIN_SLEEP_NS UINT64_C(20000)
 #define HQQ_MAX_SLEEP_NS UINT64_C(2000000)
@@ -116,6 +117,12 @@ hqq_status hqq_link_check_peer(hqq_link *l) {
 static void wake_both(hqq_link *l) {
     hqq_ring_wake_all(&l->ring[0]);
     hqq_ring_wake_all(&l->ring[1]);
+}
+
+void hqq_link_wake(hqq_link *l) {
+    if (l != NULL) {
+        wake_both(l);
+    }
 }
 
 static void heartbeat_main(void *arg) {
@@ -397,6 +404,7 @@ typedef struct hqq_call {
     const hqq_cancel *cancel;
     uint64_t deadline_ns; /* absolute monotonic; 0 = none */
     int nowait;
+    int cancel_wakeable;  /* caller wakes the link when cancel is signalled */
     unsigned iter;
     uint64_t next_check_ns;
     uint64_t sleep_ns;
@@ -503,17 +511,19 @@ static hqq_status call_wait_step(hqq_call *c, hqq_ring *ring, int side, uint64_t
     if (st != HQQ_OK) {
         return st;
     }
-    timeout = HQQ_MAX_PARK_NS;
+    timeout = c->cancel_wakeable ? HQQ_IDLE_PARK_NS : HQQ_MAX_PARK_NS;
     if (c->deadline_ns != 0) {
-        timeout = c->deadline_ns > now ? c->deadline_ns - now : 0;
-        if (timeout > HQQ_MAX_PARK_NS) {
-            timeout = HQQ_MAX_PARK_NS;
+        uint64_t rem = c->deadline_ns > now ? c->deadline_ns - now : 0;
+        if (rem < timeout) {
+            timeout = rem;
         }
     }
-    if (c->next_check_ns > now && c->next_check_ns - now < timeout) {
-        timeout = c->next_check_ns - now;
+    if (!c->cancel_wakeable || l->heartbeat_interval_ns <= 0) {
+        if (c->next_check_ns > now && c->next_check_ns - now < timeout) {
+            timeout = c->next_check_ns - now;
+        }
     }
-    if (c->cancel != NULL && timeout > HQQ_CANCEL_PARK_NS) {
+    if (c->cancel != NULL && !c->cancel_wakeable && timeout > HQQ_CANCEL_PARK_NS) {
         timeout = HQQ_CANCEL_PARK_NS;
     }
     if (timeout == 0) {
@@ -889,7 +899,8 @@ hqq_status hqq_read_zc(hqq_link *l, hqq_read_fn fn, void *user, size_t *len, con
     return st;
 }
 
-hqq_status hqq_read_reserve(hqq_link *l, hqq_read_reservation *res, const hqq_wait *wait) {
+static hqq_status read_reserve_impl(hqq_link *l, hqq_read_reservation *res, const hqq_wait *wait,
+                                    int cancel_wakeable) {
     hqq_call c;
     hqq_status st;
     uint64_t pos;
@@ -907,6 +918,7 @@ hqq_status hqq_read_reserve(hqq_link *l, hqq_read_reservation *res, const hqq_wa
         return st;
     }
     call_init(&c, l, wait);
+    c.cancel_wakeable = cancel_wakeable;
     st = rx_next(l, &c, SIZE_MAX, &pos, &n);
     if (st == HQQ_OK) {
         res->link = l;
@@ -917,6 +929,14 @@ hqq_status hqq_read_reserve(hqq_link *l, hqq_read_reservation *res, const hqq_wa
     }
     exit_rx(l);
     return st;
+}
+
+hqq_status hqq_read_reserve(hqq_link *l, hqq_read_reservation *res, const hqq_wait *wait) {
+    return read_reserve_impl(l, res, wait, 0);
+}
+
+hqq_status hqq_read_reserve_wakeable(hqq_link *l, hqq_read_reservation *res, const hqq_wait *wait) {
+    return read_reserve_impl(l, res, wait, 1);
 }
 
 hqq_status hqq_read_release(hqq_read_reservation *res) {

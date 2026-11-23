@@ -217,3 +217,51 @@ func TestPoolConcurrent(t *testing.T) {
 		t.Fatalf("dialed %d, closed %d", h.dialed.Load(), h.closed.Load())
 	}
 }
+
+func TestPoolIdleEviction(t *testing.T) {
+	h := newPoolHarness(8)
+	h.pool.SetIdleTimeout(2, 80*time.Millisecond)
+	ctx := context.Background()
+
+	items := make([]*poolItem, 6)
+	for i := range items {
+		v, err := h.pool.Get(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		items[i] = v
+	}
+	for _, v := range items {
+		h.pool.Put(v)
+	}
+	if h.closed.Load() != 0 {
+		t.Fatalf("closed %d before idle timeout", h.closed.Load())
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for h.closed.Load() < 4 && time.Now().Before(deadline) {
+		time.Sleep(15 * time.Millisecond)
+	}
+	if got := h.closed.Load(); got != 4 {
+		t.Fatalf("closed %d surplus idle items, want 4", got)
+	}
+	// The 2 warm items stay open and are reused on the next Get.
+	a, err := h.pool.Get(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := h.pool.Get(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h.dialed.Load() != 6 {
+		t.Fatalf("dialed %d, want 6 (reusing 2 warm idle items)", h.dialed.Load())
+	}
+	h.pool.Put(a)
+	h.pool.Put(b)
+	if err := h.pool.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if h.closed.Load() != 6 {
+		t.Fatalf("closed %d after Close, want 6", h.closed.Load())
+	}
+}
