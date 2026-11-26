@@ -44,22 +44,21 @@ Compiler flag conventions:
 
 Compilers are divided into two tiers:
 
-- **Supported**: Built and tested on every push and pull request; any failure blocks merge.
-- **Best effort**: Built in CI with `continue-on-error: true` to track upstream compiler evolution without blocking merges on runner-specific quirks.
+- **Supported**: Built and tested at the cadence in the CI table below. Failures remain blocking for each scheduled job.
+- **Best effort**: Available for manual local verification. These compiler variants do not allocate CI runners.
 
-| Platform | Compiler | Atomics Implementation | Support Tier |
+| Platform | Compiler | Atomics implementation | CI cadence |
 | --- | --- | --- | --- |
-| Linux `x86_64` (`ubuntu-24.04`) | GCC 13, GCC 14 | `<stdatomic.h>` | **Supported** |
-| Linux `x86_64` (`ubuntu-24.04`) | Clang 18, Clang 20 | `<stdatomic.h>` (`__c11_atomic_*` builtins) | **Supported** |
-| Linux `arm64` (`ubuntu-24.04-arm`) | GCC 13, GCC 14, Clang 18, Clang 20 | `<stdatomic.h>` | **Supported** (native weak-memory hardware; runs `stress_litmus`) |
-| macOS `arm64` (`macos-latest`) | Apple Clang | `<stdatomic.h>` | **Supported** |
-| macOS `x86_64` (`macos-15-intel`) | Apple Clang | `<stdatomic.h>` | **Supported** |
-| Windows `x64` (`windows-latest`) | `clang-cl` (LLVM 20) | Clang `<stdatomic.h>` (`__c11_atomic_*` builtins) | **Supported** |
-| Windows `x64` (`windows-latest`) | MSVC `cl.exe` (VS 2022 17.5+ / VS 2026) | `/std:c11 /experimental:c11atomics` | **Best effort** |
-| Windows `arm64` (`windows-11-arm`) | `clang-cl`, MSVC `cl.exe` | Same as Windows `x64` | **Best effort** |
-| Linux / macOS | `g++` 14, `clang++` 18 | `<atomic>` (C++17 header consumer check) | **Supported** |
-| Sanitizers: Linux `x86_64` & `arm64` | Clang 18 (`address+undefined`, `thread`) | `<stdatomic.h>` | **Supported** |
-| Sanitizers: macOS `arm64` | Apple Clang (`address+undefined`, `thread`) | `<stdatomic.h>` | **Best effort** |
+| Linux x86_64 | GCC 14, Clang 18 | C11 atomics | Pushes and pull requests |
+| Linux arm64 | Clang 18 | C11 atomics; native weak-memory stress | Pushes and pull requests |
+| macOS arm64 | Apple Clang | C11 atomics | Weekly and manual |
+| Windows x64 | clang-cl | Clang C11 atomics | Weekly and manual |
+| Linux x86_64 and arm64 sanitizers | Clang 18 | ASan/UBSan and TSan | Pushes and pull requests |
+| Linux C++ header consumers | g++ 14, clang++ 18 | C++17, C++20, C++23 and C11 headers | Pushes and pull requests |
+
+GCC 13, Clang 20, MSVC, macOS sanitizers, native Intel macOS, and native
+Windows arm64 are outside the automated matrix. This is a CI coverage
+reduction, not a claim that those compiler or runtime combinations passed.
 
 ### 3.1 Windows Compiler Policy: `clang-cl` (Supported) and MSVC `cl.exe` (Best Effort)
 
@@ -69,7 +68,7 @@ Microsoft Visual Studio 2022 17.5+ and Visual Studio 2026 provide lock-free C11 
 - **`__STDC_NO_ATOMICS__` macro**: Even with `/experimental:c11atomics` enabled, `cl.exe` continues to predefine `__STDC_NO_ATOMICS__`. When `HQQ_HAVE_C11_ATOMICS` succeeds on MSVC, `c/CMakeLists.txt` defines `HQQ_FORCE_C11_ATOMICS=1`, which `c/include/hqq/hqq.h` honors.
 - **Lock-free ABI compatibility**: MSVC's C11 atomics support power-of-two types up to 8 bytes (`ATOMIC_INT_LOCK_FREE == 2` and `ATOMIC_LLONG_LOCK_FREE == 2`) using the exact same ABI and `seq_cst` code generation (`xchg` / `lock cmpxchg` on x64, `ldar` / `stlr` on ARM64) as MSVC's C++ `std::atomic<T>`.
 
-Because Microsoft still marks `/experimental:c11atomics` as experimental and the weak-memory stress suite (`c/verify/stress/`) currently uses POSIX threads, **`clang-cl` is the primary supported Windows C compiler** and **MSVC `cl.exe` is maintained in CI as best-effort**. Windows applications written in C++ can always consume `libhqq` using standard C++17 `std::atomic`.
+Because Microsoft still marks `/experimental:c11atomics` as experimental and the weak-memory stress suite (`c/verify/stress/`) currently uses POSIX threads, **`clang-cl` is the primary supported Windows C compiler** and **MSVC `cl.exe` remains a manual best-effort target**. Windows applications written in C++ can always consume `libhqq` using standard C++17 `std::atomic`.
 
 ### 3.2 Additional Compiler Notes
 
@@ -82,15 +81,14 @@ Because Microsoft still marks `/experimental:c11atomics` as experimental and the
 
 Workflow [`.github/workflows/c.yml`](../../.github/workflows/c.yml) runs the following verification jobs:
 
-| Job | Runners | Verification Steps |
+| Job | Depot runners | Verification |
 | --- | --- | --- |
-| `linux` | `ubuntu-24.04` (`x86_64`), `ubuntu-24.04-arm` (`arm64`) across `gcc-13`, `gcc-14`, `clang-18`, `clang-20` | Release build with `-DHQQ_WERROR=ON`, full `ctest` suite, and (on `arm64`) three bounded 3-second passes of `hqq_stress_litmus`. |
-| `linux-sanitizers` | `ubuntu-24.04` and `ubuntu-24.04-arm` across `address+undefined` and `thread` | `clang-18` Debug builds with `-DHQQ_WERROR=ON` and full `ctest` execution. |
-| `macos` | `macos-latest` (`arm64`), `macos-15-intel` (`x86_64`) | Apple Clang Release build with `-DHQQ_WERROR=ON` and full `ctest` suite. |
-| `macos-sanitizers` | `macos-latest` (`arm64`) | Apple Clang Debug builds with `address+undefined` and `thread` (best effort). |
-| `windows` | `windows-latest` (`x64`) and `windows-11-arm` (`arm64`) across `clang-cl` and MSVC `cl.exe` | Ninja + `ilammy/msvc-dev-cmd` Release build and full `ctest` suite (`windows-latest` with `clang-cl` is blocking; MSVC and `arm64` are best effort). |
-| `cxx17` | `ubuntu-24.04` | `g++-14` and `clang++-18` `-fsyntax-only` header checks (C++17, C++20, C++23, C11) plus the `test_cxx17` binary. |
-| `memory-model` | `ubuntu-24.04` | Automated GenMC stateless model checking (`c/verify/genmc/run.sh`) and `herd7` litmus verification. |
+| `linux` | `depot-ubuntu-24.04` and `depot-ubuntu-24.04-arm` | Three compiler/architecture cells; full release `ctest`; bounded ARM weak-memory stress |
+| `linux-sanitizers` | Both Linux architectures | ASan/UBSan and TSan; full debug `ctest` |
+| `macos` | `depot-macos-latest` | Weekly/manual Apple Clang arm64 release `ctest` |
+| `windows` | `depot-windows-2025` | Weekly/manual clang-cl x64 release `ctest` |
+| `cxx17` | `depot-ubuntu-24.04` | Both compiler families; all header standards and the C++17 consumer |
+| `memory-model` | `depot-ubuntu-24.04` | GenMC and herd7 checks |
 
 To reproduce the full Linux compiler and sanitizer matrix locally inside Docker, run:
 
