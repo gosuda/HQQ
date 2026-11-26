@@ -149,6 +149,14 @@ jobs:
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
         run: ctest --test-dir build-cpp --output-on-failure --timeout 180
 
+      - name: Require the Go helper for interoperability checks
+        if: needs.helper.result != 'success'
+        shell: bash
+        run: |
+          echo "Standalone binding checks passed; interoperability is blocked by the failed Go helper job." >> "$GITHUB_STEP_SUMMARY"
+          echo "::error::Go helper prerequisite failed; interoperability has not been verified."
+          exit 1
+
       - name: Download prebuilt Go helper
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -252,6 +260,14 @@ jobs:
       - name: Examples (rpc)
         working-directory: bindings/rust
         run: cargo run --release --locked -p hqq --example rpc -- --selftest
+
+      - name: Require the Go helper for interoperability checks
+        if: needs.helper.result != 'success'
+        shell: bash
+        run: |
+          echo "Standalone binding checks passed; interoperability is blocked by the failed Go helper job." >> "$GITHUB_STEP_SUMMARY"
+          echo "::error::Go helper prerequisite failed; interoperability has not been verified."
+          exit 1
 
       - name: Download prebuilt Go helper
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
