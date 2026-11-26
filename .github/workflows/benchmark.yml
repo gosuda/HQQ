@@ -51,20 +51,25 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          runs=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/benchmark.yml/runs?branch=main&status=completed&per_page=20" \
-            --jq '.workflow_runs[] | select(.head_repository.full_name == env.GITHUB_REPOSITORY) | [.id, .conclusion] | @tsv')
-          while IFS=$'\t' read -r run_id conclusion; do
-            if [ -z "$run_id" ]; then continue; fi
-            artifact=$(RUN_CONCLUSION="$conclusion" gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/artifacts" \
-              --jq '[.artifacts[] | select((.name == "hqq-benchmark-history" or (.name == "hqq-benchmark-artifacts-Linux" and env.RUN_CONCLUSION == "success")) and .expired == false)] | sort_by(.name != "hqq-benchmark-history") | .[0].name // empty')
-            if [ -n "$artifact" ]; then
-              gh run download "$run_id" --repo "$GITHUB_REPOSITORY" \
-                --name "$artifact" --dir "$RUNNER_TEMP/benchmark-history"
-              test -s "$RUNNER_TEMP/benchmark-history/benchmark-data.json"
-              cp "$RUNNER_TEMP/benchmark-history/benchmark-data.json" benchmark-data.json
-              exit 0
-            fi
-          done <<< "$runs"
+          page=1
+          while true; do
+            runs=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/benchmark.yml/runs?branch=main&status=completed&per_page=20&page=$page" \
+              --jq '.workflow_runs[] | select(.head_repository.full_name == env.GITHUB_REPOSITORY) | [.id, .conclusion] | @tsv')
+            if [ -z "$runs" ]; then break; fi
+            while IFS=$'\t' read -r run_id conclusion; do
+              if [ -z "$run_id" ]; then continue; fi
+              artifact=$(RUN_CONCLUSION="$conclusion" gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/artifacts" \
+                --jq '[.artifacts[] | select((.name == "hqq-benchmark-history" or (.name == "hqq-benchmark-artifacts-Linux" and env.RUN_CONCLUSION == "success")) and .expired == false)] | sort_by(.name != "hqq-benchmark-history") | .[0].name // empty')
+              if [ -n "$artifact" ]; then
+                gh run download "$run_id" --repo "$GITHUB_REPOSITORY" \
+                  --name "$artifact" --dir "$RUNNER_TEMP/benchmark-history"
+                test -s "$RUNNER_TEMP/benchmark-history/benchmark-data.json"
+                cp "$RUNNER_TEMP/benchmark-history/benchmark-data.json" benchmark-data.json
+                exit 0
+              fi
+            done <<< "$runs"
+            page=$((page + 1))
+          done
           printf '%s\n' '::error::No trusted benchmark history remains. Dispatch this workflow on main with reset_history=true to explicitly begin a new history.'
           exit 1
 
