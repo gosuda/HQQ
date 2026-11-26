@@ -97,7 +97,7 @@ jobs:
       matrix:
         os:
           - ubuntu-24.04
-          - macos-latest
+          - depot-macos-latest
 
     steps:
       - name: Checkout
@@ -196,14 +196,14 @@ jobs:
             build_type: Debug
             experimental: false
           - name: macOS
-            runner: macos-latest
+            runner: depot-macos-latest
             sanitize: none
             test_sanitize: ''
             build_type: Release
             experimental: false
           # Sanitizer support on hosted macOS images depends on the OS release, as in c.yml.
           - name: macOS ASan+UBSan (best effort)
-            runner: macos-latest
+            runner: depot-macos-latest
             sanitize: address+undefined
             test_sanitize: address+undefined
             build_type: Debug

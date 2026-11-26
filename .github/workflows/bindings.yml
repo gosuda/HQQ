@@ -96,13 +96,13 @@ jobs:
             build_type: Debug
             sanitize: address+undefined
           - name: macOS clang
-            runner: macos-latest
+            runner: depot-macos-latest
             cc: clang
             cxx: clang++
             build_type: Release
             sanitize: none
           - name: Windows clang-cl
-            runner: windows-latest
+            runner: depot-windows-2025
             cc: clang-cl
             cxx: clang-cl
             build_type: Release
@@ -202,9 +202,9 @@ jobs:
           - os: Linux
             runner: ubuntu-24.04
           - os: macOS
-            runner: macos-latest
+            runner: depot-macos-latest
           - os: Windows
-            runner: windows-latest
+            runner: depot-windows-2025
 
     steps:
       - name: Checkout
