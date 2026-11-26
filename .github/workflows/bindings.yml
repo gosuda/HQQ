@@ -204,7 +204,7 @@ jobs:
           - os: macOS
             runner: depot-macos-latest
           - os: Windows
-            runner: depot-windows-2025
+            runner: windows-latest
 
     steps:
       - name: Checkout
