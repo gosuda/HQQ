@@ -53,9 +53,10 @@ jobs:
           set -euo pipefail
           page=1
           while true; do
-            runs=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/benchmark.yml/runs?branch=main&status=completed&per_page=20&page=$page" \
-              --jq '.workflow_runs[] | select(.head_repository.full_name == env.GITHUB_REPOSITORY) | [.id, .conclusion] | @tsv')
-            if [ -z "$runs" ]; then break; fi
+            page_runs=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/benchmark.yml/runs?branch=main&status=completed&per_page=20&page=$page" \
+              --jq '.workflow_runs')
+            if [ "$(jq 'length' <<< "$page_runs")" -eq 0 ]; then break; fi
+            runs=$(jq -r '.[] | select(.head_repository.full_name == env.GITHUB_REPOSITORY) | [.id, .conclusion] | @tsv' <<< "$page_runs")
             while IFS=$'\t' read -r run_id conclusion; do
               if [ -z "$run_id" ]; then continue; fi
               artifact=$(RUN_CONCLUSION="$conclusion" gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/artifacts" \
