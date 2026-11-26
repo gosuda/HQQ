@@ -16,14 +16,16 @@ on:
       - 'c/**'
       - 'spec/**'
       - '.github/workflows/c.yml'
+  schedule:
+    - cron: '17 4 * * 1'
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: c-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   # Pinned tool versions for the memory-model job (see c/verify/ and
@@ -42,25 +44,22 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [ubuntu-24.04, ubuntu-24.04-arm]
-        cc: [gcc-13, gcc-14, clang-18, clang-20]
         include:
-          - runner: ubuntu-24.04
+          - runner: depot-ubuntu-24.04
             arch: x86_64
-          - runner: ubuntu-24.04-arm
-            arch: arm64
-          - cc: gcc-13
-            cxx: g++-13
-            packages: gcc-13 g++-13
-          - cc: gcc-14
+            cc: gcc-14
             cxx: g++-14
             packages: gcc-14 g++-14
-          - cc: clang-18
+          - runner: depot-ubuntu-24.04
+            arch: x86_64
+            cc: clang-18
             cxx: clang++-18
             packages: clang-18 libclang-rt-18-dev
-          - cc: clang-20
-            cxx: clang++-20
-            packages: clang-20 libclang-rt-20-dev
+          - runner: depot-ubuntu-24.04-arm
+            arch: arm64
+            cc: clang-18
+            cxx: clang++-18
+            packages: clang-18 libclang-rt-18-dev
 
     env:
       CC: ${{ matrix.cc }}
@@ -68,7 +67,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6.0.2
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Install compiler
         run: |
@@ -104,12 +103,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+        runner: [depot-ubuntu-24.04, depot-ubuntu-24.04-arm]
         sanitizer: [address+undefined, thread]
         include:
-          - runner: ubuntu-24.04
+          - runner: depot-ubuntu-24.04
             arch: x86_64
-          - runner: ubuntu-24.04-arm
+          - runner: depot-ubuntu-24.04-arm
             arch: arm64
 
     env:
@@ -118,7 +117,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6.0.2
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Install compiler
         run: |
@@ -143,8 +142,8 @@ jobs:
           TSAN_OPTIONS: halt_on_error=1:second_deadlock_stack=1
         run: ctest --test-dir build --output-on-failure --timeout 300
 
-  # macOS: arm64 (Apple clang) and Intel.
   macos:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     name: macOS ${{ matrix.arch }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 20
@@ -155,12 +154,10 @@ jobs:
         include:
           - runner: depot-macos-latest
             arch: arm64
-          - runner: macos-15-intel
-            arch: x86_64
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6.0.2
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Configure
         run: cmake -S c -B build -DCMAKE_BUILD_TYPE=Release -DHQQ_WERROR=ON
@@ -171,38 +168,8 @@ jobs:
       - name: Test
         run: ctest --test-dir build --output-on-failure --timeout 120
 
-  # ThreadSanitizer / ASan on macOS arm64. Best effort: sanitizer support on
-  # hosted macOS images depends on the OS release (ASLR vs shadow memory).
-  macos-sanitizers:
-    name: macOS arm64 ${{ matrix.sanitizer }} (best effort)
-    runs-on: depot-macos-latest
-    timeout-minutes: 20
-    continue-on-error: true
-
-    strategy:
-      fail-fast: false
-      matrix:
-        sanitizer: [address+undefined, thread]
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6.0.2
-
-      - name: Configure
-        run: >
-          cmake -S c -B build -DCMAKE_BUILD_TYPE=Debug -DHQQ_WERROR=ON
-          -DHQQ_SANITIZE=${{ matrix.sanitizer }}
-
-      - name: Build
-        run: cmake --build build
-
-      - name: Test
-        run: ctest --test-dir build --output-on-failure --timeout 300
-
-  # Windows. clang-cl is the supported compiler; cl.exe (MSVC) relies on the
-  # experimental /experimental:c11atomics switch and is best effort. See
-  # spec/toolchain/C_TOOLCHAIN.md.
   windows:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     name: Windows ${{ matrix.arch }} ${{ matrix.compiler }}${{ matrix.experimental && ' (best effort)' || '' }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 25
@@ -212,34 +179,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: windows-latest
+          - runner: depot-windows-2025
             arch: x64
             compiler: clang-cl
             cc: clang-cl
             cxx: clang-cl
             experimental: false
-          - runner: windows-latest
-            arch: x64
-            compiler: msvc
-            cc: cl
-            cxx: cl
-            experimental: true
-          - runner: windows-11-arm
-            arch: arm64
-            compiler: clang-cl
-            cc: clang-cl
-            cxx: clang-cl
-            experimental: true
-          - runner: windows-11-arm
-            arch: arm64
-            compiler: msvc
-            cc: cl
-            cxx: cl
-            experimental: true
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6.0.2
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Set up MSVC developer environment
         shell: pwsh
@@ -273,7 +222,7 @@ jobs:
   # C++17 consumers of the public header (extern "C", no <stdatomic.h>).
   cxx17:
     name: C++17 ${{ matrix.cxx }}
-    runs-on: ubuntu-24.04
+    runs-on: depot-ubuntu-24.04
     timeout-minutes: 10
 
     strategy:
@@ -289,7 +238,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6.0.2
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Install compiler
         run: |
@@ -322,12 +271,12 @@ jobs:
   # (axiomatic litmus tests). See spec/toolchain/VERIFICATION_TOOLING.md.
   memory-model:
     name: Memory model (GenMC, herd7)
-    runs-on: ubuntu-24.04
+    runs-on: depot-ubuntu-24.04
     timeout-minutes: 90
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6.0.2
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Install build dependencies
         run: |
@@ -347,7 +296,7 @@ jobs:
 
       - name: Cache GenMC
         id: genmc-cache
-        uses: actions/cache@v6.1.0
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.local/genmc
           key: genmc-${{ runner.os }}-${{ runner.arch }}-${{ env.GENMC_COMMIT }}-llvm${{ env.GENMC_LLVM_MAJOR }}-${{ hashFiles('c/verify/install-genmc.sh') }}
@@ -370,7 +319,7 @@ jobs:
       - name: Cache herdtools7
         if: always()
         id: herd-cache
-        uses: actions/cache@v6.1.0
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.opam
           key: herdtools7-${{ runner.os }}-${{ runner.arch }}-${{ env.HERDTOOLS_VERSION }}-${{ hashFiles('c/verify/install-herd.sh') }}

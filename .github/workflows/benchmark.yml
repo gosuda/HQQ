@@ -1,35 +1,36 @@
 name: Benchmark
 
 on:
-  push:
-    branches:
-      - main
-  pull_request:
+  schedule:
+    - cron: '41 4 * * 1'
   workflow_dispatch:
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
-  group: benchmark-${{ github.ref }}
-  cancel-in-progress: true
+  group: hqq-benchmark-history
+  cancel-in-progress: false
 
 jobs:
   benchmarks:
     name: HQQ benchmarks
-    runs-on: ubuntu-latest
+    runs-on: depot-ubuntu-24.04
     timeout-minutes: 10
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6.0.2
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Set up Go
-        uses: actions/setup-go@v6.4.0
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
         with:
           go-version-file: go.mod
-          check-latest: true
           cache: true
+          cache-dependency-path: |
+            go.mod
+            go.sum
 
       - name: Install Linux profiling dependencies
         if: runner.os == 'Linux'
@@ -38,14 +39,26 @@ jobs:
           sudo apt-get install -y graphviz
           dot -V
 
-      - name: Restore benchmark history
-        id: benchmark-history
-        uses: actions/cache/restore@v5.0.5
-        with:
-          path: benchmark-data.json
-          key: ${{ runner.os }}-hqq-benchmark-${{ github.run_id }}
-          restore-keys: |
-            ${{ runner.os }}-hqq-benchmark-
+      - name: Restore the latest trusted benchmark history
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          runs=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/benchmark.yml/runs?branch=main&status=success&per_page=20" \
+            --jq '.workflow_runs[] | select(.head_repository.full_name == env.GITHUB_REPOSITORY) | .id')
+          for run_id in $runs; do
+            artifact=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/artifacts" \
+              --jq '.artifacts[] | select(.name == "hqq-benchmark-artifacts-Linux" and .expired == false) | .id')
+            if [ -n "$artifact" ]; then
+              gh run download "$run_id" --repo "$GITHUB_REPOSITORY" \
+                --name hqq-benchmark-artifacts-Linux --dir "$RUNNER_TEMP/benchmark-history"
+              test -s "$RUNNER_TEMP/benchmark-history/benchmark-data.json"
+              cp "$RUNNER_TEMP/benchmark-history/benchmark-data.json" benchmark-data.json
+              exit 0
+            fi
+          done
+          echo '::error::No trusted benchmark history remains; restore the baseline before publishing another benchmark.'
+          exit 1
 
       - name: Run CPU-ratio performance tests
         env:
@@ -78,7 +91,7 @@ jobs:
           mv "$test_binary" benchmark-artifacts/pprof/hqq.test
 
       - name: Publish benchmark summary
-        uses: benchmark-action/github-action-benchmark@v1.22.0
+        uses: benchmark-action/github-action-benchmark@a60cea5bc7b49e15c1f58f411161f99e0df48372 # v1.22.0
         with:
           name: HQQ Go Benchmark
           tool: go
@@ -116,7 +129,7 @@ jobs:
 
       - name: Upload benchmark artifacts
         if: always()
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: hqq-benchmark-artifacts-${{ runner.os }}
           path: |
@@ -125,10 +138,3 @@ jobs:
             benchmark-artifacts/
           if-no-files-found: warn
           retention-days: 14
-
-      - name: Save benchmark history
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        uses: actions/cache/save@v5.0.5
-        with:
-          path: benchmark-data.json
-          key: ${{ runner.os }}-hqq-benchmark-${{ github.run_id }}
