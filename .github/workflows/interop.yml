@@ -28,8 +28,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: interop-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   # CMake target of the C helper. Its executable is located under build-c/
@@ -53,6 +53,9 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+          cache-dependency-path: |
+            go.mod
+            go.sum
 
       - name: Cross-compile the helper for every test OS
         shell: bash
@@ -94,6 +97,9 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+          cache-dependency-path: |
+            go.mod
+            go.sum
 
       - name: Download prebuilt Go helper
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2

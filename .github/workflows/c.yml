@@ -24,8 +24,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: c-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   # Pinned tool versions for the memory-model job (see c/verify/ and

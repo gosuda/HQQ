@@ -38,8 +38,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: bindgen-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   # The generated files are functions of the IDL files: regenerate with -check, like
@@ -58,6 +58,9 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+          cache-dependency-path: |
+            go.mod
+            go.sum
 
       - name: Generated microlib client and server glue are fresh
         run: >
@@ -176,6 +179,9 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+          cache-dependency-path: |
+            go.mod
+            go.sum
 
       - name: Build the microlib server
         run: >
@@ -215,6 +221,9 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+          cache-dependency-path: |
+            go.mod
+            go.sum
 
       - name: Build the benchmark server and hqq_echo
         run: |
