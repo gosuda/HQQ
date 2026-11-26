@@ -22,10 +22,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6.0.2
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Set up Go
-        uses: actions/setup-go@v6.4.0
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
         with:
           go-version-file: go.mod
           check-latest: true
@@ -40,7 +40,7 @@ jobs:
 
       - name: Restore benchmark history
         id: benchmark-history
-        uses: actions/cache/restore@v5.0.5
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: benchmark-data.json
           key: ${{ runner.os }}-hqq-benchmark-${{ github.run_id }}
@@ -78,7 +78,7 @@ jobs:
           mv "$test_binary" benchmark-artifacts/pprof/hqq.test
 
       - name: Publish benchmark summary
-        uses: benchmark-action/github-action-benchmark@v1.22.0
+        uses: benchmark-action/github-action-benchmark@a60cea5bc7b49e15c1f58f411161f99e0df48372 # v1.22.0
         with:
           name: HQQ Go Benchmark
           tool: go
@@ -116,7 +116,7 @@ jobs:
 
       - name: Upload benchmark artifacts
         if: always()
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: hqq-benchmark-artifacts-${{ runner.os }}
           path: |
@@ -128,7 +128,7 @@ jobs:
 
       - name: Save benchmark history
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        uses: actions/cache/save@v5.0.5
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: benchmark-data.json
           key: ${{ runner.os }}-hqq-benchmark-${{ github.run_id }}
