@@ -153,8 +153,8 @@ jobs:
         if: needs.helper.result != 'success'
         shell: bash
         run: |
-          echo "Standalone binding checks passed; interoperability is blocked by the failed Go helper job." >> "$GITHUB_STEP_SUMMARY"
-          echo "::error::Go helper prerequisite failed; interoperability has not been verified."
+          printf '%s\n' "Standalone binding checks passed; interoperability is blocked by the failed Go helper job." >> "$GITHUB_STEP_SUMMARY"
+          printf '%s\n' "::error::Go helper prerequisite failed; interoperability has not been verified."
           exit 1
 
       - name: Download prebuilt Go helper
@@ -265,8 +265,8 @@ jobs:
         if: needs.helper.result != 'success'
         shell: bash
         run: |
-          echo "Standalone binding checks passed; interoperability is blocked by the failed Go helper job." >> "$GITHUB_STEP_SUMMARY"
-          echo "::error::Go helper prerequisite failed; interoperability has not been verified."
+          printf '%s\n' "Standalone binding checks passed; interoperability is blocked by the failed Go helper job." >> "$GITHUB_STEP_SUMMARY"
+          printf '%s\n' "::error::Go helper prerequisite failed; interoperability has not been verified."
           exit 1
 
       - name: Download prebuilt Go helper

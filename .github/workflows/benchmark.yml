@@ -51,11 +51,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          runs=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/benchmark.yml/runs?branch=main&status=success&per_page=20" \
-            --jq '.workflow_runs[] | select(.head_repository.full_name == env.GITHUB_REPOSITORY) | .id')
-          for run_id in $runs; do
-            artifact=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/artifacts" \
-              --jq '[.artifacts[] | select((.name == "hqq-benchmark-history" or .name == "hqq-benchmark-artifacts-Linux") and .expired == false)] | sort_by(.name != "hqq-benchmark-history") | .[0].name // empty')
+          runs=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/benchmark.yml/runs?branch=main&status=completed&per_page=20" \
+            --jq '.workflow_runs[] | select(.head_repository.full_name == env.GITHUB_REPOSITORY) | [.id, .conclusion] | @tsv')
+          while IFS=$'\t' read -r run_id conclusion; do
+            if [ -z "$run_id" ]; then continue; fi
+            artifact=$(RUN_CONCLUSION="$conclusion" gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/artifacts" \
+              --jq '[.artifacts[] | select((.name == "hqq-benchmark-history" or (.name == "hqq-benchmark-artifacts-Linux" and env.RUN_CONCLUSION == "success")) and .expired == false)] | sort_by(.name != "hqq-benchmark-history") | .[0].name // empty')
             if [ -n "$artifact" ]; then
               gh run download "$run_id" --repo "$GITHUB_REPOSITORY" \
                 --name "$artifact" --dir "$RUNNER_TEMP/benchmark-history"
@@ -63,8 +64,8 @@ jobs:
               cp "$RUNNER_TEMP/benchmark-history/benchmark-data.json" benchmark-data.json
               exit 0
             fi
-          done
-          echo '::error::No trusted benchmark history remains. Dispatch this workflow on main with reset_history=true to explicitly begin a new history.'
+          done <<< "$runs"
+          printf '%s\n' '::error::No trusted benchmark history remains. Dispatch this workflow on main with reset_history=true to explicitly begin a new history.'
           exit 1
 
       - name: Run CPU-ratio performance tests
