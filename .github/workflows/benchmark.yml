@@ -1,10 +1,8 @@
 name: Benchmark
 
 on:
-  push:
-    branches:
-      - main
-  pull_request:
+  schedule:
+    - cron: '41 4 * * 1'
   workflow_dispatch:
 
 permissions:
@@ -17,7 +15,7 @@ concurrency:
 jobs:
   benchmarks:
     name: HQQ benchmarks
-    runs-on: ubuntu-latest
+    runs-on: depot-ubuntu-24.04
     timeout-minutes: 10
 
     steps:
@@ -126,7 +124,7 @@ jobs:
           retention-days: 14
 
       - name: Save benchmark history
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        if: github.ref == 'refs/heads/main'
         uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: benchmark-data.json

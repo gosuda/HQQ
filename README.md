@@ -322,3 +322,19 @@ type AdvancedOptions struct {
 | [**`secureexec/README.md`**](secureexec/README.md) | TOCTOU-free executable verification (`memfd`, private vault, Windows share lock) and signed release manifests (`cmd/hqq-manifest`). |
 | [**`c/README.md`**](c/README.md) | C11 reference library (`libhqq`) and `hqqrpc_main` server runtime. |
 | [**`spec/SPEC.md`**](spec/SPEC.md) | Normative HQQ protocol specification and [`spec/MEMORY_MODEL.md`](spec/MEMORY_MODEL.md). |
+
+## CI cadence
+
+Every routine change runs the Linux Go tests, race tests, six fuzz smoke
+targets, and TLC. Path-matched C changes keep both compiler families,
+native ARM weak-memory stress, both Linux sanitizer architectures, C++
+header checks, GenMC, and herd7. Bindgen keeps generated/vector checks,
+C runtime sanitizers, and Linux E2E checks. C++ and Rust bindings and
+cross-implementation interoperability keep their Linux gates.
+
+macOS and Windows runtime checks run weekly and on manual dispatch.
+Informational benchmarks run weekly or manually. The duplicate bindgen
+Go/race job is removed; its unique fuzz targets run in the main CI job.
+The C compiler cross-product and best-effort native platform cells are
+reduced as listed in `spec/toolchain/C_TOOLCHAIN.md`. Every runner is
+Depot, and all macOS jobs use `depot-macos-latest`.

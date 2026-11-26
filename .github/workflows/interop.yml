@@ -42,7 +42,7 @@ jobs:
   # of rebuilding it in each matrix cell.
   helper:
     name: Go interop helper
-    runs-on: ubuntu-24.04
+    runs-on: depot-ubuntu-24.04
     timeout-minutes: 10
     steps:
       - name: Checkout
@@ -80,11 +80,10 @@ jobs:
 
     strategy:
       fail-fast: false
-      matrix:
-        os:
-          - ubuntu-latest
-          - depot-macos-latest
-          - depot-windows-2025
+      matrix: >-
+        ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+          && '{"os":["depot-ubuntu-24.04","depot-macos-latest","depot-windows-2025"]}'
+          || '{"os":["depot-ubuntu-24.04"]}') }}
 
     steps:
       - name: Checkout
@@ -154,7 +153,7 @@ jobs:
           # Absolute path: the driver runs from the package directory.
           echo "path=$GITHUB_WORKSPACE/$path" >> "$GITHUB_OUTPUT"
 
-      # Vectors are checked on ubuntu-latest only. Superblock, ring, packet and
+      # Vectors are checked on depot-ubuntu-24.04 only. Superblock, ring, packet and
       # frame vectors are host independent and are compared in full. Golden
       # sequences exist per page family (only the host family is generated, and
       # only the families that are committed are compared), so they are compared

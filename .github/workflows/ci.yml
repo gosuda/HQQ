@@ -5,6 +5,8 @@ on:
     branches:
       - main
   pull_request:
+  schedule:
+    - cron: '11 4 * * 1'
   workflow_dispatch:
 
 permissions:
@@ -22,11 +24,10 @@ jobs:
 
     strategy:
       fail-fast: false
-      matrix:
-        os:
-          - ubuntu-latest
-          - depot-macos-latest
-          - depot-windows-2025
+      matrix: >-
+        ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+          && '{"os":["depot-ubuntu-24.04","depot-macos-latest","depot-windows-2025"]}'
+          || '{"os":["depot-ubuntu-24.04"]}') }}
 
     steps:
       - name: Checkout
@@ -67,10 +68,13 @@ jobs:
           go test ./internal/protocol -run '^$' -fuzz=FuzzPacketRoundTrip -fuzztime=5s
           go test . -run '^$' -fuzz='^FuzzConsumeAdvancedChunk$' -fuzztime=5s
           go test . -run '^$' -fuzz='^FuzzOpenOverCorruptSuperblock$' -fuzztime=5s
+          go test ./bindgen/idl -run '^$' -fuzz='^FuzzParse$' -fuzztime=5s
+          go test ./bindgen/rt -run '^$' -fuzz='^FuzzDecodeResponse$' -fuzztime=5s
+          go test ./bindgen/rt -run '^$' -fuzz='^FuzzDecodeValues$' -fuzztime=5s
 
   tlc:
     name: TLA+ Model Check
-    runs-on: ubuntu-latest
+    runs-on: depot-ubuntu-24.04
     timeout-minutes: 10
 
     steps:

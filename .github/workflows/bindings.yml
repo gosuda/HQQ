@@ -26,6 +26,8 @@ on:
       - 'interop/**'
       - 'cmd/hqq-interop/**'
       - '.github/workflows/bindings.yml'
+  schedule:
+    - cron: '23 4 * * 1'
   workflow_dispatch:
 
 permissions:
@@ -41,7 +43,7 @@ jobs:
   # an artifact instead of rebuilding it in each of the seven cells below.
   helper:
     name: Go interop helper
-    runs-on: ubuntu-24.04
+    runs-on: depot-ubuntu-24.04
     timeout-minutes: 10
     steps:
       - name: Checkout
@@ -81,32 +83,10 @@ jobs:
 
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - name: Linux gcc
-            runner: ubuntu-24.04
-            cc: gcc
-            cxx: g++
-            build_type: Release
-            sanitize: none
-          - name: Linux clang
-            runner: ubuntu-24.04
-            cc: clang-18
-            cxx: clang++-18
-            build_type: Debug
-            sanitize: address+undefined
-          - name: macOS clang
-            runner: depot-macos-latest
-            cc: clang
-            cxx: clang++
-            build_type: Release
-            sanitize: none
-          - name: Windows clang-cl
-            runner: depot-windows-2025
-            cc: clang-cl
-            cxx: clang-cl
-            build_type: Release
-            sanitize: none
+      matrix: >-
+        ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+          && '{"include":[{"name":"Linux gcc","runner":"depot-ubuntu-24.04","cc":"gcc","cxx":"g++","build_type":"Release","sanitize":"none"},{"name":"Linux clang","runner":"depot-ubuntu-24.04","cc":"clang-18","cxx":"clang++-18","build_type":"Debug","sanitize":"address+undefined"},{"name":"macOS clang","runner":"depot-macos-latest","cc":"clang","cxx":"clang++","build_type":"Release","sanitize":"none"},{"name":"Windows clang-cl","runner":"depot-windows-2025","cc":"clang-cl","cxx":"clang-cl","build_type":"Release","sanitize":"none"}]}'
+          || '{"include":[{"name":"Linux gcc","runner":"depot-ubuntu-24.04","cc":"gcc","cxx":"g++","build_type":"Release","sanitize":"none"},{"name":"Linux clang","runner":"depot-ubuntu-24.04","cc":"clang-18","cxx":"clang++-18","build_type":"Debug","sanitize":"address+undefined"}]}') }}
 
     env:
       CC: ${{ matrix.cc }}
@@ -197,24 +177,21 @@ jobs:
 
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - os: Linux
-            runner: ubuntu-24.04
-          - os: macOS
-            runner: depot-macos-latest
-          - os: Windows
-            runner: windows-latest
+      matrix: >-
+        ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+          && '{"include":[{"os":"Linux","runner":"depot-ubuntu-24.04"},{"os":"macOS","runner":"depot-macos-latest"},{"os":"Windows","runner":"depot-windows-2025"}]}'
+          || '{"include":[{"os":"Linux","runner":"depot-ubuntu-24.04"}]}') }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
-      # The runners ship rustup with the stable toolchain; no third-party action is needed.
-      - name: Show toolchain
+      - name: Install and select Rust
         shell: bash
         working-directory: bindings/rust
         run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
           rustup show active-toolchain
           cargo --version
 
