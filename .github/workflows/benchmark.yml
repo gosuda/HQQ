@@ -4,17 +4,23 @@ on:
   schedule:
     - cron: '41 4 * * 1'
   workflow_dispatch:
+    inputs:
+      reset_history:
+        description: Start a new benchmark history after the retained baseline expires
+        type: boolean
+        default: false
 
 permissions:
   contents: read
   actions: read
 
 concurrency:
-  group: hqq-benchmark-history
+  group: ${{ github.ref == 'refs/heads/main' && 'hqq-benchmark-history' || format('hqq-benchmark-skip-{0}', github.run_id) }}
   cancel-in-progress: false
 
 jobs:
   benchmarks:
+    if: github.ref == 'refs/heads/main'
     name: HQQ benchmarks
     runs-on: depot-ubuntu-24.04
     timeout-minutes: 10
@@ -40,24 +46,32 @@ jobs:
           dot -V
 
       - name: Restore the latest trusted benchmark history
+        if: ${{ !inputs.reset_history }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          runs=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/benchmark.yml/runs?branch=main&status=success&per_page=20" \
-            --jq '.workflow_runs[] | select(.head_repository.full_name == env.GITHUB_REPOSITORY) | .id')
-          for run_id in $runs; do
-            artifact=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/artifacts" \
-              --jq '.artifacts[] | select(.name == "hqq-benchmark-artifacts-Linux" and .expired == false) | .id')
-            if [ -n "$artifact" ]; then
-              gh run download "$run_id" --repo "$GITHUB_REPOSITORY" \
-                --name hqq-benchmark-artifacts-Linux --dir "$RUNNER_TEMP/benchmark-history"
-              test -s "$RUNNER_TEMP/benchmark-history/benchmark-data.json"
-              cp "$RUNNER_TEMP/benchmark-history/benchmark-data.json" benchmark-data.json
-              exit 0
-            fi
+          page=1
+          while true; do
+            page_runs=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/benchmark.yml/runs?branch=main&status=completed&per_page=20&page=$page" \
+              --jq '.workflow_runs')
+            if [ "$(jq 'length' <<< "$page_runs")" -eq 0 ]; then break; fi
+            runs=$(jq -r '.[] | select(.head_repository.full_name == env.GITHUB_REPOSITORY) | [.id, .conclusion] | @tsv' <<< "$page_runs")
+            while IFS=$'\t' read -r run_id conclusion; do
+              if [ -z "$run_id" ]; then continue; fi
+              artifact=$(RUN_CONCLUSION="$conclusion" gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/artifacts" \
+                --jq '[.artifacts[] | select((.name == "hqq-benchmark-history" or (.name == "hqq-benchmark-artifacts-Linux" and env.RUN_CONCLUSION == "success")) and .expired == false)] | sort_by(.name != "hqq-benchmark-history") | .[0].name // empty')
+              if [ -n "$artifact" ]; then
+                gh run download "$run_id" --repo "$GITHUB_REPOSITORY" \
+                  --name "$artifact" --dir "$RUNNER_TEMP/benchmark-history"
+                test -s "$RUNNER_TEMP/benchmark-history/benchmark-data.json"
+                cp "$RUNNER_TEMP/benchmark-history/benchmark-data.json" benchmark-data.json
+                exit 0
+              fi
+            done <<< "$runs"
+            page=$((page + 1))
           done
-          echo '::error::No trusted benchmark history remains; restore the baseline before publishing another benchmark.'
+          printf '%s\n' '::error::No trusted benchmark history remains. Dispatch this workflow on main with reset_history=true to explicitly begin a new history.'
           exit 1
 
       - name: Run CPU-ratio performance tests
@@ -106,6 +120,14 @@ jobs:
           alert-threshold: '130%'
           auto-push: false
           github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Preserve benchmark history
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: hqq-benchmark-history
+          path: benchmark-data.json
+          if-no-files-found: error
+          retention-days: 90
 
       - name: Render pprof reports
         if: runner.os == 'Linux'
