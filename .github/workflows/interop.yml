@@ -36,6 +36,7 @@ env:
   # by name (hqq-interop or this target name), so the target can change here.
   HQQ_INTEROP_C_TARGET: hqq_interop
 
+jobs:
   # The Go helper is pure Go (no cgo), so one Ubuntu job cross-compiles it
   # for every test OS and shares the binaries through an artifact instead
   # of rebuilding it in each matrix cell.
